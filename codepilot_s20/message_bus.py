@@ -5,7 +5,6 @@ from .runtime_state import *
 # Team communication is append-only JSONL mailboxes. This keeps the protocol
 # inspectable on disk and lets background teammates send messages.
 MAILBOX_DIR = WORKDIR / ".mailboxes"
-MAILBOX_DIR.mkdir(exist_ok=True)
 
 
 class MessageBus:

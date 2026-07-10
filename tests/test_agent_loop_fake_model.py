@@ -198,3 +198,21 @@ def test_max_tokens_triggers_continuation_path(monkeypatch):
     assert len(fake_client.messages.calls) == 2
     assert fake_client.messages.calls[1]["max_tokens"] == agent_loop.ESCALATED_MAX_TOKENS
     assert messages[-1]["content"][0].text == "complete"
+
+
+def test_run_agent_task_uses_injected_fake_model_client(tmp_path):
+    fake_client = FakeClient([response([text_block("task complete")])])
+    trace_path = tmp_path / "trace.jsonl"
+
+    result = agent_loop.run_agent_task(
+        "say done",
+        str(tmp_path),
+        str(trace_path),
+        model_client=fake_client,
+        model_provider="test",
+        model="fake",
+    )
+
+    assert result["final_answer"] == "task complete"
+    assert trace_path.exists()
+    assert len(fake_client.messages.calls) == 1

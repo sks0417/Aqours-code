@@ -15,6 +15,8 @@ os.environ.setdefault("CODEPILOT_S20_WORKDIR", tempfile.mkdtemp(prefix="codepilo
 
 @pytest.fixture(autouse=True)
 def isolated_s20_state(tmp_path, monkeypatch):
+    from codepilot_s20 import bootstrap
+    bootstrap()
     from codepilot_s20 import runtime_state, message_bus, protocol, task_system, hooks, trace
 
     monkeypatch.setenv("CODEPILOT_S20_WORKDIR", str(tmp_path))

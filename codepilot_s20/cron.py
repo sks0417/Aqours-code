@@ -31,6 +31,8 @@ scheduled_jobs: dict[str, CronJob] = {}
 scheduled_once_jobs: dict[str, OnceJob] = {}
 cron_queue: list = []
 cron_lock = threading.Lock()
+_scheduler_lock = threading.Lock()
+_scheduler_thread = None
 _last_fired: dict[str, str] = {}
 
 
@@ -281,6 +283,23 @@ def cron_scheduler_loop():
                     print(f"  \033[31m[once error] {job.id}: {e}\033[0m")
 
 
+def start_scheduler(load_durable: bool = True):
+    global _scheduler_thread
+    with _scheduler_lock:
+        if _scheduler_thread is not None and _scheduler_thread.is_alive():
+            return _scheduler_thread
+        if load_durable:
+            load_durable_jobs()
+            load_durable_once_jobs()
+        _scheduler_thread = threading.Thread(
+            target=cron_scheduler_loop,
+            name="codepilot-s20-cron",
+            daemon=True,
+        )
+        _scheduler_thread.start()
+        return _scheduler_thread
+
+
 def consume_cron_queue() -> list[CronJob]:
     with cron_lock:
         fired = list(cron_queue)
@@ -331,13 +350,6 @@ def run_cancel_cron(job_id: str) -> str:
     if result.endswith("not found"):
         return cancel_once_job(job_id)
     return result
-
-
-load_durable_jobs()
-load_durable_once_jobs()
-threading.Thread(target=cron_scheduler_loop, daemon=True).start()
-
-
 
 import sys as _sys
 from . import runtime_state as _runtime_state

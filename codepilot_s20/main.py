@@ -1,12 +1,27 @@
 from __future__ import annotations
 
 from . import bootstrap
-from . import terminal
-from .runtime_state import *
-
-bootstrap()
 
 def main():
+    bootstrap()
+    import threading
+    from . import terminal
+    from .agent_loop import (
+        agent_lock,
+        agent_loop,
+        cron_autorun_loop,
+        print_turn_assistants,
+    )
+    from .config import MODEL, MODEL_PROVIDER, WORKDIR
+    from .context import update_context
+    from .cron import start_scheduler
+    from .hooks import trigger_hooks
+    from .protocol import consume_lead_inbox
+    from .subagent import extract_text
+    from .terminal import PROMPT
+    from .trace import finish_run, record_hook, start_run
+
+    start_scheduler()
     terminal.CLI_ACTIVE = True
     print("s20: comprehensive agent")
     print("Enter a question, press Enter to send. Type q to quit.\n")

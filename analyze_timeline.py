@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """Analyze the timeline file from the 5000-file large-dir test."""
+import argparse
 import json
-import os
+from pathlib import Path
 
-DATA_DIR = r"C:\Users\Alan_\Documents\New project\codepilot_s20"
-RUN_DIR = r"C:\Users\Alan_\Documents\New project\codepilot_s20\.codepilot\stress_workspace\20260707-230838\.codepilot\runs\20260707-230843-5f119e85"
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_dir", type=Path, help="Path to a .codepilot run directory")
+    return parser.parse_args()
+
+
+RUN_DIR = parse_args().run_dir
 
 # Check what files are in the run dir
 print("=== Files in run dir ===")
-for f in os.listdir(RUN_DIR):
-    size = os.path.getsize(os.path.join(RUN_DIR, f))
-    print(f"  {f}: {size} bytes")
+for path in RUN_DIR.iterdir():
+    print(f"  {path.name}: {path.stat().st_size} bytes")
 
 # Read timeline
 print("\n=== Timeline Analysis ===")
-with open(os.path.join(RUN_DIR, 'timeline.jsonl'), 'r', encoding='utf-8', errors='replace') as f:
+with (RUN_DIR / "timeline.jsonl").open("r", encoding="utf-8", errors="replace") as f:
     content = f.read()
 
 lines = content.strip().split('\n')

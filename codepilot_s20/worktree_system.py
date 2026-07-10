@@ -5,7 +5,6 @@ from .runtime_state import *
 # Worktree names become filesystem paths, so the teaching version keeps the
 # validation rules strict and reuses them for create/remove/keep.
 WORKTREES_DIR = WORKDIR / ".worktrees"
-WORKTREES_DIR.mkdir(exist_ok=True)
 
 VALID_WT_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
 
@@ -32,6 +31,7 @@ def run_git(args: list[str]) -> tuple[bool, str]:
 
 
 def log_event(event_type: str, worktree_name: str, task_id: str = ""):
+    WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
     event = {"type": event_type, "worktree": worktree_name,
              "task_id": task_id, "ts": time.time()}
     events_file = WORKTREES_DIR / "events.jsonl"
@@ -50,6 +50,7 @@ def create_worktree(name: str, task_id: str = "") -> str:
             load_task(task_id)
         except FileNotFoundError:
             return f"Error: task {task_id} not found"
+    WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
     path = WORKTREES_DIR / name
     if path.exists():
         return f"Worktree '{name}' already exists at {path}"

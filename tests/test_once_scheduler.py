@@ -56,6 +56,7 @@ def test_schedule_once_seconds_fires_once_and_disappears(tmp_path):
 
 def test_schedule_once_is_consumed_by_scheduler_loop(tmp_path):
     reset_scheduler(tmp_path)
+    cron.start_scheduler(load_durable=False)
 
     result = cron.schedule_once("answer trace once test", delay_seconds=1)
     assert not isinstance(result, str)
@@ -65,6 +66,34 @@ def test_schedule_once_is_consumed_by_scheduler_loop(tmp_path):
     assert [job.id for job in fired] == [result.id]
     assert result.id not in cron.scheduled_once_jobs
     assert cron.consume_cron_queue() == []
+
+
+def test_start_scheduler_is_idempotent(monkeypatch):
+    old_thread = cron._scheduler_thread
+    cron._scheduler_thread = None
+    starts = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.started = False
+
+        def start(self):
+            self.started = True
+            starts.append(self)
+
+        def is_alive(self):
+            return self.started
+
+    monkeypatch.setattr(cron.threading, "Thread", FakeThread)
+    try:
+        first = cron.start_scheduler(load_durable=False)
+        second = cron.start_scheduler(load_durable=False)
+    finally:
+        cron._scheduler_thread = old_thread
+
+    assert first is second
+    assert len(starts) == 1
 
 
 def test_schedule_once_minute_delay(tmp_path):

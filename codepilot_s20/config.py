@@ -48,10 +48,38 @@ def _env_float(name: str, default: float) -> float:
 
 WORKDIR = Path(os.getenv("CODEPILOT_S20_WORKDIR", Path.cwd())).resolve()
 MODEL_PROVIDER = provider_from_env()
-client = build_model_client(MODEL_PROVIDER)
 MODEL = os.getenv("MODEL_ID", default_model_for_provider(MODEL_PROVIDER))
 PRIMARY_MODEL = MODEL
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")
+
+_CLIENT = None
+_CLIENT_PROVIDER = None
+
+
+def _active_model_provider() -> str:
+    try:
+        from . import runtime_state as _state
+        return getattr(_state, "MODEL_PROVIDER", MODEL_PROVIDER)
+    except Exception:
+        return MODEL_PROVIDER
+
+
+def get_model_client(provider: str | None = None):
+    global _CLIENT, _CLIENT_PROVIDER
+    provider = provider or _active_model_provider()
+    if _CLIENT is None or _CLIENT_PROVIDER != provider:
+        _CLIENT = build_model_client(provider)
+        _CLIENT_PROVIDER = provider
+    return _CLIENT
+
+
+class LazyModelClient:
+    @property
+    def messages(self):
+        return get_model_client().messages
+
+
+client = LazyModelClient()
 
 SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"

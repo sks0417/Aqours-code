@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """Analyze trace.jsonl entries from the 5000-file test."""
-import os
+import argparse
 import json
+from pathlib import Path
 
-RUN_DIR = r"C:\Users\Alan_\Documents\New project\codepilot_s20\.codepilot\stress_workspace\20260707-230838\.codepilot\runs\20260707-230843-5f119e85"
 
-with open(os.path.join(RUN_DIR, 'trace.jsonl'), 'r', encoding='utf-8', errors='replace') as f:
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_dir", type=Path, help="Path to a .codepilot run directory")
+    return parser.parse_args()
+
+
+RUN_DIR = parse_args().run_dir
+
+with (RUN_DIR / "trace.jsonl").open("r", encoding="utf-8", errors="replace") as f:
     lines = f.read().strip().split('\n')
 
 print(f"Total trace entries: {len(lines)}")
@@ -52,7 +60,7 @@ for i, line in enumerate(lines):
 
 # Check timeline.jsonl raw content
 print("\n\n=== timeline.jsonl raw entries ===")
-with open(os.path.join(RUN_DIR, 'timeline.jsonl'), 'r', encoding='utf-8', errors='replace') as f:
+with (RUN_DIR / "timeline.jsonl").open("r", encoding="utf-8", errors="replace") as f:
     tlines = f.read().strip().split('\n')
 print(f"Total timeline entries: {len(tlines)}")
 for i, line in enumerate(tlines):

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .runtime_state import *
 
 from pathlib import Path as _Path
@@ -178,6 +180,8 @@ def call_llm(messages: list, context: dict, tools: list,
 
 def agent_loop(messages: list, context: dict):
     global rounds_since_todo
+    from . import bootstrap
+    bootstrap()
     tools, handlers = assemble_tool_pool()
     state = RecoveryState()
     max_tokens = DEFAULT_MAX_TOKENS
@@ -403,6 +407,8 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
                    model: str | None = None) -> dict:
     """Run one non-interactive agent task using the existing loop and trace."""
     global rounds_since_todo
+    from . import bootstrap
+    bootstrap()
 
     workdir_path = _Path(workdir).resolve()
     workdir_path.mkdir(parents=True, exist_ok=True)

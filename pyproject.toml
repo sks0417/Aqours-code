@@ -16,3 +16,4 @@ codepilot-s20 = "codepilot_s20.main:main"
 include = ["codepilot_s20*"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
+testpaths = ["tests"]

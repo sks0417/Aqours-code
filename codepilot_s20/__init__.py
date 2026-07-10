@@ -10,4 +10,3 @@ def bootstrap():
     from . import runtime_state
     runtime_state.wire_modules()
     _BOOTSTRAPPED = True
-bootstrap()

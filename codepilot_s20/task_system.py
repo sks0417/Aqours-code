@@ -5,7 +5,6 @@ from .runtime_state import *
 # Tasks are tiny durable records. Later systems add ownership, dependencies,
 # worktrees, and teammates on top of this same file-backed state.
 TASKS_DIR = WORKDIR / ".tasks"
-TASKS_DIR.mkdir(exist_ok=True)
 CURRENT_TODOS: list[dict] = []
 
 

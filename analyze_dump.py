@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """Analyze raw content of run files from the 5000-file test."""
-import os
+import argparse
 import json
+from pathlib import Path
 
-RUN_DIR = r"C:\Users\Alan_\Documents\New project\codepilot_s20\.codepilot\stress_workspace\20260707-230838\.codepilot\runs\20260707-230843-5f119e85"
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_dir", type=Path, help="Path to a .codepilot run directory")
+    return parser.parse_args()
+
+
+RUN_DIR = parse_args().run_dir
 
 # 1. metadata.json
 print("=== metadata.json ===")
-with open(os.path.join(RUN_DIR, 'metadata.json'), 'r', encoding='utf-8', errors='replace') as f:
+with (RUN_DIR / "metadata.json").open("r", encoding="utf-8", errors="replace") as f:
     print(f.read())
 
 # 2. final.md
 print("\n=== final.md ===")
-with open(os.path.join(RUN_DIR, 'final.md'), 'r', encoding='utf-8', errors='replace') as f:
+with (RUN_DIR / "final.md").open("r", encoding="utf-8", errors="replace") as f:
     content = f.read()
     print(f"Size: {len(content)} bytes")
     if content.strip():
@@ -22,13 +30,13 @@ with open(os.path.join(RUN_DIR, 'final.md'), 'r', encoding='utf-8', errors='repl
 
 # 3. timeline.md - first portion
 print("\n=== timeline.md (first 3000 chars) ===")
-with open(os.path.join(RUN_DIR, 'timeline.md'), 'r', encoding='utf-8', errors='replace') as f:
+with (RUN_DIR / "timeline.md").open("r", encoding="utf-8", errors="replace") as f:
     content = f.read()
     print(content[:3000])
 
 # 4. trace.jsonl - last entries
 print("\n=== trace.jsonl (last 3000 chars) ===")
-with open(os.path.join(RUN_DIR, 'trace.jsonl'), 'r', encoding='utf-8', errors='replace') as f:
+with (RUN_DIR / "trace.jsonl").open("r", encoding="utf-8", errors="replace") as f:
     content = f.read()
     lines = content.strip().split('\n')
     print(f"Total lines: {len(lines)}")
