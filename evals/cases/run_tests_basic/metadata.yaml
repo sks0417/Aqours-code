@@ -1,0 +1,8 @@
+id: run_tests_basic
+suite: regression
+difficulty: 1
+category: test_execution
+max_turns: 4
+max_tool_calls: 4
+forbidden_paths: []
+expected_artifacts: []

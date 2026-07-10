@@ -1,0 +1,2 @@
+service=atlas-relay
+status=PLACEHOLDER_STATUS

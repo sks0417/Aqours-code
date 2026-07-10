@@ -1,0 +1,8 @@
+id: capability_catalog_generation
+suite: regression
+difficulty: 2
+category: file_generation
+max_turns: 8
+max_tool_calls: 10
+forbidden_paths: []
+expected_artifacts: [catalog.csv, processed/A-100.done, processed/B-200.done, processed/C-300.done]

@@ -1,0 +1,8 @@
+id: capability_bug_fix_tests
+suite: regression
+difficulty: 2
+category: bug_fix_tests
+max_turns: 8
+max_tool_calls: 10
+forbidden_paths: [test_stats.py]
+expected_artifacts: [stats.py]

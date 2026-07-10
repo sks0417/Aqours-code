@@ -1,0 +1,26 @@
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+
+# Runtime state and local agent artifacts
+.codepilot/
+.mailboxes/
+.tasks/
+.task_outputs/
+.transcripts/
+.worktrees/
+.scheduled_tasks.json
+.scheduled_once_tasks.json
+
+# Eval outputs; keep case definitions, ignore run results
+evals/results/*
+!evals/results/.gitkeep
+
+# Local scratch/debug artifacts
+output.txt
+tmp_test.txt
+yosoro.txt
+trace_*.jsonl
+timeline_*.jsonl
+timeline_dump.txt

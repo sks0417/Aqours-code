@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "codepilot-s20"
+version = "0.1.0"
+description = "Function-parity engineering split of learn-claude-code s20 comprehensive harness."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["anthropic>=0.34", "python-dotenv>=1.0", "pyyaml>=6.0"]
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+[project.scripts]
+codepilot-s20 = "codepilot_s20.main:main"
+[tool.setuptools.packages.find]
+include = ["codepilot_s20*"]
+[tool.pytest.ini_options]
+pythonpath = ["."]

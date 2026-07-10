@@ -1,0 +1,8 @@
+id: mini_auth_service_security_fix
+suite: capability
+difficulty: 3
+category: security_bug_fix
+max_turns: 10
+max_tool_calls: 14
+forbidden_paths: [tests/test_auth_service.py]
+expected_artifacts: [src/auth_service.py]

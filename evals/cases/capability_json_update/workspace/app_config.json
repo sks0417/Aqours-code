@@ -1,0 +1,15 @@
+{
+  "service": {
+    "name": "atlas-relay",
+    "region": "us-east-1",
+    "timeout_ms": 1200
+  },
+  "retries": {
+    "max_attempts": 2,
+    "backoff_ms": 250
+  },
+  "feature_flags": {
+    "beta_dashboard": false,
+    "legacy_export": true
+  }
+}
