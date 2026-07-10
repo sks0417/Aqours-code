@@ -3,6 +3,19 @@
 __pycache__/
 .pytest_cache/
 
+# Virtual environments
+.venv/
+venv/
+
+# Python packaging
+*.egg-info/
+build/
+dist/
+
+# Coverage
+.coverage
+htmlcov/
+
 # Runtime state and local agent artifacts
 .codepilot/
 .mailboxes/
