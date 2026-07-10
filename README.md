@@ -45,7 +45,18 @@ pytest package from the controlled Python environment:
 pip install -e ".[dev]"
 ```
 
-Eval grading uses a clean-room flow: the agent edits an isolated
-`agent_workspace`, the runner records a change manifest, then a fresh
-`grading_workspace` is copied from the original case fixture and only
-`allowed_changes` are applied before the grader runs.
+Eval grading uses a clean-room flow: before the agent runs, the runner creates
+a trusted baseline copy of `task.md`, `metadata.yaml`, `grader.py`,
+`grader_tests/`, and `workspace/`. The agent edits an isolated
+`agent_workspace`; the runner records a change manifest, verifies that the
+trusted case files were not modified, creates a fresh `grading_workspace` from
+the trusted baseline, and applies only `allowed_changes`.
+
+Symlinks are recorded in manifests but are never submitted to the grading
+workspace. If case/grader files change during a run, the case fails with
+`constraint_violation`. Grader pytest runs use `sys.executable -m pytest` with
+plugin autoloading and user site packages disabled for reproducibility.
+
+This is still not a strong OS sandbox. The `bash` tool runs with the host
+process permissions; truly adversarial isolation requires a future container or
+separate restricted process.

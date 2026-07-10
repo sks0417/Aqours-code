@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -71,10 +72,26 @@ def trace_contains_test_run(trace_path: str | Path) -> bool:
     for event in trace_events(trace_path):
         if event.get("type") != "tool_use":
             continue
-        text = json.dumps(event.get("input", {}), ensure_ascii=False).lower()
-        if "pytest" in text or "test" in text:
+        tool_name = str(event.get("tool") or event.get("name") or "").lower()
+        tool_input = event.get("input", {}) if isinstance(event.get("input"), dict) else {}
+        command = str(tool_input.get("command") or tool_input.get("cmd") or "").lower()
+        if tool_name and tool_name not in {"bash", "shell", "powershell", "cmd"}:
+            continue
+        if not command:
+            continue
+        if is_test_command(command):
             return True
     return False
+
+
+def is_test_command(command: str) -> bool:
+    command = str(command).lower()
+    patterns = [
+        r"(^|[;&|]\s*|\&\&\s*)\"?[^\";&|]*\b(python|python3|py)(\.exe)?\"?(\s+-u)?\s+-m\s+pytest\b",
+        r"(^|[;&|]\s*|\&\&\s*)\"?[^\";&|]*\b(python|python3|py)(\.exe)?\"?(\s+-u)?\s+-m\s+unittest\b",
+        r"(^|[;&|]\s*|\&\&\s*)\"?[^\";&|]*\bpytest(\.exe)?\"?\b",
+    ]
+    return any(re.search(pattern, command) for pattern in patterns)
 
 
 def run_pytest(
@@ -92,7 +109,10 @@ def run_pytest(
         resolved_tests.append(str(path.resolve()))
     env = os.environ.copy()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
     env["EVAL_GRADING_WORKSPACE"] = str(workspace)
+    env.pop("PYTHONPATH", None)
     cmd = [sys.executable, "-m", "pytest", "-q", *resolved_tests]
     try:
         proc = subprocess.run(

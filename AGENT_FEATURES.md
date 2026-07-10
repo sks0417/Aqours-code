@@ -766,8 +766,9 @@ case workspace template
 -> agent_workspace
 -> agent edits
 -> change_manifest.json
+-> trusted baseline check for task.md, metadata.yaml, grader.py, grader_tests/, and workspace/
 -> allowed_changes / forbidden_paths validation
--> fresh grading_workspace copied from the original case fixture
+-> fresh grading_workspace copied from the trusted baseline
 -> apply only allowed submitted changes
 -> public tests + grader-only tests
 -> structured result
@@ -786,9 +787,21 @@ workspace. Common tampering paths such as `pytest.py`, `conftest.py`,
 `sitecustomize.py`, and `usercustomize.py` are constraint violations unless a
 case explicitly allows them.
 
+The runner snapshots trusted case inputs before the agent starts. If the
+original `task.md`, `metadata.yaml`, `grader.py`, `grader_tests/`, or
+`workspace/` changes during a case, the case fails with `constraint_violation`
+and the potentially modified grader is not executed. Grading always uses the
+pre-run trusted copy. Symlinks are recorded in snapshots and manifests, but any
+new or replacement symlink is forbidden and is not copied into the grading
+workspace.
+
 The three engineering capability cases also include `grader_tests/` held-out
 tests. These tests are not copied into the agent workspace; they are executed
 only during grading together with the public tests.
+
+Pytest graders run through `sys.executable -m pytest` with bytecode writes,
+plugin autoloading, user site packages, and inherited `PYTHONPATH` disabled for
+more reproducible local grading.
 
 This prevents common test-file and pytest-runner tampering in the local eval
 harness. It is still not a strong OS sandbox. The current `bash` tool can still

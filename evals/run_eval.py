@@ -11,7 +11,7 @@ import sys
 import time
 import fnmatch
 import hashlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 
@@ -73,6 +73,8 @@ RUNTIME_IGNORE_PATTERNS = [
     "*.pyc",
 ]
 TAMPER_ENTRY_NAMES = {"pytest.py", "conftest.py", "sitecustomize.py", "usercustomize.py"}
+TRUSTED_ROOT_FILES = {"task.md", "metadata.yaml", "grader.py"}
+TRUSTED_DIRS = {"workspace", "grader_tests"}
 
 
 def text_block(text: str):
@@ -241,10 +243,8 @@ def trace_metrics(trace_path: Path) -> dict:
 
 
 def posix_relative(root: Path, path: Path) -> str:
-    root_resolved = root.resolve()
-    path_resolved = path.resolve(strict=False)
     try:
-        relative = path_resolved.relative_to(root_resolved)
+        relative = path.relative_to(root)
     except ValueError as exc:
         raise ValueError(f"path escapes workspace: {path}") from exc
     text = relative.as_posix()
@@ -253,9 +253,51 @@ def posix_relative(root: Path, path: Path) -> str:
     return text
 
 
+def normalize_posix_path(value: str) -> str:
+    text = str(value).replace("\\", "/").strip()
+    pure = PurePosixPath(text)
+    if not text or pure.is_absolute() or ":" in pure.parts[0] or ".." in pure.parts:
+        raise ValueError(f"unsafe relative path: {value}")
+    return pure.as_posix()
+
+
+def _match_segments(path_parts: tuple[str, ...], pattern_parts: tuple[str, ...]) -> bool:
+    if not pattern_parts:
+        return not path_parts
+    head = pattern_parts[0]
+    if head == "**":
+        return (
+            _match_segments(path_parts, pattern_parts[1:])
+            or (bool(path_parts) and _match_segments(path_parts[1:], pattern_parts))
+        )
+    return (
+        bool(path_parts)
+        and fnmatch.fnmatchcase(path_parts[0], head)
+        and _match_segments(path_parts[1:], pattern_parts[1:])
+    )
+
+
+def path_matches_pattern(path: str, pattern: str) -> bool:
+    normalized_path = normalize_posix_path(path)
+    normalized_pattern = normalize_posix_path(pattern)
+    return _match_segments(
+        tuple(PurePosixPath(normalized_path).parts),
+        tuple(PurePosixPath(normalized_pattern).parts),
+    )
+
+
 def matches_any(path: str, patterns: list[str]) -> bool:
-    normalized = path.replace("\\", "/")
-    return any(fnmatch.fnmatchcase(normalized, pattern.replace("\\", "/")) for pattern in patterns)
+    try:
+        normalize_posix_path(path)
+    except ValueError:
+        return False
+    for pattern in patterns:
+        try:
+            if path_matches_pattern(path, pattern):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def is_runtime_artifact(path: str) -> bool:
@@ -278,6 +320,7 @@ def workspace_snapshot(workspace: Path) -> dict[str, dict]:
     snapshot: dict[str, dict] = {}
     if not workspace.exists():
         return snapshot
+    workspace = workspace.resolve()
     for path in sorted(workspace.rglob("*")):
         rel = posix_relative(workspace, path)
         if is_runtime_artifact(rel):
@@ -286,15 +329,15 @@ def workspace_snapshot(workspace: Path) -> dict[str, dict]:
             stat = path.lstat()
         except OSError:
             continue
-        if path.is_dir() and not path.is_symlink():
-            continue
         if path.is_symlink():
             snapshot[rel] = {
                 "path": rel,
                 "sha256": None,
                 "type": "symlink",
-                "size": 0,
+                "size": stat.st_size,
             }
+            continue
+        if path.is_dir():
             continue
         if path.is_file():
             snapshot[rel] = {
@@ -352,6 +395,7 @@ def build_change_manifest(
 
 
 def safe_workspace_path(root: Path, rel: str) -> Path:
+    rel = normalize_posix_path(rel)
     path = root / rel
     resolved_root = root.resolve()
     resolved_path = path.resolve(strict=False)
@@ -374,6 +418,63 @@ def copy_case_workspace(case_dir: Path, destination: Path):
         symlinks=True,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
+
+
+def trusted_input_snapshot(case_dir: Path) -> dict[str, dict]:
+    snapshot: dict[str, dict] = {}
+    case_root = case_dir.resolve()
+    for path in sorted(case_root.rglob("*")):
+        rel = posix_relative(case_root, path)
+        if is_runtime_artifact(rel):
+            continue
+        parts = PurePosixPath(rel).parts
+        if not parts:
+            continue
+        if parts[0] not in TRUSTED_DIRS and rel not in TRUSTED_ROOT_FILES:
+            continue
+        try:
+            stat = path.lstat()
+        except OSError:
+            continue
+        if path.is_symlink():
+            snapshot[rel] = {"path": rel, "sha256": None, "type": "symlink", "size": stat.st_size}
+        elif path.is_file():
+            snapshot[rel] = {
+                "path": rel,
+                "sha256": file_sha256(path),
+                "type": "file",
+                "size": stat.st_size,
+            }
+    return snapshot
+
+
+def trusted_input_changes(before: dict[str, dict], after: dict[str, dict]) -> list[str]:
+    changes = changed_paths(before, after)
+    changed = set(changes["added"] + changes["modified"] + changes["deleted"])
+    changed.update(path for path, data in after.items() if data.get("type") == "symlink")
+    return sorted(changed)
+
+
+def copy_trusted_case(case_dir: Path, trusted_eval_root: Path, case_name: str) -> Path:
+    trusted_case = trusted_eval_root / "cases" / case_name
+    if trusted_eval_root.exists():
+        shutil.rmtree(trusted_eval_root)
+    trusted_case.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(PROJECT_ROOT / "evals" / "grader_common.py", trusted_eval_root / "grader_common.py")
+    for filename in TRUSTED_ROOT_FILES:
+        source = case_dir / filename
+        if source.exists():
+            shutil.copy2(source, trusted_case / filename)
+    for dirname in TRUSTED_DIRS:
+        source = case_dir / dirname
+        if source.exists():
+            shutil.copytree(
+                source,
+                trusted_case / dirname,
+                symlinks=True,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+    return trusted_case
 
 
 def apply_allowed_changes(agent_workspace: Path, grading_workspace: Path, manifest: dict):
@@ -408,6 +509,23 @@ def create_grading_workspace(
 ):
     copy_case_workspace(case_dir, grading_workspace)
     apply_allowed_changes(agent_workspace, grading_workspace, manifest)
+
+
+def failure_result(
+    *,
+    reason: str,
+    failure_category: str,
+    score: float = 0,
+    metrics: dict | None = None,
+) -> dict:
+    return normalize_grader_payload({
+        "passed": False,
+        "score": score,
+        "breakdown": {key: 0 for key in DEFAULT_BREAKDOWN_WEIGHTS},
+        "reason": reason,
+        "failure_category": failure_category,
+        "metrics": metrics or {},
+    }, subprocess.CompletedProcess([], 1, "", ""))
 
 
 def normalize_breakdown(value, passed: bool) -> dict:
@@ -497,8 +615,8 @@ def write_text(path: Path, text: str):
 
 def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
     case_name = case_dir.name
-    metadata = load_metadata(case_dir)
     case_output = run_root / case_name
+    trusted_eval_root = case_output / "trusted_eval"
     agent_workspace = case_output / "agent_workspace"
     grading_workspace = case_output / "grading_workspace"
     trace_path = case_output / "trace.jsonl"
@@ -511,9 +629,12 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
     change_manifest_path = case_output / "change_manifest.json"
 
     case_output.mkdir(parents=True, exist_ok=True)
-    original_snapshot = workspace_snapshot(case_dir / "workspace")
-    copy_case_workspace(case_dir, agent_workspace)
-    task = (case_dir / "task.md").read_text(encoding="utf-8")
+    trusted_before = trusted_input_snapshot(case_dir)
+    trusted_case_dir = copy_trusted_case(case_dir, trusted_eval_root, case_name)
+    metadata = load_metadata(trusted_case_dir)
+    original_snapshot = workspace_snapshot(trusted_case_dir / "workspace")
+    copy_case_workspace(trusted_case_dir, agent_workspace)
+    task = (trusted_case_dir / "task.md").read_text(encoding="utf-8")
 
     start = time.perf_counter()
     agent_error = ""
@@ -571,25 +692,42 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
         metadata=metadata,
     )
     write_text(change_manifest_path, json.dumps(change_manifest, indent=2))
+    trusted_after = trusted_input_snapshot(case_dir)
+    trusted_violations = trusted_input_changes(trusted_before, trusted_after)
 
-    try:
-        create_grading_workspace(
-            case_dir=case_dir,
-            agent_workspace=agent_workspace,
-            grading_workspace=grading_workspace,
-            manifest=change_manifest,
+    if trusted_violations:
+        grader_result = failure_result(
+            reason="trusted case inputs were modified: " + ", ".join(trusted_violations),
+            failure_category="constraint_violation",
+            metrics={"trusted_violations": trusted_violations},
         )
-        grader_result, grader_proc = run_grader(
-            case_dir, grading_workspace, trace_path, final_path, stdout_path, stderr_path)
-    except Exception as exc:
-        grader_reason = f"grader failed to run: {type(exc).__name__}: {exc}"
-        grader_result = normalize_grader_payload({
-            "passed": False,
-            "score": 0,
-            "reason": grader_reason,
-            "failure_category": "grader_error",
-        }, subprocess.CompletedProcess([], 1, "", ""))
-        grader_proc = subprocess.CompletedProcess([], 1, "", grader_reason)
+        grader_proc = subprocess.CompletedProcess([], 1, "", grader_result["reason"])
+        try:
+            create_grading_workspace(
+                case_dir=trusted_case_dir,
+                agent_workspace=agent_workspace,
+                grading_workspace=grading_workspace,
+                manifest=change_manifest,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            create_grading_workspace(
+                case_dir=trusted_case_dir,
+                agent_workspace=agent_workspace,
+                grading_workspace=grading_workspace,
+                manifest=change_manifest,
+            )
+            grader_result, grader_proc = run_grader(
+                trusted_case_dir, grading_workspace, trace_path, final_path, stdout_path, stderr_path)
+        except Exception as exc:
+            grader_reason = f"grader failed to run: {type(exc).__name__}: {exc}"
+            grader_result = failure_result(
+                reason=grader_reason,
+                failure_category="grader_error",
+            )
+            grader_proc = subprocess.CompletedProcess([], 1, "", grader_reason)
 
     write_text(grader_stdout_path, grader_proc.stdout or "")
     write_text(grader_stderr_path, grader_proc.stderr or "")
@@ -604,17 +742,16 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
         }, subprocess.CompletedProcess([], 1, "", ""))
     elif change_manifest["unexpected_changes"] or change_manifest["forbidden_changes"]:
         violations = sorted(set(change_manifest["unexpected_changes"] + change_manifest["forbidden_changes"]))
-        grader_result = normalize_grader_payload({
-            "passed": False,
-            "score": 0,
-            "reason": "unexpected or forbidden changes: " + ", ".join(violations),
-            "failure_category": "constraint_violation",
-        }, subprocess.CompletedProcess([], 1, "", ""))
+        grader_result = failure_result(
+            reason="unexpected or forbidden changes: " + ", ".join(violations),
+            failure_category="constraint_violation",
+        )
 
     metrics = {
         **trace_metrics(trace_path),
         **grader_result.get("metrics", {}),
         "runtime_sec": round(duration_ms / 1000, 3),
+        "trusted_violations": trusted_violations,
     }
 
     return {
@@ -635,6 +772,8 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
         "unexpected_changes": change_manifest["unexpected_changes"],
         "forbidden_changes": change_manifest["forbidden_changes"],
         "submitted_changes": change_manifest["submitted_changes"],
+        "trusted_violations": trusted_violations,
+        "trusted_case": str(trusted_case_dir),
         "trace": str(trace_path),
         "transcript": str(transcript_path),
         "stdout": str(stdout_path),
@@ -723,6 +862,39 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
     }
 
 
+def case_exception_result(case: Path, run_root: Path, exc: Exception) -> dict:
+    reason = f"case failed before completion: {type(exc).__name__}: {exc}"
+    metadata = load_metadata(case)
+    result = failure_result(reason=reason, failure_category="grader_error")
+    return {
+        "case": case.name,
+        "metadata": metadata,
+        "passed": False,
+        "score": result["score"],
+        "breakdown": result["breakdown"],
+        "metrics": {"runtime_sec": 0},
+        "reason": reason,
+        "failure_category": "grader_error",
+        "error": reason,
+        "duration_ms": 0,
+        "workspace": str(run_root / case.name / "agent_workspace"),
+        "agent_workspace": str(run_root / case.name / "agent_workspace"),
+        "grading_workspace": str(run_root / case.name / "grading_workspace"),
+        "change_manifest": str(run_root / case.name / "change_manifest.json"),
+        "unexpected_changes": [],
+        "forbidden_changes": [],
+        "submitted_changes": [],
+        "trusted_violations": [],
+        "trace": str(run_root / case.name / "trace.jsonl"),
+        "transcript": str(run_root / case.name / "transcript.md"),
+        "stdout": str(run_root / case.name / "stdout.txt"),
+        "stderr": str(run_root / case.name / "stderr.txt"),
+        "final": str(run_root / case.name / "final.md"),
+        "grader": result,
+        "run": {},
+    }
+
+
 def write_summary(results_dir: Path, summary: dict):
     summary_path = results_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -787,6 +959,14 @@ def main() -> int:
             interrupt_reason = f"Interrupted while running {case.name}"
             print(f"[eval] interrupted during {case.name}; partial summary will be written", flush=True)
             break
+        except Exception as exc:
+            result = case_exception_result(case, run_root, exc)
+            results.append(result)
+            print(
+                f"[eval] done  {index}/{len(cases)} {case.name} FAIL "
+                f"score=0 elapsed={time.time() - case_started:.1f}s reason={result['reason']}",
+                flush=True,
+            )
         finally:
             write_summary(
                 results_dir,

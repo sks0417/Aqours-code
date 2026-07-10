@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from evals import grader_common
 from evals import run_eval
 
 
@@ -40,7 +41,7 @@ def build_and_apply(case_dir: Path, metadata: dict, before: dict, agent: Path, g
 
 def write_trace(path: Path):
     path.write_text(
-        json.dumps({"type": "tool_use", "input": {"command": "python -m pytest -q"}}) + "\n",
+        json.dumps({"type": "tool_use", "tool": "bash", "input": {"command": "python -m pytest -q"}}) + "\n",
         encoding="utf-8",
     )
 
@@ -146,6 +147,14 @@ def test_allowed_glob_matches_processed_done_files(tmp_path):
     assert (grading / "processed" / "A-100.done").exists()
 
 
+def test_allowed_glob_is_path_segment_aware():
+    assert run_eval.matches_any("processed/A-100.done", ["processed/*.done"])
+    assert not run_eval.matches_any("processed/nested/A-100.done", ["processed/*.done"])
+    assert run_eval.matches_any("catalog.csv", ["catalog.csv"])
+    assert not run_eval.matches_any("../catalog.csv", ["*.csv"])
+    assert not run_eval.matches_any("C:\\temp\\catalog.csv", ["*.csv"])
+
+
 def test_unsafe_paths_and_symlinks_cannot_enter_grading_workspace(tmp_path):
     assert pytest.raises(ValueError, run_eval.safe_workspace_path, tmp_path, "../outside.py")
     assert pytest.raises(ValueError, run_eval.safe_workspace_path, tmp_path, str(tmp_path / "absolute.py"))
@@ -167,6 +176,27 @@ def test_unsafe_paths_and_symlinks_cannot_enter_grading_workspace(tmp_path):
     )
 
     assert "src/auth_service.py" in manifest["forbidden_changes"]
+
+
+def test_internal_and_external_symlinks_are_snapshotted_and_forbidden(tmp_path):
+    metadata, before, agent, _grading = prepare_case(AUTH_CASE, tmp_path / "case")
+    internal_link = agent / "internal_link.py"
+    external_link = agent / "external_link.py"
+    outside = tmp_path / "outside.py"
+    outside.write_text("outside", encoding="utf-8")
+    try:
+        internal_link.symlink_to(agent / "src" / "auth_service.py")
+        external_link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is not available in this environment")
+
+    after = run_eval.workspace_snapshot(agent)
+    manifest = run_eval.build_change_manifest(before=before, after=after, metadata=metadata)
+
+    assert after["internal_link.py"]["type"] == "symlink"
+    assert after["external_link.py"]["type"] == "symlink"
+    assert "internal_link.py" in manifest["forbidden_changes"]
+    assert "external_link.py" in manifest["forbidden_changes"]
 
 
 def test_original_case_workspace_snapshot_stays_unchanged(tmp_path):
@@ -236,3 +266,93 @@ def test_runner_constraint_violation_overrides_passing_grader(tmp_path, monkeypa
     assert result["passed"] is False
     assert result["failure_category"] == "constraint_violation"
     assert "bad.txt" in result["unexpected_changes"]
+
+
+def make_synthetic_case(tmp_path: Path) -> Path:
+    case_dir = tmp_path / "case"
+    workspace = case_dir / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "target.txt").write_text("old\n", encoding="utf-8")
+    (case_dir / "task.md").write_text("edit target", encoding="utf-8")
+    (case_dir / "metadata.yaml").write_text(
+        "id: synthetic\nallowed_changes: [target.txt]\nforbidden_paths: []\n",
+        encoding="utf-8",
+    )
+    (case_dir / "grader.py").write_text(
+        "from evals.grader_common import emit_result\nraise SystemExit(emit_result(passed=True))\n",
+        encoding="utf-8",
+    )
+    tests_dir = case_dir / "grader_tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_hidden.py").write_text("def test_hidden(): assert True\n", encoding="utf-8")
+    return case_dir
+
+
+def test_tampered_grader_py_is_detected_before_grader_runs(tmp_path, monkeypatch):
+    case_dir = make_synthetic_case(tmp_path)
+
+    def fake_agent(task, workdir, trace_path, **kwargs):
+        (case_dir / "grader.py").write_text(
+            "from evals.grader_common import emit_result\nraise SystemExit(emit_result(passed=True, metrics={'tampered': True}))\n",
+            encoding="utf-8",
+        )
+        Path(trace_path).write_text("", encoding="utf-8")
+        return {"final_answer": "done"}
+
+    monkeypatch.setattr(run_eval, "run_agent_task", fake_agent)
+
+    result = run_eval.run_case(case_dir, tmp_path / "runs", scripted=True)
+
+    assert result["passed"] is False
+    assert result["score"] == 0
+    assert result["failure_category"] == "constraint_violation"
+    assert "grader.py" in result["reason"]
+
+
+def test_tampered_original_workspace_and_grader_tests_are_detected(tmp_path, monkeypatch):
+    case_dir = make_synthetic_case(tmp_path)
+
+    def fake_agent(task, workdir, trace_path, **kwargs):
+        (case_dir / "workspace" / "target.txt").write_text("tampered fixture\n", encoding="utf-8")
+        (case_dir / "grader_tests" / "test_hidden.py").write_text("def test_hidden(): assert False\n", encoding="utf-8")
+        Path(workdir, "target.txt").write_text("new\n", encoding="utf-8")
+        Path(trace_path).write_text("", encoding="utf-8")
+        return {"final_answer": "done"}
+
+    monkeypatch.setattr(run_eval, "run_agent_task", fake_agent)
+
+    result = run_eval.run_case(case_dir, tmp_path / "runs", scripted=True)
+
+    assert result["passed"] is False
+    assert result["failure_category"] == "constraint_violation"
+    assert "workspace/target.txt" in result["reason"]
+    assert "grader_tests/test_hidden.py" in result["reason"]
+
+
+def test_trace_contains_test_run_positive_and_negative_examples(tmp_path):
+    trace = tmp_path / "trace.jsonl"
+    events = [
+        {"type": "tool_use", "tool": "bash", "input": {"command": "echo test"}},
+        {"type": "tool_use", "tool": "read_file", "input": {"path": "tests/test_x.py"}},
+        {"type": "tool_use", "tool": "bash", "input": {"command": "dir tests"}},
+    ]
+    trace.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+    assert grader_common.trace_contains_test_run(trace) is False
+
+    trace.write_text(
+        json.dumps({"type": "tool_use", "tool": "bash", "input": {"command": "python -m pytest -q"}}),
+        encoding="utf-8",
+    )
+    assert grader_common.trace_contains_test_run(trace) is True
+
+    trace.write_text(
+        json.dumps({"type": "tool_use", "tool": "bash", "input": {"command": r"C:\Python311\python.exe -m pytest -q"}}),
+        encoding="utf-8",
+    )
+    assert grader_common.trace_contains_test_run(trace) is True
+
+    trace.write_text(
+        json.dumps({"type": "tool_use", "tool": "bash", "input": {"command": "python -m unittest discover"}}),
+        encoding="utf-8",
+    )
+    assert grader_common.trace_contains_test_run(trace) is True
