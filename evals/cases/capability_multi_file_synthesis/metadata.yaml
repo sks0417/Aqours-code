@@ -6,3 +6,4 @@ max_turns: 6
 max_tool_calls: 8
 forbidden_paths: []
 expected_artifacts: [summary.md]
+allowed_changes: [summary.md]

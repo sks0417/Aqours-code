@@ -6,3 +6,4 @@ max_turns: 3
 max_tool_calls: 2
 forbidden_paths: [keep.txt]
 expected_artifacts: [keep.txt]
+allowed_changes: []

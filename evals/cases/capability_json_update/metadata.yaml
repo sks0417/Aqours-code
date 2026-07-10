@@ -6,3 +6,4 @@ max_turns: 5
 max_tool_calls: 6
 forbidden_paths: []
 expected_artifacts: [app_config.json]
+allowed_changes: [app_config.json]

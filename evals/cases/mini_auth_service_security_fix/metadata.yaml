@@ -6,3 +6,4 @@ max_turns: 10
 max_tool_calls: 14
 forbidden_paths: [tests/test_auth_service.py]
 expected_artifacts: [src/auth_service.py]
+allowed_changes: [src/auth_service.py]

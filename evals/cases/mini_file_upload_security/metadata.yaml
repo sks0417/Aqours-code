@@ -6,3 +6,4 @@ max_turns: 12
 max_tool_calls: 16
 forbidden_paths: [tests/test_uploader.py]
 expected_artifacts: [src/uploader.py]
+allowed_changes: [src/uploader.py]

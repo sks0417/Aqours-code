@@ -6,3 +6,4 @@ max_turns: 4
 max_tool_calls: 4
 forbidden_paths: []
 expected_artifacts: [config.txt]
+allowed_changes: [config.txt]

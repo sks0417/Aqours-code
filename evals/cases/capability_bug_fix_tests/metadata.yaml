@@ -6,3 +6,4 @@ max_turns: 8
 max_tool_calls: 10
 forbidden_paths: [test_stats.py]
 expected_artifacts: [stats.py]
+allowed_changes: [stats.py]

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from grader_common import emit_result, trace_contains_test_run, trace_tool_count
+from grader_common import emit_result, run_pytest, trace_contains_test_run, trace_tool_count
 
 
 EXPECTED_TESTS = '''import sys
@@ -71,9 +70,10 @@ def main() -> int:
     tests_unchanged = (workspace / "tests" / "test_uploader.py").read_text(encoding="utf-8") == EXPECTED_TESTS
     source = (workspace / "src" / "uploader.py").read_text(encoding="utf-8", errors="replace")
     blanket_dot_ban = "'.' in filename" in source or '".\" in filename' in source or "filename.startswith('.')" in source
-    result = subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=workspace, capture_output=True, text=True, timeout=60)
+    grader_tests = Path(__file__).parent / "grader_tests" / "test_uploader_grader.py"
+    result = run_pytest(workspace, ["tests/test_uploader.py", grader_tests])
     saw_test_run = trace_contains_test_run(args.trace)
-    passed = tests_unchanged and not blanket_dot_ban and result.returncode == 0 and saw_test_run
+    passed = tests_unchanged and not blanket_dot_ban and result["returncode"] == 0 and saw_test_run
     if passed:
         reason = ""
         category = None
@@ -87,13 +87,13 @@ def main() -> int:
         reason = "trace did not show a test run"
         category = "test_failure"
     else:
-        reason = (result.stdout + result.stderr).strip()
-        category = "test_failure"
+        reason = (result["stdout"] + result["stderr"]).strip()
+        category = result["failure_category"] or "test_failure"
     return emit_result(
         passed=passed,
         reason=reason,
         failure_category=category,
-        metrics={"tool_calls": trace_tool_count(args.trace), "saw_test_run": saw_test_run},
+        metrics={"tool_calls": trace_tool_count(args.trace), "saw_test_run": saw_test_run, "pytest": result},
     )
 
 

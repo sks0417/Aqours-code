@@ -756,3 +756,41 @@ capability: 2/3
 - eval scoring schema 已建立，但细粒度评分还待完善
 - shell 能力强但风险也高
 - production 化还需要更强隔离、资源控制和观测指标
+
+## Eval Clean-Room Grading
+
+The eval runner now grades through a clean-room workflow:
+
+```text
+case workspace template
+-> agent_workspace
+-> agent edits
+-> change_manifest.json
+-> allowed_changes / forbidden_paths validation
+-> fresh grading_workspace copied from the original case fixture
+-> apply only allowed submitted changes
+-> public tests + grader-only tests
+-> structured result
+```
+
+Each case metadata file defines three separate concepts:
+
+- `allowed_changes`: files or globs that may be submitted from the agent workspace into the grading workspace.
+- `forbidden_paths`: files that immediately create a constraint violation if the agent modifies them.
+- `expected_artifacts`: files expected for task success, but not a broad permission to modify everything nearby.
+
+The runner ignores local runtime artifacts such as `.codepilot/`, `.tasks/`,
+`.task_outputs/`, `.transcripts/`, `.mailboxes/`, `.worktrees/`,
+`__pycache__/`, and `*.pyc`; these files are never copied into the grader
+workspace. Common tampering paths such as `pytest.py`, `conftest.py`,
+`sitecustomize.py`, and `usercustomize.py` are constraint violations unless a
+case explicitly allows them.
+
+The three engineering capability cases also include `grader_tests/` held-out
+tests. These tests are not copied into the agent workspace; they are executed
+only during grading together with the public tests.
+
+This prevents common test-file and pytest-runner tampering in the local eval
+harness. It is still not a strong OS sandbox. The current `bash` tool can still
+access the host according to the process permissions; true hard isolation is
+left for a later Docker/container sandbox stage.

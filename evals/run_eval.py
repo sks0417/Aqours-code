@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import time
+import fnmatch
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,7 +58,21 @@ FAILURE_CATEGORIES = {
     "grader_error",
     "model_error",
     "api_timeout",
+    "test_timeout",
 }
+
+RUNTIME_IGNORE_PATTERNS = [
+    ".codepilot/**",
+    ".tasks/**",
+    ".task_outputs/**",
+    ".transcripts/**",
+    ".mailboxes/**",
+    ".worktrees/**",
+    "__pycache__/**",
+    "*/__pycache__/**",
+    "*.pyc",
+]
+TAMPER_ENTRY_NAMES = {"pytest.py", "conftest.py", "sitecustomize.py", "usercustomize.py"}
 
 
 def text_block(text: str):
@@ -174,6 +190,7 @@ def load_metadata(case_dir: Path) -> dict:
         "max_tool_calls": None,
         "forbidden_paths": [],
         "expected_artifacts": [],
+        "allowed_changes": [],
     }
     if not path.exists():
         return metadata
@@ -185,7 +202,7 @@ def load_metadata(case_dir: Path) -> dict:
         key, value = line.split(":", 1)
         key = key.strip()
         value = value.strip()
-        if key in {"forbidden_paths", "expected_artifacts"}:
+        if key in {"forbidden_paths", "expected_artifacts", "allowed_changes"}:
             metadata[key] = parse_list(value)
         elif key in {"difficulty", "max_turns", "max_tool_calls"}:
             metadata[key] = parse_scalar(value)
@@ -221,6 +238,176 @@ def trace_metrics(trace_path: Path) -> dict:
         ),
         "event_count": len(events),
     }
+
+
+def posix_relative(root: Path, path: Path) -> str:
+    root_resolved = root.resolve()
+    path_resolved = path.resolve(strict=False)
+    try:
+        relative = path_resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(f"path escapes workspace: {path}") from exc
+    text = relative.as_posix()
+    if Path(text).is_absolute() or ".." in relative.parts:
+        raise ValueError(f"unsafe relative path: {text}")
+    return text
+
+
+def matches_any(path: str, patterns: list[str]) -> bool:
+    normalized = path.replace("\\", "/")
+    return any(fnmatch.fnmatchcase(normalized, pattern.replace("\\", "/")) for pattern in patterns)
+
+
+def is_runtime_artifact(path: str) -> bool:
+    return matches_any(path, RUNTIME_IGNORE_PATTERNS)
+
+
+def is_tamper_path(path: str) -> bool:
+    return Path(path).name in TAMPER_ENTRY_NAMES
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def workspace_snapshot(workspace: Path) -> dict[str, dict]:
+    snapshot: dict[str, dict] = {}
+    if not workspace.exists():
+        return snapshot
+    for path in sorted(workspace.rglob("*")):
+        rel = posix_relative(workspace, path)
+        if is_runtime_artifact(rel):
+            continue
+        try:
+            stat = path.lstat()
+        except OSError:
+            continue
+        if path.is_dir() and not path.is_symlink():
+            continue
+        if path.is_symlink():
+            snapshot[rel] = {
+                "path": rel,
+                "sha256": None,
+                "type": "symlink",
+                "size": 0,
+            }
+            continue
+        if path.is_file():
+            snapshot[rel] = {
+                "path": rel,
+                "sha256": file_sha256(path),
+                "type": "file",
+                "size": stat.st_size,
+            }
+    return snapshot
+
+
+def changed_paths(before: dict[str, dict], after: dict[str, dict]) -> dict[str, list[str]]:
+    before_paths = set(before)
+    after_paths = set(after)
+    added = sorted(after_paths - before_paths)
+    deleted = sorted(before_paths - after_paths)
+    modified = sorted(
+        path for path in before_paths & after_paths
+        if before[path].get("sha256") != after[path].get("sha256")
+        or before[path].get("type") != after[path].get("type")
+        or before[path].get("size") != after[path].get("size")
+    )
+    return {"added": added, "modified": modified, "deleted": deleted}
+
+
+def build_change_manifest(
+    *,
+    before: dict[str, dict],
+    after: dict[str, dict],
+    metadata: dict,
+) -> dict:
+    changes = changed_paths(before, after)
+    changed = changes["added"] + changes["modified"] + changes["deleted"]
+    allowed = metadata.get("allowed_changes", [])
+    forbidden = metadata.get("forbidden_paths", [])
+    unexpected = sorted(path for path in changed if not matches_any(path, allowed))
+    forbidden_changes = sorted(
+        path for path in changed
+        if matches_any(path, forbidden) or (is_tamper_path(path) and not matches_any(path, allowed))
+        or after.get(path, {}).get("type") == "symlink"
+    )
+    submitted = sorted(path for path in changed if matches_any(path, allowed))
+    return {
+        "added": changes["added"],
+        "modified": changes["modified"],
+        "deleted": changes["deleted"],
+        "unexpected_changes": unexpected,
+        "forbidden_changes": forbidden_changes,
+        "submitted_changes": submitted,
+        "allowed_changes": allowed,
+        "forbidden_paths": forbidden,
+        "before": before,
+        "after": after,
+    }
+
+
+def safe_workspace_path(root: Path, rel: str) -> Path:
+    path = root / rel
+    resolved_root = root.resolve()
+    resolved_path = path.resolve(strict=False)
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"path escapes workspace: {rel}") from exc
+    if Path(rel).is_absolute() or ".." in Path(rel).parts:
+        raise ValueError(f"unsafe relative path: {rel}")
+    return path
+
+
+def copy_case_workspace(case_dir: Path, destination: Path):
+    source = case_dir / "workspace"
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(
+        source,
+        destination,
+        symlinks=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+
+
+def apply_allowed_changes(agent_workspace: Path, grading_workspace: Path, manifest: dict):
+    blocked = set(manifest.get("unexpected_changes", [])) | set(manifest.get("forbidden_changes", []))
+    submitted = set(manifest.get("submitted_changes", [])) - blocked
+    for rel in sorted(submitted):
+        if rel in manifest.get("deleted", []):
+            target = safe_workspace_path(grading_workspace, rel)
+            if target.exists() or target.is_symlink():
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+            continue
+
+        source = safe_workspace_path(agent_workspace, rel)
+        target = safe_workspace_path(grading_workspace, rel)
+        if source.is_symlink():
+            raise ValueError(f"refusing to submit symlink: {rel}")
+        if not source.is_file():
+            raise ValueError(f"submitted path is not a regular file: {rel}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target, follow_symlinks=False)
+
+
+def create_grading_workspace(
+    *,
+    case_dir: Path,
+    agent_workspace: Path,
+    grading_workspace: Path,
+    manifest: dict,
+):
+    copy_case_workspace(case_dir, grading_workspace)
+    apply_allowed_changes(agent_workspace, grading_workspace, manifest)
 
 
 def normalize_breakdown(value, passed: bool) -> dict:
@@ -303,13 +490,6 @@ def run_grader(case_dir: Path, workspace: Path, trace_path: Path,
     return parse_grader_output(proc), proc
 
 
-def copy_case_workspace(case_dir: Path, destination: Path):
-    source = case_dir / "workspace"
-    if destination.exists():
-        shutil.rmtree(destination)
-    shutil.copytree(source, destination)
-
-
 def write_text(path: Path, text: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -319,7 +499,8 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
     case_name = case_dir.name
     metadata = load_metadata(case_dir)
     case_output = run_root / case_name
-    workspace = case_output / "workspace"
+    agent_workspace = case_output / "agent_workspace"
+    grading_workspace = case_output / "grading_workspace"
     trace_path = case_output / "trace.jsonl"
     stdout_path = case_output / "stdout.txt"
     stderr_path = case_output / "stderr.txt"
@@ -327,9 +508,11 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
     transcript_path = case_output / "transcript.md"
     grader_stdout_path = case_output / "grader_stdout.txt"
     grader_stderr_path = case_output / "grader_stderr.txt"
+    change_manifest_path = case_output / "change_manifest.json"
 
     case_output.mkdir(parents=True, exist_ok=True)
-    copy_case_workspace(case_dir, workspace)
+    original_snapshot = workspace_snapshot(case_dir / "workspace")
+    copy_case_workspace(case_dir, agent_workspace)
     task = (case_dir / "task.md").read_text(encoding="utf-8")
 
     start = time.perf_counter()
@@ -341,7 +524,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
         with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
             run_info = run_agent_task(
                 task,
-                str(workspace),
+                str(agent_workspace),
                 str(trace_path),
                 model_client=ScriptedEvalClient(case_name) if scripted else None,
                 model_provider="scripted" if scripted else None,
@@ -381,9 +564,23 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
         transcript.extend(["", "## Agent Error", "", agent_error])
     write_text(transcript_path, "\n".join(transcript).rstrip() + "\n")
 
+    agent_snapshot = workspace_snapshot(agent_workspace)
+    change_manifest = build_change_manifest(
+        before=original_snapshot,
+        after=agent_snapshot,
+        metadata=metadata,
+    )
+    write_text(change_manifest_path, json.dumps(change_manifest, indent=2))
+
     try:
+        create_grading_workspace(
+            case_dir=case_dir,
+            agent_workspace=agent_workspace,
+            grading_workspace=grading_workspace,
+            manifest=change_manifest,
+        )
         grader_result, grader_proc = run_grader(
-            case_dir, workspace, trace_path, final_path, stdout_path, stderr_path)
+            case_dir, grading_workspace, trace_path, final_path, stdout_path, stderr_path)
     except Exception as exc:
         grader_reason = f"grader failed to run: {type(exc).__name__}: {exc}"
         grader_result = normalize_grader_payload({
@@ -405,6 +602,14 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
             "reason": f"agent failed: {agent_error}",
             "failure_category": agent_failure_category(agent_error),
         }, subprocess.CompletedProcess([], 1, "", ""))
+    elif change_manifest["unexpected_changes"] or change_manifest["forbidden_changes"]:
+        violations = sorted(set(change_manifest["unexpected_changes"] + change_manifest["forbidden_changes"]))
+        grader_result = normalize_grader_payload({
+            "passed": False,
+            "score": 0,
+            "reason": "unexpected or forbidden changes: " + ", ".join(violations),
+            "failure_category": "constraint_violation",
+        }, subprocess.CompletedProcess([], 1, "", ""))
 
     metrics = {
         **trace_metrics(trace_path),
@@ -423,7 +628,13 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
         "failure_category": grader_result["failure_category"],
         "error": "" if grader_result["passed"] else grader_result["reason"],
         "duration_ms": duration_ms,
-        "workspace": str(workspace),
+        "workspace": str(agent_workspace),
+        "agent_workspace": str(agent_workspace),
+        "grading_workspace": str(grading_workspace),
+        "change_manifest": str(change_manifest_path),
+        "unexpected_changes": change_manifest["unexpected_changes"],
+        "forbidden_changes": change_manifest["forbidden_changes"],
+        "submitted_changes": change_manifest["submitted_changes"],
         "trace": str(trace_path),
         "transcript": str(transcript_path),
         "stdout": str(stdout_path),

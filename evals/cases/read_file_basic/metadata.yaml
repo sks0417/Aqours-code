@@ -6,3 +6,4 @@ max_turns: 3
 max_tool_calls: 3
 forbidden_paths: []
 expected_artifacts: []
+allowed_changes: []
