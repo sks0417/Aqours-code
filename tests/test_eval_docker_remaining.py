@@ -60,6 +60,11 @@ def test_grader_receives_only_remaining_case_budget(tmp_path, monkeypatch):
 
     monkeypatch.setattr(run_eval, "_run_isolated_agent_phase", fake_agent)
     monkeypatch.setattr(run_eval, "run_docker_grader", fake_grader)
+    monkeypatch.setattr(
+        run_eval,
+        "prepare_docker_disposable_paths",
+        lambda *_args, **_kwargs: None,
+    )
     result = run_eval.run_case(
         run_eval.PROJECT_ROOT / "evals" / "cases" / "read_file_basic",
         tmp_path / "runs", scripted=True,
@@ -93,6 +98,11 @@ def test_stuck_grader_and_cleanup_end_within_deadline_plus_shared_grace(
     monkeypatch.setattr(run_eval, "_run_isolated_agent_phase", fake_agent)
     monkeypatch.setattr(run_eval, "DockerGraderRunner", runner_factory)
     monkeypatch.setattr(run_eval, "CLEANUP_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(
+        run_eval,
+        "prepare_docker_disposable_paths",
+        lambda *_args, **_kwargs: None,
+    )
     started = time.monotonic()
     result = run_eval.run_case(
         run_eval.PROJECT_ROOT / "evals" / "cases" / "read_file_basic",
