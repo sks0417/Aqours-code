@@ -4,11 +4,13 @@ import argparse
 import contextlib
 import io
 import json
+import multiprocessing
 import os
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 import fnmatch
 import hashlib
 from dataclasses import dataclass
@@ -84,6 +86,22 @@ RUNTIME_IGNORE_PATTERNS = [
 TAMPER_ENTRY_NAMES = {"pytest.py", "conftest.py", "sitecustomize.py", "usercustomize.py"}
 TRUSTED_ROOT_FILES = {"task.md", "metadata.yaml", "grader.py"}
 TRUSTED_DIRS = {"workspace", "grader_tests"}
+DOCKER_EVAL_TOOL_POLICY = {
+    "name": "docker_eval_restricted",
+    "allowed_tools": [
+        "bash", "read_file", "write_file", "edit_file", "glob",
+        "todo_write", "compact", "task",
+    ],
+    "disabled_tools": [
+        "create_task", "list_tasks", "get_task", "claim_task", "complete_task",
+        "schedule_cron", "schedule_once", "list_crons", "cancel_cron",
+        "spawn_teammate", "send_message", "check_inbox", "request_shutdown",
+        "request_plan", "review_plan", "create_worktree", "remove_worktree",
+        "keep_worktree", "connect_mcp", "load_skill",
+    ],
+    "allow_mcp": False,
+    "background_tasks": False,
+}
 
 
 @dataclass(frozen=True)
@@ -110,7 +128,9 @@ def configured_resource_limits(config: EvalExecutionConfig) -> dict:
     }
 
 
-def command_executor_for_case(config: EvalExecutionConfig, workspace: Path, case_name: str):
+def command_executor_for_case(config: EvalExecutionConfig, workspace: Path, case_name: str,
+                              *, container_name: str | None = None,
+                              verify_workspace_write: bool = True):
     if config.backend == "local":
         return LocalCommandExecutor()
     if config.backend == "docker":
@@ -122,7 +142,8 @@ def command_executor_for_case(config: EvalExecutionConfig, workspace: Path, case
             cpus=config.docker_cpus,
             pids_limit=config.docker_pids_limit,
             command_timeout=config.docker_timeout,
-            overall_timeout=config.docker_timeout,
+            container_name=container_name,
+            verify_workspace_write=verify_workspace_write,
         )
     raise ValueError(f"unsupported execution backend: {config.backend}")
 
@@ -160,6 +181,19 @@ class ScriptedEvalMessages:
         self.calls += 1
         messages = kwargs.get("messages", [])
         results = tool_results(messages)
+
+        if self.case_name == "_infinite_non_bash_tool_loop":
+            return response([tool_block(
+                "read_file", {"path": "missing.txt"}, f"call_read_{self.calls}")])
+
+        if self.case_name == "_docker_bash_write_smoke":
+            if not results:
+                return response([tool_block(
+                    "bash",
+                    {"command": "printf 'written in sandbox\\n' > from_bash.txt"},
+                    "call_bash_write",
+                )])
+            return response([text_block("Created from_bash.txt through sandboxed bash.")])
 
         if self.case_name == "read_file_basic":
             if not results:
@@ -703,6 +737,152 @@ def write_text(path: Path, text: str):
     path.write_text(text, encoding="utf-8")
 
 
+def _docker_agent_process(payload: dict, result_queue):
+    """Child-process entry point for one Docker-backed Agent phase."""
+    config = EvalExecutionConfig(**payload["execution_config"])
+    executor = command_executor_for_case(
+        config,
+        Path(payload["agent_workspace"]),
+        payload["case_name"],
+        container_name=payload["container_name"],
+    )
+    deadline = time.monotonic() + config.docker_timeout
+    try:
+        with open(payload["stdout_path"], "w", encoding="utf-8") as stdout_handle, \
+                open(payload["stderr_path"], "w", encoding="utf-8") as stderr_handle, \
+                contextlib.redirect_stdout(stdout_handle), contextlib.redirect_stderr(stderr_handle):
+            run_info = run_agent_task(
+                payload["task"],
+                payload["agent_workspace"],
+                payload["trace_path"],
+                model_client=(ScriptedEvalClient(payload["case_name"])
+                              if payload["scripted"] else None),
+                model_provider="scripted" if payload["scripted"] else None,
+                model="scripted-eval" if payload["scripted"] else None,
+                command_executor=executor,
+                tool_policy=DOCKER_EVAL_TOOL_POLICY,
+                case_deadline=deadline,
+                trace_storage_root=payload["trace_storage_root"],
+            )
+        result_queue.put({
+            "ok": True,
+            "run_info": run_info,
+            "execution_metadata": executor.execution_metadata(),
+        })
+    except BaseException as exc:
+        result_queue.put({
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "execution_metadata": executor.execution_metadata(),
+        })
+
+
+def _run_isolated_agent_phase(
+    *,
+    task: str,
+    case_name: str,
+    agent_workspace: Path,
+    trace_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    scripted: bool,
+    config: EvalExecutionConfig,
+) -> tuple[dict, str, dict]:
+    """Run the complete host Agent loop in a killable per-case process."""
+    container_name = (
+        f"codepilot-agent-{DockerCommandExecutor._safe_name(case_name)}-"
+        f"{uuid.uuid4().hex[:10]}"
+    )
+    payload = {
+        "task": task,
+        "case_name": case_name,
+        "agent_workspace": str(agent_workspace),
+        "trace_path": str(trace_path),
+        "trace_storage_root": str(trace_path.parent / "agent_runtime"),
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "scripted": scripted,
+        "container_name": container_name,
+        "execution_config": {
+            "backend": config.backend,
+            "docker_image": config.docker_image,
+            "docker_memory": config.docker_memory,
+            "docker_cpus": config.docker_cpus,
+            "docker_pids_limit": config.docker_pids_limit,
+            "docker_timeout": config.docker_timeout,
+        },
+    }
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue(maxsize=1)
+    process = context.Process(
+        target=_docker_agent_process,
+        args=(payload, result_queue),
+        name=f"codepilot-eval-{case_name}",
+    )
+    process.start()
+    process.join(config.docker_timeout)
+    timed_out = process.is_alive()
+    if timed_out:
+        process.terminate()
+        process.join(2.0)
+        if process.is_alive():
+            process.kill()
+            process.join(1.0)
+
+        if config.backend == "docker":
+            cleanup = command_executor_for_case(
+                config, agent_workspace, case_name,
+                container_name=container_name,
+                verify_workspace_write=False,
+            )
+            cleanup.overall_timed_out = True
+            cleanup.container_timed_out = True
+            cleanup.stop()
+            metadata = cleanup.execution_metadata()
+        else:
+            metadata = LocalCommandExecutor().execution_metadata()
+            metadata.update({
+                "overall_timed_out": True,
+                "container_timed_out": False,
+            })
+        metadata["resource_limits"] = configured_resource_limits(config)
+        metadata["agent_process_exit_code"] = process.exitcode
+        result_queue.close()
+        return {}, f"CaseTimeoutError: agent case exceeded {config.docker_timeout:g}s", metadata
+
+    try:
+        payload_result = result_queue.get(timeout=1.0)
+    except Exception:
+        if config.backend == "docker":
+            cleanup = command_executor_for_case(
+                config, agent_workspace, case_name,
+                container_name=container_name,
+                verify_workspace_write=False,
+            )
+            cleanup.stop()
+            metadata = cleanup.execution_metadata()
+        else:
+            metadata = LocalCommandExecutor().execution_metadata()
+        metadata["agent_process_exit_code"] = process.exitcode
+        result_queue.close()
+        return {}, f"AgentProcessError: child exited {process.exitcode} without a result", metadata
+    finally:
+        result_queue.close()
+
+    metadata = payload_result.get("execution_metadata", {})
+    metadata["resource_limits"] = configured_resource_limits(config)
+    metadata["agent_process_exit_code"] = process.exitcode
+    if "CaseTimeoutError" in payload_result.get("error", ""):
+        metadata["overall_timed_out"] = True
+        if config.backend == "docker":
+            metadata["container_timed_out"] = True
+    return (
+        payload_result.get("run_info", {}),
+        "" if payload_result.get("ok") else payload_result.get("error", "AgentProcessError"),
+        metadata,
+    )
+
+
 def run_case(case_dir: Path, run_root: Path, scripted: bool,
              execution_config: EvalExecutionConfig | None = None) -> dict:
     execution_config = execution_config or EvalExecutionConfig()
@@ -727,29 +907,49 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
     original_snapshot = workspace_snapshot(trusted_case_dir / "workspace")
     copy_case_workspace(trusted_case_dir, agent_workspace)
     task = (trusted_case_dir / "task.md").read_text(encoding="utf-8")
-    command_executor = command_executor_for_case(execution_config, agent_workspace, case_name)
+    command_executor = None
 
     start = time.perf_counter()
     agent_error = ""
     run_info = {}
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
-            run_info = run_agent_task(
-                task,
-                str(agent_workspace),
-                str(trace_path),
-                model_client=ScriptedEvalClient(case_name) if scripted else None,
-                model_provider="scripted" if scripted else None,
-                model="scripted-eval" if scripted else None,
-                command_executor=command_executor,
-            )
-    except Exception as exc:
-        agent_error = f"{type(exc).__name__}: {exc}"
-    finally:
-        write_text(stdout_path, stdout_buffer.getvalue())
-        write_text(stderr_path, stderr_buffer.getvalue())
+    if execution_config.backend == "docker":
+        run_info, agent_error, execution_metadata = _run_isolated_agent_phase(
+            task=task,
+            case_name=case_name,
+            agent_workspace=agent_workspace,
+            trace_path=trace_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            scripted=scripted,
+            config=execution_config,
+        )
+    else:
+        command_executor = command_executor_for_case(
+            execution_config, agent_workspace, case_name)
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+                run_info = run_agent_task(
+                    task,
+                    str(agent_workspace),
+                    str(trace_path),
+                    model_client=ScriptedEvalClient(case_name) if scripted else None,
+                    model_provider="scripted" if scripted else None,
+                    model="scripted-eval" if scripted else None,
+                    command_executor=command_executor,
+                )
+        except Exception as exc:
+            agent_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            write_text(stdout_path, stdout_buffer.getvalue())
+            write_text(stderr_path, stderr_buffer.getvalue())
+        execution_metadata = command_executor.execution_metadata()
+
+    if not stdout_path.exists():
+        write_text(stdout_path, "")
+    if not stderr_path.exists():
+        write_text(stderr_path, "")
 
     source_final_value = run_info.get("final_path")
     source_final = Path(source_final_value) if source_final_value else None
@@ -793,7 +993,9 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
         "execution_backend": execution_config.backend,
         "docker_image": execution_config.docker_image if execution_config.backend == "docker" else None,
         "timed_out": False,
-        "cleanup_succeeded": True,
+        "cleanup_succeeded": execution_config.backend != "docker",
+        "container_started": False,
+        "container_exit_code": None,
         "resource_limits": {},
     }
     if trusted_violations:
@@ -801,6 +1003,21 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             reason="trusted case inputs were modified: " + ", ".join(trusted_violations),
             failure_category="constraint_violation",
             metrics={"trusted_violations": trusted_violations},
+        )
+        grader_proc = subprocess.CompletedProcess([], 1, "", grader_result["reason"])
+        try:
+            create_grading_workspace(
+                case_dir=trusted_case_dir,
+                agent_workspace=agent_workspace,
+                grading_workspace=grading_workspace,
+                manifest=change_manifest,
+            )
+        except Exception:
+            pass
+    elif agent_error:
+        grader_result = failure_result(
+            reason=f"agent failed before grading: {agent_error}",
+            failure_category=agent_failure_category(agent_error),
         )
         grader_proc = subprocess.CompletedProcess([], 1, "", grader_result["reason"])
         try:
@@ -836,6 +1053,9 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
                 grader_result, grader_proc = run_grader(
                     trusted_case_dir, grading_workspace, trace_path, final_path, stdout_path, stderr_path)
         except Exception as exc:
+            if isinstance(exc, SandboxError):
+                grader_execution.update(
+                    getattr(exc, "execution_metadata", {}))
             grader_reason = f"grader failed to run: {type(exc).__name__}: {exc}"
             grader_result = failure_result(
                 reason=grader_reason,
@@ -847,7 +1067,6 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
     write_text(grader_stderr_path, grader_proc.stderr or "")
 
     duration_ms = int((time.perf_counter() - start) * 1000)
-    execution_metadata = command_executor.execution_metadata()
     if agent_error:
         grader_result = normalize_grader_payload({
             "passed": False,
@@ -958,6 +1177,8 @@ def failure_category_counts(results: list[dict]) -> dict:
 
 def agent_failure_category(agent_error: str) -> str:
     lowered = agent_error.lower()
+    if "casetimeouterror" in lowered or "agent case exceeded" in lowered:
+        return "tool_loop"
     if "sandboxerror" in lowered or "docker sandbox" in lowered or "docker daemon" in lowered:
         return "sandbox_error"
     if "timeout" in lowered or "timed out" in lowered:
@@ -988,7 +1209,7 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
             None,
         ),
         "container_timed_out": any(result.get("container_timed_out", False) for result in results),
-        "container_cleanup_succeeded": all(
+        "container_cleanup_succeeded": bool(results) and all(
             result.get("container_cleanup_succeeded", True) for result in results
         ),
         "command_execution_count": sum(
@@ -1052,7 +1273,7 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
         "container_started": False,
         "container_exit_code": None,
         "container_timed_out": False,
-        "container_cleanup_succeeded": True,
+        "container_cleanup_succeeded": False,
         "command_execution_count": 0,
         "resource_limits": configured_resource_limits(execution_config),
         "grader_execution": {},

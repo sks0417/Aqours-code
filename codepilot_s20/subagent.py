@@ -1,13 +1,9 @@
 from .runtime_state import *
+import os as _os
+import time as _time
+from .command_executor import CaseTimeoutError as _CaseTimeoutError
 
 # ── Subagent Tool ──
-
-SUB_SYSTEM = (
-    f"You are a coding subagent at {WORKDIR}. "
-    "Complete the task, then return a concise final summary. "
-    "Do not spawn more agents."
-)
-
 
 SUB_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -63,10 +59,32 @@ def has_tool_use(content) -> bool:
 
 def spawn_subagent(description: str) -> str:
     messages = [{"role": "user", "content": description}]
+    system = (
+        f"You are a coding subagent at {WORKDIR}. "
+        "Complete the task, then return a concise final summary. "
+        "Do not spawn more agents."
+    )
     for _ in range(30):
-        response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM, messages=messages,
-            tools=SUB_TOOLS, max_tokens=8000)
+        remaining = None if CASE_DEADLINE is None else CASE_DEADLINE - _time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise _CaseTimeoutError("eval case deadline exceeded")
+        old_timeout = _os.environ.get("MODEL_REQUEST_TIMEOUT")
+        if remaining is not None:
+            try:
+                configured = float(old_timeout or "30")
+            except (TypeError, ValueError):
+                configured = 30.0
+            _os.environ["MODEL_REQUEST_TIMEOUT"] = str(max(0.1, min(configured, remaining)))
+        try:
+            response = client.messages.create(
+                model=MODEL, system=system, messages=messages,
+                tools=SUB_TOOLS, max_tokens=8000)
+        finally:
+            if remaining is not None:
+                if old_timeout is None:
+                    _os.environ.pop("MODEL_REQUEST_TIMEOUT", None)
+                else:
+                    _os.environ["MODEL_REQUEST_TIMEOUT"] = old_timeout
         messages.append({"role": "assistant", "content": response.content})
         if not has_tool_use(response.content):
             break

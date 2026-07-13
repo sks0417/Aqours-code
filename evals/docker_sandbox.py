@@ -6,11 +6,12 @@ import uuid
 from pathlib import Path
 
 from codepilot_s20.command_executor import SandboxError, _decode_timeout_stream
+from codepilot_s20.docker_utils import host_container_user, normalize_bind_source
 
 
 def bind_mount(source: str | Path, target: str, *, readonly: bool = False) -> str:
     """Build one --mount value without colon-delimited Windows path parsing."""
-    value = f"type=bind,source={Path(source).resolve()},target={target}"
+    value = f"type=bind,source={normalize_bind_source(source)},target={target}"
     if readonly:
         value += ",readonly"
     return value
@@ -63,10 +64,14 @@ class DockerGraderRunner:
         self.timeout = float(timeout)
         self.docker_timeout = float(docker_timeout)
         self.runner = runner
+        self.container_user = host_container_user()
         safe_case = "".join(ch.lower() if ch.isalnum() else "-" for ch in case_name).strip("-")[:40]
         self.container_name = f"codepilot-grader-{safe_case or 'case'}-{uuid.uuid4().hex[:10]}"
+        self.container_started = False
+        self.container_exit_code = None
         self.timed_out = False
         self.cleanup_succeeded = False
+        self._cleanup_done = False
 
     @property
     def resource_limits(self) -> dict:
@@ -104,7 +109,7 @@ class DockerGraderRunner:
             "--read-only",
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
-            "--user", "10001:10001",
+            "--user", self.container_user,
             "--memory", self.memory,
             "--memory-swap", self.memory,
             "--cpus", self.cpus,
@@ -132,6 +137,9 @@ class DockerGraderRunner:
         return args
 
     def _cleanup(self):
+        if self._cleanup_done:
+            return
+        self._cleanup_done = True
         try:
             proc = self.runner(
                 ["docker", "rm", "-f", self.container_name],
@@ -156,8 +164,12 @@ class DockerGraderRunner:
                 text=True,
                 timeout=self.timeout,
             )
+            self.container_started = proc.returncode != 125
+            self.container_exit_code = proc.returncode
         except subprocess.TimeoutExpired as exc:
             self.timed_out = True
+            self.container_started = True
+            self.container_exit_code = 124
             proc = subprocess.CompletedProcess(
                 args,
                 124,
@@ -165,15 +177,34 @@ class DockerGraderRunner:
                 _decode_timeout_stream(exc.stderr),
             )
         except (FileNotFoundError, OSError) as exc:
-            raise SandboxError(f"Docker grader failed to start: {type(exc).__name__}: {exc}") from exc
+            self._cleanup()
+            error = SandboxError(
+                f"Docker grader failed to start: {type(exc).__name__}: {exc}")
+            error.execution_metadata = {
+                "container_started": self.container_started,
+                "container_exit_code": self.container_exit_code,
+                "timed_out": self.timed_out,
+                "cleanup_succeeded": self.cleanup_succeeded,
+                "resource_limits": self.resource_limits,
+            }
+            raise error from exc
         finally:
             self._cleanup()
         if proc.returncode == 125:
             detail = (proc.stderr or proc.stdout or "docker run failed").strip()
-            raise SandboxError(f"Docker grader failed to start: {detail}")
+            error = SandboxError(f"Docker grader failed to start: {detail}")
+            error.execution_metadata = {
+                "container_started": self.container_started,
+                "container_exit_code": self.container_exit_code,
+                "timed_out": self.timed_out,
+                "cleanup_succeeded": self.cleanup_succeeded,
+                "resource_limits": self.resource_limits,
+            }
+            raise error
         return proc, {
+            "container_started": self.container_started,
             "timed_out": self.timed_out,
-            "container_exit_code": proc.returncode,
+            "container_exit_code": self.container_exit_code,
             "cleanup_succeeded": self.cleanup_succeeded,
             "duration_ms": int((time.perf_counter() - started) * 1000),
             "resource_limits": self.resource_limits,

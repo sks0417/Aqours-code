@@ -21,6 +21,8 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
 
 
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
+    if not BACKGROUND_TASKS_ENABLED:
+        return False
     if tool_name != "bash":
         return False
     return bool(tool_input.get("run_in_background")) or is_slow_operation(tool_name, tool_input)
@@ -73,17 +75,23 @@ def collect_background_results() -> list[str]:
     return notifications
 
 
-def wait_for_background_tasks():
-    """Wait for already-started tool workers before their runtime is restored."""
+def wait_for_background_tasks(timeout: float | None = None) -> bool:
+    """Wait up to timeout for active workers; return whether all stopped."""
+    deadline = None if timeout is None else time.monotonic() + max(0, timeout)
     while True:
         with background_lock:
             threads = [task.get("thread") for task in background_tasks.values()
                        if task.get("status") == "running"]
         threads = [thread for thread in threads if thread is not None]
         if not threads:
-            return
+            return True
         for thread in threads:
-            thread.join()
+            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            if remaining == 0:
+                return False
+            thread.join(remaining)
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
 
 
 

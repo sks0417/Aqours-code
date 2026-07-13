@@ -100,9 +100,15 @@ def connect_mcp(name: str) -> str:
 
 def assemble_tool_pool() -> tuple[list[dict], dict]:
     """Merge builtin tools + all MCP tools into one pool."""
-    tools = list(BUILTIN_TOOLS)
-    handlers = dict(BUILTIN_HANDLERS)
-    for server_name, mcp_client in mcp_clients.items():
+    policy = TOOL_POLICY if isinstance(TOOL_POLICY, dict) else None
+    allowed = (set(policy["allowed_tools"])
+               if policy and "allowed_tools" in policy else None)
+    tools = [tool for tool in BUILTIN_TOOLS
+             if allowed is None or tool.get("name") in allowed]
+    handlers = {name: handler for name, handler in BUILTIN_HANDLERS.items()
+                if allowed is None or name in allowed}
+    clients = mcp_clients.items() if not policy or policy.get("allow_mcp") else ()
+    for server_name, mcp_client in clients:
         safe_server = normalize_mcp_name(server_name)
         for tool_def in mcp_client.tools:
             safe_tool = normalize_mcp_name(tool_def["name"])

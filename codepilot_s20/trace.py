@@ -678,9 +678,13 @@ def get_trace_storage_stats(workdir: Path | None = None) -> dict:
 
 class TraceRun:
     def __init__(self, workdir: Path, model_provider: str, model: str,
-                 user_prompt: str = ""):
+                 user_prompt: str = "", storage_root: Path | None = None):
         self.run_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
         self.workdir = Path(workdir)
+        # Eval runs can keep trusted trace data outside the workspace mounted
+        # into the Agent container.  Local/interactive runs retain the existing
+        # layout by default.
+        self.storage_root = Path(storage_root) if storage_root is not None else self.workdir
         self.model_provider = model_provider
         self.model = model
         self.start_time = time.time()
@@ -693,7 +697,7 @@ class TraceRun:
         self.blocked_count = 0
         self.event_count = 0
         self.timeline_event_count = 0
-        self.run_dir = self.workdir / ".codepilot" / "runs" / self.run_id
+        self.run_dir = self.storage_root / ".codepilot" / "runs" / self.run_id
         self.trace_path = self.run_dir / "trace.jsonl"
         self.timeline_path = self.run_dir / "timeline.jsonl"
         self.timeline_md_path = self.run_dir / "timeline.md"
@@ -730,10 +734,10 @@ class TraceRun:
                 "blocked_count": self.blocked_count,
                 "event_count": self.event_count,
                 "timeline_event_count": self.timeline_event_count,
-                "trace_path": _relative_display_path(self.trace_path, self.workdir),
-                "timeline_path": _relative_display_path(self.timeline_path, self.workdir),
-                "timeline_md_path": _relative_display_path(self.timeline_md_path, self.workdir),
-                "final_path": _relative_display_path(self.final_path, self.workdir),
+                "trace_path": _relative_display_path(self.trace_path, self.storage_root),
+                "timeline_path": _relative_display_path(self.timeline_path, self.storage_root),
+                "timeline_md_path": _relative_display_path(self.timeline_md_path, self.storage_root),
+                "final_path": _relative_display_path(self.final_path, self.storage_root),
                 "pinned": self.is_pinned(),
             }
             self.metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -763,16 +767,16 @@ class TraceRun:
             "event_count": self.event_count,
             "timeline_event_count": self.timeline_event_count,
             "pinned": self.is_pinned(),
-            "run_dir": _relative_display_path(self.run_dir, self.workdir),
-            "trace_path": _relative_display_path(self.trace_path, self.workdir),
-            "timeline_path": _relative_display_path(self.timeline_path, self.workdir),
-            "timeline_md_path": _relative_display_path(self.timeline_md_path, self.workdir),
-            "final_path": _relative_display_path(self.final_path, self.workdir),
+            "run_dir": _relative_display_path(self.run_dir, self.storage_root),
+            "trace_path": _relative_display_path(self.trace_path, self.storage_root),
+            "timeline_path": _relative_display_path(self.timeline_path, self.storage_root),
+            "timeline_md_path": _relative_display_path(self.timeline_md_path, self.storage_root),
+            "final_path": _relative_display_path(self.final_path, self.storage_root),
         }
 
     def sync_metadata_and_index(self):
         self.write_metadata()
-        _update_run_index_item(self.workdir, self.index_item())
+        _update_run_index_item(self.storage_root, self.index_item())
 
     def _update_counts(self, event: dict):
         event_type = event.get("type")
@@ -832,11 +836,14 @@ class TraceRun:
         self.sync_metadata_and_index()
 
 
-def start_run(user_prompt: str, *, workdir: Path, model_provider: str, model: str) -> TraceRun:
+def start_run(user_prompt: str, *, workdir: Path, model_provider: str, model: str,
+              storage_root: Path | None = None) -> TraceRun:
     global CURRENT_TRACE
-    CURRENT_TRACE = TraceRun(workdir, model_provider, model, user_prompt)
+    CURRENT_TRACE = TraceRun(workdir, model_provider, model, user_prompt,
+                             storage_root=storage_root)
     CURRENT_TRACE.event("user_prompt", prompt=user_prompt)
-    cleanup_old_runs(workdir=workdir, current_run_id=CURRENT_TRACE.run_id)
+    cleanup_old_runs(workdir=CURRENT_TRACE.storage_root,
+                     current_run_id=CURRENT_TRACE.run_id)
     return CURRENT_TRACE
 
 

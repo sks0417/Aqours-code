@@ -63,12 +63,20 @@ By default evals remain local and backward compatible:
 python evals/run_eval.py --scripted --execution local
 ```
 
-Docker mode keeps the Agent Loop and model API client on the host, but routes
-every eval `bash` call through `docker exec` into one per-case container. The
-container sees only the writable `agent_workspace` at `/workspace`. After the
-agent stops, grading runs in a different one-shot container with read-only
-mounts for `trusted_eval`, `grading_workspace`, and the trace/final/stdout/stderr
-inputs.
+Docker mode runs the Agent Loop and model API client in a dedicated, killable
+host process and routes every `bash` call through `docker exec` into one
+per-case container. The model is offered only workspace-safe file tools,
+containerized `bash`, todo/compact, and the synchronous subagent. Host worktree,
+persistent task, teammate, cron, skill, and MCP tools are not exposed. Disabled
+tools and the active policy are recorded in the trace.
+
+The Agent container sees only the writable `agent_workspace` at `/workspace`.
+Run traces and their index are written under a sibling trusted `agent_runtime`
+directory, then exported for grading, so the Agent cannot rewrite its own audit
+trail through Bash or file tools.
+After the Agent process stops, grading runs in a different one-shot container
+with read-only mounts for `trusted_eval`, `grading_workspace`, and the
+trace/final/stdout/stderr inputs.
 
 ```powershell
 python evals/run_eval.py --scripted --execution docker --docker-build
@@ -81,6 +89,14 @@ root filesystem, a non-root user, dropped capabilities, no-new-privileges,
 bounded memory/CPU/PIDs/file descriptors, and a size-limited `/tmp`. Docker
 failure is reported as `sandbox_error`; it never falls back to host command
 execution. The normal interactive CLI continues to use the local executor.
+
+On POSIX hosts the Agent/Grader numeric UID and GID match the non-root host
+owner so Linux and WSL2 bind mounts remain writable/readable. Windows Docker
+Desktop uses the image's fixed non-root identity. Agent startup performs a real
+write/delete probe inside `/workspace` and fails closed if the mount is not
+writable. `--docker-timeout` is enforced by the parent process: it terminates
+the complete Agent process, performs bounded cleanup by container name, records
+`tool_loop`, and continues with later cases.
 
 The permission hook remains active in Docker mode. It is an application policy
 layer in addition to the container boundary, not a replacement for it.

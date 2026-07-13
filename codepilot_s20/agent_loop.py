@@ -4,6 +4,9 @@ from .runtime_state import *
 
 from pathlib import Path as _Path
 import shutil as _shutil
+import os as _os
+import time as _time
+from .command_executor import CaseTimeoutError as _CaseTimeoutError
 
 # ── Agent Loop ──
 
@@ -165,17 +168,46 @@ def scheduled_prompt_text(job) -> str:
 
 def call_llm(messages: list, context: dict, tools: list,
              state: RecoveryState, max_tokens: int):
+    remaining = _remaining_case_time()
+    if remaining is not None and remaining <= 0:
+        raise _CaseTimeoutError("eval case deadline exceeded")
     system = assemble_system_prompt(context)
     record_llm_request(model=state.current_model, max_tokens=max_tokens,
                        message_count=len(messages), tool_count=len(tools))
-    return with_retry(
-        lambda: client.messages.create(
-            model=state.current_model,
-            system=system,
-            messages=messages,
-            tools=tools,
-            max_tokens=max_tokens),
-        state)
+    old_timeout = _os.environ.get("MODEL_REQUEST_TIMEOUT")
+    if remaining is not None:
+        try:
+            configured = float(old_timeout or "30")
+        except (TypeError, ValueError):
+            configured = 30.0
+        _os.environ["MODEL_REQUEST_TIMEOUT"] = str(max(0.1, min(configured, remaining)))
+    try:
+        return with_retry(
+            lambda: client.messages.create(
+                model=state.current_model,
+                system=system,
+                messages=messages,
+                tools=tools,
+                max_tokens=max_tokens),
+            state)
+    finally:
+        if remaining is not None:
+            if old_timeout is None:
+                _os.environ.pop("MODEL_REQUEST_TIMEOUT", None)
+            else:
+                _os.environ["MODEL_REQUEST_TIMEOUT"] = old_timeout
+
+
+def _remaining_case_time() -> float | None:
+    if CASE_DEADLINE is None:
+        return None
+    return CASE_DEADLINE - _time.monotonic()
+
+
+def _check_case_deadline():
+    remaining = _remaining_case_time()
+    if remaining is not None and remaining <= 0:
+        raise _CaseTimeoutError("eval case deadline exceeded")
 
 
 def agent_loop(messages: list, context: dict):
@@ -189,6 +221,7 @@ def agent_loop(messages: list, context: dict):
     todo_started = False
 
     while True:
+        _check_case_deadline()
         # One cycle: inject scheduled/background work, prepare context, call
         # the model, execute tool_use blocks, append tool_results, repeat.
         fired = consume_cron_queue()
@@ -247,6 +280,7 @@ def agent_loop(messages: list, context: dict):
         results = []
         compacted_now = False
         for block in response.content:
+            _check_case_deadline()
             if block.type != "tool_use":
                 continue
             print(f"\033[36m> {block.name}\033[0m")
@@ -392,6 +426,25 @@ def _runtime_value(name: str):
     return getattr(_state, name)
 
 
+_WORKDIR_DERIVED_PATHS = {
+    "SKILLS_DIR": ("skills",),
+    "TRANSCRIPT_DIR": (".transcripts",),
+    "TOOL_RESULTS_DIR": (".task_outputs", "tool-results"),
+    "MEMORY_DIR": (".memory",),
+    "MAILBOX_DIR": (".mailboxes",),
+    "TASKS_DIR": (".tasks",),
+    "WORKTREES_DIR": (".worktrees",),
+    "DURABLE_PATH": (".scheduled_tasks.json",),
+    "ONCE_DURABLE_PATH": (".scheduled_once_tasks.json",),
+}
+
+
+def _set_runtime_workdir(workdir):
+    _set_runtime_value("WORKDIR", workdir)
+    for name, parts in _WORKDIR_DERIVED_PATHS.items():
+        _set_runtime_value(name, workdir.joinpath(*parts))
+
+
 def _copy_trace_file(source, target):
     if not source or not target:
         return
@@ -404,7 +457,11 @@ def _copy_trace_file(source, target):
 
 def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
                    *, model_client=None, model_provider: str | None = None,
-                   model: str | None = None, command_executor=None) -> dict:
+                   model: str | None = None, command_executor=None,
+                   tool_policy: dict | None = None,
+                   case_deadline: float | None = None,
+                   cleanup_grace: float = 2.0,
+                   trace_storage_root: str | None = None) -> dict:
     """Run one non-interactive agent task using the existing loop and trace."""
     global rounds_since_todo
     from . import bootstrap
@@ -412,34 +469,44 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
 
     workdir_path = _Path(workdir).resolve()
     workdir_path.mkdir(parents=True, exist_ok=True)
-    old_workdir = _runtime_value("WORKDIR")
-    old_client = _runtime_value("client")
-    old_provider = _runtime_value("MODEL_PROVIDER")
-    old_model = _runtime_value("MODEL")
-    old_primary_model = _runtime_value("PRIMARY_MODEL")
-    old_command_executor = _runtime_value("COMMAND_EXECUTOR")
-
-    _set_runtime_value("WORKDIR", workdir_path)
-    if model_client is not None:
-        _set_runtime_value("client", model_client)
-    if command_executor is not None:
-        _set_runtime_value("COMMAND_EXECUTOR", command_executor)
-
-    provider_name = model_provider or _runtime_value("MODEL_PROVIDER")
-    model_name = model or _runtime_value("MODEL")
-    _set_runtime_value("MODEL_PROVIDER", provider_name)
-    _set_runtime_value("MODEL", model_name)
-    _set_runtime_value("PRIMARY_MODEL", model_name)
-    run = start_run(task, workdir=workdir_path,
-                    model_provider=provider_name, model=model_name)
-    record_hook("UserPromptSubmit", input=task)
-    trigger_hooks("UserPromptSubmit", task)
-
-    messages = [{"role": "user", "content": task}]
-    context = update_context({}, [])
+    state_names = [
+        "WORKDIR", "client", "MODEL_PROVIDER", "MODEL", "PRIMARY_MODEL",
+        "COMMAND_EXECUTOR", "TOOL_POLICY", "CASE_DEADLINE",
+        "BACKGROUND_TASKS_ENABLED", *_WORKDIR_DERIVED_PATHS,
+    ]
+    old_state = {name: _runtime_value(name) for name in state_names}
+    run = None
     final_text = ""
     rounds_since_todo = 0
+    cleanup_errors = []
     try:
+        # The outer try begins before the first runtime mutation.
+        _set_runtime_workdir(workdir_path)
+        if model_client is not None:
+            _set_runtime_value("client", model_client)
+        if command_executor is not None:
+            _set_runtime_value("COMMAND_EXECUTOR", command_executor)
+        _set_runtime_value("TOOL_POLICY", tool_policy)
+        _set_runtime_value("CASE_DEADLINE", case_deadline)
+        if isinstance(tool_policy, dict) and "background_tasks" in tool_policy:
+            _set_runtime_value("BACKGROUND_TASKS_ENABLED", bool(tool_policy["background_tasks"]))
+
+        provider_name = model_provider or _runtime_value("MODEL_PROVIDER")
+        model_name = model or _runtime_value("MODEL")
+        _set_runtime_value("MODEL_PROVIDER", provider_name)
+        _set_runtime_value("MODEL", model_name)
+        _set_runtime_value("PRIMARY_MODEL", model_name)
+        run = start_run(task, workdir=workdir_path,
+                        model_provider=provider_name, model=model_name,
+                        storage_root=(_Path(trace_storage_root).resolve()
+                                      if trace_storage_root else None))
+        record_hook("UserPromptSubmit", input=task)
+        trigger_hooks("UserPromptSubmit", task)
+        if tool_policy:
+            record_event("tool_policy", **tool_policy)
+
+        messages = [{"role": "user", "content": task}]
+        context = update_context({}, [])
         if command_executor is not None:
             command_executor.start()
         with agent_lock:
@@ -452,29 +519,36 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         if get_current_run():
             finish_run(final_text)
     except Exception as exc:
-        record_error(exc)
+        try:
+            record_error(exc)
+        except Exception:
+            pass
         final_text = f"[Error] {type(exc).__name__}: {exc}"
-        finish_run(final_text)
+        try:
+            finish_run(final_text)
+        except Exception:
+            pass
         raise
     finally:
-        try:
-            # Background bash handlers share the active executor. Let them
-            # finish before stopping its container.
-            wait_for_background_tasks()
-        finally:
+        active_exception = _sys.exc_info()[0] is not None
+
+        def cleanup_step(func):
             try:
-                if command_executor is not None:
-                    command_executor.stop()
-            finally:
-                try:
-                    _copy_trace_file(run.trace_path, trace_path)
-                finally:
-                    _set_runtime_value("WORKDIR", old_workdir)
-                    _set_runtime_value("client", old_client)
-                    _set_runtime_value("MODEL_PROVIDER", old_provider)
-                    _set_runtime_value("MODEL", old_model)
-                    _set_runtime_value("PRIMARY_MODEL", old_primary_model)
-                    _set_runtime_value("COMMAND_EXECUTOR", old_command_executor)
+                func()
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+
+        # Stop the executor first so in-flight docker exec calls unblock, then
+        # give worker threads only a small bounded grace period.
+        if command_executor is not None:
+            cleanup_step(command_executor.stop)
+        cleanup_step(lambda: wait_for_background_tasks(cleanup_grace))
+        if run is not None:
+            cleanup_step(lambda: _copy_trace_file(run.trace_path, trace_path))
+        for name in reversed(state_names):
+            cleanup_step(lambda name=name: _set_runtime_value(name, old_state[name]))
+        if cleanup_errors and not active_exception:
+            raise cleanup_errors[0]
 
     return {
         "run_id": run.run_id,
@@ -483,7 +557,7 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         "timeline_path": str(run.timeline_path),
         "final_path": str(run.final_path),
         "final_answer": final_text,
-        "execution": (command_executor or old_command_executor).execution_metadata(),
+        "execution": (command_executor or old_state["COMMAND_EXECUTOR"]).execution_metadata(),
     }
 
 

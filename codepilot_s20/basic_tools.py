@@ -1,4 +1,5 @@
 from .runtime_state import *
+from .command_executor import CaseTimeoutError
 
 # ── Basic Tools ──
 
@@ -21,11 +22,20 @@ def run_bash(command: str, cwd: Path = None,
     if any(token in lowered for token in delete_commands):
         return "Permission denied: delete commands are disabled for bash"
     try:
-        result = (executor or COMMAND_EXECUTOR).execute(command, cwd or WORKDIR, timeout)
+        effective_timeout = float(timeout)
+        if CASE_DEADLINE is not None:
+            remaining = CASE_DEADLINE - time.monotonic()
+            if remaining <= 0:
+                raise CaseTimeoutError("eval case deadline exceeded")
+            effective_timeout = min(effective_timeout, remaining)
+        result = (executor or COMMAND_EXECUTOR).execute(
+            command, cwd or WORKDIR, effective_timeout)
         out = (result["stdout"] + result["stderr"]).strip()
         if result["timed_out"]:
             return f"Error: Timeout ({timeout:g}s)" + (f"\n{out[:50000]}" if out else "")
         return out[:50000] if out else "(no output)"
+    except CaseTimeoutError:
+        raise
     except Exception as exc:
         return f"Error: {type(exc).__name__}: {exc}"
 

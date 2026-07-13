@@ -823,29 +823,47 @@ host: snapshot + change manifest + clean grading workspace
 ```
 
 `LocalCommandExecutor` retains the normal CLI subprocess behavior.
-`DockerCommandExecutor` creates one long-lived container per eval case; all
-foreground, background, subagent, and teammate `bash` handlers share the
-injected runtime executor. Async teammates capture that executor when spawned,
-so a teammate that outlives the lead cannot fall back to host execution.
-`run_agent_task` waits for active background handlers, stops the executor in
-`finally`, and restores the previous executor so subsequent local CLI turns
-cannot accidentally keep using Docker.
+`DockerCommandExecutor` creates one long-lived container per eval case. The
+Docker Eval tool policy exposes only `bash`, workspace-safe read/write/edit/glob,
+todo/compact, and the synchronous subagent. Worktree, persistent task,
+teammate, cron, skill, MCP, and other host-affecting tools are excluded from the
+tool pool and listed in a traceable policy event. Background execution is also
+disabled for this policy, so no case worker can outlive its runtime.
+
+The complete Docker Agent phase runs in a dedicated spawned host process. The
+parent enforces `--docker-timeout`, terminates and then kills the process after
+a bounded grace period, cleans the container by its preassigned name, and
+continues to the next case. Cooperative deadline checks additionally cap model
+requests and commands to the smaller of their configured timeout and remaining
+case time.
 
 The Agent container mounts only `agent_workspace` read-write at `/workspace`.
-It cannot see the original case workspace, `trusted_eval`, `grading_workspace`,
-grader code/tests, the project root, `.env`, API keys, or the Docker socket.
+All tools exposed by the Docker Eval policy are prevented from reading the
+original case workspace, `trusted_eval`, `grading_workspace`, grader code/tests,
+the project root, host `.env`, API keys, or the Docker socket. Trace runs and
+their index live in the sibling host-only `agent_runtime` directory and are
+copied to the grader input only after the Agent phase, preventing audit-trail
+tampering through either Bash or file tools.
 The Grader container separately mounts `trusted_eval`, `grading_workspace`, and
 trace/final/stdout/stderr files read-only. Model requests never enter either
 container and Agent containers remain network-disabled.
 
 Both containers use `--network none`, `--read-only`, `--cap-drop ALL`,
-`no-new-privileges`, UID/GID 10001, memory and CPU limits, a PID limit, a file
+`no-new-privileges`, a non-root UID/GID, memory and CPU limits, a PID limit, a file
 descriptor limit, and a bounded tmpfs. Docker mounts use one `--mount` argument
 per bind so Windows drive-letter colons are not parsed as volume separators.
 No host environment is inherited through Docker CLI arguments.
+
+Windows Docker Desktop uses UID/GID 10001. On non-root Linux/WSL2 hosts the
+container numeric UID/GID matches the bind-mount owner. Startup verifies actual
+non-root write access with a probe inside `/workspace` and fails closed when
+permissions are incompatible; it never removes the non-root restriction.
 
 Docker mode adds `sandbox_error` and `command_timeout` failure categories plus
 execution and cleanup metadata to case results and `summary.json`. A command
 timeout force-removes its Agent container. Grader timeout remains
 `test_timeout`; grader exceptions remain `grader_error`. There is no automatic
-fallback to local execution.
+fallback to local execution. Cleanup success is reported only after successful
+removal or an explicit Docker "No such container" response; exit codes are read
+from container state or the one-shot grader process rather than inferred from
+the cleanup command.

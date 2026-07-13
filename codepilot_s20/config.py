@@ -49,6 +49,9 @@ def _env_float(name: str, default: float) -> float:
 
 WORKDIR = Path(os.getenv("CODEPILOT_S20_WORKDIR", Path.cwd())).resolve()
 COMMAND_EXECUTOR = LocalCommandExecutor()
+TOOL_POLICY = None
+CASE_DEADLINE = None
+BACKGROUND_TASKS_ENABLED = True
 MODEL_PROVIDER = provider_from_env()
 MODEL = os.getenv("MODEL_ID", default_model_for_provider(MODEL_PROVIDER))
 PRIMARY_MODEL = MODEL

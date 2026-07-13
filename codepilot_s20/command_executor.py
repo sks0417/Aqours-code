@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from .docker_utils import host_container_user, normalize_bind_source
 
 
 class CommandExecutorError(RuntimeError):
@@ -13,6 +14,10 @@ class CommandExecutorError(RuntimeError):
 
 class SandboxError(CommandExecutorError):
     """Docker could not create or operate the requested sandbox."""
+
+
+class CaseTimeoutError(CommandExecutorError):
+    """The enclosing eval case exhausted its wall-clock budget."""
 
 
 def _decode_timeout_stream(value) -> str:
@@ -94,6 +99,9 @@ class DockerCommandExecutor:
         command_timeout: float = 120,
         overall_timeout: float | None = None,
         docker_timeout: float = 30,
+        container_name: str | None = None,
+        container_user: str | None = None,
+        verify_workspace_write: bool = True,
         runner=subprocess.run,
     ):
         self.workspace = Path(workspace).resolve()
@@ -106,7 +114,9 @@ class DockerCommandExecutor:
         self.overall_timeout = float(overall_timeout) if overall_timeout is not None else None
         self.docker_timeout = float(docker_timeout)
         self.runner = runner
-        self.container_name = f"codepilot-agent-{self.case_name}-{uuid.uuid4().hex[:10]}"
+        self.container_name = container_name or f"codepilot-agent-{self.case_name}-{uuid.uuid4().hex[:10]}"
+        self.container_user = container_user or host_container_user()
+        self.verify_workspace_write = verify_workspace_write
         self.container_started = False
         self.container_exit_code = None
         self.container_timed_out = False
@@ -137,7 +147,7 @@ class DockerCommandExecutor:
         }
 
     def docker_run_args(self) -> list[str]:
-        mount = f"type=bind,source={self.workspace},target=/workspace"
+        mount = f"type=bind,source={normalize_bind_source(self.workspace)},target=/workspace"
         return [
             "docker", "run", "--detach",
             "--name", self.container_name,
@@ -145,7 +155,7 @@ class DockerCommandExecutor:
             "--read-only",
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
-            "--user", "10001:10001",
+            "--user", self.container_user,
             "--memory", self.memory,
             "--memory-swap", self.memory,
             "--cpus", self.cpus,
@@ -154,6 +164,7 @@ class DockerCommandExecutor:
             "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
             "--mount", mount,
             "--workdir", "/workspace",
+            "--env", "HOME=/tmp/home",
             self.image,
             "sleep", "infinity",
         ]
@@ -180,6 +191,26 @@ class DockerCommandExecutor:
             self.sandbox_error = detail
             raise SandboxError(f"Docker sandbox failed to start: {detail}")
         self.container_started = True
+        if self.verify_workspace_write:
+            try:
+                probe = self.runner(
+                    ["docker", "exec", "--workdir", "/workspace",
+                     self.container_name, "/bin/sh", "-lc",
+                     "umask 077; p=.codepilot-write-probe-$$; : > \"$p\" && rm -f \"$p\""],
+                    capture_output=True,
+                    text=True,
+                    timeout=min(self.docker_timeout, 10),
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+                self.sandbox_error = f"workspace write probe failed: {type(exc).__name__}: {exc}"
+                self.stop()
+                raise SandboxError(self.sandbox_error) from exc
+            if probe.returncode != 0:
+                detail = (probe.stderr or probe.stdout or "workspace is not writable").strip()
+                self.sandbox_error = detail
+                self.stop()
+                raise SandboxError(
+                    f"non-root sandbox user {self.container_user} cannot write /workspace: {detail}")
         if self.overall_timeout is not None:
             self._overall_timer = threading.Timer(
                 self.overall_timeout,
@@ -259,16 +290,57 @@ class DockerCommandExecutor:
             self._stopped = True
             if self._overall_timer is not None:
                 self._overall_timer.cancel()
+            running = None
+            explicitly_missing = False
+            try:
+                inspect = self.runner(
+                    ["docker", "inspect", "--format",
+                     "{{.State.Running}} {{.State.ExitCode}}", self.container_name],
+                    capture_output=True, text=True, timeout=self.docker_timeout)
+                detail = ((inspect.stderr or "") + (inspect.stdout or "")).lower()
+                if inspect.returncode != 0 and "no such" in detail:
+                    explicitly_missing = True
+                elif inspect.returncode == 0:
+                    self.container_started = True
+                    parts = (inspect.stdout or "").strip().split()
+                    if parts:
+                        running = parts[0].lower() == "true"
+                    if len(parts) > 1 and not running:
+                        try:
+                            self.container_exit_code = int(parts[1])
+                        except ValueError:
+                            pass
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                pass
+
+            if explicitly_missing:
+                self.container_cleanup_succeeded = True
+                return
+
+            if running:
+                try:
+                    stopped = self.runner(
+                        ["docker", "stop", "--time", "1", self.container_name],
+                        capture_output=True, text=True, timeout=self.docker_timeout)
+                    if stopped.returncode == 0:
+                        inspect = self.runner(
+                            ["docker", "inspect", "--format", "{{.State.ExitCode}}",
+                             self.container_name],
+                            capture_output=True, text=True, timeout=self.docker_timeout)
+                        if inspect.returncode == 0:
+                            self.container_exit_code = int((inspect.stdout or "").strip())
+                except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+                    pass
+
             try:
                 proc = self.runner(
                     ["docker", "rm", "-f", self.container_name],
-                    capture_output=True,
-                    text=True,
-                    timeout=self.docker_timeout,
-                )
-                self.container_cleanup_succeeded = proc.returncode == 0 or not self.container_started
+                    capture_output=True, text=True, timeout=self.docker_timeout)
+                detail = ((proc.stderr or "") + (proc.stdout or "")).lower()
+                self.container_cleanup_succeeded = (
+                    proc.returncode == 0 or "no such container" in detail)
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                self.container_cleanup_succeeded = not self.container_started
+                self.container_cleanup_succeeded = False
 
     def terminate_for_overall_timeout(self):
         self.container_timed_out = True
