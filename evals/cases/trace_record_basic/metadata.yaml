@@ -1,4 +1,5 @@
 id: trace_record_basic
+scripted_supported: true
 suite: regression
 difficulty: 1
 category: trace

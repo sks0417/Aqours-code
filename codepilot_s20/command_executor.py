@@ -102,6 +102,7 @@ class DockerCommandExecutor:
         container_name: str | None = None,
         container_user: str | None = None,
         verify_workspace_write: bool = True,
+        operation_deadline: float | None = None,
         runner=subprocess.run,
     ):
         self.workspace = Path(workspace).resolve()
@@ -117,6 +118,7 @@ class DockerCommandExecutor:
         self.container_name = container_name or f"codepilot-agent-{self.case_name}-{uuid.uuid4().hex[:10]}"
         self.container_user = container_user or host_container_user()
         self.verify_workspace_write = verify_workspace_write
+        self.operation_deadline = operation_deadline
         self.container_started = False
         self.container_exit_code = None
         self.container_timed_out = False
@@ -128,6 +130,17 @@ class DockerCommandExecutor:
         self._stop_lock = threading.Lock()
         self._stopped = False
         self._overall_timer = None
+
+    def _timeout(self, configured: float | None = None,
+                 deadline: float | None = None) -> float:
+        active_deadline = self.operation_deadline if deadline is None else deadline
+        configured = self.docker_timeout if configured is None else float(configured)
+        if active_deadline is None:
+            return configured
+        remaining = active_deadline - time.monotonic()
+        if remaining <= 0:
+            raise CaseTimeoutError("eval case deadline exceeded")
+        return min(configured, remaining)
 
     @staticmethod
     def _safe_name(value: str) -> str:
@@ -179,7 +192,7 @@ class DockerCommandExecutor:
                 self.docker_run_args(),
                 capture_output=True,
                 text=True,
-                timeout=self.docker_timeout,
+                timeout=self._timeout(),
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
             self.sandbox_error = f"{type(exc).__name__}: {exc}"
@@ -199,7 +212,7 @@ class DockerCommandExecutor:
                      "umask 077; p=.codepilot-write-probe-$$; : > \"$p\" && rm -f \"$p\""],
                     capture_output=True,
                     text=True,
-                    timeout=min(self.docker_timeout, 10),
+                    timeout=self._timeout(10),
                 )
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
                 self.sandbox_error = f"workspace write probe failed: {type(exc).__name__}: {exc}"
@@ -235,6 +248,7 @@ class DockerCommandExecutor:
         started = time.perf_counter()
         self.command_execution_count += 1
         effective_timeout = self.command_timeout if timeout is None else min(float(timeout), self.command_timeout)
+        effective_timeout = self._timeout(effective_timeout)
         args = [
             "docker", "exec",
             "--workdir", self._container_cwd(cwd),
@@ -283,7 +297,7 @@ class DockerCommandExecutor:
             self.stop()
             raise SandboxError(f"docker exec failed: {type(exc).__name__}: {exc}") from exc
 
-    def stop(self):
+    def stop(self, deadline: float | None = None):
         with self._stop_lock:
             if self._stopped:
                 return
@@ -292,11 +306,23 @@ class DockerCommandExecutor:
                 self._overall_timer.cancel()
             running = None
             explicitly_missing = False
+            def cleanup_timeout():
+                active_deadline = self.operation_deadline if deadline is None else deadline
+                if active_deadline is None:
+                    return self.docker_timeout
+                remaining = active_deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                return min(self.docker_timeout, remaining)
+
             try:
+                timeout = cleanup_timeout()
+                if timeout is None:
+                    return
                 inspect = self.runner(
                     ["docker", "inspect", "--format",
                      "{{.State.Running}} {{.State.ExitCode}}", self.container_name],
-                    capture_output=True, text=True, timeout=self.docker_timeout)
+                    capture_output=True, text=True, timeout=timeout)
                 detail = ((inspect.stderr or "") + (inspect.stdout or "")).lower()
                 if inspect.returncode != 0 and "no such" in detail:
                     explicitly_missing = True
@@ -319,23 +345,32 @@ class DockerCommandExecutor:
 
             if running:
                 try:
+                    timeout = cleanup_timeout()
+                    if timeout is None:
+                        return
                     stopped = self.runner(
                         ["docker", "stop", "--time", "1", self.container_name],
-                        capture_output=True, text=True, timeout=self.docker_timeout)
+                        capture_output=True, text=True, timeout=timeout)
                     if stopped.returncode == 0:
+                        timeout = cleanup_timeout()
+                        if timeout is None:
+                            return
                         inspect = self.runner(
                             ["docker", "inspect", "--format", "{{.State.ExitCode}}",
                              self.container_name],
-                            capture_output=True, text=True, timeout=self.docker_timeout)
+                            capture_output=True, text=True, timeout=timeout)
                         if inspect.returncode == 0:
                             self.container_exit_code = int((inspect.stdout or "").strip())
                 except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
                     pass
 
             try:
+                timeout = cleanup_timeout()
+                if timeout is None:
+                    return
                 proc = self.runner(
                     ["docker", "rm", "-f", self.container_name],
-                    capture_output=True, text=True, timeout=self.docker_timeout)
+                    capture_output=True, text=True, timeout=timeout)
                 detail = ((proc.stderr or "") + (proc.stdout or "")).lower()
                 self.container_cleanup_succeeded = (
                     proc.returncode == 0 or "no such container" in detail)

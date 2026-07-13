@@ -2,16 +2,18 @@ from .runtime_state import *
 
 # ── Prompt Assembly ──
 
+ALL_TOOL_NAMES = [
+    "bash", "read_file", "write_file", "edit_file", "glob", "todo_write",
+    "task", "load_skill", "compact", "create_task", "list_tasks", "get_task",
+    "claim_task", "complete_task", "schedule_cron", "schedule_once", "list_crons",
+    "cancel_cron", "spawn_teammate", "send_message", "check_inbox",
+    "request_shutdown", "request_plan", "review_plan", "create_worktree",
+    "remove_worktree", "keep_worktree", "connect_mcp",
+]
+
+
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
-    "tools": "Available tools: bash, read_file, write_file, edit_file, glob, "
-             "todo_write, task, load_skill, compact, "
-             "create_task, list_tasks, get_task, claim_task, complete_task, "
-             "schedule_cron, schedule_once, list_crons, cancel_cron, "
-             "spawn_teammate, send_message, check_inbox, "
-             "request_shutdown, request_plan, review_plan, "
-             "create_worktree, remove_worktree, keep_worktree, "
-             "connect_mcp. MCP tools are prefixed mcp__{server}__{tool}.",
     "scheduling": ("Scheduling rules: use schedule_cron only for repeating "
                    "standard 5-field cron tasks (minute hour day-of-month "
                    "month day-of-week), such as daily, weekly, monthly, "
@@ -41,19 +43,27 @@ PROMPT_SECTIONS = {
 def assemble_system_prompt(context: dict) -> str:
     # The system prompt is rebuilt each turn from live context. This is where
     # memory, skill catalog, MCP state, and active teammates become visible.
+    policy = TOOL_POLICY if isinstance(TOOL_POLICY, dict) else {}
+    allowed_tools = (policy["allowed_tools"]
+                     if "allowed_tools" in policy else ALL_TOOL_NAMES)
+    tool_section = "Available tools: " + ", ".join(allowed_tools) + "."
+    if policy.get("allow_mcp", True):
+        tool_section += " MCP tools are prefixed mcp__{server}__{tool}."
     sections = [PROMPT_SECTIONS["identity"],
-                PROMPT_SECTIONS["tools"],
-                PROMPT_SECTIONS["scheduling"],
+                tool_section,
                 PROMPT_SECTIONS["workspace"],
                 format_runtime_context_for_prompt(detect_runtime_context(WORKDIR)),
                 PROMPT_SECTIONS["tool_strategy"],
                 PROMPT_SECTIONS["permissions"]]
+    if any(name in allowed_tools for name in ("schedule_cron", "schedule_once")):
+        sections.insert(2, PROMPT_SECTIONS["scheduling"])
     sections.append(f"Current time: {datetime.now().isoformat(timespec='seconds')}")
-    sections.append("Skills catalog:\n" + list_skills() +
-                    "\nUse load_skill(name) when a skill is relevant.")
-    if context.get("memories"):
+    if policy.get("allow_skill_context", True) and "load_skill" in allowed_tools:
+        sections.append("Skills catalog:\n" + list_skills() +
+                        "\nUse load_skill(name) when a skill is relevant.")
+    if policy.get("allow_memory_context", True) and context.get("memories"):
         sections.append(f"Relevant memories:\n{context['memories']}")
-    mcp_names = list(mcp_clients.keys())
+    mcp_names = context.get("connected_mcp", []) if policy.get("allow_mcp", True) else []
     if mcp_names:
         sections.append(f"Connected MCP servers: {', '.join(mcp_names)}")
     return "\n\n".join(sections)

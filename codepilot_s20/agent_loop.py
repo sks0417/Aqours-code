@@ -431,6 +431,7 @@ _WORKDIR_DERIVED_PATHS = {
     "TRANSCRIPT_DIR": (".transcripts",),
     "TOOL_RESULTS_DIR": (".task_outputs", "tool-results"),
     "MEMORY_DIR": (".memory",),
+    "MEMORY_INDEX": (".memory", "MEMORY.md"),
     "MAILBOX_DIR": (".mailboxes",),
     "TASKS_DIR": (".tasks",),
     "WORKTREES_DIR": (".worktrees",),

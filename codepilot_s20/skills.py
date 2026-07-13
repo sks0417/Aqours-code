@@ -39,10 +39,10 @@ def scan_skills():
         }
 
 
-scan_skills()
-
-
 def list_skills() -> str:
+    # Scan lazily from the current runtime SKILLS_DIR. Restricted eval policies
+    # never call this function, so host skill manifests are not read at import.
+    scan_skills()
     if not SKILL_REGISTRY:
         return "(no skills found)"
     return "\n".join(
@@ -51,6 +51,7 @@ def list_skills() -> str:
 
 
 def load_skill(name: str) -> str:
+    scan_skills()
     skill = SKILL_REGISTRY.get(name)
     if not skill:
         available = ", ".join(SKILL_REGISTRY.keys()) or "(none)"

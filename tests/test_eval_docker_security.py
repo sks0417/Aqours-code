@@ -17,6 +17,7 @@ from codepilot_s20 import (
     cron,
     mcp,
     message_bus,
+    skills,
     runtime_state,
     task_system,
     worktree_system,
@@ -71,6 +72,7 @@ def runtime_snapshot():
         "DURABLE_PATH": cron.DURABLE_PATH,
         "SKILLS_DIR": runtime_state.SKILLS_DIR,
         "MEMORY_DIR": context.MEMORY_DIR,
+        "MEMORY_INDEX": context.MEMORY_INDEX,
         "MAILBOX_DIR": message_bus.MAILBOX_DIR,
     }
 
@@ -176,8 +178,90 @@ def test_workdir_derived_paths_follow_agent_workspace_and_restore(tmp_path, monk
     assert observed["DURABLE_PATH"] == tmp_path / ".scheduled_tasks.json"
     assert observed["SKILLS_DIR"] == tmp_path / "skills"
     assert observed["MEMORY_DIR"] == tmp_path / ".memory"
+    assert observed["MEMORY_INDEX"] == tmp_path / ".memory" / "MEMORY.md"
     assert observed["MAILBOX_DIR"] == tmp_path / ".mailboxes"
     assert runtime_snapshot() == before
+
+
+def test_docker_policy_prompt_cannot_leak_host_memory_skills_or_disabled_tools(
+    tmp_path, monkeypatch,
+):
+    host = tmp_path / "host"
+    workspace = tmp_path / "agent_workspace"
+    (host / ".memory").mkdir(parents=True)
+    (host / ".memory" / "MEMORY.md").write_text(
+        "HOST_MEMORY_SECRET_7F91", encoding="utf-8")
+    (host / "skills" / "secret-skill").mkdir(parents=True)
+    (host / "skills" / "secret-skill" / "SKILL.md").write_text(
+        "---\nname: host-secret-skill\ndescription: HOST_SKILL_SECRET_4A22\n---\nHOST_SKILL_BODY_8C33",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(context, "MEMORY_DIR", host / ".memory")
+    monkeypatch.setattr(context, "MEMORY_INDEX", host / ".memory" / "MEMORY.md")
+    monkeypatch.setattr(runtime_state, "MEMORY_DIR", host / ".memory")
+    monkeypatch.setattr(runtime_state, "MEMORY_INDEX", host / ".memory" / "MEMORY.md")
+    monkeypatch.setattr(skills, "SKILLS_DIR", host / "skills")
+    monkeypatch.setitem(context.mcp_clients, "HOST_MCP_SECRET_91AB", object())
+    monkeypatch.setitem(context.active_teammates, "HOST_TEAM_SECRET_52CD", object())
+    captured = {}
+
+    class Messages:
+        def create(self, **kwargs):
+            captured["system"] = kwargs["system"]
+            captured["memory_dir"] = context.MEMORY_DIR
+            captured["memory_index"] = context.MEMORY_INDEX
+            return SimpleNamespace(content=[text_block("done")], stop_reason="end_turn")
+
+    before = runtime_snapshot()
+    agent_loop.run_agent_task(
+        "capture restricted prompt", str(workspace),
+        model_client=SimpleNamespace(messages=Messages()),
+        model_provider="scripted", model="scripted",
+        command_executor=LocalCommandExecutor(),
+        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+    )
+
+    prompt = captured["system"]
+    assert "HOST_MEMORY_SECRET_7F91" not in prompt
+    assert "HOST_SKILL_SECRET_4A22" not in prompt
+    assert "HOST_SKILL_BODY_8C33" not in prompt
+    assert "host-secret-skill" not in prompt
+    assert "HOST_MCP_SECRET_91AB" not in prompt
+    assert "HOST_TEAM_SECRET_52CD" not in prompt
+    assert "create_worktree" not in prompt
+    assert "spawn_teammate" not in prompt
+    assert "load_skill" not in prompt
+    assert captured["memory_dir"] == workspace / ".memory"
+    assert captured["memory_index"] == workspace / ".memory" / "MEMORY.md"
+    assert runtime_snapshot() == before
+
+
+def test_local_policy_still_loads_workspace_memory_and_skills(tmp_path):
+    (tmp_path / ".memory").mkdir()
+    (tmp_path / ".memory" / "MEMORY.md").write_text(
+        "LOCAL_MEMORY_VISIBLE", encoding="utf-8")
+    (tmp_path / "skills" / "local-skill").mkdir(parents=True)
+    (tmp_path / "skills" / "local-skill" / "SKILL.md").write_text(
+        "---\nname: local-skill\ndescription: LOCAL_SKILL_VISIBLE\n---\nbody",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class Messages:
+        def create(self, **kwargs):
+            captured["system"] = kwargs["system"]
+            return SimpleNamespace(content=[text_block("done")], stop_reason="end_turn")
+
+    agent_loop.run_agent_task(
+        "capture local prompt", str(tmp_path),
+        model_client=SimpleNamespace(messages=Messages()),
+        model_provider="scripted", model="scripted",
+        command_executor=LocalCommandExecutor(),
+    )
+
+    assert "LOCAL_MEMORY_VISIBLE" in captured["system"]
+    assert "LOCAL_SKILL_VISIBLE" in captured["system"]
+    assert "load_skill" in captured["system"]
 
 
 def test_eval_trace_storage_is_outside_container_visible_workspace(tmp_path, monkeypatch):
@@ -268,6 +352,80 @@ def test_real_process_timeout_stops_non_bash_tool_loop_and_next_case_runs(tmp_pa
     assert next_error == ""
     assert "ALPHA-42" in run_info["final_answer"]
     assert next_metadata["agent_process_exit_code"] == 0
+
+
+def test_large_pipe_result_is_complete_and_does_not_leave_child(tmp_path):
+    workspace = tmp_path / "large"
+    workspace.mkdir()
+    run_info, error, metadata = run_eval._run_isolated_agent_phase(
+        task="return a large answer", case_name="_large_final_answer",
+        agent_workspace=workspace, trace_path=tmp_path / "large-trace.jsonl",
+        stdout_path=tmp_path / "large-stdout.txt",
+        stderr_path=tmp_path / "large-stderr.txt", scripted=True,
+        config=run_eval.EvalExecutionConfig(backend="local", docker_timeout=10),
+    )
+
+    assert error == ""
+    assert len(run_info["final_answer"]) == 1024 * 1024 + 8192
+    assert set(run_info["final_answer"]) == {"L"}
+    assert metadata["agent_process_exit_code"] == 0
+    assert not any(child.name.startswith("codepilot-eval-")
+                   for child in multiprocessing.active_children())
+
+
+def test_child_exception_returns_structured_error_without_residual_process(tmp_path):
+    workspace = tmp_path / "error"
+    workspace.mkdir()
+    _run, error, metadata = run_eval._run_isolated_agent_phase(
+        task="fail", case_name="_child_process_exception",
+        agent_workspace=workspace, trace_path=tmp_path / "error-trace.jsonl",
+        stdout_path=tmp_path / "error-stdout.txt",
+        stderr_path=tmp_path / "error-stderr.txt", scripted=True,
+        config=run_eval.EvalExecutionConfig(backend="local", docker_timeout=8),
+    )
+
+    assert "RuntimeError: scripted child process failure" in error
+    assert metadata["agent_process_exit_code"] == 0
+    assert not any(child.name.startswith("codepilot-eval-")
+                   for child in multiprocessing.active_children())
+
+
+def test_child_exit_without_result_is_structured_and_reaped(tmp_path):
+    workspace = tmp_path / "no-result"
+    workspace.mkdir()
+    _run, error, metadata = run_eval._run_isolated_agent_phase(
+        task="exit", case_name="_child_no_result",
+        agent_workspace=workspace, trace_path=tmp_path / "no-result-trace.jsonl",
+        stdout_path=tmp_path / "no-result-stdout.txt",
+        stderr_path=tmp_path / "no-result-stderr.txt", scripted=True,
+        config=run_eval.EvalExecutionConfig(backend="local", docker_timeout=8),
+    )
+
+    assert "AgentProcessError" in error
+    assert metadata["agent_process_exit_code"] == 7
+    assert not any(child.name.startswith("codepilot-eval-")
+                   for child in multiprocessing.active_children())
+
+
+def test_parent_keyboard_interrupt_closes_channel_and_reaps_child(tmp_path, monkeypatch):
+    workspace = tmp_path / "interrupt"
+    workspace.mkdir()
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(run_eval, "wait_for_connection", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        run_eval._run_isolated_agent_phase(
+            task="loop", case_name="_infinite_non_bash_tool_loop",
+            agent_workspace=workspace, trace_path=tmp_path / "interrupt-trace.jsonl",
+            stdout_path=tmp_path / "interrupt-stdout.txt",
+            stderr_path=tmp_path / "interrupt-stderr.txt", scripted=True,
+            config=run_eval.EvalExecutionConfig(backend="local", docker_timeout=8),
+        )
+
+    assert not any(child.name.startswith("codepilot-eval-")
+                   for child in multiprocessing.active_children())
 
 
 def test_case_exception_result_does_not_claim_unverified_cleanup(tmp_path):

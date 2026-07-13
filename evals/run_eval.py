@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import multiprocessing
+from multiprocessing.connection import wait as wait_for_connection
 import os
 import shutil
 import subprocess
@@ -45,11 +46,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from codepilot_s20.agent_loop import run_agent_task  # noqa: E402
 from codepilot_s20.command_executor import (  # noqa: E402
+    CaseTimeoutError,
     DockerCommandExecutor,
     LocalCommandExecutor,
     SandboxError,
 )
 from evals.docker_sandbox import DockerGraderRunner, build_eval_image  # noqa: E402
+from codepilot_s20.docker_utils import prepare_disposable_tree  # noqa: E402
 
 
 DEFAULT_BREAKDOWN_WEIGHTS = {
@@ -71,6 +74,20 @@ FAILURE_CATEGORIES = {
     "command_timeout",
     "sandbox_error",
 }
+CLEANUP_GRACE_SECONDS = 3.0
+
+
+def remaining_timeout(deadline: float | None, configured: float | None = None) -> float:
+    """Return the remaining shared budget, optionally capped per operation."""
+    if deadline is None:
+        return float(configured) if configured is not None else 0.0
+    remaining = max(0.0, deadline - time.monotonic())
+    return min(remaining, float(configured)) if configured is not None else remaining
+
+
+def require_case_time(deadline: float | None, stage: str):
+    if deadline is not None and remaining_timeout(deadline) <= 0:
+        raise CaseTimeoutError(f"eval case deadline exceeded during {stage}")
 
 RUNTIME_IGNORE_PATTERNS = [
     ".codepilot/**",
@@ -100,6 +117,9 @@ DOCKER_EVAL_TOOL_POLICY = {
         "keep_worktree", "connect_mcp", "load_skill",
     ],
     "allow_mcp": False,
+    "allow_memory_context": False,
+    "allow_skill_context": False,
+    "allow_teammate_context": False,
     "background_tasks": False,
 }
 
@@ -130,7 +150,8 @@ def configured_resource_limits(config: EvalExecutionConfig) -> dict:
 
 def command_executor_for_case(config: EvalExecutionConfig, workspace: Path, case_name: str,
                               *, container_name: str | None = None,
-                              verify_workspace_write: bool = True):
+                              verify_workspace_write: bool = True,
+                              operation_deadline: float | None = None):
     if config.backend == "local":
         return LocalCommandExecutor()
     if config.backend == "docker":
@@ -144,6 +165,7 @@ def command_executor_for_case(config: EvalExecutionConfig, workspace: Path, case
             command_timeout=config.docker_timeout,
             container_name=container_name,
             verify_workspace_write=verify_workspace_write,
+            operation_deadline=operation_deadline,
         )
     raise ValueError(f"unsupported execution backend: {config.backend}")
 
@@ -185,6 +207,12 @@ class ScriptedEvalMessages:
         if self.case_name == "_infinite_non_bash_tool_loop":
             return response([tool_block(
                 "read_file", {"path": "missing.txt"}, f"call_read_{self.calls}")])
+
+        if self.case_name == "_large_final_answer":
+            return response([text_block("L" * (1024 * 1024 + 8192))])
+
+        if self.case_name == "_child_model_exception":
+            raise RuntimeError("scripted child model failure")
 
         if self.case_name == "_docker_bash_write_smoke":
             if not results:
@@ -277,6 +305,7 @@ def load_metadata(case_dir: Path) -> dict:
         "forbidden_paths": [],
         "expected_artifacts": [],
         "allowed_changes": [],
+        "scripted_supported": False,
     }
     if not path.exists():
         return metadata
@@ -290,7 +319,7 @@ def load_metadata(case_dir: Path) -> dict:
         value = value.strip()
         if key in {"forbidden_paths", "expected_artifacts", "allowed_changes"}:
             metadata[key] = parse_list(value)
-        elif key in {"difficulty", "max_turns", "max_tool_calls"}:
+        elif key in {"difficulty", "max_turns", "max_tool_calls", "scripted_supported"}:
             metadata[key] = parse_scalar(value)
         else:
             metadata[key] = str(parse_scalar(value, ""))
@@ -705,14 +734,18 @@ def run_docker_grader(
     stdout_path: Path,
     stderr_path: Path,
     config: EvalExecutionConfig,
+    case_deadline: float,
 ) -> tuple[dict, subprocess.CompletedProcess, dict]:
+    timeout = remaining_timeout(case_deadline, config.docker_timeout)
     runner = DockerGraderRunner(
         image=config.docker_image,
         case_name=trusted_case_dir.name,
         memory=config.docker_memory,
         cpus=config.docker_cpus,
         pids_limit=config.docker_pids_limit,
-        timeout=config.docker_timeout,
+        timeout=timeout,
+        operation_deadline=case_deadline,
+        cleanup_deadline=case_deadline + CLEANUP_GRACE_SECONDS,
     )
     proc, metadata = runner.run(
         trusted_eval_root=trusted_eval_root,
@@ -724,7 +757,7 @@ def run_docker_grader(
     )
     if metadata["timed_out"]:
         result = failure_result(
-            reason=f"grader timed out after {config.docker_timeout:g}s",
+            reason=f"grader exceeded the remaining case budget ({timeout:g}s)",
             failure_category="test_timeout",
         )
     else:
@@ -737,17 +770,30 @@ def write_text(path: Path, text: str):
     path.write_text(text, encoding="utf-8")
 
 
-def _docker_agent_process(payload: dict, result_queue):
+def prepare_docker_disposable_paths(case_output: Path, *paths: Path):
+    """Prepare only per-case copies for the fallback UID used by root hosts."""
+    for path in paths:
+        if path.exists():
+            prepare_disposable_tree(path, allowed_root=case_output)
+
+
+def _docker_agent_process(payload: dict, result_connection):
     """Child-process entry point for one Docker-backed Agent phase."""
     config = EvalExecutionConfig(**payload["execution_config"])
-    executor = command_executor_for_case(
-        config,
-        Path(payload["agent_workspace"]),
-        payload["case_name"],
-        container_name=payload["container_name"],
-    )
-    deadline = time.monotonic() + config.docker_timeout
+    executor = None
+    deadline = payload["case_deadline"]
     try:
+        executor = command_executor_for_case(
+            config,
+            Path(payload["agent_workspace"]),
+            payload["case_name"],
+            container_name=payload["container_name"],
+            operation_deadline=deadline,
+        )
+        if payload["case_name"] == "_child_process_exception":
+            raise RuntimeError("scripted child process failure")
+        if payload["case_name"] == "_child_no_result":
+            os._exit(7)
         with open(payload["stdout_path"], "w", encoding="utf-8") as stdout_handle, \
                 open(payload["stderr_path"], "w", encoding="utf-8") as stderr_handle, \
                 contextlib.redirect_stdout(stdout_handle), contextlib.redirect_stderr(stderr_handle):
@@ -764,17 +810,23 @@ def _docker_agent_process(payload: dict, result_queue):
                 case_deadline=deadline,
                 trace_storage_root=payload["trace_storage_root"],
             )
-        result_queue.put({
+        result_connection.send({
             "ok": True,
             "run_info": run_info,
             "execution_metadata": executor.execution_metadata(),
         })
     except BaseException as exc:
-        result_queue.put({
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "execution_metadata": executor.execution_metadata(),
-        })
+        try:
+            result_connection.send({
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "execution_metadata": (executor.execution_metadata()
+                                       if executor else {}),
+            })
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        result_connection.close()
 
 
 def _run_isolated_agent_phase(
@@ -787,12 +839,14 @@ def _run_isolated_agent_phase(
     stderr_path: Path,
     scripted: bool,
     config: EvalExecutionConfig,
+    case_deadline: float | None = None,
 ) -> tuple[dict, str, dict]:
     """Run the complete host Agent loop in a killable per-case process."""
     container_name = (
         f"codepilot-agent-{DockerCommandExecutor._safe_name(case_name)}-"
         f"{uuid.uuid4().hex[:10]}"
     )
+    case_deadline = case_deadline or (time.monotonic() + config.docker_timeout)
     payload = {
         "task": task,
         "case_name": case_name,
@@ -803,6 +857,7 @@ def _run_isolated_agent_phase(
         "stderr_path": str(stderr_path),
         "scripted": scripted,
         "container_name": container_name,
+        "case_deadline": case_deadline,
         "execution_config": {
             "backend": config.backend,
             "docker_image": config.docker_image,
@@ -813,31 +868,75 @@ def _run_isolated_agent_phase(
         },
     }
     context = multiprocessing.get_context("spawn")
-    result_queue = context.Queue(maxsize=1)
+    result_connection, child_connection = context.Pipe(duplex=False)
     process = context.Process(
         target=_docker_agent_process,
-        args=(payload, result_queue),
+        args=(payload, child_connection),
         name=f"codepilot-eval-{case_name}",
     )
-    process.start()
-    process.join(config.docker_timeout)
-    timed_out = process.is_alive()
-    if timed_out:
-        process.terminate()
-        process.join(2.0)
+    payload_result = None
+    channel_error = ""
+    timed_out = False
+
+    def terminate_child(cleanup_deadline: float):
+        if process.is_alive():
+            process.terminate()
+            process.join(remaining_timeout(cleanup_deadline, 1.5))
         if process.is_alive():
             process.kill()
-            process.join(1.0)
+            process.join(remaining_timeout(cleanup_deadline))
+
+    try:
+        process.start()
+        child_connection.close()
+        while payload_result is None:
+            remaining = remaining_timeout(case_deadline)
+            if remaining <= 0:
+                timed_out = True
+                break
+            ready = wait_for_connection(
+                [result_connection, process.sentinel], timeout=remaining)
+            if result_connection in ready:
+                try:
+                    payload_result = result_connection.recv()
+                except (EOFError, OSError) as exc:
+                    channel_error = f"{type(exc).__name__}: {exc}"
+                break
+            if process.sentinel in ready:
+                process.join(0)
+                if result_connection.poll():
+                    try:
+                        payload_result = result_connection.recv()
+                    except (EOFError, OSError) as exc:
+                        channel_error = f"{type(exc).__name__}: {exc}"
+                break
+    except KeyboardInterrupt:
+        cleanup_deadline = case_deadline + CLEANUP_GRACE_SECONDS
+        terminate_child(cleanup_deadline)
+        result_connection.close()
+        raise
+    except BaseException:
+        cleanup_deadline = case_deadline + CLEANUP_GRACE_SECONDS
+        terminate_child(cleanup_deadline)
+        result_connection.close()
+        raise
+    finally:
+        child_connection.close()
+
+    if timed_out:
+        cleanup_deadline = case_deadline + CLEANUP_GRACE_SECONDS
+        terminate_child(cleanup_deadline)
 
         if config.backend == "docker":
             cleanup = command_executor_for_case(
                 config, agent_workspace, case_name,
                 container_name=container_name,
                 verify_workspace_write=False,
+                operation_deadline=cleanup_deadline,
             )
             cleanup.overall_timed_out = True
             cleanup.container_timed_out = True
-            cleanup.stop()
+            cleanup.stop(deadline=cleanup_deadline)
             metadata = cleanup.execution_metadata()
         else:
             metadata = LocalCommandExecutor().execution_metadata()
@@ -847,29 +946,59 @@ def _run_isolated_agent_phase(
             })
         metadata["resource_limits"] = configured_resource_limits(config)
         metadata["agent_process_exit_code"] = process.exitcode
-        result_queue.close()
+        result_connection.close()
         return {}, f"CaseTimeoutError: agent case exceeded {config.docker_timeout:g}s", metadata
 
-    try:
-        payload_result = result_queue.get(timeout=1.0)
-    except Exception:
+    if payload_result is None:
+        cleanup_deadline = case_deadline + CLEANUP_GRACE_SECONDS
+        terminate_child(cleanup_deadline)
         if config.backend == "docker":
             cleanup = command_executor_for_case(
                 config, agent_workspace, case_name,
                 container_name=container_name,
                 verify_workspace_write=False,
+                operation_deadline=cleanup_deadline,
             )
-            cleanup.stop()
+            cleanup.stop(deadline=cleanup_deadline)
             metadata = cleanup.execution_metadata()
         else:
             metadata = LocalCommandExecutor().execution_metadata()
         metadata["agent_process_exit_code"] = process.exitcode
-        result_queue.close()
-        return {}, f"AgentProcessError: child exited {process.exitcode} without a result", metadata
-    finally:
-        result_queue.close()
+        result_connection.close()
+        detail = f" ({channel_error})" if channel_error else ""
+        return {}, f"AgentProcessError: child exited {process.exitcode} without a result{detail}", metadata
+
+    # A result means the Agent work is complete. Reap the process within the
+    # same case budget; use only the shared cleanup grace if it lingers.
+    try:
+        process.join(remaining_timeout(case_deadline))
+    except KeyboardInterrupt:
+        terminate_child(case_deadline + CLEANUP_GRACE_SECONDS)
+        result_connection.close()
+        raise
+    if process.is_alive():
+        terminate_child(case_deadline + CLEANUP_GRACE_SECONDS)
+    result_connection.close()
 
     metadata = payload_result.get("execution_metadata", {})
+    if (config.backend == "docker"
+            and metadata.get("container_cleanup_succeeded") is not True):
+        cleanup_deadline = case_deadline + CLEANUP_GRACE_SECONDS
+        cleanup = command_executor_for_case(
+            config, agent_workspace, case_name,
+            container_name=container_name,
+            verify_workspace_write=False,
+            operation_deadline=cleanup_deadline,
+        )
+        cleanup.stop(deadline=cleanup_deadline)
+        cleanup_metadata = cleanup.execution_metadata()
+        metadata["container_started"] = (
+            metadata.get("container_started", False)
+            or cleanup_metadata.get("container_started", False))
+        if cleanup_metadata.get("container_exit_code") is not None:
+            metadata["container_exit_code"] = cleanup_metadata["container_exit_code"]
+        metadata["container_cleanup_succeeded"] = cleanup_metadata.get(
+            "container_cleanup_succeeded", False)
     metadata["resource_limits"] = configured_resource_limits(config)
     metadata["agent_process_exit_code"] = process.exitcode
     if "CaseTimeoutError" in payload_result.get("error", ""):
@@ -886,6 +1015,11 @@ def _run_isolated_agent_phase(
 def run_case(case_dir: Path, run_root: Path, scripted: bool,
              execution_config: EvalExecutionConfig | None = None) -> dict:
     execution_config = execution_config or EvalExecutionConfig()
+    start = time.perf_counter()
+    case_deadline = (
+        time.monotonic() + execution_config.docker_timeout
+        if execution_config.backend == "docker" else None
+    )
     case_name = case_dir.name
     case_output = run_root / case_name
     trusted_eval_root = case_output / "trusted_eval"
@@ -900,16 +1034,19 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
     grader_stderr_path = case_output / "grader_stderr.txt"
     change_manifest_path = case_output / "change_manifest.json"
 
+    require_case_time(case_deadline, "case setup")
     case_output.mkdir(parents=True, exist_ok=True)
     trusted_before = trusted_input_snapshot(case_dir)
     trusted_case_dir = copy_trusted_case(case_dir, trusted_eval_root, case_name)
     metadata = load_metadata(trusted_case_dir)
     original_snapshot = workspace_snapshot(trusted_case_dir / "workspace")
     copy_case_workspace(trusted_case_dir, agent_workspace)
+    if execution_config.backend == "docker":
+        prepare_docker_disposable_paths(case_output, agent_workspace)
+    require_case_time(case_deadline, "workspace preparation")
     task = (trusted_case_dir / "task.md").read_text(encoding="utf-8")
     command_executor = None
 
-    start = time.perf_counter()
     agent_error = ""
     run_info = {}
     if execution_config.backend == "docker":
@@ -922,6 +1059,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             stderr_path=stderr_path,
             scripted=scripted,
             config=execution_config,
+            case_deadline=case_deadline,
         )
     else:
         command_executor = command_executor_for_case(
@@ -993,7 +1131,8 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
         "execution_backend": execution_config.backend,
         "docker_image": execution_config.docker_image if execution_config.backend == "docker" else None,
         "timed_out": False,
-        "cleanup_succeeded": execution_config.backend != "docker",
+        "cleanup_succeeded": None if execution_config.backend == "docker" else True,
+        "status": "not_started" if execution_config.backend == "docker" else "not_applicable",
         "container_started": False,
         "container_exit_code": None,
         "resource_limits": {},
@@ -1020,24 +1159,23 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             failure_category=agent_failure_category(agent_error),
         )
         grader_proc = subprocess.CompletedProcess([], 1, "", grader_result["reason"])
-        try:
-            create_grading_workspace(
-                case_dir=trusted_case_dir,
-                agent_workspace=agent_workspace,
-                grading_workspace=grading_workspace,
-                manifest=change_manifest,
-            )
-        except Exception:
-            pass
     else:
         try:
+            require_case_time(case_deadline, "grading workspace preparation")
             create_grading_workspace(
                 case_dir=trusted_case_dir,
                 agent_workspace=agent_workspace,
                 grading_workspace=grading_workspace,
                 manifest=change_manifest,
             )
+            require_case_time(case_deadline, "grading workspace preparation")
             if execution_config.backend == "docker":
+                prepare_docker_disposable_paths(
+                    case_output, trusted_eval_root, grading_workspace,
+                    trace_path, final_path, stdout_path, stderr_path,
+                )
+                require_case_time(case_deadline, "grader input preparation")
+                grader_execution["status"] = "starting"
                 grader_result, grader_proc, grader_details = run_docker_grader(
                     trusted_eval_root=trusted_eval_root,
                     trusted_case_dir=trusted_case_dir,
@@ -1047,8 +1185,10 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
                     stdout_path=stdout_path,
                     stderr_path=stderr_path,
                     config=execution_config,
+                    case_deadline=case_deadline,
                 )
                 grader_execution.update(grader_details)
+                grader_execution["status"] = "completed"
             else:
                 grader_result, grader_proc = run_grader(
                     trusted_case_dir, grading_workspace, trace_path, final_path, stdout_path, stderr_path)
@@ -1059,9 +1199,14 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             grader_reason = f"grader failed to run: {type(exc).__name__}: {exc}"
             grader_result = failure_result(
                 reason=grader_reason,
-                failure_category="sandbox_error" if isinstance(exc, SandboxError) else "grader_error",
+                failure_category=("sandbox_error" if isinstance(exc, SandboxError)
+                                  else "test_timeout" if isinstance(exc, CaseTimeoutError)
+                                  else "grader_error"),
             )
             grader_proc = subprocess.CompletedProcess([], 1, "", grader_reason)
+            if (execution_config.backend == "docker"
+                    and grader_execution["status"] != "not_started"):
+                grader_execution["status"] = "failed"
 
     write_text(grader_stdout_path, grader_proc.stdout or "")
     write_text(grader_stderr_path, grader_proc.stderr or "")
@@ -1103,6 +1248,34 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
         "trusted_violations": trusted_violations,
     }
 
+    if execution_config.backend == "docker":
+        agent_cleanup = execution_metadata.get("container_cleanup_succeeded")
+        grader_attempted = grader_execution.get("status") != "not_started"
+        grader_cleanup = (grader_execution.get("cleanup_succeeded")
+                          if grader_attempted else None)
+        lifecycle = {
+            "agent_container_started": execution_metadata.get("container_started", False),
+            "agent_container_exit_code": execution_metadata.get("container_exit_code"),
+            "agent_container_cleanup_succeeded": agent_cleanup,
+            "grader_container_started": (grader_execution.get("container_started")
+                                           if grader_attempted else None),
+            "grader_container_exit_code": (grader_execution.get("container_exit_code")
+                                             if grader_attempted else None),
+            "grader_container_cleanup_succeeded": grader_cleanup,
+            "all_container_cleanup_succeeded": (
+                agent_cleanup is True and grader_cleanup is True),
+        }
+    else:
+        lifecycle = {
+            "agent_container_started": None,
+            "agent_container_exit_code": None,
+            "agent_container_cleanup_succeeded": None,
+            "grader_container_started": None,
+            "grader_container_exit_code": None,
+            "grader_container_cleanup_succeeded": None,
+            "all_container_cleanup_succeeded": True,
+        }
+
     return {
         "case": case_name,
         "metadata": metadata,
@@ -1132,6 +1305,8 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
         "run": run_info,
         **execution_metadata,
         "grader_execution": grader_execution,
+        **lifecycle,
+        "container_cleanup_succeeded": lifecycle["all_container_cleanup_succeeded"],
     }
 
 
@@ -1202,16 +1377,36 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
         "mode": mode,
         "execution_backend": execution_config.backend,
         "docker_image": execution_config.docker_image if execution_config.backend == "docker" else None,
-        "container_started": any(result.get("container_started", False) for result in results),
+        "container_started": any(
+            result.get("agent_container_started") is True
+            or result.get("grader_container_started") is True for result in results),
         "container_exit_code": next(
             (result.get("container_exit_code") for result in reversed(results)
              if result.get("container_exit_code") is not None),
             None,
         ),
-        "container_timed_out": any(result.get("container_timed_out", False) for result in results),
-        "container_cleanup_succeeded": bool(results) and all(
-            result.get("container_cleanup_succeeded", True) for result in results
-        ),
+        "container_timed_out": any(
+            result.get("container_timed_out", False)
+            or result.get("grader_execution", {}).get("timed_out", False)
+            for result in results),
+        "container_cleanup_succeeded": (
+            True if execution_config.backend != "docker" else bool(results) and all(
+                result.get("all_container_cleanup_succeeded") is True for result in results)),
+        "agent_container_cleanup_succeeded": (
+            None if execution_config.backend != "docker" else bool(results) and all(
+                result.get("agent_container_cleanup_succeeded") is True for result in results)),
+        "grader_container_cleanup_succeeded": (
+            None if execution_config.backend != "docker" else bool(results) and all(
+                result.get("grader_container_cleanup_succeeded") is True for result in results)),
+        "all_container_cleanup_succeeded": (
+            True if execution_config.backend != "docker" else bool(results) and all(
+                result.get("all_container_cleanup_succeeded") is True for result in results)),
+        "agent_container_exit_code": next(
+            (result.get("agent_container_exit_code") for result in reversed(results)
+             if result.get("agent_container_exit_code") is not None), None),
+        "grader_container_exit_code": next(
+            (result.get("grader_container_exit_code") for result in reversed(results)
+             if result.get("grader_container_exit_code") is not None), None),
         "command_execution_count": sum(
             result.get("command_execution_count", 0) for result in results
         ),
@@ -1240,7 +1435,9 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
     execution_config = execution_config or EvalExecutionConfig()
     reason = f"case failed before completion: {type(exc).__name__}: {exc}"
     metadata = load_metadata(case)
-    category = "sandbox_error" if isinstance(exc, SandboxError) else "grader_error"
+    category = ("sandbox_error" if isinstance(exc, SandboxError)
+                else "test_timeout" if isinstance(exc, CaseTimeoutError)
+                else "grader_error")
     result = failure_result(reason=reason, failure_category=category)
     return {
         "case": case.name,
@@ -1274,9 +1471,21 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
         "container_exit_code": None,
         "container_timed_out": False,
         "container_cleanup_succeeded": False,
+        "agent_container_started": False if execution_config.backend == "docker" else None,
+        "agent_container_exit_code": None,
+        "agent_container_cleanup_succeeded": False if execution_config.backend == "docker" else None,
+        "grader_container_started": None,
+        "grader_container_exit_code": None,
+        "grader_container_cleanup_succeeded": None,
+        "all_container_cleanup_succeeded": False if execution_config.backend == "docker" else True,
         "command_execution_count": 0,
         "resource_limits": configured_resource_limits(execution_config),
-        "grader_execution": {},
+        "grader_execution": {
+            "status": "not_started" if execution_config.backend == "docker" else "not_applicable",
+            "cleanup_succeeded": None if execution_config.backend == "docker" else True,
+            "container_started": None,
+            "container_exit_code": None,
+        },
     }
 
 
@@ -1311,7 +1520,7 @@ def main() -> int:
     parser.add_argument("--docker-pids-limit", type=int, default=128,
                         help="Container process limit.")
     parser.add_argument("--docker-timeout", type=float, default=120,
-                        help="Maximum seconds for the Agent sandbox lifetime, one command, or the grader run.")
+                        help="Total wall-clock budget for one Docker case, including Agent, grading, and cleanup.")
     args = parser.parse_args()
     os.environ["MODEL_REQUEST_TIMEOUT"] = str(args.request_timeout)
 
@@ -1326,6 +1535,18 @@ def main() -> int:
     if args.case:
         selected = set(args.case)
         cases = [case for case in cases if case.name in selected]
+        missing = sorted(selected - {case.name for case in cases})
+        if missing:
+            parser.error("unknown eval case(s): " + ", ".join(missing))
+    if args.scripted:
+        unsupported = [case.name for case in cases
+                       if not load_metadata(case).get("scripted_supported", False)]
+        if args.case and unsupported:
+            parser.error(
+                "scripted mode is not supported for: " + ", ".join(unsupported))
+        if not args.case:
+            cases = [case for case in cases
+                     if load_metadata(case).get("scripted_supported", False)]
     if args.list_cases:
         for case in cases:
             metadata = load_metadata(case)

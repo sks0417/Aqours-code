@@ -813,6 +813,10 @@ boundary.
 The second eval hardening stage adds an opt-in Docker execution backend while
 leaving `--execution local` as the default.
 
+Offline `--scripted` runs select only cases whose metadata declares
+`scripted_supported: true`; explicitly selecting an unsupported case is a CLI
+usage error rather than a fabricated evaluation failure.
+
 ```text
 host: Agent Loop + model client + guarded file tools
   -> per-case Agent container: bash via docker exec, /workspace only
@@ -829,13 +833,17 @@ todo/compact, and the synchronous subagent. Worktree, persistent task,
 teammate, cron, skill, MCP, and other host-affecting tools are excluded from the
 tool pool and listed in a traceable policy event. Background execution is also
 disabled for this policy, so no case worker can outlive its runtime.
+Memory, skill-catalog, MCP-state, and teammate-state prompt context are also
+disabled; prompt tool descriptions are generated from the active allowlist.
 
 The complete Docker Agent phase runs in a dedicated spawned host process. The
-parent enforces `--docker-timeout`, terminates and then kills the process after
-a bounded grace period, cleans the container by its preassigned name, and
-continues to the next case. Cooperative deadline checks additionally cap model
-requests and commands to the smaller of their configured timeout and remaining
-case time.
+parent reads a one-way Pipe while the child is running, so large results cannot
+deadlock process exit through a full Queue feeder. `--docker-timeout` is one
+absolute deadline created at the beginning of `run_case`, covering preparation,
+Agent startup/runtime, model and Bash requests, IPC, grading, and cleanup. Each
+operation gets the smaller of its configured timeout and remaining case time.
+Cleanup uses the same absolute cleanup deadline with only a bounded three-second
+grace, then later cases continue.
 
 The Agent container mounts only `agent_workspace` read-write at `/workspace`.
 All tools exposed by the Docker Eval policy are prevented from reading the
@@ -855,7 +863,9 @@ per bind so Windows drive-letter colons are not parsed as volume separators.
 No host environment is inherited through Docker CLI arguments.
 
 Windows Docker Desktop uses UID/GID 10001. On non-root Linux/WSL2 hosts the
-container numeric UID/GID matches the bind-mount owner. Startup verifies actual
+container numeric UID/GID matches the bind-mount owner. On UID-0 hosts only the
+disposable workspaces and copied grader inputs are chowned to 10001; traversal
+skips symlinks and is constrained to the case output root. Startup verifies actual
 non-root write access with a probe inside `/workspace` and fails closed when
 permissions are incompatible; it never removes the non-root restriction.
 
@@ -866,4 +876,8 @@ timeout force-removes its Agent container. Grader timeout remains
 fallback to local execution. Cleanup success is reported only after successful
 removal or an explicit Docker "No such container" response; exit codes are read
 from container state or the one-shot grader process rather than inferred from
-the cleanup command.
+the cleanup command. Results distinguish Agent and Grader started state, exit
+code, and cleanup outcome; legacy `container_cleanup_succeeded` is true only
+when every container created for the case was cleaned up. The legacy generic
+`container_exit_code` remains the Agent code for compatibility; new consumers
+should use the explicit Agent and Grader exit-code fields.

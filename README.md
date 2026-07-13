@@ -68,7 +68,9 @@ host process and routes every `bash` call through `docker exec` into one
 per-case container. The model is offered only workspace-safe file tools,
 containerized `bash`, todo/compact, and the synchronous subagent. Host worktree,
 persistent task, teammate, cron, skill, and MCP tools are not exposed. Disabled
-tools and the active policy are recorded in the trace.
+tools and the active policy are recorded in the trace. Restricted prompt
+assembly also disables memory, skill-catalog, MCP-state, and teammate-state
+context, and describes only the tools actually present in the allowlist.
 
 The Agent container sees only the writable `agent_workspace` at `/workspace`.
 Run traces and their index are written under a sibling trusted `agent_runtime`
@@ -92,11 +94,18 @@ execution. The normal interactive CLI continues to use the local executor.
 
 On POSIX hosts the Agent/Grader numeric UID and GID match the non-root host
 owner so Linux and WSL2 bind mounts remain writable/readable. Windows Docker
-Desktop uses the image's fixed non-root identity. Agent startup performs a real
+Desktop uses the image's fixed non-root identity. When the host itself is UID 0,
+only disposable per-case copies are prepared for UID/GID 10001; symlinks are not
+followed and original cases or project files are never chowned. Agent startup performs a real
 write/delete probe inside `/workspace` and fails closed if the mount is not
-writable. `--docker-timeout` is enforced by the parent process: it terminates
-the complete Agent process, performs bounded cleanup by container name, records
-`tool_loop`, and continues with later cases.
+writable. `--docker-timeout` is one wall-clock budget for the complete case:
+workspace preparation, Agent execution, model requests, Bash, result transfer,
+grading, and cleanup. Cleanup shares one absolute deadline with a bounded
+three-second grace; it does not receive a fresh timeout per Docker command.
+
+With no explicit `--case`, `--scripted` runs only cases marked
+`scripted_supported: true`. Explicitly selecting an unsupported case returns a
+clear command-line error instead of fabricating an eval failure.
 
 The permission hook remains active in Docker mode. It is an application policy
 layer in addition to the container boundary, not a replacement for it.

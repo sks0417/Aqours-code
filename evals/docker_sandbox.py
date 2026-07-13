@@ -54,6 +54,8 @@ class DockerGraderRunner:
         pids_limit: int = 128,
         timeout: float = 120,
         docker_timeout: float = 30,
+        operation_deadline: float | None = None,
+        cleanup_deadline: float | None = None,
         runner=subprocess.run,
     ):
         self.image = image
@@ -64,6 +66,8 @@ class DockerGraderRunner:
         self.timeout = float(timeout)
         self.docker_timeout = float(docker_timeout)
         self.runner = runner
+        self.operation_deadline = operation_deadline
+        self.cleanup_deadline = cleanup_deadline
         self.container_user = host_container_user()
         safe_case = "".join(ch.lower() if ch.isalnum() else "-" for ch in case_name).strip("-")[:40]
         self.container_name = f"codepilot-grader-{safe_case or 'case'}-{uuid.uuid4().hex[:10]}"
@@ -72,6 +76,14 @@ class DockerGraderRunner:
         self.timed_out = False
         self.cleanup_succeeded = False
         self._cleanup_done = False
+
+    def _timeout(self, configured: float, deadline: float | None) -> float | None:
+        if deadline is None:
+            return float(configured)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        return min(float(configured), remaining)
 
     @property
     def resource_limits(self) -> dict:
@@ -141,11 +153,15 @@ class DockerGraderRunner:
             return
         self._cleanup_done = True
         try:
+            timeout = self._timeout(self.docker_timeout, self.cleanup_deadline)
+            if timeout is None:
+                self.cleanup_succeeded = False
+                return
             proc = self.runner(
                 ["docker", "rm", "-f", self.container_name],
                 capture_output=True,
                 text=True,
-                timeout=self.docker_timeout,
+                timeout=timeout,
             )
             # A completed `docker run` leaves the named stopped container. A
             # daemon "not found" response is also a successful no-residue state.
@@ -158,14 +174,20 @@ class DockerGraderRunner:
         args = self.docker_run_args(**paths)
         started = time.perf_counter()
         try:
-            proc = self.runner(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
-            self.container_started = proc.returncode != 125
-            self.container_exit_code = proc.returncode
+            timeout = self._timeout(self.timeout, self.operation_deadline)
+            if timeout is None:
+                self.timed_out = True
+                self.container_exit_code = 124
+                proc = subprocess.CompletedProcess(args, 124, "", "case deadline exceeded")
+            else:
+                proc = self.runner(
+                    args,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                self.container_started = proc.returncode != 125
+                self.container_exit_code = proc.returncode
         except subprocess.TimeoutExpired as exc:
             self.timed_out = True
             self.container_started = True

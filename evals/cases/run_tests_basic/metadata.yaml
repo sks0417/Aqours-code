@@ -1,4 +1,5 @@
 id: run_tests_basic
+scripted_supported: true
 suite: regression
 difficulty: 1
 category: test_execution
