@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -113,32 +114,61 @@ def run_pytest(
     env["PYTHONNOUSERSITE"] = "1"
     env["EVAL_GRADING_WORKSPACE"] = str(workspace)
     env.pop("PYTHONPATH", None)
-    cmd = [sys.executable, "-m", "pytest", "-q", *resolved_tests]
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-        return {
-            "command": cmd,
-            "test_paths": resolved_tests,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "timed_out": False,
-            "failure_category": "test_failure" if proc.returncode else None,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "command": cmd,
-            "test_paths": resolved_tests,
-            "returncode": None,
-            "stdout": exc.stdout or "",
-            "stderr": exc.stderr or "",
-            "timed_out": True,
-            "failure_category": "test_timeout",
-        }
+    # Run trusted and workspace test paths independently. This avoids pytest
+    # selecting their filesystem common ancestor ("/" in Docker or a user
+    # profile on Windows) as a collection root and inspecting unrelated files.
+    commands = []
+    stdout_parts = []
+    stderr_parts = []
+    returncode = 0
+    deadline = time.monotonic() + timeout
+    for test_path in resolved_tests:
+        test_path_obj = Path(test_path)
+        try:
+            test_path_obj.relative_to(workspace)
+            test_root = workspace
+        except ValueError:
+            test_root = test_path_obj.parent
+        cmd = [
+            sys.executable, "-m", "pytest", "-q",
+            "-p", "no:cacheprovider",
+            "--rootdir", str(test_root),
+            "--confcutdir", str(test_root),
+            test_path,
+        ]
+        commands.append(cmd)
+        remaining = max(0.001, deadline - time.monotonic())
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=remaining,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout_parts.append(exc.stdout or "")
+            stderr_parts.append(exc.stderr or "")
+            return {
+                "command": commands,
+                "test_paths": resolved_tests,
+                "returncode": None,
+                "stdout": "\n".join(stdout_parts),
+                "stderr": "\n".join(stderr_parts),
+                "timed_out": True,
+                "failure_category": "test_timeout",
+            }
+        stdout_parts.append(proc.stdout or "")
+        stderr_parts.append(proc.stderr or "")
+        if proc.returncode and returncode == 0:
+            returncode = proc.returncode
+    return {
+        "command": commands,
+        "test_paths": resolved_tests,
+        "returncode": returncode,
+        "stdout": "\n".join(stdout_parts),
+        "stderr": "\n".join(stderr_parts),
+        "timed_out": False,
+        "failure_category": "test_failure" if returncode else None,
+    }

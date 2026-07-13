@@ -40,13 +40,15 @@ def start_background_task(block, handlers: dict) -> str:
             background_tasks[bg_id]["status"] = "completed"
             background_results[bg_id] = str(result)
 
+    thread = threading.Thread(target=worker, daemon=True)
     with background_lock:
         background_tasks[bg_id] = {
             "tool_use_id": block.id,
             "command": command,
             "status": "running",
+            "thread": thread,
         }
-    threading.Thread(target=worker, daemon=True).start()
+    thread.start()
     print(f"  \033[33m[background] {bg_id}: {str(command)[:60]}\033[0m")
     return bg_id
 
@@ -69,6 +71,19 @@ def collect_background_results() -> list[str]:
             f"  <summary>{summary}</summary>\n"
             f"</task_notification>")
     return notifications
+
+
+def wait_for_background_tasks():
+    """Wait for already-started tool workers before their runtime is restored."""
+    while True:
+        with background_lock:
+            threads = [task.get("thread") for task in background_tasks.values()
+                       if task.get("status") == "running"]
+        threads = [thread for thread in threads if thread is not None]
+        if not threads:
+            return
+        for thread in threads:
+            thread.join()
 
 
 

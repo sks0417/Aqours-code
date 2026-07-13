@@ -17,3 +17,7 @@ include = ["codepilot_s20*"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+addopts = "-m 'not docker'"
+markers = [
+    "docker: integration tests requiring a working Docker daemon",
+]

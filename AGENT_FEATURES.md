@@ -803,7 +803,49 @@ Pytest graders run through `sys.executable -m pytest` with bytecode writes,
 plugin autoloading, user site packages, and inherited `PYTHONPATH` disabled for
 more reproducible local grading.
 
-This prevents common test-file and pytest-runner tampering in the local eval
-harness. It is still not a strong OS sandbox. The current `bash` tool can still
-access the host according to the process permissions; true hard isolation is
-left for a later Docker/container sandbox stage.
+This prevents common test-file and pytest-runner tampering in the clean-room
+grader. Local execution remains a compatibility mode whose `bash` tool has host
+process permissions; the opt-in Docker backend below supplies the stronger eval
+boundary.
+
+## Eval Docker Sandbox (Stage 2)
+
+The second eval hardening stage adds an opt-in Docker execution backend while
+leaving `--execution local` as the default.
+
+```text
+host: Agent Loop + model client + guarded file tools
+  -> per-case Agent container: bash via docker exec, /workspace only
+  -> destroy Agent container
+host: snapshot + change manifest + clean grading workspace
+  -> separate one-shot Grader container: trusted inputs read-only
+  -> destroy Grader container
+```
+
+`LocalCommandExecutor` retains the normal CLI subprocess behavior.
+`DockerCommandExecutor` creates one long-lived container per eval case; all
+foreground, background, subagent, and teammate `bash` handlers share the
+injected runtime executor. Async teammates capture that executor when spawned,
+so a teammate that outlives the lead cannot fall back to host execution.
+`run_agent_task` waits for active background handlers, stops the executor in
+`finally`, and restores the previous executor so subsequent local CLI turns
+cannot accidentally keep using Docker.
+
+The Agent container mounts only `agent_workspace` read-write at `/workspace`.
+It cannot see the original case workspace, `trusted_eval`, `grading_workspace`,
+grader code/tests, the project root, `.env`, API keys, or the Docker socket.
+The Grader container separately mounts `trusted_eval`, `grading_workspace`, and
+trace/final/stdout/stderr files read-only. Model requests never enter either
+container and Agent containers remain network-disabled.
+
+Both containers use `--network none`, `--read-only`, `--cap-drop ALL`,
+`no-new-privileges`, UID/GID 10001, memory and CPU limits, a PID limit, a file
+descriptor limit, and a bounded tmpfs. Docker mounts use one `--mount` argument
+per bind so Windows drive-letter colons are not parsed as volume separators.
+No host environment is inherited through Docker CLI arguments.
+
+Docker mode adds `sandbox_error` and `command_timeout` failure categories plus
+execution and cleanup metadata to case results and `summary.json`. A command
+timeout force-removes its Agent container. Grader timeout remains
+`test_timeout`; grader exceptions remain `grader_error`. There is no automatic
+fallback to local execution.

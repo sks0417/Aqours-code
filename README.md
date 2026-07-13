@@ -57,6 +57,30 @@ workspace. If case/grader files change during a run, the case fails with
 `constraint_violation`. Grader pytest runs use `sys.executable -m pytest` with
 plugin autoloading and user site packages disabled for reproducibility.
 
-This is still not a strong OS sandbox. The `bash` tool runs with the host
-process permissions; truly adversarial isolation requires a future container or
-separate restricted process.
+By default evals remain local and backward compatible:
+
+```powershell
+python evals/run_eval.py --scripted --execution local
+```
+
+Docker mode keeps the Agent Loop and model API client on the host, but routes
+every eval `bash` call through `docker exec` into one per-case container. The
+container sees only the writable `agent_workspace` at `/workspace`. After the
+agent stops, grading runs in a different one-shot container with read-only
+mounts for `trusted_eval`, `grading_workspace`, and the trace/final/stdout/stderr
+inputs.
+
+```powershell
+python evals/run_eval.py --scripted --execution docker --docker-build
+python evals/run_eval.py --execution docker --case mini_auth_service_security_fix
+```
+
+The eval image is pinned to Python 3.11.9 with locked Python dependencies in
+`evals/docker/requirements.lock`. Docker sandboxes use no network, a read-only
+root filesystem, a non-root user, dropped capabilities, no-new-privileges,
+bounded memory/CPU/PIDs/file descriptors, and a size-limited `/tmp`. Docker
+failure is reported as `sandbox_error`; it never falls back to host command
+execution. The normal interactive CLI continues to use the local executor.
+
+The permission hook remains active in Docker mode. It is an application policy
+layer in addition to the container boundary, not a replacement for it.

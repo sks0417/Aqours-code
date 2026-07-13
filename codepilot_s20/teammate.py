@@ -9,6 +9,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     # Plan approval is a real gate: after submit_plan, the teammate stops
     # taking model/tool steps until lead sends plan_approval_response.
     protocol_ctx = {"waiting_plan": None}
+    # An async teammate may outlive the lead run. Pin its bash backend now so
+    # runtime restoration can never make a sandboxed eval fall back to local.
+    teammate_command_executor = COMMAND_EXECUTOR
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
               f"If a task has a worktree, work in that directory.")
@@ -41,7 +44,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             return Path(p) if p else None
 
         def _run_bash(command: str) -> str:
-            return run_bash(command, cwd=_wt_cwd())
+            return run_bash(command, cwd=_wt_cwd(), executor=teammate_command_executor)
 
         def _run_read(path: str) -> str:
             return run_read(path, cwd=_wt_cwd())

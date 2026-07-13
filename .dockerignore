@@ -1,0 +1,16 @@
+.env
+.git
+.pytest_cache
+.codepilot
+.mailboxes
+.tasks
+.task_outputs
+.transcripts
+.worktrees
+__pycache__
+*.pyc
+evals/cases
+evals/results
+tests
+*.jsonl
+*.log

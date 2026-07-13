@@ -20,6 +20,7 @@ except ImportError:
     def load_dotenv(*args, **kwargs): return False
 
 from .model_api import build_model_client, default_model_for_provider, provider_from_env
+from .command_executor import LocalCommandExecutor
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -47,6 +48,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 WORKDIR = Path(os.getenv("CODEPILOT_S20_WORKDIR", Path.cwd())).resolve()
+COMMAND_EXECUTOR = LocalCommandExecutor()
 MODEL_PROVIDER = provider_from_env()
 MODEL = os.getenv("MODEL_ID", default_model_for_provider(MODEL_PROVIDER))
 PRIMARY_MODEL = MODEL

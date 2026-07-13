@@ -11,6 +11,7 @@ import sys
 import time
 import fnmatch
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
@@ -41,6 +42,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from codepilot_s20.agent_loop import run_agent_task  # noqa: E402
+from codepilot_s20.command_executor import (  # noqa: E402
+    DockerCommandExecutor,
+    LocalCommandExecutor,
+    SandboxError,
+)
+from evals.docker_sandbox import DockerGraderRunner, build_eval_image  # noqa: E402
 
 
 DEFAULT_BREAKDOWN_WEIGHTS = {
@@ -59,6 +66,8 @@ FAILURE_CATEGORIES = {
     "model_error",
     "api_timeout",
     "test_timeout",
+    "command_timeout",
+    "sandbox_error",
 }
 
 RUNTIME_IGNORE_PATTERNS = [
@@ -75,6 +84,47 @@ RUNTIME_IGNORE_PATTERNS = [
 TAMPER_ENTRY_NAMES = {"pytest.py", "conftest.py", "sitecustomize.py", "usercustomize.py"}
 TRUSTED_ROOT_FILES = {"task.md", "metadata.yaml", "grader.py"}
 TRUSTED_DIRS = {"workspace", "grader_tests"}
+
+
+@dataclass(frozen=True)
+class EvalExecutionConfig:
+    backend: str = "local"
+    docker_image: str = "codepilot-s20-eval:py311"
+    docker_memory: str = "1g"
+    docker_cpus: str = "1"
+    docker_pids_limit: int = 128
+    docker_timeout: float = 120
+
+
+def configured_resource_limits(config: EvalExecutionConfig) -> dict:
+    if config.backend != "docker":
+        return {}
+    return {
+        "memory": config.docker_memory,
+        "memory_swap": config.docker_memory,
+        "cpus": config.docker_cpus,
+        "pids_limit": config.docker_pids_limit,
+        "nofile": "256:256",
+        "tmpfs": "/tmp:rw,noexec,nosuid,size=64m",
+        "overall_timeout_seconds": config.docker_timeout,
+    }
+
+
+def command_executor_for_case(config: EvalExecutionConfig, workspace: Path, case_name: str):
+    if config.backend == "local":
+        return LocalCommandExecutor()
+    if config.backend == "docker":
+        return DockerCommandExecutor(
+            workspace=workspace,
+            image=config.docker_image,
+            case_name=case_name,
+            memory=config.docker_memory,
+            cpus=config.docker_cpus,
+            pids_limit=config.docker_pids_limit,
+            command_timeout=config.docker_timeout,
+            overall_timeout=config.docker_timeout,
+        )
+    raise ValueError(f"unsupported execution backend: {config.backend}")
 
 
 def text_block(text: str):
@@ -128,7 +178,7 @@ class ScriptedEvalMessages:
 
         if self.case_name == "run_tests_basic":
             if not results:
-                return response([tool_block("bash", {"command": f"{sys.executable} -m pytest -q"}, "call_pytest")])
+                return response([tool_block("bash", {"command": "python -m pytest -q"}, "call_pytest")])
             return response([text_block(f"Tests finished:\n{results[-1].get('content', '')}")])
 
         if self.case_name == "permission_denied_basic":
@@ -591,21 +641,61 @@ def parse_grader_output(proc: subprocess.CompletedProcess) -> dict:
 
 def run_grader(case_dir: Path, workspace: Path, trace_path: Path,
                final_path: Path, stdout_path: Path, stderr_path: Path) -> tuple[dict, subprocess.CompletedProcess]:
-    proc = subprocess.run(
-        [
-            sys.executable,
-            str(case_dir / "grader.py"),
-            "--workspace", str(workspace),
-            "--trace", str(trace_path),
-            "--final", str(final_path),
-            "--stdout", str(stdout_path),
-            "--stderr", str(stderr_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    args = [
+        sys.executable,
+        str(case_dir / "grader.py"),
+        "--workspace", str(workspace),
+        "--trace", str(trace_path),
+        "--final", str(final_path),
+        "--stdout", str(stdout_path),
+        "--stderr", str(stderr_path),
+    ]
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as exc:
+        proc = subprocess.CompletedProcess(args, 124, exc.stdout or "", exc.stderr or "")
+        return failure_result(
+            reason="grader timed out after 120s",
+            failure_category="test_timeout",
+        ), proc
     return parse_grader_output(proc), proc
+
+
+def run_docker_grader(
+    *,
+    trusted_eval_root: Path,
+    trusted_case_dir: Path,
+    workspace: Path,
+    trace_path: Path,
+    final_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    config: EvalExecutionConfig,
+) -> tuple[dict, subprocess.CompletedProcess, dict]:
+    runner = DockerGraderRunner(
+        image=config.docker_image,
+        case_name=trusted_case_dir.name,
+        memory=config.docker_memory,
+        cpus=config.docker_cpus,
+        pids_limit=config.docker_pids_limit,
+        timeout=config.docker_timeout,
+    )
+    proc, metadata = runner.run(
+        trusted_eval_root=trusted_eval_root,
+        grading_workspace=workspace,
+        trace_path=trace_path,
+        final_path=final_path,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
+    if metadata["timed_out"]:
+        result = failure_result(
+            reason=f"grader timed out after {config.docker_timeout:g}s",
+            failure_category="test_timeout",
+        )
+    else:
+        result = parse_grader_output(proc)
+    return result, proc, metadata
 
 
 def write_text(path: Path, text: str):
@@ -613,7 +703,9 @@ def write_text(path: Path, text: str):
     path.write_text(text, encoding="utf-8")
 
 
-def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
+def run_case(case_dir: Path, run_root: Path, scripted: bool,
+             execution_config: EvalExecutionConfig | None = None) -> dict:
+    execution_config = execution_config or EvalExecutionConfig()
     case_name = case_dir.name
     case_output = run_root / case_name
     trusted_eval_root = case_output / "trusted_eval"
@@ -635,6 +727,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
     original_snapshot = workspace_snapshot(trusted_case_dir / "workspace")
     copy_case_workspace(trusted_case_dir, agent_workspace)
     task = (trusted_case_dir / "task.md").read_text(encoding="utf-8")
+    command_executor = command_executor_for_case(execution_config, agent_workspace, case_name)
 
     start = time.perf_counter()
     agent_error = ""
@@ -650,6 +743,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
                 model_client=ScriptedEvalClient(case_name) if scripted else None,
                 model_provider="scripted" if scripted else None,
                 model="scripted-eval" if scripted else None,
+                command_executor=command_executor,
             )
     except Exception as exc:
         agent_error = f"{type(exc).__name__}: {exc}"
@@ -695,6 +789,13 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
     trusted_after = trusted_input_snapshot(case_dir)
     trusted_violations = trusted_input_changes(trusted_before, trusted_after)
 
+    grader_execution = {
+        "execution_backend": execution_config.backend,
+        "docker_image": execution_config.docker_image if execution_config.backend == "docker" else None,
+        "timed_out": False,
+        "cleanup_succeeded": True,
+        "resource_limits": {},
+    }
     if trusted_violations:
         grader_result = failure_result(
             reason="trusted case inputs were modified: " + ", ".join(trusted_violations),
@@ -719,13 +820,26 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
                 grading_workspace=grading_workspace,
                 manifest=change_manifest,
             )
-            grader_result, grader_proc = run_grader(
-                trusted_case_dir, grading_workspace, trace_path, final_path, stdout_path, stderr_path)
+            if execution_config.backend == "docker":
+                grader_result, grader_proc, grader_details = run_docker_grader(
+                    trusted_eval_root=trusted_eval_root,
+                    trusted_case_dir=trusted_case_dir,
+                    workspace=grading_workspace,
+                    trace_path=trace_path,
+                    final_path=final_path,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    config=execution_config,
+                )
+                grader_execution.update(grader_details)
+            else:
+                grader_result, grader_proc = run_grader(
+                    trusted_case_dir, grading_workspace, trace_path, final_path, stdout_path, stderr_path)
         except Exception as exc:
             grader_reason = f"grader failed to run: {type(exc).__name__}: {exc}"
             grader_result = failure_result(
                 reason=grader_reason,
-                failure_category="grader_error",
+                failure_category="sandbox_error" if isinstance(exc, SandboxError) else "grader_error",
             )
             grader_proc = subprocess.CompletedProcess([], 1, "", grader_reason)
 
@@ -733,6 +847,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
     write_text(grader_stderr_path, grader_proc.stderr or "")
 
     duration_ms = int((time.perf_counter() - start) * 1000)
+    execution_metadata = command_executor.execution_metadata()
     if agent_error:
         grader_result = normalize_grader_payload({
             "passed": False,
@@ -740,6 +855,21 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
             "reason": f"agent failed: {agent_error}",
             "failure_category": agent_failure_category(agent_error),
         }, subprocess.CompletedProcess([], 1, "", ""))
+    elif execution_metadata.get("sandbox_error"):
+        grader_result = failure_result(
+            reason=f"agent sandbox failed: {execution_metadata['sandbox_error']}",
+            failure_category="sandbox_error",
+        )
+    elif execution_metadata.get("overall_timed_out"):
+        grader_result = failure_result(
+            reason="agent sandbox exceeded its overall timeout",
+            failure_category="tool_loop",
+        )
+    elif execution_metadata.get("command_timed_out"):
+        grader_result = failure_result(
+            reason="agent bash command timed out and the sandbox was terminated",
+            failure_category="command_timeout",
+        )
     elif change_manifest["unexpected_changes"] or change_manifest["forbidden_changes"]:
         violations = sorted(set(change_manifest["unexpected_changes"] + change_manifest["forbidden_changes"]))
         grader_result = failure_result(
@@ -781,6 +911,8 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool) -> dict:
         "final": str(final_path),
         "grader": grader_result,
         "run": run_info,
+        **execution_metadata,
+        "grader_execution": grader_execution,
     }
 
 
@@ -826,6 +958,8 @@ def failure_category_counts(results: list[dict]) -> dict:
 
 def agent_failure_category(agent_error: str) -> str:
     lowered = agent_error.lower()
+    if "sandboxerror" in lowered or "docker sandbox" in lowered or "docker daemon" in lowered:
+        return "sandbox_error"
     if "timeout" in lowered or "timed out" in lowered:
         return "api_timeout"
     if "urlerror" in lowered or "model request failed" in lowered or "missing api key" in lowered:
@@ -835,7 +969,9 @@ def agent_failure_category(agent_error: str) -> str:
 
 def build_summary(*, started: float, cases_dir: Path, run_root: Path,
                   mode: str, results: list[dict],
-                  interrupted: bool = False, interrupt_reason: str = "") -> dict:
+                  interrupted: bool = False, interrupt_reason: str = "",
+                  execution_config: EvalExecutionConfig | None = None) -> dict:
+    execution_config = execution_config or EvalExecutionConfig()
     total_cases = len(results)
     passed_count = sum(1 for result in results if result["passed"])
     return {
@@ -843,6 +979,22 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
         "finished_at": time.time(),
         "duration_ms": int((time.time() - started) * 1000),
         "mode": mode,
+        "execution_backend": execution_config.backend,
+        "docker_image": execution_config.docker_image if execution_config.backend == "docker" else None,
+        "container_started": any(result.get("container_started", False) for result in results),
+        "container_exit_code": next(
+            (result.get("container_exit_code") for result in reversed(results)
+             if result.get("container_exit_code") is not None),
+            None,
+        ),
+        "container_timed_out": any(result.get("container_timed_out", False) for result in results),
+        "container_cleanup_succeeded": all(
+            result.get("container_cleanup_succeeded", True) for result in results
+        ),
+        "command_execution_count": sum(
+            result.get("command_execution_count", 0) for result in results
+        ),
+        "resource_limits": configured_resource_limits(execution_config),
         "interrupted": interrupted,
         "interrupt_reason": interrupt_reason,
         "cases_dir": str(cases_dir),
@@ -862,10 +1014,13 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
     }
 
 
-def case_exception_result(case: Path, run_root: Path, exc: Exception) -> dict:
+def case_exception_result(case: Path, run_root: Path, exc: Exception,
+                          execution_config: EvalExecutionConfig | None = None) -> dict:
+    execution_config = execution_config or EvalExecutionConfig()
     reason = f"case failed before completion: {type(exc).__name__}: {exc}"
     metadata = load_metadata(case)
-    result = failure_result(reason=reason, failure_category="grader_error")
+    category = "sandbox_error" if isinstance(exc, SandboxError) else "grader_error"
+    result = failure_result(reason=reason, failure_category=category)
     return {
         "case": case.name,
         "metadata": metadata,
@@ -874,7 +1029,7 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception) -> dict:
         "breakdown": result["breakdown"],
         "metrics": {"runtime_sec": 0},
         "reason": reason,
-        "failure_category": "grader_error",
+        "failure_category": category,
         "error": reason,
         "duration_ms": 0,
         "workspace": str(run_root / case.name / "agent_workspace"),
@@ -892,6 +1047,15 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception) -> dict:
         "final": str(run_root / case.name / "final.md"),
         "grader": result,
         "run": {},
+        "execution_backend": execution_config.backend,
+        "docker_image": execution_config.docker_image if execution_config.backend == "docker" else None,
+        "container_started": False,
+        "container_exit_code": None,
+        "container_timed_out": False,
+        "container_cleanup_succeeded": True,
+        "command_execution_count": 0,
+        "resource_limits": configured_resource_limits(execution_config),
+        "grader_execution": {},
     }
 
 
@@ -913,6 +1077,20 @@ def main() -> int:
                         help="Per model HTTP request timeout in seconds. Default: 30.")
     parser.add_argument("--scripted", action="store_true",
                         help="Use the deterministic local scripted client for offline harness smoke tests. By default evals call the configured model API.")
+    parser.add_argument("--execution", choices=("local", "docker"), default="local",
+                        help="Where agent bash commands and grading run. Default: local.")
+    parser.add_argument("--docker-image", default="codepilot-s20-eval:py311",
+                        help="Eval sandbox image name.")
+    parser.add_argument("--docker-build", action="store_true",
+                        help="Build the pinned eval image before running cases.")
+    parser.add_argument("--docker-memory", default="1g",
+                        help="Container memory and memory-swap limit.")
+    parser.add_argument("--docker-cpus", default="1",
+                        help="Container CPU limit.")
+    parser.add_argument("--docker-pids-limit", type=int, default=128,
+                        help="Container process limit.")
+    parser.add_argument("--docker-timeout", type=float, default=120,
+                        help="Maximum seconds for the Agent sandbox lifetime, one command, or the grader run.")
     args = parser.parse_args()
     os.environ["MODEL_REQUEST_TIMEOUT"] = str(args.request_timeout)
 
@@ -932,20 +1110,43 @@ def main() -> int:
             metadata = load_metadata(case)
             print(f"{case.name}\tsuite={metadata.get('suite')}\tdifficulty={metadata.get('difficulty')}\tcategory={metadata.get('category')}")
         return 0
+    execution_config = EvalExecutionConfig(
+        backend=args.execution,
+        docker_image=args.docker_image,
+        docker_memory=args.docker_memory,
+        docker_cpus=args.docker_cpus,
+        docker_pids_limit=args.docker_pids_limit,
+        docker_timeout=args.docker_timeout,
+    )
     results = []
     mode = "scripted" if args.scripted else "real-model"
     print(
-        f"[eval] mode={mode} cases={len(cases)} request_timeout={args.request_timeout}s "
+        f"[eval] mode={mode} execution={args.execution} cases={len(cases)} request_timeout={args.request_timeout}s "
         f"provider={os.getenv('MODEL_PROVIDER', '')} model={os.getenv('MODEL_ID', '')}",
         flush=True,
     )
+    if args.execution == "docker" and args.docker_build:
+        try:
+            print(f"[eval] building Docker image {args.docker_image}", flush=True)
+            build_eval_image(project_root=PROJECT_ROOT, image=args.docker_image)
+        except SandboxError as exc:
+            print(f"[eval] Docker build failed: {exc}", flush=True)
+            results = [case_exception_result(case, run_root, exc, execution_config) for case in cases]
+            summary = build_summary(
+                started=started, cases_dir=cases_dir, run_root=run_root,
+                mode=mode, results=results, execution_config=execution_config,
+            )
+            summary_path = write_summary(results_dir, summary)
+            print(json.dumps({"summary": str(summary_path), "passed": 0,
+                              "failed": summary["failed"]}, indent=2))
+            return 1
     interrupted = False
     interrupt_reason = ""
     for index, case in enumerate(cases, start=1):
         case_started = time.time()
         print(f"[eval] start {index}/{len(cases)} {case.name}", flush=True)
         try:
-            result = run_case(case, run_root, args.scripted)
+            result = run_case(case, run_root, args.scripted, execution_config)
             results.append(result)
             status = "PASS" if result["passed"] else "FAIL"
             reason = f" reason={result['reason']}" if result.get("reason") else ""
@@ -960,7 +1161,7 @@ def main() -> int:
             print(f"[eval] interrupted during {case.name}; partial summary will be written", flush=True)
             break
         except Exception as exc:
-            result = case_exception_result(case, run_root, exc)
+            result = case_exception_result(case, run_root, exc, execution_config)
             results.append(result)
             print(
                 f"[eval] done  {index}/{len(cases)} {case.name} FAIL "
@@ -978,6 +1179,7 @@ def main() -> int:
                     results=results,
                     interrupted=interrupted,
                     interrupt_reason=interrupt_reason,
+                    execution_config=execution_config,
                 ),
             )
 
@@ -989,6 +1191,7 @@ def main() -> int:
         results=results,
         interrupted=interrupted,
         interrupt_reason=interrupt_reason,
+        execution_config=execution_config,
     )
     summary_path = write_summary(results_dir, summary)
     print(json.dumps({

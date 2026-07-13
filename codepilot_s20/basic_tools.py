@@ -13,19 +13,21 @@ def safe_path(p: str, cwd: Path = None) -> Path:
 
 
 def run_bash(command: str, cwd: Path = None,
-             run_in_background: bool = False) -> str:
+             run_in_background: bool = False, timeout: float = 120,
+             executor=None) -> str:
     # run_in_background is consumed by the dispatcher; direct execution ignores it.
     lowered = f" {command.lower()} "
     delete_commands = ("remove-item", "rmdir", "rd ", "del ", "erase ", "rm ", "unlink")
     if any(token in lowered for token in delete_commands):
         return "Permission denied: delete commands are disabled for bash"
     try:
-        r = subprocess.run(command, shell=True, cwd=cwd or WORKDIR,
-                           capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()
+        result = (executor or COMMAND_EXECUTOR).execute(command, cwd or WORKDIR, timeout)
+        out = (result["stdout"] + result["stderr"]).strip()
+        if result["timed_out"]:
+            return f"Error: Timeout ({timeout:g}s)" + (f"\n{out[:50000]}" if out else "")
         return out[:50000] if out else "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
+    except Exception as exc:
+        return f"Error: {type(exc).__name__}: {exc}"
 
 
 def run_read(path: str, limit: int | None = None,

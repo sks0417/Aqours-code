@@ -404,7 +404,7 @@ def _copy_trace_file(source, target):
 
 def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
                    *, model_client=None, model_provider: str | None = None,
-                   model: str | None = None) -> dict:
+                   model: str | None = None, command_executor=None) -> dict:
     """Run one non-interactive agent task using the existing loop and trace."""
     global rounds_since_todo
     from . import bootstrap
@@ -417,10 +417,13 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
     old_provider = _runtime_value("MODEL_PROVIDER")
     old_model = _runtime_value("MODEL")
     old_primary_model = _runtime_value("PRIMARY_MODEL")
+    old_command_executor = _runtime_value("COMMAND_EXECUTOR")
 
     _set_runtime_value("WORKDIR", workdir_path)
     if model_client is not None:
         _set_runtime_value("client", model_client)
+    if command_executor is not None:
+        _set_runtime_value("COMMAND_EXECUTOR", command_executor)
 
     provider_name = model_provider or _runtime_value("MODEL_PROVIDER")
     model_name = model or _runtime_value("MODEL")
@@ -437,6 +440,8 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
     final_text = ""
     rounds_since_todo = 0
     try:
+        if command_executor is not None:
+            command_executor.start()
         with agent_lock:
             agent_loop(messages, context)
             update_context(context, messages)
@@ -452,12 +457,24 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         finish_run(final_text)
         raise
     finally:
-        _copy_trace_file(run.trace_path, trace_path)
-        _set_runtime_value("WORKDIR", old_workdir)
-        _set_runtime_value("client", old_client)
-        _set_runtime_value("MODEL_PROVIDER", old_provider)
-        _set_runtime_value("MODEL", old_model)
-        _set_runtime_value("PRIMARY_MODEL", old_primary_model)
+        try:
+            # Background bash handlers share the active executor. Let them
+            # finish before stopping its container.
+            wait_for_background_tasks()
+        finally:
+            try:
+                if command_executor is not None:
+                    command_executor.stop()
+            finally:
+                try:
+                    _copy_trace_file(run.trace_path, trace_path)
+                finally:
+                    _set_runtime_value("WORKDIR", old_workdir)
+                    _set_runtime_value("client", old_client)
+                    _set_runtime_value("MODEL_PROVIDER", old_provider)
+                    _set_runtime_value("MODEL", old_model)
+                    _set_runtime_value("PRIMARY_MODEL", old_primary_model)
+                    _set_runtime_value("COMMAND_EXECUTOR", old_command_executor)
 
     return {
         "run_id": run.run_id,
@@ -466,6 +483,7 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         "timeline_path": str(run.timeline_path),
         "final_path": str(run.final_path),
         "final_answer": final_text,
+        "execution": (command_executor or old_command_executor).execution_metadata(),
     }
 
 
