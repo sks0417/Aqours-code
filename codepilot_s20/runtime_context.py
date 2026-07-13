@@ -55,6 +55,24 @@ def detect_runtime_context(workdir: str | Path | None = None) -> dict:
     }
 
 
+def resolve_prompt_runtime_context(
+    policy: dict | None = None,
+    workdir: str | Path | None = None,
+) -> dict:
+    """Return the runtime environment visible to tools for prompt display."""
+    configured = policy.get("prompt_runtime") if isinstance(policy, dict) else None
+    if not isinstance(configured, dict):
+        return detect_runtime_context(workdir)
+    return {
+        "os": configured.get("os", "unknown"),
+        "platform": configured.get("platform", configured.get("os", "unknown")),
+        "shell": configured.get("shell", "unknown"),
+        "path_separator": configured.get("path_separator", "/"),
+        "workdir": configured.get("workdir", ""),
+        "command_hints": list(configured.get("command_hints", [])),
+    }
+
+
 def format_runtime_context_for_prompt(context: dict | None = None) -> str:
     data = context or detect_runtime_context()
     hints = "\n".join(f"- {hint}" for hint in data.get("command_hints", []))

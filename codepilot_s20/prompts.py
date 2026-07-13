@@ -49,10 +49,11 @@ def assemble_system_prompt(context: dict) -> str:
     tool_section = "Available tools: " + ", ".join(allowed_tools) + "."
     if policy.get("allow_mcp", True):
         tool_section += " MCP tools are prefixed mcp__{server}__{tool}."
+    prompt_runtime = resolve_prompt_runtime_context(policy, WORKDIR)
     sections = [PROMPT_SECTIONS["identity"],
                 tool_section,
-                PROMPT_SECTIONS["workspace"],
-                format_runtime_context_for_prompt(detect_runtime_context(WORKDIR)),
+                f"Working directory: {prompt_runtime['workdir']}",
+                format_runtime_context_for_prompt(prompt_runtime),
                 PROMPT_SECTIONS["tool_strategy"],
                 PROMPT_SECTIONS["permissions"]]
     if any(name in allowed_tools for name in ("schedule_cron", "schedule_once")):

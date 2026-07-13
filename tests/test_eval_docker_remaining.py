@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from codepilot_s20.command_executor import DockerCommandExecutor
+from codepilot_s20.command_executor import DockerCommandExecutor, SandboxError
 from codepilot_s20.docker_utils import prepare_disposable_tree
 from evals import run_eval
 from evals.docker_sandbox import DockerGraderRunner
@@ -189,6 +189,53 @@ def test_root_host_permission_preparation_does_not_follow_symlink(tmp_path):
 
     assert link not in changed
     assert outside not in changed
+
+
+def test_chown_failure_is_fail_closed_sandbox_error_before_agent_or_grader(
+    tmp_path, monkeypatch,
+):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("untouched", encoding="utf-8")
+
+    def failing_prepare(path, *, allowed_root):
+        def failing_chown(_path, _uid, _gid, *, follow_symlinks):
+            assert follow_symlinks is False
+            raise OSError("root-squash operation not permitted")
+
+        return prepare_disposable_tree(
+            path, allowed_root=allowed_root, platform="posix",
+            getuid=lambda: 0, chown=failing_chown,
+        )
+
+    monkeypatch.setattr(run_eval, "prepare_disposable_tree", failing_prepare)
+    monkeypatch.setattr(
+        run_eval, "_run_isolated_agent_phase",
+        lambda **_kwargs: pytest.fail("Agent must not start after chown failure"),
+    )
+    monkeypatch.setattr(
+        run_eval, "run_docker_grader",
+        lambda **_kwargs: pytest.fail("Grader must not start after chown failure"),
+    )
+    case = run_eval.PROJECT_ROOT / "evals" / "cases" / "read_file_basic"
+    run_root = tmp_path / "runs"
+
+    with pytest.raises(SandboxError) as caught:
+        run_eval.run_case(
+            case, run_root, scripted=True,
+            execution_config=run_eval.EvalExecutionConfig(backend="docker"),
+        )
+
+    agent_workspace = run_root / case.name / "agent_workspace"
+    message = str(caught.value)
+    assert "unable to prepare disposable workspace for the non-root Docker user" in message
+    assert str(agent_workspace) in message
+    assert "root-squash operation not permitted" in message
+    result = run_eval.case_exception_result(
+        case, run_root, caught.value,
+        run_eval.EvalExecutionConfig(backend="docker"),
+    )
+    assert result["failure_category"] == "sandbox_error"
+    assert outside.read_text(encoding="utf-8") == "untouched"
 
 
 @pytest.mark.parametrize(

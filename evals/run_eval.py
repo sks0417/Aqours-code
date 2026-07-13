@@ -121,6 +121,14 @@ DOCKER_EVAL_TOOL_POLICY = {
     "allow_skill_context": False,
     "allow_teammate_context": False,
     "background_tasks": False,
+    "prompt_runtime": {
+        "os": "Linux",
+        "platform": "Docker Linux container",
+        "shell": "/bin/sh",
+        "path_separator": "/",
+        "workdir": "/workspace",
+        "command_hints": ["Use Linux-compatible shell commands."],
+    },
 }
 
 
@@ -774,7 +782,13 @@ def prepare_docker_disposable_paths(case_output: Path, *paths: Path):
     """Prepare only per-case copies for the fallback UID used by root hosts."""
     for path in paths:
         if path.exists():
-            prepare_disposable_tree(path, allowed_root=case_output)
+            try:
+                prepare_disposable_tree(path, allowed_root=case_output)
+            except OSError as exc:
+                raise SandboxError(
+                    "unable to prepare disposable workspace for the non-root "
+                    f"Docker user at {path}: {type(exc).__name__}: {exc}"
+                ) from exc
 
 
 def _docker_agent_process(payload: dict, result_connection):

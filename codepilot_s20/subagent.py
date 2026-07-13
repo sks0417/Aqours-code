@@ -59,8 +59,11 @@ def has_tool_use(content) -> bool:
 
 def spawn_subagent(description: str) -> str:
     messages = [{"role": "user", "content": description}]
+    policy = TOOL_POLICY if isinstance(TOOL_POLICY, dict) else {}
+    prompt_runtime = resolve_prompt_runtime_context(policy, WORKDIR)
     system = (
-        f"You are a coding subagent at {WORKDIR}. "
+        f"You are a coding subagent at {prompt_runtime['workdir']}.\n\n"
+        f"{format_runtime_context_for_prompt(prompt_runtime)}\n\n"
         "Complete the task, then return a concise final summary. "
         "Do not spawn more agents."
     )

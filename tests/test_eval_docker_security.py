@@ -19,6 +19,8 @@ from codepilot_s20 import (
     message_bus,
     skills,
     runtime_state,
+    runtime_context,
+    subagent,
     task_system,
     worktree_system,
 )
@@ -231,6 +233,16 @@ def test_docker_policy_prompt_cannot_leak_host_memory_skills_or_disabled_tools(
     assert "create_worktree" not in prompt
     assert "spawn_teammate" not in prompt
     assert "load_skill" not in prompt
+    assert "- OS: Linux" in prompt
+    assert "- Shell: /bin/sh" in prompt
+    assert "- Working directory: /workspace" in prompt
+    assert "Use Linux-compatible shell commands." in prompt
+    assert str(workspace) not in prompt
+    for host_guidance in (
+        "Windows", "cmd.exe", "PowerShell", "Use dir instead",
+        "Use type instead", "Use findstr instead",
+    ):
+        assert host_guidance not in prompt
     assert captured["memory_dir"] == workspace / ".memory"
     assert captured["memory_index"] == workspace / ".memory" / "MEMORY.md"
     assert runtime_snapshot() == before
@@ -262,6 +274,37 @@ def test_local_policy_still_loads_workspace_memory_and_skills(tmp_path):
     assert "LOCAL_MEMORY_VISIBLE" in captured["system"]
     assert "LOCAL_SKILL_VISIBLE" in captured["system"]
     assert "load_skill" in captured["system"]
+    expected_runtime = runtime_context.format_runtime_context_for_prompt(
+        runtime_context.detect_runtime_context(tmp_path))
+    assert expected_runtime in captured["system"]
+
+
+def test_docker_policy_subagent_prompt_uses_container_runtime(tmp_path, monkeypatch):
+    captured = {}
+
+    class Messages:
+        def create(self, **kwargs):
+            captured["system"] = kwargs["system"]
+            return SimpleNamespace(content=[text_block("done")], stop_reason="end_turn")
+
+    host_workspace = tmp_path / "host-agent-workspace"
+    monkeypatch.setattr(subagent, "WORKDIR", host_workspace)
+    monkeypatch.setattr(subagent, "TOOL_POLICY", run_eval.DOCKER_EVAL_TOOL_POLICY)
+    monkeypatch.setattr(subagent, "client", SimpleNamespace(messages=Messages()))
+    monkeypatch.setattr(subagent, "MODEL", "scripted")
+
+    assert subagent.spawn_subagent("inspect") == "done"
+    prompt = captured["system"]
+    assert "- OS: Linux" in prompt
+    assert "- Shell: /bin/sh" in prompt
+    assert "- Working directory: /workspace" in prompt
+    assert "Use Linux-compatible shell commands." in prompt
+    assert str(host_workspace) not in prompt
+    for host_guidance in (
+        "Windows", "cmd.exe", "PowerShell", "Use dir instead",
+        "Use type instead", "Use findstr instead",
+    ):
+        assert host_guidance not in prompt
 
 
 def test_eval_trace_storage_is_outside_container_visible_workspace(tmp_path, monkeypatch):
