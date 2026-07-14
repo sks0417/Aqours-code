@@ -42,7 +42,8 @@ def test_broker_round_trip_supports_only_messages_create_and_cleans_files(tmp_pa
     nonce = uuid.uuid4().hex
     messages = RecordingMessages()
     broker = ModelBroker(
-        tmp_path, nonce, SimpleNamespace(messages=messages)).start()
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="scripted").start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
         response = client.messages.create(
@@ -90,7 +91,8 @@ def test_broker_returns_model_errors_without_exposing_other_host_rpc(tmp_path):
 
     nonce = uuid.uuid4().hex
     broker = ModelBroker(
-        tmp_path, nonce, SimpleNamespace(messages=FailingMessages())).start()
+        tmp_path, nonce, SimpleNamespace(messages=FailingMessages()),
+        allowed_model="scripted").start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
         with pytest.raises(RuntimeError, match="model unavailable"):
@@ -100,6 +102,123 @@ def test_broker_returns_model_errors_without_exposing_other_host_rpc(tmp_path):
 
     assert broker.call_count == 1
     assert "model unavailable" in broker.last_error
+
+
+def test_broker_rejects_wrong_model_without_calling_host_client(tmp_path):
+    nonce = uuid.uuid4().hex
+    messages = RecordingMessages()
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="case-model", max_calls=2, max_total_tokens=24000,
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        with pytest.raises(BrokerProtocolError, match="not allowed"):
+            client.messages.create(
+                model="unauthorized-expensive-model", messages=[],
+                max_tokens=8000)
+    finally:
+        broker.stop()
+
+    assert messages.calls == []
+    assert broker.call_count == 0
+    assert broker.rejected_count == 1
+
+
+@pytest.mark.parametrize("max_tokens", [0, -1, 16001, 1_000_000_000])
+def test_broker_rejects_invalid_token_limits_without_host_call(
+    tmp_path, max_tokens,
+):
+    nonce = uuid.uuid4().hex
+    messages = RecordingMessages()
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="case-model", max_calls=2, max_total_tokens=24000,
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        with pytest.raises(BrokerProtocolError, match="max_tokens"):
+            client.messages.create(
+                model="case-model", messages=[], max_tokens=max_tokens)
+    finally:
+        broker.stop()
+
+    assert messages.calls == []
+    assert broker.call_count == 0
+
+
+def test_broker_accepts_normal_8000_and_16000_recovery_requests(tmp_path):
+    nonce = uuid.uuid4().hex
+    messages = RecordingMessages()
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="case-model", max_calls=2, max_total_tokens=24000,
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        client.messages.create(
+            model="case-model", messages=[], max_tokens=8000)
+        client.messages.create(
+            model="case-model", messages=[], max_tokens=16000)
+    finally:
+        broker.stop()
+
+    assert [call["model"] for call in messages.calls] == [
+        "case-model", "case-model"]
+    assert [call["max_tokens"] for call in messages.calls] == [8000, 16000]
+    assert broker.call_count == 2
+    assert broker.requested_token_count == 24000
+
+
+def test_broker_rejects_calls_beyond_case_budget_without_host_call(tmp_path):
+    nonce = uuid.uuid4().hex
+    messages = RecordingMessages()
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="case-model", max_calls=1, max_total_tokens=16000,
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        client.messages.create(
+            model="case-model", messages=[], max_tokens=8000)
+        with pytest.raises(BrokerProtocolError, match="call limit"):
+            client.messages.create(
+                model="case-model", messages=[], max_tokens=8000)
+    finally:
+        broker.stop()
+
+    assert len(messages.calls) == 1
+    assert broker.call_count == 1
+
+
+def test_broker_rejects_request_beyond_case_token_budget(tmp_path):
+    nonce = uuid.uuid4().hex
+    messages = RecordingMessages()
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="case-model", max_calls=2, max_total_tokens=8000,
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        client.messages.create(
+            model="case-model", messages=[], max_tokens=8000)
+        with pytest.raises(BrokerProtocolError, match="token budget"):
+            client.messages.create(
+                model="case-model", messages=[], max_tokens=8000)
+    finally:
+        broker.stop()
+
+    assert len(messages.calls) == 1
+    assert broker.requested_token_count == 8000
+
+
+def test_eval_broker_budget_is_derived_from_trusted_case_metadata():
+    assert run_eval.model_budgets_for_case({"max_turns": 3}) == (3, 32000)
+    assert run_eval.model_budgets_for_case({
+        "max_turns": 99,
+        "max_model_calls": 2,
+        "max_model_tokens": 24000,
+    }) == (2, 24000)
 
 
 def test_noninteractive_container_entry_runs_normal_agent_through_broker(
@@ -132,7 +251,8 @@ def test_noninteractive_container_entry_runs_normal_agent_through_broker(
     config_path = runtime / "input.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     broker = ModelBroker(
-        ipc, nonce, run_eval.ScriptedEvalClient("read_file_basic")).start()
+        ipc, nonce, run_eval.ScriptedEvalClient("read_file_basic"),
+        allowed_model="scripted-eval").start()
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-enter-runtime")
     old_cwd = Path.cwd()
     try:

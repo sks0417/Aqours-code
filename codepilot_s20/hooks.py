@@ -64,6 +64,24 @@ def recoverable_tool_rejection(message: str, guidance: str = "") -> dict:
     }
 
 
+def noninteractive_permission_denial(message: str) -> dict:
+    return {
+        "kind": "tool_policy_rejection",
+        "recoverable": False,
+        "message": f"Permission denied: {message}",
+        "guidance": (
+            "No interactive approver is available for this run. Continue only "
+            "with operations that do not require approval."
+        ),
+    }
+
+
+def _request_interactive_approval(prompt: str) -> bool:
+    if APPROVAL_MODE != "interactive":
+        return False
+    return input(prompt).strip().lower() in ("y", "yes")
+
+
 def permission_hook(block):
     # The permission layer sees the raw tool_use before dispatch. It can deny,
     # ask the user, or allow execution to continue.
@@ -82,10 +100,12 @@ def permission_hook(block):
             if pattern in command:
                 return f"Permission denied: '{pattern}' is on the deny list"
         if any(token in command for token in DESTRUCTIVE):
+            if APPROVAL_MODE != "interactive":
+                return noninteractive_permission_denial(
+                    "destructive bash command requires interactive approval")
             print(f"\n\033[33m[permission] destructive command\033[0m")
             print(f"  {command}")
-            choice = input("  Allow? [y/N] ").strip().lower()
-            if choice not in ("y", "yes"):
+            if not _request_interactive_approval("  Allow? [y/N] "):
                 return "Permission denied by user"
     if block.name in ("write_file", "edit_file"):
         path = block.input.get("path", "")
@@ -94,9 +114,11 @@ def permission_hook(block):
         except Exception:
             return f"Permission denied: path escapes workspace: {path}"
     if block.name.startswith("mcp__") and "deploy" in block.name:
+        if APPROVAL_MODE != "interactive":
+            return noninteractive_permission_denial(
+                f"{block.name} requires interactive approval")
         print(f"\n\033[33m[permission] MCP destructive-looking tool: {block.name}\033[0m")
-        choice = input("  Allow? [y/N] ").strip().lower()
-        if choice not in ("y", "yes"):
+        if not _request_interactive_approval("  Allow? [y/N] "):
             return "Permission denied by user"
     return None
 

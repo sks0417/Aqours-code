@@ -36,19 +36,22 @@ def main() -> int:
     missing = sorted(required - event_types)
     has_model_message = any(event.get("type") == "llm_response" and "content" in event for event in events)
     result_ok = result_path.exists() and result_path.read_text(encoding="utf-8").strip() == "trace ok"
-    passed = not missing and has_model_message and result_ok
+    # Trace is intentionally not a pass/fail input: it is writable by the full
+    # Agent runtime. The clean grading workspace is authoritative.
+    passed = result_ok
     error = ""
-    if missing:
-        error = f"Trace missing event types: {', '.join(missing)}"
-    elif not has_model_message:
-        error = "Trace has no model response content"
-    elif not result_ok:
+    if not result_ok:
         error = "result.txt was not written with expected content"
     return emit_result(
         passed=passed,
         reason=error,
-        failure_category="grader_error" if missing else "test_failure",
-        metrics={"tool_calls": trace_tool_count(args.trace), "trace_event_types": sorted(event_types)},
+        failure_category="test_failure",
+        metrics={
+            "untrusted_agent_tool_calls": trace_tool_count(args.trace),
+            "untrusted_agent_trace_event_types": sorted(event_types),
+            "untrusted_agent_trace_missing_types": missing,
+            "untrusted_agent_trace_has_model_message": has_model_message,
+        },
     )
 
 

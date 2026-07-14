@@ -136,7 +136,8 @@ def is_recoverable_tool_rejection(output) -> bool:
 
 
 def tool_rejection_text(output) -> str:
-    if not is_recoverable_tool_rejection(output):
+    if not (isinstance(output, dict)
+            and output.get("kind") == "tool_policy_rejection"):
         return str(output)
     guidance = output.get("guidance", "")
     text = output.get("message", "Tool not run by policy.")
@@ -246,6 +247,8 @@ def agent_loop(messages: list, context: dict):
             response = call_llm(messages, context, tools, state, max_tokens)
             record_llm_response(response)
         except Exception as e:
+            if isinstance(e, _CaseTimeoutError):
+                raise
             record_error(e)
             if is_prompt_too_long_error(e) and not state.has_attempted_reactive_compact:
                 messages[:] = reactive_compact(messages)
@@ -272,14 +275,21 @@ def agent_loop(messages: list, context: dict):
         state.has_escalated = False
         messages.append({"role": "assistant", "content": response.content})
         if not has_tool_use(response.content):
+            if background_workers_alive():
+                remaining = _remaining_case_time()
+                if not wait_for_background_tasks(remaining):
+                    raise _CaseTimeoutError(
+                        "eval case deadline exceeded while waiting for background tasks")
+            # A worker may finish while the model is producing its final text,
+            # so collect completed notifications even when no thread is alive
+            # by the time this branch is reached.
+            notes = collect_background_results()
+            if notes:
+                messages.append({"role": "user", "content": [
+                    {"type": "text", "text": note} for note in notes]})
+                continue
             remaining = _remaining_case_time()
             notification_wait = 2.0 if remaining is None else max(0, min(2.0, remaining))
-            if wait_for_background_tasks(notification_wait):
-                notes = collect_background_results()
-                if notes:
-                    messages.append({"role": "user", "content": [
-                        {"type": "text", "text": note} for note in notes]})
-                    continue
             if wait_for_imminent_once(notification_wait):
                 continue
             record_hook("Stop")
@@ -506,7 +516,8 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
                    cleanup_grace: float = 2.0,
                    trace_storage_root: str | None = None,
                    runtime_root: str | None = None,
-                   manage_lifecycle: bool = False) -> dict:
+                   manage_lifecycle: bool = False,
+                   approval_mode: str | None = None) -> dict:
     """Run one non-interactive agent task using the existing loop and trace."""
     global rounds_since_todo
     from . import bootstrap
@@ -517,7 +528,7 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
     state_names = [
         "WORKDIR", "client", "MODEL_PROVIDER", "MODEL", "PRIMARY_MODEL",
         "COMMAND_EXECUTOR", "TOOL_POLICY", "CASE_DEADLINE",
-        "BACKGROUND_TASKS_ENABLED", *_WORKDIR_DERIVED_PATHS,
+        "BACKGROUND_TASKS_ENABLED", "APPROVAL_MODE", *_WORKDIR_DERIVED_PATHS,
     ]
     old_state = {name: _runtime_value(name) for name in state_names}
     run = None
@@ -534,6 +545,10 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
             _set_runtime_value("COMMAND_EXECUTOR", command_executor)
         _set_runtime_value("TOOL_POLICY", tool_policy)
         _set_runtime_value("CASE_DEADLINE", case_deadline)
+        if approval_mode is not None:
+            if approval_mode not in {"interactive", "non_interactive"}:
+                raise ValueError(f"unsupported approval mode: {approval_mode}")
+            _set_runtime_value("APPROVAL_MODE", approval_mode)
         if manage_lifecycle:
             collection_snapshots = _isolate_runtime_collections()
         if isinstance(tool_policy, dict) and "background_tasks" in tool_policy:
@@ -581,6 +596,10 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         raise
     finally:
         active_exception = _sys.exc_info()[0] is not None
+        cleanup_deadline = _time.monotonic() + max(0, cleanup_grace)
+
+        def cleanup_remaining() -> float:
+            return max(0, cleanup_deadline - _time.monotonic())
 
         def cleanup_step(func):
             try:
@@ -588,17 +607,40 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
             except BaseException as cleanup_exc:
                 cleanup_errors.append(cleanup_exc)
 
+        def cleanup_status(func, failure_message: str) -> bool:
+            try:
+                stopped = bool(func())
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+                return False
+            if not stopped:
+                cleanup_errors.append(RuntimeError(failure_message))
+            return stopped
+
+        lifecycle_stopped = True
         if manage_lifecycle:
-            cleanup_step(lambda: stop_scheduler(cleanup_grace))
-            cleanup_step(lambda: stop_all_teammates(cleanup_grace))
+            scheduler_stopped = cleanup_status(
+                lambda: stop_scheduler(cleanup_remaining()),
+                "scheduler thread did not stop",
+            )
+            teammates_stopped = cleanup_status(
+                lambda: stop_all_teammates(cleanup_remaining()),
+                "teammate threads did not stop",
+            )
+            lifecycle_stopped = scheduler_stopped and teammates_stopped
         # Stop the executor so in-flight command calls unblock, then give
         # background workers only a small bounded grace period.
         if command_executor is not None:
             cleanup_step(command_executor.stop)
-        cleanup_step(lambda: wait_for_background_tasks(cleanup_grace))
+        background_stopped = cleanup_status(
+            lambda: wait_for_background_tasks(cleanup_remaining()),
+            "background worker threads did not stop",
+        )
         if run is not None:
             cleanup_step(lambda: _copy_trace_file(run.trace_path, trace_path))
-        if collection_snapshots is not None:
+        # Restoring these dicts while an owned worker still references them is
+        # a race. A one-shot eval process will fail closed instead.
+        if collection_snapshots is not None and lifecycle_stopped and background_stopped:
             cleanup_step(lambda: _restore_runtime_collections(collection_snapshots))
         for name in reversed(state_names):
             cleanup_step(lambda name=name: _set_runtime_value(name, old_state[name]))

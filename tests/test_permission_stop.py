@@ -1,7 +1,9 @@
 from types import SimpleNamespace
 
 from codepilot_s20 import agent_loop
+from codepilot_s20 import hooks
 from codepilot_s20 import trace
+from codepilot_s20.command_executor import LocalCommandExecutor
 
 
 class DeniedThenTextClient:
@@ -90,3 +92,92 @@ def test_recoverable_temp_cleanup_rejection_continues(monkeypatch, tmp_path):
     assert metadata["status"] == "success"
     assert metadata["blocked_count"] == 0
     assert "Recovered with a read-only approach." in (run.final_path.read_text(encoding="utf-8"))
+
+
+def approval_block(name: str, data: dict):
+    return SimpleNamespace(type="tool_use", id="approval", name=name, input=data)
+
+
+def test_noninteractive_destructive_bash_denies_without_input(monkeypatch):
+    monkeypatch.setattr(hooks, "APPROVAL_MODE", "non_interactive")
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("input must not be called")),
+    )
+
+    result = hooks.permission_hook(approval_block(
+        "bash", {"command": "echo unsafe > /etc/codepilot-eval"}))
+
+    assert result["kind"] == "tool_policy_rejection"
+    assert result["recoverable"] is False
+    assert result["message"].startswith("Permission denied:")
+    assert "interactive approval" in result["message"]
+
+
+def test_noninteractive_deploy_mcp_denies_without_input(monkeypatch):
+    monkeypatch.setattr(hooks, "APPROVAL_MODE", "non_interactive")
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("input must not be called")),
+    )
+
+    result = hooks.permission_hook(approval_block(
+        "mcp__deploy__trigger", {"environment": "production"}))
+
+    assert result["kind"] == "tool_policy_rejection"
+    assert result["recoverable"] is False
+    assert "mcp__deploy__trigger" in result["message"]
+
+
+def test_noninteractive_permission_denial_stops_safely_without_eof(tmp_path):
+    class DestructiveClient:
+        def __init__(self, block):
+            self.messages = self
+            self.calls = 0
+            self.block = block
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls > 1:
+                raise AssertionError("permission denial should stop the loop")
+            return SimpleNamespace(
+                stop_reason="tool_use",
+                content=[self.block],
+            )
+
+    blocks = [
+        approval_block(
+            "bash", {"command": "echo unsafe > /etc/codepilot-eval"}),
+        approval_block(
+            "mcp__deploy__trigger", {"environment": "production"}),
+    ]
+    for index, block in enumerate(blocks):
+        client = DestructiveClient(block)
+        result = agent_loop.run_agent_task(
+            "attempt an approval-gated operation",
+            str(tmp_path / str(index)),
+            model_client=client,
+            model_provider="scripted",
+            model="scripted",
+            command_executor=LocalCommandExecutor(),
+            approval_mode="non_interactive",
+        )
+
+        assert client.calls == 1
+        assert result["final_answer"].startswith("Permission denied:")
+        assert "interactive approval" in result["final_answer"]
+
+
+def test_interactive_permission_approval_still_uses_input(monkeypatch):
+    prompts = []
+    monkeypatch.setattr(hooks, "APPROVAL_MODE", "interactive")
+    monkeypatch.setattr(
+        "builtins.input", lambda prompt: prompts.append(prompt) or "yes")
+
+    result = hooks.permission_hook(approval_block(
+        "bash", {"command": "echo approved > /etc/codepilot-eval"}))
+
+    assert result is None
+    assert prompts == ["  Allow? [y/N] "]

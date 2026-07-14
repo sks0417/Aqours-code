@@ -25,7 +25,7 @@ def main() -> int:
         passed=passed,
         reason="" if passed else f"Expected config.txt to be timeout=30, got {content!r}",
         failure_category="test_failure",
-        metrics={"tool_calls": trace_tool_count(args.trace)},
+        metrics={"untrusted_agent_tool_calls": trace_tool_count(args.trace)},
     )
 
 

@@ -81,14 +81,28 @@ baseline is initialized inside the container so Worktree operations never run
 host Git.
 
 The network-disabled container has no model credentials. Its
-`BrokerModelClient` writes nonce-scoped, schema-validated `messages.create`
-requests to per-case IPC. A host broker holding the existing real model client
-or `ScriptedEvalClient` writes responses; it exposes no filesystem, command, or
-general RPC surface. Requests, responses, call count, deadline, and cleanup are
-tracked in case metadata.
+`BrokerModelClient` writes case-scoped, schema-validated `messages.create`
+requests to per-case IPC. The nonce selects the case channel; it is not treated
+as authentication from code already running in that container. A host broker
+binds the one allowed model, enforces a 16,000-token per-call limit plus trusted
+case call/total-token budgets, and rejects mismatched model or token requests
+before invoking the provider client. The broker exposes no filesystem, command,
+or general RPC surface. Requests, rejections, model calls, requested-token
+budget, deadline, and cleanup are tracked in host-side case metadata.
 After the Agent process stops, grading runs in a different one-shot container
 with read-only mounts for `trusted_eval`, `grading_workspace`, and the
 trace/final/stdout/stderr inputs.
+
+`/runtime` is writable because the in-container Runtime records its normal run
+artifacts there, so trace/timeline/metadata/final files are explicitly
+Agent-authored and untrusted as process evidence. Trace claims never decide
+pass/fail or prove that a test/permission event occurred. A read-only response
+case may grade the submitted final answer as its outcome, but may not use it to
+prove how the Agent worked. Code correctness and constraints come from the host
+change manifest, the clean grading workspace, and tests executed by the
+independent Grader. Host-observed Broker calls and wall-clock duration are the
+trusted process metrics. The container-reported command count is retained for
+diagnostics and marked untrusted.
 
 ```powershell
 python evals/run_eval.py --scripted --execution docker --docker-build
@@ -117,7 +131,16 @@ With no explicit `--case`, `--scripted` runs only cases marked
 clear command-line error instead of fabricating an eval failure.
 
 The permission hook remains active in Docker mode. It is an application policy
-layer in addition to the container boundary, not a replacement for it.
+layer in addition to the container boundary, not a replacement for it. Docker
+Eval explicitly uses non-interactive approval mode: an approval-gated Bash or
+deploy MCP call receives a structured permission denial without reading stdin;
+the interactive CLI retains its `Allow? [y/N]` prompt.
+
+When a model tries to finish while a background task is still running, the
+Agent waits for completion up to the shared case deadline, injects the completed
+task notification back into the loop, and only then permits a final answer.
+`cleanup_grace` is reserved for stopping workers, teammates, and the scheduler
+after normal execution; deadline exhaustion is a structured case failure.
 
 For development compatibility only, local execution remains explicit:
 

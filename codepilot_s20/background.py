@@ -34,22 +34,34 @@ def start_background_task(block, handlers: dict) -> str:
     bg_id = f"bg_{_bg_counter:04d}"
     command = block.input.get("command", block.name)
 
+    task = {
+        "tool_use_id": block.id,
+        "command": command,
+        "status": "running",
+        "thread": None,
+    }
+
     def worker():
-        handler = handlers.get(block.name)
-        result = call_tool_handler(handler, block.input, block.name)
-        trigger_hooks("PostToolUse", block, result)
+        status = "completed"
+        try:
+            handler = handlers.get(block.name)
+            result = call_tool_handler(handler, block.input, block.name)
+            trigger_hooks("PostToolUse", block, result)
+        except BaseException as exc:
+            status = "failed"
+            result = f"[Error] {type(exc).__name__}: {exc}"
         with background_lock:
-            background_tasks[bg_id]["status"] = "completed"
+            # Keep a direct reference to the task record. Runtime cleanup must
+            # still wait for this worker before restoring the owning dict, but
+            # this also prevents a late worker from indexing a replaced dict.
+            task["status"] = status
             background_results[bg_id] = str(result)
 
-    thread = threading.Thread(target=worker, daemon=True)
+    thread = threading.Thread(
+        target=worker, name=f"codepilot-background-{bg_id}", daemon=True)
+    task["thread"] = thread
     with background_lock:
-        background_tasks[bg_id] = {
-            "tool_use_id": block.id,
-            "command": command,
-            "status": "running",
-            "thread": thread,
-        }
+        background_tasks[bg_id] = task
     thread.start()
     print(f"  \033[33m[background] {bg_id}: {str(command)[:60]}\033[0m")
     return bg_id
@@ -58,7 +70,8 @@ def start_background_task(block, handlers: dict) -> str:
 def collect_background_results() -> list[str]:
     with background_lock:
         ready = [bg_id for bg_id, task in background_tasks.items()
-                 if task["status"] == "completed"]
+                 if task["status"] in {"completed", "failed"}
+                 and not task.get("thread").is_alive()]
     notifications = []
     for bg_id in ready:
         with background_lock:
@@ -68,7 +81,7 @@ def collect_background_results() -> list[str]:
         notifications.append(
             f"<task_notification>\n"
             f"  <task_id>{bg_id}</task_id>\n"
-            f"  <status>completed</status>\n"
+            f"  <status>{task['status']}</status>\n"
             f"  <command>{task['command']}</command>\n"
             f"  <summary>{summary}</summary>\n"
             f"</task_notification>")
@@ -80,9 +93,9 @@ def wait_for_background_tasks(timeout: float | None = None) -> bool:
     deadline = None if timeout is None else time.monotonic() + max(0, timeout)
     while True:
         with background_lock:
-            threads = [task.get("thread") for task in background_tasks.values()
-                       if task.get("status") == "running"]
+            threads = [task.get("thread") for task in background_tasks.values()]
         threads = [thread for thread in threads if thread is not None]
+        threads = [thread for thread in threads if thread.is_alive()]
         if not threads:
             return True
         for thread in threads:
@@ -92,6 +105,14 @@ def wait_for_background_tasks(timeout: float | None = None) -> bool:
             thread.join(remaining)
         if deadline is not None and time.monotonic() >= deadline:
             return False
+
+
+def background_workers_alive() -> bool:
+    with background_lock:
+        return any(
+            task.get("thread") is not None and task["thread"].is_alive()
+            for task in background_tasks.values()
+        )
 
 
 

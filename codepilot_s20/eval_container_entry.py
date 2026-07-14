@@ -117,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             trace_storage_root=str(runtime_root),
             runtime_root=str(state_root),
             manage_lifecycle=True,
+            approval_mode="non_interactive",
         )
         _copy_artifact(result.get("timeline_path"), runtime_root / "timeline.jsonl")
         run_dir = Path(result["run_dir"])

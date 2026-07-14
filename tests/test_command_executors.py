@@ -521,6 +521,12 @@ def test_docker_eval_integration_smoke(tmp_path):
     assert tests_result["execution_backend"] == "docker"
     assert tests_result["command_execution_count"] > 0
     assert tests_result["container_cleanup_succeeded"] is True
+    policy_events = [
+        event for event in run_eval.read_trace_events(Path(tests_result["trace"]))
+        if event.get("type") == "tool_policy"
+    ]
+    assert len(policy_events[-1]["allowed_tools"]) == 28
+    assert policy_events[-1]["disabled_tools"] == []
 
     smoke_case = tmp_path / "_docker_bash_write_smoke"
     (smoke_case / "workspace").mkdir(parents=True)
@@ -555,6 +561,112 @@ def test_docker_eval_integration_smoke(tmp_path):
     assert smoke_result["command_execution_count"] > 0
     written = Path(smoke_result["agent_workspace"]) / "from_bash.txt"
     assert written.read_text(encoding="utf-8") == "written in sandbox\n"
+    assert not (smoke_case / "workspace" / "from_bash.txt").exists()
+
+    broker_case = tmp_path / "_docker_broker_policy_smoke"
+    (broker_case / "workspace").mkdir(parents=True)
+    (broker_case / "task.md").write_text(
+        "Verify the case Model Broker policy.", encoding="utf-8")
+    (broker_case / "metadata.yaml").write_text(
+        "id: _docker_broker_policy_smoke\n"
+        "max_turns: 6\n"
+        "allowed_changes: [broker_policy.json]\n"
+        "forbidden_paths: []\n",
+        encoding="utf-8",
+    )
+    (broker_case / "grader.py").write_text(
+        "import argparse, json, sys\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parents[2]))\n"
+        "from grader_common import emit_result\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--workspace', required=True)\n"
+        "p.add_argument('--trace'); p.add_argument('--final')\n"
+        "p.add_argument('--stdout'); p.add_argument('--stderr')\n"
+        "a=p.parse_args()\n"
+        "items=json.loads((Path(a.workspace)/'broker_policy.json').read_text())\n"
+        "errors=[str(item.get('error', '')) for item in items]\n"
+        "ok=(len(items)==2 and all(not item.get('ok') for item in items) "
+        "and 'not allowed' in errors[0] and 'max_tokens' in errors[1])\n"
+        "raise SystemExit(emit_result(passed=ok, reason=str(errors)))\n",
+        encoding="utf-8",
+    )
+    broker_result = run_eval.run_case(
+        broker_case, tmp_path / "broker-runs", scripted=True,
+        execution_config=config,
+    )
+    assert broker_result["passed"] is True
+    assert broker_result["model_broker_rejected_calls"] == 2
+    assert broker_result["model_broker_calls"] == 2
+    assert broker_result["model_broker_max_tokens_per_call"] == 16000
+    assert broker_result["container_cleanup_succeeded"] is True
+
+    background_case = tmp_path / "_docker_background_lifecycle_smoke"
+    (background_case / "workspace").mkdir(parents=True)
+    (background_case / "task.md").write_text(
+        "Run a slow background test and observe it.", encoding="utf-8")
+    (background_case / "metadata.yaml").write_text(
+        "id: _docker_background_lifecycle_smoke\n"
+        "max_turns: 6\n"
+        "allowed_changes: [background_done.txt, notification_seen.txt]\n"
+        "forbidden_paths: []\n",
+        encoding="utf-8",
+    )
+    (background_case / "grader.py").write_text(
+        "import argparse, sys\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parents[2]))\n"
+        "from grader_common import emit_result\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--workspace', required=True)\n"
+        "p.add_argument('--trace'); p.add_argument('--final')\n"
+        "p.add_argument('--stdout'); p.add_argument('--stderr')\n"
+        "a=p.parse_args(); w=Path(a.workspace)\n"
+        "ok=((w/'background_done.txt').read_text() == 'complete' "
+        "and (w/'notification_seen.txt').read_text() == 'seen')\n"
+        "raise SystemExit(emit_result(passed=ok, reason='background not observed'))\n",
+        encoding="utf-8",
+    )
+    background_result = run_eval.run_case(
+        background_case, tmp_path / "background-runs", scripted=True,
+        execution_config=config,
+    )
+    assert background_result["passed"] is True
+    assert background_result["container_cleanup_succeeded"] is True
+
+    permission_case = tmp_path / "_docker_noninteractive_permission_smoke"
+    (permission_case / "workspace").mkdir(parents=True)
+    (permission_case / "task.md").write_text(
+        "Attempt the approval-gated command.", encoding="utf-8")
+    (permission_case / "metadata.yaml").write_text(
+        "id: _docker_noninteractive_permission_smoke\n"
+        "max_turns: 3\n"
+        "allowed_changes: []\n"
+        "forbidden_paths: []\n",
+        encoding="utf-8",
+    )
+    (permission_case / "grader.py").write_text(
+        "import argparse, sys\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parents[2]))\n"
+        "from grader_common import emit_result\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--workspace', required=True)\n"
+        "p.add_argument('--trace'); p.add_argument('--final')\n"
+        "p.add_argument('--stdout'); p.add_argument('--stderr')\n"
+        "p.parse_args()\n"
+        "raise SystemExit(emit_result(passed=True))\n",
+        encoding="utf-8",
+    )
+    permission_result = run_eval.run_case(
+        permission_case, tmp_path / "permission-runs", scripted=True,
+        execution_config=config,
+    )
+    assert permission_result["passed"] is True
+    assert "EOFError" not in Path(permission_result["stderr"]).read_text()
+    assert Path(permission_result["final"]).read_text().startswith(
+        "Permission denied:")
+    assert permission_result["container_cleanup_succeeded"] is True
 
     visible_workspace = tmp_path / "visibility-workspace"
     visible_workspace.mkdir()

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_TOKENS_PER_CALL = 16000
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _ALLOWED_CREATE_KEYS = {"model", "system", "messages", "tools", "max_tokens"}
 
@@ -102,7 +103,14 @@ def _protocol_path(root: Path, directory: str, nonce: str, request_id: str) -> P
     return path
 
 
-def _validate_request(payload: dict, *, nonce: str, request_id: str) -> dict:
+def _validate_request(
+    payload: dict,
+    *,
+    nonce: str,
+    request_id: str,
+    allowed_model: str,
+    max_tokens_per_call: int,
+) -> dict:
     if not isinstance(payload, dict):
         raise BrokerProtocolError("broker request must be an object")
     expected = {
@@ -121,10 +129,20 @@ def _validate_request(payload: dict, *, nonce: str, request_id: str) -> dict:
         raise BrokerProtocolError("broker messages must be a list")
     if not isinstance(params.get("model"), str) or not params["model"]:
         raise BrokerProtocolError("broker model must be a non-empty string")
+    if params["model"] != allowed_model:
+        raise BrokerProtocolError(
+            f"broker model is not allowed for this case: {params['model']}")
     if "tools" in params and not isinstance(params["tools"], list):
         raise BrokerProtocolError("broker tools must be a list")
-    if "max_tokens" in params and not isinstance(params["max_tokens"], int):
+    if ("max_tokens" not in params
+            or isinstance(params["max_tokens"], bool)
+            or not isinstance(params["max_tokens"], int)):
         raise BrokerProtocolError("broker max_tokens must be an integer")
+    if params["max_tokens"] <= 0:
+        raise BrokerProtocolError("broker max_tokens must be greater than zero")
+    if params["max_tokens"] > max_tokens_per_call:
+        raise BrokerProtocolError(
+            f"broker max_tokens exceeds the per-call limit ({max_tokens_per_call})")
     return params
 
 
@@ -153,6 +171,8 @@ class BrokerModelClient:
             raise BrokerProtocolError(
                 "messages.create received unsupported arguments: "
                 + ", ".join(sorted(kwargs)))
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+            raise BrokerProtocolError("messages.create max_tokens must be an integer")
         request_id = uuid.uuid4().hex
         request_path = _protocol_path(
             self.ipc_root, "requests", self.nonce, request_id)
@@ -189,7 +209,10 @@ class BrokerModelClient:
                             or payload.get("request_id") != request_id):
                         raise BrokerProtocolError("broker response identity mismatch")
                     if not payload.get("ok"):
-                        raise RuntimeError(str(payload.get("error") or "model broker failed"))
+                        error = str(payload.get("error") or "model broker failed")
+                        if error.startswith("BrokerProtocolError:"):
+                            raise BrokerProtocolError(error)
+                        raise RuntimeError(error)
                     return _response_object(payload.get("response"))
                 if time.monotonic() >= deadline:
                     raise TimeoutError("model broker request exceeded its deadline")
@@ -206,15 +229,34 @@ class ModelBroker:
     """Host-side, per-case broker for the single permitted model RPC."""
 
     def __init__(self, ipc_root: str | Path, nonce: str, model_client, *,
+                 allowed_model: str,
                  case_deadline: float | None = None, poll_interval: float = 0.02,
-                 max_calls: int = 256):
+                 max_calls: int = 32,
+                 max_tokens_per_call: int = MAX_TOKENS_PER_CALL,
+                 max_total_tokens: int | None = None):
         self.ipc_root = Path(ipc_root).resolve()
         self.nonce = _validate_token(nonce, "nonce")
         self.model_client = model_client
+        self.allowed_model = str(allowed_model)
+        if not self.allowed_model:
+            raise ValueError("allowed_model must be non-empty")
         self.case_deadline = case_deadline
         self.poll_interval = float(poll_interval)
-        self.max_calls = max(1, int(max_calls))
+        self.max_calls = int(max_calls)
+        self.max_tokens_per_call = int(max_tokens_per_call)
+        if self.max_calls <= 0:
+            raise ValueError("max_calls must be greater than zero")
+        if self.max_tokens_per_call <= 0:
+            raise ValueError("max_tokens_per_call must be greater than zero")
+        self.max_total_tokens = int(
+            max_total_tokens
+            if max_total_tokens is not None
+            else self.max_calls * self.max_tokens_per_call)
+        if self.max_total_tokens <= 0:
+            raise ValueError("max_total_tokens must be greater than zero")
         self.call_count = 0
+        self.rejected_count = 0
+        self.requested_token_count = 0
         self.last_error = ""
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -262,7 +304,13 @@ class ModelBroker:
             _atomic_write_json(self.ipc_root / "broker_stats.json", {
                 "version": PROTOCOL_VERSION,
                 "nonce": self.nonce,
+                "allowed_model": self.allowed_model,
                 "call_count": self.call_count,
+                "rejected_count": self.rejected_count,
+                "requested_token_count": self.requested_token_count,
+                "max_calls": self.max_calls,
+                "max_tokens_per_call": self.max_tokens_per_call,
+                "max_total_tokens": self.max_total_tokens,
                 "last_error": self.last_error,
             })
         except OSError:
@@ -290,12 +338,21 @@ class ModelBroker:
                 raise BrokerProtocolError("broker request exceeds the size limit")
             payload = json.loads(request_path.read_text(encoding="utf-8"))
             params = _validate_request(
-                payload, nonce=self.nonce, request_id=request_id)
+                payload,
+                nonce=self.nonce,
+                request_id=request_id,
+                allowed_model=self.allowed_model,
+                max_tokens_per_call=self.max_tokens_per_call,
+            )
             if self.case_deadline is not None and time.monotonic() >= self.case_deadline:
                 raise TimeoutError("eval case deadline exceeded before model request")
             if self.call_count >= self.max_calls:
                 raise BrokerProtocolError("model broker call limit exceeded")
+            requested_tokens = params["max_tokens"]
+            if self.requested_token_count + requested_tokens > self.max_total_tokens:
+                raise BrokerProtocolError("model broker token budget exceeded")
             self.call_count += 1
+            self.requested_token_count += requested_tokens
             self._write_stats()
             old_timeout = os.environ.get("MODEL_REQUEST_TIMEOUT")
             if self.case_deadline is not None:
@@ -321,6 +378,7 @@ class ModelBroker:
                 "response": _response_payload(response),
             }
         except BaseException as exc:
+            self.rejected_count += 1
             self.last_error = f"{type(exc).__name__}: {exc}"
             self._write_stats()
             result = {

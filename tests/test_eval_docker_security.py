@@ -69,6 +69,7 @@ def runtime_snapshot():
         "COMMAND_EXECUTOR": runtime_state.COMMAND_EXECUTOR,
         "TOOL_POLICY": runtime_state.TOOL_POLICY,
         "CASE_DEADLINE": runtime_state.CASE_DEADLINE,
+        "APPROVAL_MODE": runtime_state.APPROVAL_MODE,
         "TASKS_DIR": task_system.TASKS_DIR,
         "WORKTREES_DIR": worktree_system.WORKTREES_DIR,
         "DURABLE_PATH": cron.DURABLE_PATH,
@@ -346,7 +347,9 @@ def test_docker_policy_subagent_prompt_uses_container_runtime(tmp_path, monkeypa
         assert host_guidance not in prompt
 
 
-def test_eval_trace_storage_is_outside_container_visible_workspace(tmp_path, monkeypatch):
+def test_eval_trace_storage_is_separate_but_explicitly_untrusted(
+    tmp_path, monkeypatch,
+):
     workspace = tmp_path / "agent_workspace"
     trusted_runtime = tmp_path / "agent_runtime"
     exported_trace = tmp_path / "trace.jsonl"
@@ -366,6 +369,7 @@ def test_eval_trace_storage_is_outside_container_visible_workspace(tmp_path, mon
     assert Path(result["run_dir"]).is_relative_to(trusted_runtime)
     assert exported_trace.exists()
     assert (trusted_runtime / ".codepilot" / "run_index.json").exists()
+    assert run_eval.trace_metrics(exported_trace)["agent_trace_trusted"] is False
 
 
 @pytest.mark.parametrize("failure_point", ["start_run", "record_hook"])

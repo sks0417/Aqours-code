@@ -57,7 +57,13 @@ from evals.docker_sandbox import (  # noqa: E402
     build_eval_image,
 )
 from codepilot_s20.docker_utils import prepare_disposable_tree  # noqa: E402
-from codepilot_s20.config import MODEL, MODEL_PROVIDER, get_model_client  # noqa: E402
+from codepilot_s20.config import (  # noqa: E402
+    DEFAULT_MAX_TOKENS,
+    ESCALATED_MAX_TOKENS,
+    MODEL,
+    MODEL_PROVIDER,
+    get_model_client,
+)
 from codepilot_s20.model_broker import ModelBroker  # noqa: E402
 
 
@@ -81,6 +87,7 @@ FAILURE_CATEGORIES = {
     "sandbox_error",
 }
 CLEANUP_GRACE_SECONDS = 3.0
+MAX_MODEL_CALLS_PER_CASE = 64
 
 
 def remaining_timeout(deadline: float | None, configured: float | None = None) -> float:
@@ -237,6 +244,84 @@ class ScriptedEvalMessages:
                 )])
             return response([text_block("Created from_bash.txt through sandboxed bash.")])
 
+        if self.case_name == "_docker_broker_policy_smoke":
+            if not results:
+                command = """python - <<'PY'
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+
+config = json.loads(Path('/runtime/input.json').read_text())
+responses = []
+for model, max_tokens in (
+    ('unauthorized-expensive-model', 8000),
+    (config['model'], 1000000000),
+):
+    request_id = uuid.uuid4().hex
+    name = f"{config['broker_nonce']}-{request_id}.json"
+    request_path = Path('/broker/requests') / name
+    temporary = request_path.with_suffix('.tmp')
+    temporary.write_text(json.dumps({
+        'version': 1,
+        'nonce': config['broker_nonce'],
+        'request_id': request_id,
+        'method': 'messages.create',
+        'params': {
+            'model': model,
+            'messages': [],
+            'max_tokens': max_tokens,
+        },
+    }))
+    os.replace(temporary, request_path)
+    response_path = Path('/broker/responses') / name
+    deadline = time.monotonic() + 5
+    while not response_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    responses.append(json.loads(response_path.read_text()))
+Path('/workspace/broker_policy.json').write_text(json.dumps(responses))
+PY"""
+                return response([tool_block(
+                    "bash", {"command": command}, "call_broker_policy")])
+            return response([text_block("Broker policy rejections recorded.")])
+
+        if self.case_name == "_docker_background_lifecycle_smoke":
+            saw_notification = any(
+                "<task_notification>" in str(message.get("content"))
+                for message in messages
+                if isinstance(message, dict)
+            )
+            if not results:
+                return response([tool_block(
+                    "bash",
+                    {
+                        "command": (
+                            "sleep 2.2; printf complete > background_done.txt"),
+                        "run_in_background": True,
+                    },
+                    "call_slow_background",
+                )])
+            if not saw_notification:
+                return response([text_block("finishing before notification")])
+            if not any(
+                result.get("tool_use_id") == "call_notification_seen"
+                for result in results
+            ):
+                return response([tool_block(
+                    "write_file",
+                    {"path": "notification_seen.txt", "content": "seen"},
+                    "call_notification_seen",
+                )])
+            return response([text_block("Background completion was observed.")])
+
+        if self.case_name == "_docker_noninteractive_permission_smoke":
+            return response([tool_block(
+                "bash",
+                {"command": "echo unsafe > /etc/codepilot-eval"},
+                "call_destructive_noninteractive",
+            )])
+
         if self.case_name == "read_file_basic":
             if not results:
                 return response([tool_block("read_file", {"path": "info.txt"}, "call_read_info")])
@@ -316,6 +401,8 @@ def load_metadata(case_dir: Path) -> dict:
         "category": "uncategorized",
         "max_turns": None,
         "max_tool_calls": None,
+        "max_model_calls": None,
+        "max_model_tokens": None,
         "forbidden_paths": [],
         "expected_artifacts": [],
         "allowed_changes": [],
@@ -333,7 +420,10 @@ def load_metadata(case_dir: Path) -> dict:
         value = value.strip()
         if key in {"forbidden_paths", "expected_artifacts", "allowed_changes"}:
             metadata[key] = parse_list(value)
-        elif key in {"difficulty", "max_turns", "max_tool_calls", "scripted_supported"}:
+        elif key in {
+            "difficulty", "max_turns", "max_tool_calls", "max_model_calls",
+            "max_model_tokens", "scripted_supported",
+        }:
             metadata[key] = parse_scalar(value)
         else:
             metadata[key] = str(parse_scalar(value, ""))
@@ -357,16 +447,45 @@ def read_trace_events(trace_path: Path) -> list[dict]:
 def trace_metrics(trace_path: Path) -> dict:
     events = read_trace_events(trace_path)
     return {
-        "tool_calls": sum(1 for event in events if event.get("type") == "tool_use"),
-        "llm_requests": sum(1 for event in events if event.get("type") == "llm_request"),
-        "permission_blocks": sum(
+        "agent_trace_trusted": False,
+        "untrusted_agent_tool_calls": sum(
+            1 for event in events if event.get("type") == "tool_use"),
+        "untrusted_agent_llm_requests": sum(
+            1 for event in events if event.get("type") == "llm_request"),
+        "untrusted_agent_permission_blocks": sum(
             1 for event in events
             if event.get("type") == "hook"
             and event.get("name") == "PreToolUse"
             and event.get("decision") == "blocked"
         ),
-        "event_count": len(events),
+        "untrusted_agent_event_count": len(events),
     }
+
+
+def model_budgets_for_case(metadata: dict) -> tuple[int, int]:
+    """Bind broker spend to trusted case metadata, not container requests."""
+    raw_calls = metadata.get("max_model_calls")
+    if raw_calls is None:
+        raw_calls = metadata.get("max_turns")
+    if raw_calls is None:
+        raw_calls = 32
+    calls = int(raw_calls)
+    if calls <= 0 or calls > MAX_MODEL_CALLS_PER_CASE:
+        raise ValueError(
+            f"max_model_calls must be between 1 and {MAX_MODEL_CALLS_PER_CASE}")
+
+    raw_tokens = metadata.get("max_model_tokens")
+    if raw_tokens is None:
+        # Normal calls request 8k; one 16k recovery is allowed within the same
+        # explicit call budget.
+        raw_tokens = calls * DEFAULT_MAX_TOKENS + (
+            ESCALATED_MAX_TOKENS - DEFAULT_MAX_TOKENS)
+    tokens = int(raw_tokens)
+    if tokens <= 0 or tokens > calls * ESCALATED_MAX_TOKENS:
+        raise ValueError(
+            "max_model_tokens must be positive and no greater than "
+            "max_model_calls * 16000")
+    return calls, tokens
 
 
 def posix_relative(root: Path, path: Path) -> str:
@@ -843,7 +962,11 @@ def _model_broker_process(payload: dict):
         payload["ipc_root"],
         payload["nonce"],
         model_client,
+        allowed_model=payload["allowed_model"],
         case_deadline=payload["case_deadline"],
+        max_calls=payload["max_calls"],
+        max_tokens_per_call=ESCALATED_MAX_TOKENS,
+        max_total_tokens=payload["max_total_tokens"],
     )
     broker.serve_forever()
 
@@ -864,6 +987,8 @@ def _run_docker_agent_phase(
     stdout_path: Path,
     stderr_path: Path,
     scripted: bool,
+    model_call_budget: int,
+    model_token_budget: int,
     config: EvalExecutionConfig,
     case_deadline: float,
 ) -> tuple[dict, str, dict]:
@@ -886,6 +1011,9 @@ def _run_docker_agent_phase(
             float(os.getenv("MODEL_REQUEST_TIMEOUT", "30")), remaining),
         "case_timeout_seconds": remaining,
         "cleanup_grace": CLEANUP_GRACE_SECONDS,
+        "approval_mode": "non_interactive",
+        "model_call_budget": model_call_budget,
+        "model_token_budget": model_token_budget,
         "tool_policy": DOCKER_EVAL_TOOL_POLICY,
     }
     write_text(runtime_root / "input.json", json.dumps(input_payload, indent=2))
@@ -909,6 +1037,9 @@ def _run_docker_agent_phase(
             "case_name": case_name,
             "scripted": scripted,
             "model_provider": MODEL_PROVIDER,
+            "allowed_model": input_payload["model"],
+            "max_calls": model_call_budget,
+            "max_total_tokens": model_token_budget,
             "case_deadline": case_deadline,
         },),
         name=f"codepilot-model-broker-{case_name}",
@@ -1013,11 +1144,21 @@ def _run_docker_agent_phase(
             broker_stats = {}
     metadata.update({
         "model_broker_calls": broker_stats.get("call_count", 0),
+        "model_broker_rejected_calls": broker_stats.get("rejected_count", 0),
+        "model_broker_requested_tokens": broker_stats.get(
+            "requested_token_count", 0),
+        "model_broker_call_budget": broker_stats.get(
+            "max_calls", model_call_budget),
+        "model_broker_token_budget": broker_stats.get(
+            "max_total_tokens", model_token_budget),
+        "model_broker_max_tokens_per_call": broker_stats.get(
+            "max_tokens_per_call", ESCALATED_MAX_TOKENS),
         "model_broker_error": broker_stats.get("last_error", ""),
         "model_broker_stopped": broker_stopped,
         "model_broker_exit_code": broker_process.exitcode,
         "model_broker_ipc_cleaned": False,
         "command_execution_count": command_metadata.get("command_execution_count", 0),
+        "command_execution_count_trusted": False,
         "tool_policy": DOCKER_EVAL_TOOL_POLICY,
     })
     try:
@@ -1072,6 +1213,7 @@ def _isolated_local_agent_process(payload: dict, result_connection):
                 tool_policy=payload.get("tool_policy"),
                 case_deadline=deadline,
                 trace_storage_root=payload["trace_storage_root"],
+                approval_mode="non_interactive",
             )
         result_connection.send({
             "ok": True,
@@ -1313,6 +1455,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
     trusted_before = trusted_input_snapshot(case_dir)
     trusted_case_dir = copy_trusted_case(case_dir, trusted_eval_root, case_name)
     metadata = load_metadata(trusted_case_dir)
+    model_call_budget, model_token_budget = model_budgets_for_case(metadata)
     original_snapshot = workspace_snapshot(trusted_case_dir / "workspace")
     copy_case_workspace(trusted_case_dir, agent_workspace)
     if execution_config.backend == "docker":
@@ -1351,6 +1494,8 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             scripted=scripted,
+            model_call_budget=model_call_budget,
+            model_token_budget=model_token_budget,
             config=execution_config,
             case_deadline=case_deadline,
         )
@@ -1369,6 +1514,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
                     model_provider="scripted" if scripted else None,
                     model="scripted-eval" if scripted else None,
                     command_executor=command_executor,
+                    approval_mode="non_interactive",
                 )
         except Exception as exc:
             agent_error = f"{type(exc).__name__}: {exc}"
@@ -1376,6 +1522,11 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             write_text(stdout_path, stdout_buffer.getvalue())
             write_text(stderr_path, stderr_buffer.getvalue())
         execution_metadata = command_executor.execution_metadata()
+
+    execution_metadata.setdefault(
+        "command_execution_count_trusted",
+        execution_config.backend != "docker",
+    )
 
     if not stdout_path.exists():
         write_text(stdout_path, "")
@@ -1537,6 +1688,9 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
     metrics = {
         **trace_metrics(trace_path),
         **grader_result.get("metrics", {}),
+        "trusted_model_calls": (
+            execution_metadata.get("model_broker_calls")
+            if execution_config.backend == "docker" else None),
         "runtime_sec": round(duration_ms / 1000, 3),
         "trusted_violations": trusted_violations,
     }
@@ -1639,7 +1793,13 @@ def grouped_stats(results: list[dict], key_fn) -> dict:
             "failed": total - passed,
             "pass_rate": passed / total if total else 0,
             "avg_score": sum(item["score"] for item in items) / total if total else 0,
-            "avg_tool_calls": sum(item["metrics"].get("tool_calls", 0) for item in items) / total if total else 0,
+            "avg_model_calls": sum(
+                item["metrics"].get("trusted_model_calls") or 0 for item in items
+            ) / total if total else 0,
+            "avg_untrusted_agent_tool_calls": sum(
+                item["metrics"].get("untrusted_agent_tool_calls", 0)
+                for item in items
+            ) / total if total else 0,
             "avg_runtime_sec": sum(item["metrics"].get("runtime_sec", 0) for item in items) / total if total else 0,
         }
     return stats
@@ -1714,6 +1874,7 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
         "command_execution_count": sum(
             result.get("command_execution_count", 0) for result in results
         ),
+        "command_execution_count_trusted": execution_config.backend != "docker",
         "model_broker_calls": sum(
             result.get("model_broker_calls", 0) for result in results
         ),
@@ -1739,7 +1900,14 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
         "failed": total_cases - passed_count,
         "pass_rate": passed_count / total_cases if total_cases else 0,
         "avg_score": sum(result["score"] for result in results) / total_cases if total_cases else 0,
-        "avg_tool_calls": sum(result["metrics"].get("tool_calls", 0) for result in results) / total_cases if total_cases else 0,
+        "avg_model_calls": sum(
+            result["metrics"].get("trusted_model_calls") or 0
+            for result in results
+        ) / total_cases if total_cases else 0,
+        "avg_untrusted_agent_tool_calls": sum(
+            result["metrics"].get("untrusted_agent_tool_calls", 0)
+            for result in results
+        ) / total_cases if total_cases else 0,
         "avg_runtime_sec": sum(result["metrics"].get("runtime_sec", 0) for result in results) / total_cases if total_cases else 0,
         "suites": grouped_stats(results, lambda result: result["metadata"].get("suite", "unknown")),
         "difficulty": grouped_stats(results, lambda result: result["metadata"].get("difficulty", "unknown")),
@@ -1800,6 +1968,7 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
         "grader_container_cleanup_succeeded": None,
         "all_container_cleanup_succeeded": False if execution_config.backend == "docker" else True,
         "command_execution_count": 0,
+        "command_execution_count_trusted": execution_config.backend != "docker",
         "model_broker_calls": 0,
         "model_broker_stopped": False if execution_config.backend == "docker" else None,
         "model_broker_ipc_cleaned": False if execution_config.backend == "docker" else None,
