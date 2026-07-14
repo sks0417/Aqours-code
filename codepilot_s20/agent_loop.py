@@ -358,7 +358,10 @@ def agent_loop(messages: list, context: dict):
             if should_run_background(block.name, block.input):
                 bg_id = start_background_task(block, handlers)
                 output = (f"[Background task {bg_id} started] "
-                          "Result will arrive as a task_notification.")
+                          "Result will arrive as a task_notification. Do not "
+                          "rerun the same command, poll with check_inbox, or "
+                          "launch a task/subagent just to wait; continue "
+                          "independent work or finish your turn.")
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": output})

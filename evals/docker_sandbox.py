@@ -9,6 +9,18 @@ from codepilot_s20.command_executor import SandboxError, _decode_timeout_stream
 from codepilot_s20.docker_utils import host_container_user, normalize_bind_source
 
 
+def _run_docker_text(runner, args: list[str], *, timeout: float):
+    """Decode Docker CLI output consistently instead of using the host locale."""
+    return runner(
+        args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+
+
 def bind_mount(source: str | Path, target: str, *, readonly: bool = False) -> str:
     """Build one --mount value without colon-delimited Windows path parsing."""
     value = f"type=bind,source={normalize_bind_source(source)},target={target}"
@@ -32,7 +44,7 @@ def build_eval_image(
         str(project_root),
     ]
     try:
-        proc = runner(args, capture_output=True, text=True, timeout=timeout)
+        proc = _run_docker_text(runner, args, timeout=timeout)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
         raise SandboxError(f"Docker image build failed: {type(exc).__name__}: {exc}") from exc
     if proc.returncode != 0:
@@ -136,6 +148,13 @@ class DockerAgentRunner:
             "--env", "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1",
             "--env", "HOME=/tmp/home",
             "--env", "CODEPILOT_S20_WORKDIR=/workspace",
+            # Docker Desktop bind mounts do not preserve the numeric owner
+            # used by the non-root container. This process-local Git setting
+            # keeps the disposable repository and its worktrees usable without
+            # changing UID/GID or writing a global config file.
+            "--env", "GIT_CONFIG_COUNT=1",
+            "--env", "GIT_CONFIG_KEY_0=safe.directory",
+            "--env", "GIT_CONFIG_VALUE_0=*",
         ]
         for mount in mounts:
             args.extend(["--mount", mount])
@@ -154,10 +173,9 @@ class DockerAgentRunner:
             timeout = self._timeout(self.docker_timeout, self.cleanup_deadline)
             if timeout is None:
                 return
-            proc = self.runner(
+            proc = _run_docker_text(
+                self.runner,
                 ["docker", "rm", "-f", self.container_name],
-                capture_output=True,
-                text=True,
                 timeout=timeout,
             )
             detail = ((proc.stderr or "") + (proc.stdout or "")).lower()
@@ -177,8 +195,8 @@ class DockerAgentRunner:
                     args, 124, "", "case deadline exceeded")
                 self.container_exit_code = 124
             else:
-                proc = self.runner(
-                    args, capture_output=True, text=True, timeout=timeout)
+                proc = _run_docker_text(
+                    self.runner, args, timeout=timeout)
                 self.container_started = proc.returncode != 125
                 self.container_exit_code = proc.returncode
         except subprocess.TimeoutExpired as exc:
@@ -330,10 +348,9 @@ class DockerGraderRunner:
             if timeout is None:
                 self.cleanup_succeeded = False
                 return
-            proc = self.runner(
+            proc = _run_docker_text(
+                self.runner,
                 ["docker", "rm", "-f", self.container_name],
-                capture_output=True,
-                text=True,
                 timeout=timeout,
             )
             # A completed `docker run` leaves the named stopped container. A
@@ -353,12 +370,8 @@ class DockerGraderRunner:
                 self.container_exit_code = 124
                 proc = subprocess.CompletedProcess(args, 124, "", "case deadline exceeded")
             else:
-                proc = self.runner(
-                    args,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                )
+                proc = _run_docker_text(
+                    self.runner, args, timeout=timeout)
                 self.container_started = proc.returncode != 125
                 self.container_exit_code = proc.returncode
         except subprocess.TimeoutExpired as exc:

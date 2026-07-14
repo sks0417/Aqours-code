@@ -128,20 +128,25 @@ def test_full_agent_container_is_one_shot_entrypoint_with_isolated_mounts(tmp_pa
         "/trusted_eval", "/grading_workspace", "/var/run/docker.sock",
     ):
         assert forbidden not in joined
+    assert "GIT_CONFIG_COUNT=1" in args
+    assert "GIT_CONFIG_KEY_0=safe.directory" in args
+    assert "GIT_CONFIG_VALUE_0=*" in args
 
 
 def test_eval_image_build_uses_project_root_and_installs_runtime_and_git(tmp_path):
     calls = []
 
-    def runner(args, **_kwargs):
-        calls.append(args)
+    def runner(args, **kwargs):
+        calls.append((args, kwargs))
         return subprocess.CompletedProcess(args, 0, "", "")
 
     build_eval_image(
         project_root=run_eval.PROJECT_ROOT, image="eval:test", runner=runner)
-    args = calls[0]
+    args, kwargs = calls[0]
     assert Path(args[-1]).resolve() == run_eval.PROJECT_ROOT.resolve()
     assert Path(args[args.index("--file") + 1]).name == "Dockerfile"
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs["errors"] == "replace"
 
     dockerfile = (run_eval.PROJECT_ROOT / "evals" / "docker" / "Dockerfile").read_text(
         encoding="utf-8")

@@ -9,6 +9,22 @@ background_tasks: dict[str, dict] = {}
 background_results: dict[str, str] = {}
 background_lock = threading.Lock()
 
+_BACKGROUND_SUMMARY_LIMIT = 4000
+_BACKGROUND_SUMMARY_HEAD = 1200
+
+
+def _summarize_background_output(output: str) -> str:
+    """Keep both command context and the completion summary in notifications."""
+    if len(output) <= _BACKGROUND_SUMMARY_LIMIT:
+        return output
+    omitted = len(output) - _BACKGROUND_SUMMARY_LIMIT
+    tail_size = _BACKGROUND_SUMMARY_LIMIT - _BACKGROUND_SUMMARY_HEAD
+    return (
+        output[:_BACKGROUND_SUMMARY_HEAD]
+        + f"\n... ({omitted} characters omitted) ...\n"
+        + output[-tail_size:]
+    )
+
 
 def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
     if tool_name != "bash":
@@ -77,7 +93,7 @@ def collect_background_results() -> list[str]:
         with background_lock:
             task = background_tasks.pop(bg_id)
             output = background_results.pop(bg_id, "")
-        summary = output[:200] if len(output) > 200 else output
+        summary = _summarize_background_output(output)
         notifications.append(
             f"<task_notification>\n"
             f"  <task_id>{bg_id}</task_id>\n"

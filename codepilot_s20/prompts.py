@@ -36,7 +36,11 @@ PROMPT_SECTIONS = {
                       "If a tool result says 'Tool not run' with guidance, treat it "
                       "as a recoverable policy rejection: follow the guidance and "
                       "continue with a safer read-only approach. If a result starts "
-                      "with 'Permission denied', stop immediately."),
+                      "with 'Permission denied', stop immediately. After a Bash "
+                      "command starts in the background, do not rerun that command, "
+                      "use check_inbox to poll it, or launch a task/subagent solely "
+                      "to wait. Continue independent work or finish the turn; its "
+                      "task_notification will report the result."),
 }
 
 

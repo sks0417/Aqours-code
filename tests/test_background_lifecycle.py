@@ -121,6 +121,11 @@ def test_final_answer_waits_past_old_window_and_reinjects_notification(
         "observed the completed background test")
     assert any(timeout is not None and timeout > 2 for timeout in observed_waits)
     assert len(client.calls) == 3
+    second_messages = client.calls[1]["messages"]
+    assert any(
+        "launch a task/subagent just to wait" in str(message.get("content"))
+        for message in second_messages
+    )
     third_messages = client.calls[2]["messages"]
     assert any(
         "<task_notification>" in str(message.get("content"))
@@ -226,3 +231,19 @@ def test_interactive_loop_returns_while_long_background_task_keeps_running(
         for message in messages if message.get("role") == "assistant"
         for block in message.get("content", [])
     )
+
+
+def test_background_notification_preserves_long_test_result_tail():
+    block = tool_block()
+    output = "pytest session starts\n" + ("collection output\n" * 500)
+    output += "\n================ 5 passed in 0.42s ================"
+
+    background.start_background_task(block, {"bash": lambda **_kwargs: output})
+    assert background.wait_for_background_tasks(1.0) is True
+
+    notes = background.collect_background_results()
+
+    assert len(notes) == 1
+    assert "pytest session starts" in notes[0]
+    assert "characters omitted" in notes[0]
+    assert "5 passed in 0.42s" in notes[0]

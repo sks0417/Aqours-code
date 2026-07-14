@@ -78,7 +78,9 @@ BUILTIN_TOOLS = [
                                     "required": ["content", "status"]}}},
                       "required": ["todos"]}},
     {"name": "task",
-     "description": "Launch a focused subagent. Returns only its final summary.",
+     "description": ("Launch a focused subagent for independent delegated work. "
+                     "Returns only its final summary. Do not use it merely to wait "
+                     "for a background task_notification."),
      "input_schema": {"type": "object",
                       "properties": {"description": {"type": "string"}},
                       "required": ["description"]}},

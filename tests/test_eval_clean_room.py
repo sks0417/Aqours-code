@@ -233,6 +233,24 @@ def test_change_manifest_records_added_modified_deleted_and_violations(tmp_path)
     assert "tests/test_auth_service.py" in manifest["forbidden_changes"]
 
 
+def test_pytest_cache_is_ignored_as_agent_runtime_output(tmp_path):
+    metadata, before, agent, _grading = prepare_case(AUTH_CASE, tmp_path)
+    cache = agent / ".pytest_cache"
+    (cache / "v" / "cache").mkdir(parents=True)
+    (cache / "README.md").write_text("pytest cache", encoding="utf-8")
+    (cache / "v" / "cache" / "nodeids").write_text("[]", encoding="utf-8")
+
+    after = run_eval.workspace_snapshot(agent)
+    manifest = run_eval.build_change_manifest(
+        before=before, after=after, metadata=metadata)
+
+    assert not any(path.startswith(".pytest_cache/") for path in after)
+    assert not any(
+        path.startswith(".pytest_cache/")
+        for path in manifest["unexpected_changes"]
+    )
+
+
 def test_runner_constraint_violation_overrides_passing_grader(tmp_path, monkeypatch):
     case_dir = tmp_path / "case"
     workspace = case_dir / "workspace"

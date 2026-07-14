@@ -219,6 +219,16 @@ def test_eval_broker_budget_is_derived_from_trusted_case_metadata():
         "max_model_calls": 2,
         "max_model_tokens": 24000,
     }) == (2, 24000)
+    assert run_eval.model_budgets_for_case({
+        "max_turns": 10,
+        "max_model_calls": 12,
+    }) == (12, 104000)
+
+
+def test_broker_call_budget_exhaustion_is_a_process_limit_failure():
+    assert run_eval.agent_failure_category(
+        "BrokerProtocolError: model broker call limit exceeded"
+    ) == "tool_loop"
 
 
 def test_noninteractive_container_entry_runs_normal_agent_through_broker(

@@ -110,6 +110,7 @@ RUNTIME_IGNORE_PATTERNS = [
     ".transcripts/**",
     ".mailboxes/**",
     ".worktrees/**",
+    ".pytest_cache/**",
     "__pycache__/**",
     "*/__pycache__/**",
     "*.pyc",
@@ -1808,6 +1809,8 @@ def failure_category_counts(results: list[dict]) -> dict:
 
 def agent_failure_category(agent_error: str) -> str:
     lowered = agent_error.lower()
+    if "model broker call limit exceeded" in lowered:
+        return "tool_loop"
     if "casetimeouterror" in lowered or "agent case exceeded" in lowered:
         return "tool_loop"
     if "sandboxerror" in lowered or "docker sandbox" in lowered or "docker daemon" in lowered:
