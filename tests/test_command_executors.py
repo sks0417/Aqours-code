@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -128,9 +129,12 @@ def test_full_agent_container_is_one_shot_entrypoint_with_isolated_mounts(tmp_pa
         "/trusted_eval", "/grading_workspace", "/var/run/docker.sock",
     ):
         assert forbidden not in joined
-    assert "GIT_CONFIG_COUNT=1" in args
+    assert "GIT_CONFIG_COUNT=2" in args
     assert "GIT_CONFIG_KEY_0=safe.directory" in args
-    assert "GIT_CONFIG_VALUE_0=*" in args
+    assert "GIT_CONFIG_VALUE_0=/workspace" in args
+    assert "GIT_CONFIG_KEY_1=safe.directory" in args
+    assert "GIT_CONFIG_VALUE_1=/state/.worktrees/*" in args
+    assert "GIT_CONFIG_VALUE_0=*" not in args
 
 
 def test_eval_image_build_uses_project_root_and_installs_runtime_and_git(tmp_path):
@@ -505,8 +509,9 @@ def test_docker_eval_integration_smoke(tmp_path):
     if available.returncode != 0:
         pytest.skip("Docker daemon is unavailable")
 
-    image = "codepilot-s20-eval:test"
-    build_eval_image(project_root=run_eval.PROJECT_ROOT, image=image)
+    image = os.getenv("CODEPILOT_EVAL_TEST_IMAGE", "codepilot-s20-eval:test")
+    if "CODEPILOT_EVAL_TEST_IMAGE" not in os.environ:
+        build_eval_image(project_root=run_eval.PROJECT_ROOT, image=image)
     image_probe = subprocess.run(
         [
             "docker", "run", "--rm", "--network", "none", image,
@@ -564,6 +569,13 @@ def test_docker_eval_integration_smoke(tmp_path):
 
     assert smoke_result["passed"] is True
     assert smoke_result["command_execution_count"] > 0
+    smoke_events = run_eval.read_trace_events(Path(smoke_result["trace"]))
+    assert any(
+        event.get("type") == "tool_result"
+        and event.get("tool") == "create_worktree"
+        and "created" in str(event.get("content", "")).lower()
+        for event in smoke_events
+    )
     written = Path(smoke_result["agent_workspace"]) / "from_bash.txt"
     assert written.read_text(encoding="utf-8") == "written in sandbox\n"
     assert not (smoke_case / "workspace" / "from_bash.txt").exists()
@@ -574,7 +586,6 @@ def test_docker_eval_integration_smoke(tmp_path):
         "Verify the case Model Broker policy.", encoding="utf-8")
     (broker_case / "metadata.yaml").write_text(
         "id: _docker_broker_policy_smoke\n"
-        "max_turns: 6\n"
         "allowed_changes: [broker_policy.json]\n"
         "forbidden_paths: []\n",
         encoding="utf-8",
@@ -612,7 +623,6 @@ def test_docker_eval_integration_smoke(tmp_path):
         "Run a slow background test and observe it.", encoding="utf-8")
     (background_case / "metadata.yaml").write_text(
         "id: _docker_background_lifecycle_smoke\n"
-        "max_turns: 6\n"
         "allowed_changes: [background_done.txt, notification_seen.txt]\n"
         "forbidden_paths: []\n",
         encoding="utf-8",
@@ -645,7 +655,6 @@ def test_docker_eval_integration_smoke(tmp_path):
         "Attempt the approval-gated command.", encoding="utf-8")
     (permission_case / "metadata.yaml").write_text(
         "id: _docker_noninteractive_permission_smoke\n"
-        "max_turns: 3\n"
         "allowed_changes: []\n"
         "forbidden_paths: []\n",
         encoding="utf-8",

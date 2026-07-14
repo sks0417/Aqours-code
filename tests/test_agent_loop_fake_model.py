@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from codepilot_s20 import agent_loop
+from evals import run_eval
 
 
 def text_block(text: str):
@@ -216,3 +217,27 @@ def test_run_agent_task_uses_injected_fake_model_client(tmp_path):
     assert result["final_answer"] == "task complete"
     assert trace_path.exists()
     assert len(fake_client.messages.calls) == 1
+
+
+def test_turns_and_tool_calls_remain_trace_metrics_without_loop_limits(tmp_path):
+    (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
+    fake_client = FakeClient([
+        response([tool_block("read_file", {"path": "note.txt"}, "read_1")]),
+        response([tool_block("read_file", {"path": "note.txt"}, "read_2")]),
+        response([text_block("done after two tools")]),
+    ])
+    trace_path = tmp_path / "trace.jsonl"
+
+    result = agent_loop.run_agent_task(
+        "read the note twice",
+        str(tmp_path),
+        str(trace_path),
+        model_client=fake_client,
+        model_provider="test",
+        model="fake",
+    )
+
+    metrics = run_eval.trace_metrics(trace_path)
+    assert result["final_answer"] == "done after two tools"
+    assert metrics["llm_requests"] == 3
+    assert metrics["tool_calls"] == 2

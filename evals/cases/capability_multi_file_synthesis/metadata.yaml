@@ -2,8 +2,6 @@ id: capability_multi_file_synthesis
 suite: regression
 difficulty: 2
 category: multi_file_synthesis
-max_turns: 6
-max_tool_calls: 8
 forbidden_paths: []
 expected_artifacts: [summary.md]
 allowed_changes: [summary.md]

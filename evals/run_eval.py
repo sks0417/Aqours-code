@@ -79,6 +79,7 @@ FAILURE_CATEGORIES = {
     "test_failure",
     "constraint_violation",
     "tool_loop",
+    "budget_exhausted",
     "grader_error",
     "model_error",
     "api_timeout",
@@ -87,6 +88,7 @@ FAILURE_CATEGORIES = {
     "sandbox_error",
 }
 CLEANUP_GRACE_SECONDS = 3.0
+DEFAULT_MODEL_CALLS_PER_CASE = 32
 MAX_MODEL_CALLS_PER_CASE = 64
 
 
@@ -238,11 +240,17 @@ class ScriptedEvalMessages:
 
         if self.case_name == "_docker_bash_write_smoke":
             if not results:
-                return response([tool_block(
-                    "bash",
-                    {"command": "printf 'written in sandbox\\n' > from_bash.txt"},
-                    "call_bash_write",
-                )])
+                return response([
+                    tool_block(
+                        "bash",
+                        {"command": "printf 'written in sandbox\\n' > from_bash.txt"},
+                        "call_bash_write",
+                    ),
+                    tool_block(
+                        "create_worktree", {"name": "smoke-wt"},
+                        "call_create_worktree",
+                    ),
+                ])
             return response([text_block("Created from_bash.txt through sandboxed bash.")])
 
         if self.case_name == "_docker_broker_policy_smoke":
@@ -400,8 +408,6 @@ def load_metadata(case_dir: Path) -> dict:
         "suite": "regression",
         "difficulty": 1,
         "category": "uncategorized",
-        "max_turns": None,
-        "max_tool_calls": None,
         "max_model_calls": None,
         "max_model_tokens": None,
         "forbidden_paths": [],
@@ -422,7 +428,7 @@ def load_metadata(case_dir: Path) -> dict:
         if key in {"forbidden_paths", "expected_artifacts", "allowed_changes"}:
             metadata[key] = parse_list(value)
         elif key in {
-            "difficulty", "max_turns", "max_tool_calls", "max_model_calls",
+            "difficulty", "max_model_calls",
             "max_model_tokens", "scripted_supported",
         }:
             metadata[key] = parse_scalar(value)
@@ -466,9 +472,7 @@ def model_budgets_for_case(metadata: dict) -> tuple[int, int]:
     """Bind broker spend to trusted case metadata, not container requests."""
     raw_calls = metadata.get("max_model_calls")
     if raw_calls is None:
-        raw_calls = metadata.get("max_turns")
-    if raw_calls is None:
-        raw_calls = 32
+        raw_calls = DEFAULT_MODEL_CALLS_PER_CASE
     calls = int(raw_calls)
     if calls <= 0 or calls > MAX_MODEL_CALLS_PER_CASE:
         raise ValueError(
@@ -1011,9 +1015,6 @@ def _run_docker_agent_phase(
             float(os.getenv("MODEL_REQUEST_TIMEOUT", "30")), remaining),
         "case_timeout_seconds": remaining,
         "cleanup_grace": CLEANUP_GRACE_SECONDS,
-        "approval_mode": "non_interactive",
-        "model_call_budget": model_call_budget,
-        "model_token_budget": model_token_budget,
         "tool_policy": DOCKER_EVAL_TOOL_POLICY,
     }
     write_text(runtime_root / "input.json", json.dumps(input_payload, indent=2))
@@ -1809,8 +1810,11 @@ def failure_category_counts(results: list[dict]) -> dict:
 
 def agent_failure_category(agent_error: str) -> str:
     lowered = agent_error.lower()
-    if "model broker call limit exceeded" in lowered:
-        return "tool_loop"
+    if ("model broker call limit exceeded" in lowered
+            or "broker model call limit exceeded" in lowered
+            or "model broker token budget exceeded" in lowered
+            or "broker token budget exceeded" in lowered):
+        return "budget_exhausted"
     if "casetimeouterror" in lowered or "agent case exceeded" in lowered:
         return "tool_loop"
     if "sandboxerror" in lowered or "docker sandbox" in lowered or "docker daemon" in lowered:

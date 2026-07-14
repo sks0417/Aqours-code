@@ -740,7 +740,7 @@ capability: 2/3
 
 - 当前 scoring 多数仍是二值化
 - 可进一步实现 partial credit
-- 可用 `max_tool_calls` 影响 efficiency 分
+- turn 和 tool call 由 Trace 记录并用于过程与 efficiency 评分，不作为执行中断预算
 - 可增加 flaky retry / pass rate
 - 可增加历史趋势比较
 
@@ -883,10 +883,10 @@ container directly. The Agent has no API key and remains network-disabled.
 through atomic per-case files. The nonce selects the isolated case channel and
 is not an authentication boundary against that case's Agent Bash. The host Model
 Broker binds the exact allowed model, limits each request to 16,000 tokens,
-enforces call and total requested-token budgets derived from trusted case
-metadata, and rejects invalid requests before calling the provider. It offers no
-host command, file-read, or generic RPC operation. IPC is cleaned after every
-case.
+enforces one case-wide call budget and requested-token budget for the main and
+nested agents together, and rejects invalid requests before calling the
+provider. It offers no host command, file-read, or generic RPC operation. IPC
+is cleaned after every case.
 
 Docker Eval sets `approval_mode=non_interactive`. Approval-gated destructive
 Bash and deploy MCP calls remain present in the full tool pool but receive a

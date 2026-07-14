@@ -80,6 +80,39 @@ def test_grader_receives_only_remaining_case_budget(tmp_path, monkeypatch):
     assert result["all_container_cleanup_succeeded"] is True
 
 
+def test_budget_failure_preserves_broker_usage_metadata(tmp_path, monkeypatch):
+    usage = {
+        "model_broker_calls": 32,
+        "model_broker_call_budget": 32,
+        "model_broker_requested_tokens": 264000,
+        "model_broker_token_budget": 264000,
+        "model_broker_rejected_calls": 1,
+    }
+
+    monkeypatch.setattr(
+        run_eval, "_run_docker_agent_phase",
+        lambda **_kwargs: (
+            {},
+            "BrokerProtocolError: model broker token budget exceeded",
+            agent_metadata(**usage),
+        ),
+    )
+    monkeypatch.setattr(
+        run_eval, "prepare_docker_disposable_paths",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = run_eval.run_case(
+        run_eval.PROJECT_ROOT / "evals" / "cases" / "read_file_basic",
+        tmp_path / "runs", scripted=True,
+        execution_config=run_eval.EvalExecutionConfig(
+            backend="docker", docker_image="eval:test"),
+    )
+
+    assert result["failure_category"] == "budget_exhausted"
+    assert {key: result[key] for key in usage} == usage
+
+
 def test_stuck_grader_and_cleanup_end_within_deadline_plus_shared_grace(
     tmp_path, monkeypatch,
 ):

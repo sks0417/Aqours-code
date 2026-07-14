@@ -2,8 +2,6 @@ id: mini_order_service_amount_bug
 suite: capability
 difficulty: 4
 category: business_logic_bug_fix
-max_turns: 12
-max_tool_calls: 16
 forbidden_paths: [tests/test_order_service.py]
 expected_artifacts: [src/order_service.py]
 allowed_changes: [src/order_service.py]

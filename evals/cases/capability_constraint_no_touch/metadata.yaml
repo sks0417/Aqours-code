@@ -2,8 +2,6 @@ id: capability_constraint_no_touch
 suite: regression
 difficulty: 2
 category: constraint_following
-max_turns: 6
-max_tool_calls: 8
 forbidden_paths: [protected/DO_NOT_TOUCH.txt]
 expected_artifacts: [src/main.txt, report.txt]
 allowed_changes: [src/main.txt, report.txt]

@@ -213,22 +213,20 @@ def test_broker_rejects_request_beyond_case_token_budget(tmp_path):
 
 
 def test_eval_broker_budget_is_derived_from_trusted_case_metadata():
-    assert run_eval.model_budgets_for_case({"max_turns": 3}) == (3, 32000)
+    assert run_eval.model_budgets_for_case({}) == (32, 264000)
+    assert run_eval.model_budgets_for_case({"max_turns": 3}) == (32, 264000)
     assert run_eval.model_budgets_for_case({
-        "max_turns": 99,
         "max_model_calls": 2,
         "max_model_tokens": 24000,
     }) == (2, 24000)
-    assert run_eval.model_budgets_for_case({
-        "max_turns": 10,
-        "max_model_calls": 12,
-    }) == (12, 104000)
 
 
-def test_broker_call_budget_exhaustion_is_a_process_limit_failure():
-    assert run_eval.agent_failure_category(
-        "BrokerProtocolError: model broker call limit exceeded"
-    ) == "tool_loop"
+@pytest.mark.parametrize("message", [
+    "BrokerProtocolError: model broker call limit exceeded",
+    "BrokerProtocolError: model broker token budget exceeded",
+])
+def test_broker_budget_exhaustion_has_one_clear_failure_category(message):
+    assert run_eval.agent_failure_category(message) == "budget_exhausted"
 
 
 def test_noninteractive_container_entry_runs_normal_agent_through_broker(

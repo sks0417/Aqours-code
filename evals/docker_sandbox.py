@@ -150,11 +150,13 @@ class DockerAgentRunner:
             "--env", "CODEPILOT_S20_WORKDIR=/workspace",
             # Docker Desktop bind mounts do not preserve the numeric owner
             # used by the non-root container. This process-local Git setting
-            # keeps the disposable repository and its worktrees usable without
-            # changing UID/GID or writing a global config file.
-            "--env", "GIT_CONFIG_COUNT=1",
+            # keeps only the disposable repository and its worktrees usable
+            # without changing UID/GID or writing a global config file.
+            "--env", "GIT_CONFIG_COUNT=2",
             "--env", "GIT_CONFIG_KEY_0=safe.directory",
-            "--env", "GIT_CONFIG_VALUE_0=*",
+            "--env", "GIT_CONFIG_VALUE_0=/workspace",
+            "--env", "GIT_CONFIG_KEY_1=safe.directory",
+            "--env", "GIT_CONFIG_VALUE_1=/state/.worktrees/*",
         ]
         for mount in mounts:
             args.extend(["--mount", mount])
