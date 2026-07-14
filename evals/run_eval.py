@@ -447,18 +447,17 @@ def read_trace_events(trace_path: Path) -> list[dict]:
 def trace_metrics(trace_path: Path) -> dict:
     events = read_trace_events(trace_path)
     return {
-        "agent_trace_trusted": False,
-        "untrusted_agent_tool_calls": sum(
+        "tool_calls": sum(
             1 for event in events if event.get("type") == "tool_use"),
-        "untrusted_agent_llm_requests": sum(
+        "llm_requests": sum(
             1 for event in events if event.get("type") == "llm_request"),
-        "untrusted_agent_permission_blocks": sum(
+        "permission_blocks": sum(
             1 for event in events
             if event.get("type") == "hook"
             and event.get("name") == "PreToolUse"
             and event.get("decision") == "blocked"
         ),
-        "untrusted_agent_event_count": len(events),
+        "event_count": len(events),
     }
 
 
@@ -1158,7 +1157,6 @@ def _run_docker_agent_phase(
         "model_broker_exit_code": broker_process.exitcode,
         "model_broker_ipc_cleaned": False,
         "command_execution_count": command_metadata.get("command_execution_count", 0),
-        "command_execution_count_trusted": False,
         "tool_policy": DOCKER_EVAL_TOOL_POLICY,
     })
     try:
@@ -1523,11 +1521,6 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             write_text(stderr_path, stderr_buffer.getvalue())
         execution_metadata = command_executor.execution_metadata()
 
-    execution_metadata.setdefault(
-        "command_execution_count_trusted",
-        execution_config.backend != "docker",
-    )
-
     if not stdout_path.exists():
         write_text(stdout_path, "")
     if not stderr_path.exists():
@@ -1796,9 +1789,8 @@ def grouped_stats(results: list[dict], key_fn) -> dict:
             "avg_model_calls": sum(
                 item["metrics"].get("trusted_model_calls") or 0 for item in items
             ) / total if total else 0,
-            "avg_untrusted_agent_tool_calls": sum(
-                item["metrics"].get("untrusted_agent_tool_calls", 0)
-                for item in items
+            "avg_tool_calls": sum(
+                item["metrics"].get("tool_calls", 0) for item in items
             ) / total if total else 0,
             "avg_runtime_sec": sum(item["metrics"].get("runtime_sec", 0) for item in items) / total if total else 0,
         }
@@ -1874,7 +1866,6 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
         "command_execution_count": sum(
             result.get("command_execution_count", 0) for result in results
         ),
-        "command_execution_count_trusted": execution_config.backend != "docker",
         "model_broker_calls": sum(
             result.get("model_broker_calls", 0) for result in results
         ),
@@ -1904,9 +1895,8 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
             result["metrics"].get("trusted_model_calls") or 0
             for result in results
         ) / total_cases if total_cases else 0,
-        "avg_untrusted_agent_tool_calls": sum(
-            result["metrics"].get("untrusted_agent_tool_calls", 0)
-            for result in results
+        "avg_tool_calls": sum(
+            result["metrics"].get("tool_calls", 0) for result in results
         ) / total_cases if total_cases else 0,
         "avg_runtime_sec": sum(result["metrics"].get("runtime_sec", 0) for result in results) / total_cases if total_cases else 0,
         "suites": grouped_stats(results, lambda result: result["metadata"].get("suite", "unknown")),
@@ -1968,7 +1958,6 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
         "grader_container_cleanup_succeeded": None,
         "all_container_cleanup_succeeded": False if execution_config.backend == "docker" else True,
         "command_execution_count": 0,
-        "command_execution_count_trusted": execution_config.backend != "docker",
         "model_broker_calls": 0,
         "model_broker_stopped": False if execution_config.backend == "docker" else None,
         "model_broker_ipc_cleaned": False if execution_config.backend == "docker" else None,

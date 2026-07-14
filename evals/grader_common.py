@@ -51,7 +51,6 @@ def emit_result(
 
 
 def trace_events(trace_path: str | Path) -> list[dict]:
-    """Read Agent-authored diagnostics; callers must not use them for pass/fail."""
     path = Path(trace_path)
     if not path.exists():
         return []
@@ -67,12 +66,10 @@ def trace_events(trace_path: str | Path) -> list[dict]:
 
 
 def trace_tool_count(trace_path: str | Path) -> int:
-    """Return an untrusted diagnostic count from the Agent-authored trace."""
     return sum(1 for event in trace_events(trace_path) if event.get("type") == "tool_use")
 
 
 def trace_contains_test_run(trace_path: str | Path) -> bool:
-    """Report an untrusted Agent claim; the grader must run its own tests."""
     for event in trace_events(trace_path):
         if event.get("type") != "tool_use":
             continue

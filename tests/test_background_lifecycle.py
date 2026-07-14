@@ -164,3 +164,65 @@ def test_background_task_past_case_deadline_is_structured_timeout_and_stops(
         thread.name.startswith("codepilot-background-")
         for thread in threading.enumerate()
     )
+
+
+def test_interactive_loop_returns_while_long_background_task_keeps_running(
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+    loop_done = threading.Event()
+
+    def long_running_handler(command, run_in_background=False):
+        started.set()
+        release.wait()
+        return f"completed: {command}"
+
+    responses = iter([
+        SimpleNamespace(content=[tool_block()], stop_reason="tool_use"),
+        SimpleNamespace(
+            content=[text_block("The task is still running in the background.")],
+            stop_reason="end_turn",
+        ),
+        SimpleNamespace(
+            content=[text_block("Observed the later notification.")],
+            stop_reason="end_turn",
+        ),
+    ])
+    monkeypatch.setattr(
+        agent_loop, "assemble_tool_pool",
+        lambda: ([], {"bash": long_running_handler}),
+    )
+    monkeypatch.setattr(
+        agent_loop, "call_llm",
+        lambda _messages, _context, _tools, _state, _max_tokens: next(responses),
+    )
+    monkeypatch.setattr(agent_loop, "CASE_DEADLINE", None)
+    monkeypatch.setattr(agent_loop, "requires_initial_todo", lambda _messages: False)
+
+    messages = [{"role": "user", "content": "start one background task"}]
+
+    def run_loop():
+        try:
+            agent_loop.agent_loop(messages, {})
+        finally:
+            loop_done.set()
+
+    loop_thread = threading.Thread(target=run_loop, name="interactive-loop-test")
+    loop_thread.start()
+    assert started.wait(0.5)
+    returned_before_completion = loop_done.wait(0.5)
+    worker_was_alive = background.background_workers_alive()
+    release.set()
+    loop_thread.join(1)
+    assert background.wait_for_background_tasks(1)
+    background.collect_background_results()
+
+    assert returned_before_completion is True
+    assert worker_was_alive is True
+    assert not loop_thread.is_alive()
+    assert any(
+        "still running in the background" in getattr(block, "text", "")
+        for message in messages if message.get("role") == "assistant"
+        for block in message.get("content", [])
+    )

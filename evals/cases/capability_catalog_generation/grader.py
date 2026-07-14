@@ -57,7 +57,7 @@ def main() -> int:
         passed=passed,
         reason=error,
         failure_category="test_failure",
-        metrics={"untrusted_agent_tool_calls": trace_tool_count(args.trace), "row_count": len(rows)},
+        metrics={"tool_calls": trace_tool_count(args.trace), "row_count": len(rows)},
     )
 
 

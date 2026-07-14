@@ -275,7 +275,7 @@ def agent_loop(messages: list, context: dict):
         state.has_escalated = False
         messages.append({"role": "assistant", "content": response.content})
         if not has_tool_use(response.content):
-            if background_workers_alive():
+            if background_workers_alive() and CASE_DEADLINE is not None:
                 remaining = _remaining_case_time()
                 if not wait_for_background_tasks(remaining):
                     raise _CaseTimeoutError(
@@ -288,6 +288,14 @@ def agent_loop(messages: list, context: dict):
                 messages.append({"role": "user", "content": [
                     {"type": "text", "text": note} for note in notes]})
                 continue
+            # Interactive CLI runs have no case deadline. Preserve real
+            # background semantics: finish this turn immediately and inject
+            # the task notification on a later user turn when it is ready.
+            if background_workers_alive() and CASE_DEADLINE is None:
+                record_hook("Stop")
+                trigger_hooks("Stop", messages)
+                finish_run(extract_text(response.content))
+                return
             remaining = _remaining_case_time()
             notification_wait = 2.0 if remaining is None else max(0, min(2.0, remaining))
             if wait_for_imminent_once(notification_wait):

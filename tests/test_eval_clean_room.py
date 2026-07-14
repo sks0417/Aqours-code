@@ -15,6 +15,8 @@ AUTH_CASE = PROJECT_ROOT / "evals" / "cases" / "mini_auth_service_security_fix"
 CATALOG_CASE = PROJECT_ROOT / "evals" / "cases" / "capability_catalog_generation"
 BUG_FIX_CASE = PROJECT_ROOT / "evals" / "cases" / "capability_bug_fix_tests"
 RUN_TESTS_CASE = PROJECT_ROOT / "evals" / "cases" / "run_tests_basic"
+TRACE_RECORD_CASE = PROJECT_ROOT / "evals" / "cases" / "trace_record_basic"
+PERMISSION_CASE = PROJECT_ROOT / "evals" / "cases" / "permission_denied_basic"
 
 
 def prepare_case(case_dir: Path, tmp_path: Path):
@@ -393,11 +395,11 @@ def test_forged_agent_trace_cannot_make_failing_clean_room_tests_pass(tmp_path):
         BUG_FIX_CASE, workspace, trace, final, stdout, stderr)
 
     assert result["passed"] is False
-    assert result["metrics"]["untrusted_agent_reported_test_run"] is True
+    assert result["metrics"]["saw_test_run"] is True
     assert result["metrics"]["pytest"]["returncode"] != 0
 
 
-def test_authoritative_grader_tests_pass_without_agent_trace_claim(tmp_path):
+def test_run_tests_basic_fails_process_check_without_agent_test_run(tmp_path):
     workspace = tmp_path / "grading"
     run_eval.copy_case_workspace(RUN_TESTS_CASE, workspace)
     trace = tmp_path / "trace.jsonl"
@@ -410,5 +412,99 @@ def test_authoritative_grader_tests_pass_without_agent_trace_claim(tmp_path):
     result, _proc = run_eval.run_grader(
         RUN_TESTS_CASE, workspace, trace, final, stdout, stderr)
 
+    assert result["passed"] is False
+    assert result["metrics"]["saw_test_run"] is False
+    assert result["metrics"]["pytest"]["returncode"] == 0
+    assert "trace did not show" in result["reason"]
+
+
+def test_run_tests_basic_accepts_normal_trace_test_run(tmp_path):
+    workspace = tmp_path / "grading"
+    run_eval.copy_case_workspace(RUN_TESTS_CASE, workspace)
+    trace = tmp_path / "trace.jsonl"
+    final = tmp_path / "final.md"
+    stdout = tmp_path / "stdout.txt"
+    stderr = tmp_path / "stderr.txt"
+    write_trace(trace)
+    for path in (final, stdout, stderr):
+        path.write_text("", encoding="utf-8")
+
+    result, _proc = run_eval.run_grader(
+        RUN_TESTS_CASE, workspace, trace, final, stdout, stderr)
+
     assert result["passed"] is True
-    assert result["metrics"]["untrusted_agent_reported_test_run"] is False
+    assert result["metrics"]["saw_test_run"] is True
+    assert result["metrics"]["tool_calls"] == 1
+
+
+def test_trace_record_basic_requires_complete_runtime_trace(tmp_path):
+    workspace = tmp_path / "grading"
+    run_eval.copy_case_workspace(TRACE_RECORD_CASE, workspace)
+    (workspace / "result.txt").write_text("trace ok\n", encoding="utf-8")
+    trace = tmp_path / "trace.jsonl"
+    final = tmp_path / "final.md"
+    stdout = tmp_path / "stdout.txt"
+    stderr = tmp_path / "stderr.txt"
+    for path in (final, stdout, stderr):
+        path.write_text("", encoding="utf-8")
+    complete_events = [
+        {"type": "user_prompt", "content": "read note"},
+        {"type": "llm_request", "model": "scripted"},
+        {"type": "llm_response", "content": [{"type": "text", "text": "working"}]},
+        {"type": "tool_use", "tool": "write_file", "input": {"path": "result.txt"}},
+        {"type": "tool_result", "tool": "write_file", "content": "ok"},
+        {"type": "final_answer", "content": "done"},
+    ]
+    trace.write_text(
+        "\n".join(json.dumps(event) for event in complete_events),
+        encoding="utf-8",
+    )
+
+    complete, _proc = run_eval.run_grader(
+        TRACE_RECORD_CASE, workspace, trace, final, stdout, stderr)
+    assert complete["passed"] is True
+    assert set(complete["metrics"]["trace_event_types"]) >= {
+        "user_prompt", "llm_request", "llm_response", "tool_use",
+        "tool_result", "final_answer",
+    }
+
+    trace.write_text(
+        "\n".join(json.dumps(event) for event in complete_events
+                  if event["type"] != "tool_result"),
+        encoding="utf-8",
+    )
+    incomplete, _proc = run_eval.run_grader(
+        TRACE_RECORD_CASE, workspace, trace, final, stdout, stderr)
+    assert incomplete["passed"] is False
+    assert incomplete["metrics"]["trace_missing_types"] == ["tool_result"]
+
+
+def test_permission_grader_requires_survival_and_refusal_evidence(tmp_path):
+    workspace = tmp_path / "grading"
+    run_eval.copy_case_workspace(PERMISSION_CASE, workspace)
+    trace = tmp_path / "trace.jsonl"
+    final = tmp_path / "final.md"
+    stdout = tmp_path / "stdout.txt"
+    stderr = tmp_path / "stderr.txt"
+    for path in (trace, final, stdout, stderr):
+        path.write_text("", encoding="utf-8")
+
+    no_refusal, _proc = run_eval.run_grader(
+        PERMISSION_CASE, workspace, trace, final, stdout, stderr)
+    assert no_refusal["passed"] is False
+    assert no_refusal["metrics"]["hook_denied"] is False
+
+    trace.write_text(json.dumps({
+        "type": "hook", "name": "PreToolUse", "decision": "blocked",
+        "reason": "Permission denied: delete commands are disabled",
+    }), encoding="utf-8")
+    refused, _proc = run_eval.run_grader(
+        PERMISSION_CASE, workspace, trace, final, stdout, stderr)
+    assert refused["passed"] is True
+    assert refused["metrics"]["hook_denied"] is True
+
+    (workspace / "keep.txt").unlink()
+    deleted, _proc = run_eval.run_grader(
+        PERMISSION_CASE, workspace, trace, final, stdout, stderr)
+    assert deleted["passed"] is False
+    assert "keep.txt was deleted" in deleted["reason"]

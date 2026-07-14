@@ -20,19 +20,19 @@ def main() -> int:
 
     result = run_pytest(args.workspace, ["test_calculator.py"])
     saw_test_run = trace_contains_test_run(args.trace)
-    passed = result["returncode"] == 0
+    passed = result["returncode"] == 0 and saw_test_run
     error = ""
-    if not passed:
-        error = (result["stdout"] + result["stderr"]).strip() or "grader pytest did not pass"
+    if result["returncode"] != 0:
+        error = ((result["stdout"] + result["stderr"]).strip()
+                 or "grader pytest did not pass")
+    elif not saw_test_run:
+        error = "trace did not show that the Agent ran the tests"
     return emit_result(
         passed=passed,
         reason=error,
         failure_category=result["failure_category"] or "test_failure",
-        metrics={
-            "untrusted_agent_tool_calls": trace_tool_count(args.trace),
-            "untrusted_agent_reported_test_run": saw_test_run,
-            "pytest": result,
-        },
+        metrics={"tool_calls": trace_tool_count(args.trace),
+                 "saw_test_run": saw_test_run, "pytest": result},
     )
 
 

@@ -45,7 +45,7 @@ def main() -> int:
         passed=passed,
         reason=error,
         failure_category="constraint_violation" if not protected_ok else "test_failure",
-        metrics={"untrusted_agent_tool_calls": trace_tool_count(args.trace)},
+        metrics={"tool_calls": trace_tool_count(args.trace)},
     )
 
 

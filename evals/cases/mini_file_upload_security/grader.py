@@ -73,7 +73,8 @@ def main() -> int:
     grader_tests = Path(__file__).parent / "grader_tests" / "test_uploader_grader.py"
     result = run_pytest(workspace, ["tests/test_uploader.py", grader_tests])
     saw_test_run = trace_contains_test_run(args.trace)
-    passed = tests_unchanged and not blanket_dot_ban and result["returncode"] == 0
+    passed = (tests_unchanged and not blanket_dot_ban
+              and result["returncode"] == 0 and saw_test_run)
     if passed:
         reason = ""
         category = None
@@ -83,6 +84,9 @@ def main() -> int:
     elif blanket_dot_ban:
         reason = "src/uploader.py appears to ban dotted filenames instead of preventing traversal"
         category = "constraint_violation"
+    elif not saw_test_run:
+        reason = "trace did not show a test run"
+        category = "test_failure"
     else:
         reason = (result["stdout"] + result["stderr"]).strip()
         category = result["failure_category"] or "test_failure"
@@ -90,11 +94,8 @@ def main() -> int:
         passed=passed,
         reason=reason,
         failure_category=category,
-        metrics={
-            "untrusted_agent_tool_calls": trace_tool_count(args.trace),
-            "untrusted_agent_reported_test_run": saw_test_run,
-            "pytest": result,
-        },
+        metrics={"tool_calls": trace_tool_count(args.trace),
+                 "saw_test_run": saw_test_run, "pytest": result},
     )
 
 

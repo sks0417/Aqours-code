@@ -18,8 +18,7 @@ def main() -> int:
     parser.add_argument("--stderr", required=True)
     args = parser.parse_args()
 
-    # The final response is the outcome for this read-only task. Trace/stdout/
-    # stderr are writable process diagnostics and cannot supply missing facts.
+    # The final response is the submitted outcome for this read-only task.
     text = (Path(args.final).read_text(encoding="utf-8", errors="replace")
             if Path(args.final).exists() else "")
     missing = [token for token in ("ALPHA-42", "Eval Systems", "September") if token not in text]
@@ -28,7 +27,7 @@ def main() -> int:
         passed=passed,
         reason="" if passed else f"Missing expected content: {', '.join(missing)}",
         failure_category="test_failure",
-        metrics={"untrusted_agent_tool_calls": trace_tool_count(args.trace)},
+        metrics={"tool_calls": trace_tool_count(args.trace)},
     )
 
 

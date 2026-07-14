@@ -98,6 +98,7 @@ def test_docker_eval_policy_exposes_full_harness(monkeypatch):
 
 def test_docker_path_never_calls_host_run_agent_task(tmp_path, monkeypatch):
     case = run_eval.PROJECT_ROOT / "evals" / "cases" / "read_file_basic"
+    phase_order = []
 
     monkeypatch.setattr(
         run_eval, "run_agent_task",
@@ -105,6 +106,7 @@ def test_docker_path_never_calls_host_run_agent_task(tmp_path, monkeypatch):
     )
 
     def fake_container(**kwargs):
+        phase_order.append("agent")
         kwargs["trace_path"].write_text("", encoding="utf-8")
         kwargs["final_path"].write_text("done", encoding="utf-8")
         return ({"final_answer": "done"}, "", {
@@ -120,6 +122,8 @@ def test_docker_path_never_calls_host_run_agent_task(tmp_path, monkeypatch):
         })
 
     def fake_grader(**_kwargs):
+        assert phase_order == ["agent"]
+        phase_order.append("grader")
         return ({
             "passed": True, "score": 100,
             "breakdown": dict(run_eval.DEFAULT_BREAKDOWN_WEIGHTS),
@@ -142,6 +146,8 @@ def test_docker_path_never_calls_host_run_agent_task(tmp_path, monkeypatch):
 
     assert result["passed"] is True
     assert result["agent_container_started"] is True
+    assert result["grader_container_started"] is True
+    assert phase_order == ["agent", "grader"]
 
 
 def test_eval_file_tool_cannot_read_outside_workspace(tmp_path):
@@ -347,7 +353,7 @@ def test_docker_policy_subagent_prompt_uses_container_runtime(tmp_path, monkeypa
         assert host_guidance not in prompt
 
 
-def test_eval_trace_storage_is_separate_but_explicitly_untrusted(
+def test_eval_trace_storage_is_separate_and_exposes_normal_process_metrics(
     tmp_path, monkeypatch,
 ):
     workspace = tmp_path / "agent_workspace"
@@ -369,7 +375,11 @@ def test_eval_trace_storage_is_separate_but_explicitly_untrusted(
     assert Path(result["run_dir"]).is_relative_to(trusted_runtime)
     assert exported_trace.exists()
     assert (trusted_runtime / ".codepilot" / "run_index.json").exists()
-    assert run_eval.trace_metrics(exported_trace)["agent_trace_trusted"] is False
+    metrics = run_eval.trace_metrics(exported_trace)
+    assert set(metrics) == {
+        "tool_calls", "llm_requests", "permission_blocks", "event_count",
+    }
+    assert metrics["event_count"] > 0
 
 
 @pytest.mark.parametrize("failure_point", ["start_run", "record_hook"])
