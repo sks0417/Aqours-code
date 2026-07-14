@@ -12,6 +12,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     # An async teammate may outlive the lead run. Pin its bash backend now so
     # runtime restoration can never make a sandboxed eval fall back to local.
     teammate_command_executor = COMMAND_EXECUTOR
+    stop_event = threading.Event()
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
               f"If a task has a worktree, work in that directory.")
@@ -129,12 +130,17 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         }
 
         while True:
+            if stop_event.is_set():
+                break
             if len(messages) <= 3:
                 messages.insert(0, {"role": "user",
                     "content": f"<identity>You are '{name}', role: {role}. "
                                f"Continue your work.</identity>"})
             should_shutdown = False
             for _ in range(10):
+                if stop_event.is_set():
+                    should_shutdown = True
+                    break
                 inbox = BUS.read_inbox(name)
                 for msg in inbox:
                     stopped = handle_inbox_message(name, msg, messages)
@@ -146,7 +152,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 if protocol_ctx["waiting_plan"]:
                     # Poll only for protocol replies while the approval gate is
                     # closed; do not let the model continue with the task.
-                    time.sleep(IDLE_POLL_INTERVAL)
+                    if stop_event.wait(IDLE_POLL_INTERVAL):
+                        should_shutdown = True
+                        break
                     continue
                 if inbox and not should_shutdown:
                     non_protocol = [m for m in inbox
@@ -190,7 +198,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 break
             if protocol_ctx["waiting_plan"]:
                 continue
-            idle_result = idle_poll(name, messages, name, role, wt_ctx)
+            idle_result = idle_poll(
+                name, messages, name, role, wt_ctx, stop_event=stop_event)
             if idle_result in ("shutdown", "timeout"):
                 break
 
@@ -206,10 +215,31 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 break
         BUS.send(name, "lead", summary, "result")
         active_teammates.pop(name, None)
+        teammate_threads.pop(name, None)
+        teammate_stop_events.pop(name, None)
 
     active_teammates[name] = True
-    threading.Thread(target=run, daemon=True).start()
+    thread = threading.Thread(
+        target=run, name=f"codepilot-teammate-{name}", daemon=True)
+    teammate_threads[name] = thread
+    teammate_stop_events[name] = stop_event
+    thread.start()
     return f"Teammate '{name}' spawned as {role}"
+
+
+def stop_all_teammates(timeout: float = 2.0) -> bool:
+    """Signal and boundedly join every teammate owned by this runtime."""
+    deadline = time.monotonic() + max(0, timeout)
+    for event in list(teammate_stop_events.values()):
+        event.set()
+    for thread in list(teammate_threads.values()):
+        thread.join(max(0, deadline - time.monotonic()))
+    stopped = not any(thread.is_alive() for thread in teammate_threads.values())
+    if stopped:
+        active_teammates.clear()
+        teammate_threads.clear()
+        teammate_stop_events.clear()
+    return stopped
 
 
 def _teammate_submit_plan(from_name: str, plan: str) -> str:

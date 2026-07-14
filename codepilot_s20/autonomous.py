@@ -19,11 +19,16 @@ def scan_unclaimed_tasks() -> list[dict]:
 
 def idle_poll(agent_name: str, messages: list,
               name: str, role: str,
-              worktree_context: dict | None = None) -> str:
+              worktree_context: dict | None = None,
+              stop_event=None) -> str:
     # Autonomous teammates wake up for inbox messages first, then look for
     # unclaimed tasks. This keeps direct protocol messages higher priority.
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
-        time.sleep(IDLE_POLL_INTERVAL)
+        if stop_event is not None:
+            if stop_event.wait(IDLE_POLL_INTERVAL):
+                return "shutdown"
+        else:
+            time.sleep(IDLE_POLL_INTERVAL)
         inbox = BUS.read_inbox(agent_name)
         if inbox:
             for msg in inbox:

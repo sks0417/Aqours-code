@@ -79,46 +79,68 @@ def runtime_snapshot():
     }
 
 
-def test_docker_eval_policy_exposes_only_workspace_safe_tools(monkeypatch):
+def test_docker_eval_policy_exposes_full_harness(monkeypatch):
     monkeypatch.setattr(mcp, "TOOL_POLICY", run_eval.DOCKER_EVAL_TOOL_POLICY)
     tools, handlers = mcp.assemble_tool_pool()
     names = {tool["name"] for tool in tools}
 
     assert names == set(run_eval.DOCKER_EVAL_TOOL_POLICY["allowed_tools"])
     assert set(handlers) == names - {"compact"}
-    for forbidden in (
-        "create_worktree", "remove_worktree", "spawn_teammate",
-        "create_task", "schedule_cron", "connect_mcp", "load_skill",
-    ):
-        assert forbidden not in names
-        assert forbidden not in handlers
+    assert len(names) == 28
+    assert run_eval.DOCKER_EVAL_TOOL_POLICY["disabled_tools"] == []
+    assert run_eval.DOCKER_EVAL_TOOL_POLICY["allow_mcp"] is True
+    assert run_eval.DOCKER_EVAL_TOOL_POLICY["allow_memory_context"] is True
+    assert run_eval.DOCKER_EVAL_TOOL_POLICY["allow_skill_context"] is True
+    assert run_eval.DOCKER_EVAL_TOOL_POLICY["allow_teammate_context"] is True
+    assert run_eval.DOCKER_EVAL_TOOL_POLICY["background_tasks"] is True
 
 
-def test_forbidden_worktree_call_cannot_reach_host_git(tmp_path, monkeypatch):
+def test_docker_path_never_calls_host_run_agent_task(tmp_path, monkeypatch):
+    case = run_eval.PROJECT_ROOT / "evals" / "cases" / "read_file_basic"
+
     monkeypatch.setattr(
-        worktree_system,
-        "run_git",
-        lambda *_a, **_kw: pytest.fail("host git subprocess must not run"),
-    )
-    trace = tmp_path / "trace.jsonl"
-    client = OneForbiddenToolClient("create_worktree", {"name": "escape"})
-
-    result = agent_loop.run_agent_task(
-        "try worktree",
-        str(tmp_path),
-        str(trace),
-        model_client=client,
-        model_provider="scripted",
-        model="scripted",
-        command_executor=LocalCommandExecutor(),
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+        run_eval, "run_agent_task",
+        lambda *_a, **_kw: pytest.fail("host run_agent_task must not run"),
     )
 
-    assert result["final_answer"] == "done"
-    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
-    policy = next(event for event in events if event.get("type") == "tool_policy")
-    assert "create_worktree" in policy["disabled_tools"]
-    assert any("Unknown: create_worktree" in str(event) for event in events)
+    def fake_container(**kwargs):
+        kwargs["trace_path"].write_text("", encoding="utf-8")
+        kwargs["final_path"].write_text("done", encoding="utf-8")
+        return ({"final_answer": "done"}, "", {
+            "execution_backend": "docker",
+            "container_started": True,
+            "container_exit_code": 0,
+            "container_cleanup_succeeded": True,
+            "command_execution_count": 0,
+            "resource_limits": {},
+            "model_broker_stopped": True,
+            "model_broker_ipc_cleaned": True,
+            "agent_state_cleaned": True,
+        })
+
+    def fake_grader(**_kwargs):
+        return ({
+            "passed": True, "score": 100,
+            "breakdown": dict(run_eval.DEFAULT_BREAKDOWN_WEIGHTS),
+            "metrics": {}, "reason": "", "failure_category": None,
+        }, subprocess.CompletedProcess([], 0, "", ""), {
+            "container_started": True, "container_exit_code": 0,
+            "cleanup_succeeded": True, "timed_out": False,
+        })
+
+    monkeypatch.setattr(run_eval, "_run_docker_agent_phase", fake_container)
+    monkeypatch.setattr(run_eval, "run_docker_grader", fake_grader)
+    monkeypatch.setattr(
+        run_eval, "prepare_docker_disposable_paths", lambda *_a, **_kw: None)
+
+    result = run_eval.run_case(
+        case, tmp_path / "runs", scripted=True,
+        execution_config=run_eval.EvalExecutionConfig(
+            backend="docker", docker_image="eval:test"),
+    )
+
+    assert result["passed"] is True
+    assert result["agent_container_started"] is True
 
 
 def test_eval_file_tool_cannot_read_outside_workspace(tmp_path):
@@ -141,7 +163,7 @@ def test_eval_file_tool_cannot_read_outside_workspace(tmp_path):
     assert "Path escapes workspace" in trace_text
 
 
-def test_eval_background_request_runs_synchronously_and_leaves_no_worker(tmp_path):
+def test_eval_background_request_completes_and_leaves_no_worker(tmp_path):
     class RecordingExecutor(LocalCommandExecutor):
         def __init__(self):
             super().__init__()
@@ -185,17 +207,26 @@ def test_workdir_derived_paths_follow_agent_workspace_and_restore(tmp_path, monk
     assert runtime_snapshot() == before
 
 
-def test_docker_policy_prompt_cannot_leak_host_memory_skills_or_disabled_tools(
+def test_docker_full_prompt_uses_only_case_memory_skills_and_state(
     tmp_path, monkeypatch,
 ):
     host = tmp_path / "host"
     workspace = tmp_path / "agent_workspace"
+    state = tmp_path / "agent_state"
     (host / ".memory").mkdir(parents=True)
     (host / ".memory" / "MEMORY.md").write_text(
         "HOST_MEMORY_SECRET_7F91", encoding="utf-8")
     (host / "skills" / "secret-skill").mkdir(parents=True)
     (host / "skills" / "secret-skill" / "SKILL.md").write_text(
         "---\nname: host-secret-skill\ndescription: HOST_SKILL_SECRET_4A22\n---\nHOST_SKILL_BODY_8C33",
+        encoding="utf-8",
+    )
+    (state / ".memory").mkdir(parents=True)
+    (state / ".memory" / "MEMORY.md").write_text(
+        "CASE_MEMORY_VISIBLE", encoding="utf-8")
+    (state / "skills" / "case-skill").mkdir(parents=True)
+    (state / "skills" / "case-skill" / "SKILL.md").write_text(
+        "---\nname: case-skill\ndescription: CASE_SKILL_VISIBLE\n---\nbody",
         encoding="utf-8",
     )
     monkeypatch.setattr(context, "MEMORY_DIR", host / ".memory")
@@ -221,6 +252,8 @@ def test_docker_policy_prompt_cannot_leak_host_memory_skills_or_disabled_tools(
         model_provider="scripted", model="scripted",
         command_executor=LocalCommandExecutor(),
         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+        runtime_root=str(state),
+        manage_lifecycle=True,
     )
 
     prompt = captured["system"]
@@ -230,9 +263,15 @@ def test_docker_policy_prompt_cannot_leak_host_memory_skills_or_disabled_tools(
     assert "host-secret-skill" not in prompt
     assert "HOST_MCP_SECRET_91AB" not in prompt
     assert "HOST_TEAM_SECRET_52CD" not in prompt
-    assert "create_worktree" not in prompt
-    assert "spawn_teammate" not in prompt
-    assert "load_skill" not in prompt
+    assert "CASE_MEMORY_VISIBLE" in prompt
+    assert "CASE_SKILL_VISIBLE" in prompt
+    assert "create_worktree" in prompt
+    assert "spawn_teammate" in prompt
+    assert "load_skill" in prompt
+    assert "Memory context:" in prompt
+    assert "MCP state:" in prompt
+    assert "Active teammate state:" in prompt
+    assert "Available tools (full descriptions):" in prompt
     assert "- OS: Linux" in prompt
     assert "- Shell: /bin/sh" in prompt
     assert "- Working directory: /workspace" in prompt
@@ -243,8 +282,8 @@ def test_docker_policy_prompt_cannot_leak_host_memory_skills_or_disabled_tools(
         "Use type instead", "Use findstr instead",
     ):
         assert host_guidance not in prompt
-    assert captured["memory_dir"] == workspace / ".memory"
-    assert captured["memory_index"] == workspace / ".memory" / "MEMORY.md"
+    assert captured["memory_dir"] == state / ".memory"
+    assert captured["memory_index"] == state / ".memory" / "MEMORY.md"
     assert runtime_snapshot() == before
 
 

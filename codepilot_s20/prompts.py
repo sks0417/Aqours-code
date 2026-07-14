@@ -46,7 +46,19 @@ def assemble_system_prompt(context: dict) -> str:
     policy = TOOL_POLICY if isinstance(TOOL_POLICY, dict) else {}
     allowed_tools = (policy["allowed_tools"]
                      if "allowed_tools" in policy else ALL_TOOL_NAMES)
-    tool_section = "Available tools: " + ", ".join(allowed_tools) + "."
+    try:
+        live_tools, _ = assemble_tool_pool()
+    except (NameError, AttributeError):
+        live_tools = [tool for tool in BUILTIN_TOOLS
+                      if tool.get("name") in allowed_tools]
+    descriptions = {tool["name"]: tool.get("description", "")
+                    for tool in live_tools}
+    displayed_tools = list(allowed_tools)
+    displayed_tools.extend(
+        name for name in descriptions
+        if name.startswith("mcp__") and name not in displayed_tools)
+    tool_section = "Available tools (full descriptions):\n" + "\n".join(
+        f"- {name}: {descriptions.get(name, '')}" for name in displayed_tools)
     if policy.get("allow_mcp", True):
         tool_section += " MCP tools are prefixed mcp__{server}__{tool}."
     prompt_runtime = resolve_prompt_runtime_context(policy, WORKDIR)
@@ -62,11 +74,19 @@ def assemble_system_prompt(context: dict) -> str:
     if policy.get("allow_skill_context", True) and "load_skill" in allowed_tools:
         sections.append("Skills catalog:\n" + list_skills() +
                         "\nUse load_skill(name) when a skill is relevant.")
-    if policy.get("allow_memory_context", True) and context.get("memories"):
-        sections.append(f"Relevant memories:\n{context['memories']}")
+    if policy.get("allow_memory_context", True):
+        sections.append(
+            "Memory context:\n" + (context.get("memories") or "(no case memory)"))
     mcp_names = context.get("connected_mcp", []) if policy.get("allow_mcp", True) else []
-    if mcp_names:
-        sections.append(f"Connected MCP servers: {', '.join(mcp_names)}")
+    if policy.get("allow_mcp", True):
+        sections.append(
+            "MCP state:\nConnected servers: "
+            + (", ".join(mcp_names) if mcp_names else "(none)"))
+    if policy.get("allow_teammate_context", True):
+        teammates = context.get("active_teammates", [])
+        sections.append(
+            "Active teammate state:\n"
+            + (", ".join(teammates) if teammates else "(none)"))
     return "\n\n".join(sections)
 
 

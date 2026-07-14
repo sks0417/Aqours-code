@@ -513,7 +513,9 @@ make
 - 自动发现 `evals/cases/`
 - 每个 case 复制隔离 workspace
 - 默认调用真实模型 API
-- `--scripted` 本地假模型 smoke test
+- 默认在一次性 Docker Agent 容器中运行完整 Harness
+- `--scripted` 使用宿主机假模型 Broker，但仍运行完整 Agent 容器
+- `--execution local` 仅用于显式开发兼容
 - `--case` 单独运行指定 case
 - `--list-cases` 列出所有 case
 - `--request-timeout` 控制模型请求超时
@@ -529,7 +531,8 @@ make
 python evals\run_eval.py --list-cases
 python evals\run_eval.py --case read_file_basic --request-timeout 10
 python evals\run_eval.py --request-timeout 30
-python evals\run_eval.py --scripted
+python evals\run_eval.py --scripted --docker-build
+python evals\run_eval.py --scripted --execution local
 ```
 
 ## 14. Eval 评分体系
@@ -804,80 +807,85 @@ plugin autoloading, user site packages, and inherited `PYTHONPATH` disabled for
 more reproducible local grading.
 
 This prevents common test-file and pytest-runner tampering in the clean-room
-grader. Local execution remains a compatibility mode whose `bash` tool has host
-process permissions; the opt-in Docker backend below supplies the stronger eval
-boundary.
+grader. Local execution remains an explicit compatibility mode whose `bash`
+tool has host process permissions; Docker full-runtime execution is the default
+eval boundary.
 
-## Eval Docker Sandbox (Stage 2)
+## Eval Docker Full Runtime
 
-The second eval hardening stage adds an opt-in Docker execution backend while
-leaving `--execution local` as the default.
+Docker Eval isolates the complete Agent Runtime. `--execution docker` is the
+default; `--execution local` is available only for explicit development
+compatibility, and Docker errors never fall back to local execution.
 
 Offline `--scripted` runs select only cases whose metadata declares
 `scripted_supported: true`; explicitly selecting an unsupported case is a CLI
 usage error rather than a fabricated evaluation failure.
 
 ```text
-host: Agent Loop + model client + guarded file tools
-  -> per-case Agent container: bash via docker exec, /workspace only
+host: prepare trusted_eval + agent_workspace + grading_workspace
+  -> start per-case Model Broker
+  -> one-shot Agent container: python -m codepilot_s20.eval_container_entry
+     -> full Agent Loop + all tools + per-case Harness state
   -> destroy Agent container
 host: snapshot + change manifest + clean grading workspace
   -> separate one-shot Grader container: trusted inputs read-only
   -> destroy Grader container
 ```
 
-`LocalCommandExecutor` retains the normal CLI subprocess behavior.
-`DockerCommandExecutor` creates one long-lived container per eval case. The
-Docker Eval tool policy exposes only `bash`, workspace-safe read/write/edit/glob,
-todo/compact, and the synchronous subagent. Worktree, persistent task,
-teammate, cron, skill, MCP, and other host-affecting tools are excluded from the
-tool pool and listed in a traceable policy event. Background execution is also
-disabled for this policy, so no case worker can outlive its runtime.
-Memory, skill-catalog, MCP-state, and teammate-state prompt context are also
-disabled; prompt tool descriptions are generated from the active allowlist.
+The Agent container uses `LocalCommandExecutor` because the entire Python
+runtime is already sandboxed. `DockerCommandExecutor` remains only as a legacy
+compatibility/unit-test backend; it is not the Docker Eval main path. The full
+policy exposes all 28 built-ins plus dynamically discovered `mcp__...` tools.
+Memory context, Skill catalog, MCP state, teammate state, background work,
+persistent tasks, protocols, Worktree, Cron/Once, subagents, and multi-agent
+tools remain enabled. Permission hooks still run before tools.
 
-The complete Docker Agent phase runs in a dedicated spawned host process. The
-parent reads a one-way Pipe while the child is running, so large results cannot
-deadlock process exit through a full Queue feeder. `--docker-timeout` is one
-absolute deadline created at the beginning of `run_case`, covering preparation,
-Agent startup/runtime, model and Bash requests, IPC, grading, and cleanup. Each
-operation gets the smaller of its configured timeout and remaining case time.
-Cleanup uses the same absolute cleanup deadline with only a bounded three-second
-grace, then later cases continue.
+Each case receives fresh `/state` paths for skills, memory, tasks, mailboxes,
+worktrees, task outputs, transcripts, scheduled jobs, MCP state, and teammate
+state. The non-interactive lifecycle starts the scheduler, delivers imminent
+Once jobs and completed background notifications, and boundedly stops the
+scheduler, background workers, and teammates. The state and Broker IPC trees
+are removed after the Agent exits.
 
-The Agent container mounts only `agent_workspace` read-write at `/workspace`.
-All tools exposed by the Docker Eval policy are prevented from reading the
-original case workspace, `trusted_eval`, `grading_workspace`, grader code/tests,
-the project root, host `.env`, API keys, or the Docker socket. Trace runs and
-their index live in the sibling host-only `agent_runtime` directory and are
-copied to the grader input only after the Agent phase, preventing audit-trail
-tampering through either Bash or file tools.
+The immutable Python 3.11.9 image installs the whole package and Git. The Agent
+container mounts the current `agent_workspace` at `/workspace`, per-case state
+at `/state`, trace/results at `/runtime`, and split request/readonly-response
+Broker directories under `/broker`. It never mounts the original project,
+trusted grader inputs, grading workspace, host `.env`, user state, or Docker
+socket. A disposable Git repository is initialized inside `/workspace`, so
+Worktree subprocesses occur only in the container. Trace is outside
+`/workspace`; correctness still comes only from the clean grading workspace.
 The Grader container separately mounts `trusted_eval`, `grading_workspace`, and
 trace/final/stdout/stderr files read-only. Model requests never enter either
-container and Agent containers remain network-disabled.
+container directly. The Agent has no API key and remains network-disabled.
+
+`BrokerModelClient` supports only nonce-scoped, schema-validated
+`messages.create` requests through atomic per-case files. The host Model Broker
+holds the real provider client or `ScriptedEvalClient`, applies the case
+deadline, records call counts, and offers no host command, file-read, or generic
+RPC operation. IPC is cleaned after every case.
 
 Both containers use `--network none`, `--read-only`, `--cap-drop ALL`,
 `no-new-privileges`, a non-root UID/GID, memory and CPU limits, a PID limit, a file
 descriptor limit, and a bounded tmpfs. Docker mounts use one `--mount` argument
 per bind so Windows drive-letter colons are not parsed as volume separators.
-No host environment is inherited through Docker CLI arguments.
+No host environment or API credential is inherited through Docker CLI
+arguments.
 
 Windows Docker Desktop uses UID/GID 10001. On non-root Linux/WSL2 hosts the
 container numeric UID/GID matches the bind-mount owner. On UID-0 hosts only the
 disposable workspaces and copied grader inputs are chowned to 10001; traversal
-skips symlinks and is constrained to the case output root. Startup verifies actual
-non-root write access with a probe inside `/workspace` and fails closed when
-permissions are incompatible; it never removes the non-root restriction.
+skips symlinks and is constrained to the case output root. Permission failures
+fail closed and never remove the non-root restriction.
 
-Docker mode adds `sandbox_error` and `command_timeout` failure categories plus
-execution and cleanup metadata to case results and `summary.json`. A command
-timeout force-removes its Agent container. Grader timeout remains
+Docker mode records Agent entrypoint, model call count, IPC/state cleanup,
+container exit/timeout/removal, full tool policy, and resource limits in case
+results and `summary.json`. Agent timeout force-removes its container. Grader
+timeout remains
 `test_timeout`; grader exceptions remain `grader_error`. There is no automatic
 fallback to local execution. Cleanup success is reported only after successful
 removal or an explicit Docker "No such container" response; exit codes are read
 from container state or the one-shot grader process rather than inferred from
 the cleanup command. Results distinguish Agent and Grader started state, exit
-code, and cleanup outcome; legacy `container_cleanup_succeeded` is true only
-when every container created for the case was cleaned up. The legacy generic
-`container_exit_code` remains the Agent code for compatibility; new consumers
-should use the explicit Agent and Grader exit-code fields.
+code, and cleanup outcome; `container_cleanup_succeeded` is true only
+when every container created for the case was cleaned up.

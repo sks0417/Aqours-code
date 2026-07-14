@@ -15,7 +15,12 @@ from codepilot_s20.command_executor import (
 )
 from codepilot_s20.docker_utils import host_container_user, normalize_bind_source
 from evals import run_eval
-from evals.docker_sandbox import DockerGraderRunner, bind_mount, build_eval_image
+from evals.docker_sandbox import (
+    DockerAgentRunner,
+    DockerGraderRunner,
+    bind_mount,
+    build_eval_image,
+)
 
 
 class RecordingRunner:
@@ -82,6 +87,68 @@ def test_docker_agent_run_args_include_security_limits_and_one_mount(tmp_path):
     assert mounts == [bind_mount(tmp_path, "/workspace")]
     assert all("trusted_eval" not in mount and "grading_workspace" not in mount for mount in mounts)
     assert all(".env" not in arg for arg in args)
+
+
+def test_full_agent_container_is_one_shot_entrypoint_with_isolated_mounts(tmp_path):
+    paths = {}
+    for name in ("workspace", "state", "runtime", "ipc"):
+        paths[name] = tmp_path / name
+        paths[name].mkdir()
+    runner = DockerAgentRunner(
+        image="eval:test", case_name="full", memory="768m",
+        cpus="0.5", pids_limit=64,
+    )
+
+    args = runner.docker_run_args(
+        agent_workspace=paths["workspace"],
+        agent_state=paths["state"],
+        runtime_root=paths["runtime"],
+        ipc_root=paths["ipc"],
+    )
+
+    assert args[:3] == ["docker", "run", "--name"]
+    assert "--network" in args and args[args.index("--network") + 1] == "none"
+    assert "--read-only" in args
+    assert "sleep" not in args and "infinity" not in args
+    assert args[-5:] == [
+        "python", "-m", "codepilot_s20.eval_container_entry",
+        "--config", "/runtime/input.json",
+    ]
+    mounts = [args[index + 1] for index, value in enumerate(args)
+              if value == "--mount"]
+    assert {mount.split("target=", 1)[1].split(",", 1)[0] for mount in mounts} == {
+        "/workspace", "/state", "/runtime", "/broker/requests",
+        "/broker/responses",
+    }
+    assert next(mount for mount in mounts if "target=/broker/responses" in mount).endswith(
+        ",readonly")
+    joined = " ".join(args)
+    for forbidden in (
+        "OPENAI_API_KEY", "MODEL_API_KEY", "ANTHROPIC_API_KEY",
+        "/trusted_eval", "/grading_workspace", "/var/run/docker.sock",
+    ):
+        assert forbidden not in joined
+
+
+def test_eval_image_build_uses_project_root_and_installs_runtime_and_git(tmp_path):
+    calls = []
+
+    def runner(args, **_kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    build_eval_image(
+        project_root=run_eval.PROJECT_ROOT, image="eval:test", runner=runner)
+    args = calls[0]
+    assert Path(args[-1]).resolve() == run_eval.PROJECT_ROOT.resolve()
+    assert Path(args[args.index("--file") + 1]).name == "Dockerfile"
+
+    dockerfile = (run_eval.PROJECT_ROOT / "evals" / "docker" / "Dockerfile").read_text(
+        encoding="utf-8")
+    assert "FROM python:3.11.9-slim-bookworm" in dockerfile
+    assert "apt-get install --no-install-recommends --yes git" in dockerfile
+    assert "python -m pip install --no-cache-dir /opt/codepilot-src" in dockerfile
+    assert "COPY codepilot_s20 /opt/codepilot-src/codepilot_s20" in dockerfile
 
 
 def test_windows_mount_is_one_argument_not_colon_delimited():
@@ -435,6 +502,16 @@ def test_docker_eval_integration_smoke(tmp_path):
 
     image = "codepilot-s20-eval:test"
     build_eval_image(project_root=run_eval.PROJECT_ROOT, image=image)
+    image_probe = subprocess.run(
+        [
+            "docker", "run", "--rm", "--network", "none", image,
+            "/bin/sh", "-lc",
+            "python -c 'import codepilot_s20' && git --version",
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert image_probe.returncode == 0, image_probe.stderr
+    assert "git version" in image_probe.stdout
     config = run_eval.EvalExecutionConfig(backend="docker", docker_image=image)
     tests_case = run_eval.PROJECT_ROOT / "evals" / "cases" / "run_tests_basic"
     tests_result = run_eval.run_case(
@@ -487,7 +564,8 @@ def test_docker_eval_integration_smoke(tmp_path):
         executor.start()
         visibility = executor.execute(
             "test \"$(id -u)\" -ne 0 && "
-            "test ! -e /trusted_eval && test ! -e /grading_workspace && "
+            "test -z \"$(ls -A /trusted_eval)\" && "
+            "test -z \"$(ls -A /grading_workspace)\" && "
             "test ! -e /workspace/.env && "
             "printf visible > /workspace/nonroot-write.txt",
             visible_workspace,

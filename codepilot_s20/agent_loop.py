@@ -272,6 +272,16 @@ def agent_loop(messages: list, context: dict):
         state.has_escalated = False
         messages.append({"role": "assistant", "content": response.content})
         if not has_tool_use(response.content):
+            remaining = _remaining_case_time()
+            notification_wait = 2.0 if remaining is None else max(0, min(2.0, remaining))
+            if wait_for_background_tasks(notification_wait):
+                notes = collect_background_results()
+                if notes:
+                    messages.append({"role": "user", "content": [
+                        {"type": "text", "text": note} for note in notes]})
+                    continue
+            if wait_for_imminent_once(notification_wait):
+                continue
             record_hook("Stop")
             trigger_hooks("Stop", messages)
             finish_run(extract_text(response.content))
@@ -439,11 +449,43 @@ _WORKDIR_DERIVED_PATHS = {
     "ONCE_DURABLE_PATH": (".scheduled_once_tasks.json",),
 }
 
+_ISOLATED_RUNTIME_COLLECTIONS = (
+    "mcp_clients", "active_teammates", "teammate_threads",
+    "teammate_stop_events", "pending_requests", "scheduled_jobs",
+    "scheduled_once_jobs", "CRON_LAST_FIRED", "background_tasks",
+    "background_results",
+)
+_ISOLATED_RUNTIME_LISTS = ("cron_queue", "CURRENT_TODOS")
 
-def _set_runtime_workdir(workdir):
+
+def _isolate_runtime_collections() -> dict:
+    snapshots = {}
+    for name in _ISOLATED_RUNTIME_COLLECTIONS:
+        value = _runtime_value(name)
+        snapshots[name] = dict(value)
+        value.clear()
+    for name in _ISOLATED_RUNTIME_LISTS:
+        value = _runtime_value(name)
+        snapshots[name] = list(value)
+        value.clear()
+    return snapshots
+
+
+def _restore_runtime_collections(snapshots: dict):
+    for name, snapshot in snapshots.items():
+        value = _runtime_value(name)
+        value.clear()
+        if isinstance(value, dict):
+            value.update(snapshot)
+        else:
+            value.extend(snapshot)
+
+
+def _set_runtime_workdir(workdir, runtime_root=None):
     _set_runtime_value("WORKDIR", workdir)
+    state_root = _Path(runtime_root).resolve() if runtime_root else workdir
     for name, parts in _WORKDIR_DERIVED_PATHS.items():
-        _set_runtime_value(name, workdir.joinpath(*parts))
+        _set_runtime_value(name, state_root.joinpath(*parts))
 
 
 def _copy_trace_file(source, target):
@@ -462,7 +504,9 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
                    tool_policy: dict | None = None,
                    case_deadline: float | None = None,
                    cleanup_grace: float = 2.0,
-                   trace_storage_root: str | None = None) -> dict:
+                   trace_storage_root: str | None = None,
+                   runtime_root: str | None = None,
+                   manage_lifecycle: bool = False) -> dict:
     """Run one non-interactive agent task using the existing loop and trace."""
     global rounds_since_todo
     from . import bootstrap
@@ -480,15 +524,18 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
     final_text = ""
     rounds_since_todo = 0
     cleanup_errors = []
+    collection_snapshots = None
     try:
         # The outer try begins before the first runtime mutation.
-        _set_runtime_workdir(workdir_path)
+        _set_runtime_workdir(workdir_path, runtime_root)
         if model_client is not None:
             _set_runtime_value("client", model_client)
         if command_executor is not None:
             _set_runtime_value("COMMAND_EXECUTOR", command_executor)
         _set_runtime_value("TOOL_POLICY", tool_policy)
         _set_runtime_value("CASE_DEADLINE", case_deadline)
+        if manage_lifecycle:
+            collection_snapshots = _isolate_runtime_collections()
         if isinstance(tool_policy, dict) and "background_tasks" in tool_policy:
             _set_runtime_value("BACKGROUND_TASKS_ENABLED", bool(tool_policy["background_tasks"]))
 
@@ -508,6 +555,8 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
 
         messages = [{"role": "user", "content": task}]
         context = update_context({}, [])
+        if manage_lifecycle:
+            start_scheduler(load_durable=True)
         if command_executor is not None:
             command_executor.start()
         with agent_lock:
@@ -539,13 +588,18 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
             except BaseException as cleanup_exc:
                 cleanup_errors.append(cleanup_exc)
 
-        # Stop the executor first so in-flight docker exec calls unblock, then
-        # give worker threads only a small bounded grace period.
+        if manage_lifecycle:
+            cleanup_step(lambda: stop_scheduler(cleanup_grace))
+            cleanup_step(lambda: stop_all_teammates(cleanup_grace))
+        # Stop the executor so in-flight command calls unblock, then give
+        # background workers only a small bounded grace period.
         if command_executor is not None:
             cleanup_step(command_executor.stop)
         cleanup_step(lambda: wait_for_background_tasks(cleanup_grace))
         if run is not None:
             cleanup_step(lambda: _copy_trace_file(run.trace_path, trace_path))
+        if collection_snapshots is not None:
+            cleanup_step(lambda: _restore_runtime_collections(collection_snapshots))
         for name in reversed(state_names):
             cleanup_step(lambda name=name: _set_runtime_value(name, old_state[name]))
         if cleanup_errors and not active_exception:

@@ -32,6 +32,8 @@ class MessageBus:
 
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
+teammate_threads: dict[str, threading.Thread] = {}
+teammate_stop_events: dict[str, threading.Event] = {}
 
 
 import sys as _sys

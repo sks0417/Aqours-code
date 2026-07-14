@@ -261,7 +261,10 @@ def test_runner_constraint_violation_overrides_passing_grader(tmp_path, monkeypa
     monkeypatch.setattr(run_eval, "run_agent_task", fake_agent)
     monkeypatch.setattr(run_eval, "run_grader", fake_grader)
 
-    result = run_eval.run_case(case_dir, tmp_path / "runs", scripted=True)
+    result = run_eval.run_case(
+        case_dir, tmp_path / "runs", scripted=True,
+        execution_config=run_eval.EvalExecutionConfig(backend="local"),
+    )
 
     assert result["passed"] is False
     assert result["failure_category"] == "constraint_violation"
@@ -301,7 +304,10 @@ def test_tampered_grader_py_is_detected_before_grader_runs(tmp_path, monkeypatch
 
     monkeypatch.setattr(run_eval, "run_agent_task", fake_agent)
 
-    result = run_eval.run_case(case_dir, tmp_path / "runs", scripted=True)
+    result = run_eval.run_case(
+        case_dir, tmp_path / "runs", scripted=True,
+        execution_config=run_eval.EvalExecutionConfig(backend="local"),
+    )
 
     assert result["passed"] is False
     assert result["score"] == 0
@@ -321,7 +327,10 @@ def test_tampered_original_workspace_and_grader_tests_are_detected(tmp_path, mon
 
     monkeypatch.setattr(run_eval, "run_agent_task", fake_agent)
 
-    result = run_eval.run_case(case_dir, tmp_path / "runs", scripted=True)
+    result = run_eval.run_case(
+        case_dir, tmp_path / "runs", scripted=True,
+        execution_config=run_eval.EvalExecutionConfig(backend="local"),
+    )
 
     assert result["passed"] is False
     assert result["failure_category"] == "constraint_violation"

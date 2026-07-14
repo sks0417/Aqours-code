@@ -26,6 +26,9 @@ def agent_metadata(**updates):
         "sandbox_error": "",
         "command_timed_out": False,
         "overall_timed_out": False,
+        "model_broker_stopped": True,
+        "model_broker_ipc_cleaned": True,
+        "agent_state_cleaned": True,
     }
     value.update(updates)
     return value
@@ -58,7 +61,7 @@ def test_grader_receives_only_remaining_case_budget(tmp_path, monkeypatch):
              "cleanup_succeeded": True, "timed_out": False},
         )
 
-    monkeypatch.setattr(run_eval, "_run_isolated_agent_phase", fake_agent)
+    monkeypatch.setattr(run_eval, "_run_docker_agent_phase", fake_agent)
     monkeypatch.setattr(run_eval, "run_docker_grader", fake_grader)
     monkeypatch.setattr(
         run_eval,
@@ -95,7 +98,7 @@ def test_stuck_grader_and_cleanup_end_within_deadline_plus_shared_grace(
     def runner_factory(**kwargs):
         return real_runner(**kwargs, runner=hanging_runner)
 
-    monkeypatch.setattr(run_eval, "_run_isolated_agent_phase", fake_agent)
+    monkeypatch.setattr(run_eval, "_run_docker_agent_phase", fake_agent)
     monkeypatch.setattr(run_eval, "DockerGraderRunner", runner_factory)
     monkeypatch.setattr(run_eval, "CLEANUP_GRACE_SECONDS", 0.2)
     monkeypatch.setattr(
@@ -219,7 +222,7 @@ def test_chown_failure_is_fail_closed_sandbox_error_before_agent_or_grader(
 
     monkeypatch.setattr(run_eval, "prepare_disposable_tree", failing_prepare)
     monkeypatch.setattr(
-        run_eval, "_run_isolated_agent_phase",
+        run_eval, "_run_docker_agent_phase",
         lambda **_kwargs: pytest.fail("Agent must not start after chown failure"),
     )
     monkeypatch.setattr(

@@ -33,7 +33,9 @@ cron_queue: list = []
 cron_lock = threading.Lock()
 _scheduler_lock = threading.Lock()
 _scheduler_thread = None
+_scheduler_stop = threading.Event()
 _last_fired: dict[str, str] = {}
+CRON_LAST_FIRED = _last_fired
 
 
 def _cron_field_matches(field: str, value: int) -> bool:
@@ -256,8 +258,7 @@ def cancel_once_job(job_id: str) -> str:
 
 
 def cron_scheduler_loop():
-    while True:
-        time.sleep(1)
+    while not _scheduler_stop.wait(0.05):
         now = datetime.now()
         marker = now.strftime("%Y-%m-%d %H:%M")
         with cron_lock:
@@ -288,6 +289,7 @@ def start_scheduler(load_durable: bool = True):
     with _scheduler_lock:
         if _scheduler_thread is not None and _scheduler_thread.is_alive():
             return _scheduler_thread
+        _scheduler_stop.clear()
         if load_durable:
             load_durable_jobs()
             load_durable_once_jobs()
@@ -300,11 +302,48 @@ def start_scheduler(load_durable: bool = True):
         return _scheduler_thread
 
 
+def stop_scheduler(timeout: float = 2.0) -> bool:
+    """Stop the non-interactive scheduler within a bounded grace period."""
+    global _scheduler_thread
+    with _scheduler_lock:
+        thread = _scheduler_thread
+        _scheduler_stop.set()
+    if thread is not None:
+        thread.join(max(0, timeout))
+    stopped = thread is None or not thread.is_alive()
+    if stopped:
+        with _scheduler_lock:
+            if _scheduler_thread is thread:
+                _scheduler_thread = None
+    return stopped
+
+
 def consume_cron_queue() -> list[CronJob]:
     with cron_lock:
         fired = list(cron_queue)
         cron_queue.clear()
     return fired
+
+
+def wait_for_imminent_once(max_wait: float = 2.0) -> bool:
+    """Wait only for a near-term once job; never hold a run for long schedules."""
+    deadline = time.monotonic() + max(0, max_wait)
+    while time.monotonic() < deadline:
+        with cron_lock:
+            if cron_queue:
+                return True
+            due_times = [job.run_at for job in scheduled_once_jobs.values()]
+        if not due_times:
+            return False
+        delay = min(due_times) - time.time()
+        if delay > max_wait:
+            return False
+        if delay <= 0:
+            time.sleep(0.02)
+        else:
+            time.sleep(min(0.05, delay))
+    with cron_lock:
+        return bool(cron_queue)
 
 
 def run_schedule_cron(cron: str, prompt: str,

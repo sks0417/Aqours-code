@@ -57,25 +57,35 @@ workspace. If case/grader files change during a run, the case fails with
 `constraint_violation`. Grader pytest runs use `sys.executable -m pytest` with
 plugin autoloading and user site packages disabled for reproducibility.
 
-By default evals remain local and backward compatible:
+Docker full-runtime execution is the safe default. `--scripted` changes only
+the host-side model implementation; it still runs the complete Agent container:
 
 ```powershell
-python evals/run_eval.py --scripted --execution local
+python evals/run_eval.py --scripted --docker-build
 ```
 
-Docker mode runs the Agent Loop and model API client in a dedicated, killable
-host process and routes every `bash` call through `docker exec` into one
-per-case container. The model is offered only workspace-safe file tools,
-containerized `bash`, todo/compact, and the synchronous subagent. Host worktree,
-persistent task, teammate, cron, skill, and MCP tools are not exposed. Disabled
-tools and the active policy are recorded in the trace. Restricted prompt
-assembly also disables memory, skill-catalog, MCP-state, and teammate-state
-context, and describes only the tools actually present in the allowlist.
+Docker mode starts one one-shot container whose entrypoint runs the normal
+`run_agent_task()` with `LocalCommandExecutor`. Agent Loop, file tools, Bash,
+Skill, Memory, persistent Task, subagent, teammate, protocol, Worktree, Cron,
+background work, and MCP handlers all execute inside that container. The full
+28-tool policy and dynamically connected `mcp__...` tools are recorded in the
+trace. Memory, skill catalog, MCP state, and active teammate state are assembled
+from a fresh per-case state tree.
 
-The Agent container sees only the writable `agent_workspace` at `/workspace`.
-Run traces and their index are written under a sibling trusted `agent_runtime`
-directory, then exported for grading, so the Agent cannot rewrite its own audit
-trail through Bash or file tools.
+The Agent image contains an immutable installed copy of `codepilot_s20` and Git.
+It receives only the writable case workspace at `/workspace`, isolated Harness
+state at `/state`, result/trace storage at `/runtime`, and a narrow Model Broker
+IPC at `/broker`. The original project tree, host `.env`, Docker socket,
+`trusted_eval`, and `grading_workspace` are never mounted. A disposable Git
+baseline is initialized inside the container so Worktree operations never run
+host Git.
+
+The network-disabled container has no model credentials. Its
+`BrokerModelClient` writes nonce-scoped, schema-validated `messages.create`
+requests to per-case IPC. A host broker holding the existing real model client
+or `ScriptedEvalClient` writes responses; it exposes no filesystem, command, or
+general RPC surface. Requests, responses, call count, deadline, and cleanup are
+tracked in case metadata.
 After the Agent process stops, grading runs in a different one-shot container
 with read-only mounts for `trusted_eval`, `grading_workspace`, and the
 trace/final/stdout/stderr inputs.
@@ -85,7 +95,7 @@ python evals/run_eval.py --scripted --execution docker --docker-build
 python evals/run_eval.py --execution docker --case mini_auth_service_security_fix
 ```
 
-The eval image is pinned to Python 3.11.9 with locked Python dependencies in
+The eval image is pinned to Python 3.11.9 with eval dependencies in
 `evals/docker/requirements.lock`. Docker sandboxes use no network, a read-only
 root filesystem, a non-root user, dropped capabilities, no-new-privileges,
 bounded memory/CPU/PIDs/file descriptors, and a size-limited `/tmp`. Docker
@@ -96,9 +106,8 @@ On POSIX hosts the Agent/Grader numeric UID and GID match the non-root host
 owner so Linux and WSL2 bind mounts remain writable/readable. Windows Docker
 Desktop uses the image's fixed non-root identity. When the host itself is UID 0,
 only disposable per-case copies are prepared for UID/GID 10001; symlinks are not
-followed and original cases or project files are never chowned. Agent startup performs a real
-write/delete probe inside `/workspace` and fails closed if the mount is not
-writable. `--docker-timeout` is one wall-clock budget for the complete case:
+followed and original cases or project files are never chowned.
+`--docker-timeout` is one wall-clock budget for the complete case:
 workspace preparation, Agent execution, model requests, Bash, result transfer,
 grading, and cleanup. Cleanup shares one absolute deadline with a bounded
 three-second grace; it does not receive a fresh timeout per Docker command.
@@ -109,3 +118,12 @@ clear command-line error instead of fabricating an eval failure.
 
 The permission hook remains active in Docker mode. It is an application policy
 layer in addition to the container boundary, not a replacement for it.
+
+For development compatibility only, local execution remains explicit:
+
+```powershell
+python evals/run_eval.py --scripted --execution local
+```
+
+Docker startup/build failure is a hard eval failure and never falls back to
+local execution.

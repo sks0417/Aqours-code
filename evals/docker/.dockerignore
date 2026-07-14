@@ -1,3 +1,2 @@
-**
-!Dockerfile
-!requirements.lock
+# The build context is the project root. The root .dockerignore excludes
+# credentials, local state, cases, results, tests, and VCS metadata.

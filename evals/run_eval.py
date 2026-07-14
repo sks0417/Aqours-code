@@ -51,8 +51,14 @@ from codepilot_s20.command_executor import (  # noqa: E402
     LocalCommandExecutor,
     SandboxError,
 )
-from evals.docker_sandbox import DockerGraderRunner, build_eval_image  # noqa: E402
+from evals.docker_sandbox import (  # noqa: E402
+    DockerAgentRunner,
+    DockerGraderRunner,
+    build_eval_image,
+)
 from codepilot_s20.docker_utils import prepare_disposable_tree  # noqa: E402
+from codepilot_s20.config import MODEL, MODEL_PROVIDER, get_model_client  # noqa: E402
+from codepilot_s20.model_broker import ModelBroker  # noqa: E402
 
 
 DEFAULT_BREAKDOWN_WEIGHTS = {
@@ -90,6 +96,7 @@ def require_case_time(deadline: float | None, stage: str):
         raise CaseTimeoutError(f"eval case deadline exceeded during {stage}")
 
 RUNTIME_IGNORE_PATTERNS = [
+    ".git/**",
     ".codepilot/**",
     ".tasks/**",
     ".task_outputs/**",
@@ -102,25 +109,24 @@ RUNTIME_IGNORE_PATTERNS = [
 ]
 TAMPER_ENTRY_NAMES = {"pytest.py", "conftest.py", "sitecustomize.py", "usercustomize.py"}
 TRUSTED_ROOT_FILES = {"task.md", "metadata.yaml", "grader.py"}
-TRUSTED_DIRS = {"workspace", "grader_tests"}
+TRUSTED_DIRS = {"workspace", "grader_tests", "agent_state"}
 DOCKER_EVAL_TOOL_POLICY = {
-    "name": "docker_eval_restricted",
+    "name": "docker_eval_full_harness",
     "allowed_tools": [
-        "bash", "read_file", "write_file", "edit_file", "glob",
-        "todo_write", "compact", "task",
+        "bash", "read_file", "write_file", "edit_file", "glob", "todo_write",
+        "task", "load_skill", "compact", "create_task", "list_tasks",
+        "get_task", "claim_task", "complete_task", "schedule_cron",
+        "schedule_once", "list_crons", "cancel_cron", "spawn_teammate",
+        "send_message", "check_inbox", "request_shutdown", "request_plan",
+        "review_plan", "create_worktree", "remove_worktree", "keep_worktree",
+        "connect_mcp",
     ],
-    "disabled_tools": [
-        "create_task", "list_tasks", "get_task", "claim_task", "complete_task",
-        "schedule_cron", "schedule_once", "list_crons", "cancel_cron",
-        "spawn_teammate", "send_message", "check_inbox", "request_shutdown",
-        "request_plan", "review_plan", "create_worktree", "remove_worktree",
-        "keep_worktree", "connect_mcp", "load_skill",
-    ],
-    "allow_mcp": False,
-    "allow_memory_context": False,
-    "allow_skill_context": False,
-    "allow_teammate_context": False,
-    "background_tasks": False,
+    "disabled_tools": [],
+    "allow_mcp": True,
+    "allow_memory_context": True,
+    "allow_skill_context": True,
+    "allow_teammate_context": True,
+    "background_tasks": True,
     "prompt_runtime": {
         "os": "Linux",
         "platform": "Docker Linux container",
@@ -134,7 +140,7 @@ DOCKER_EVAL_TOOL_POLICY = {
 
 @dataclass(frozen=True)
 class EvalExecutionConfig:
-    backend: str = "local"
+    backend: str = "docker"
     docker_image: str = "codepilot-s20-eval:py311"
     docker_memory: str = "1g"
     docker_cpus: str = "1"
@@ -791,8 +797,251 @@ def prepare_docker_disposable_paths(case_output: Path, *paths: Path):
                 ) from exc
 
 
-def _docker_agent_process(payload: dict, result_connection):
-    """Child-process entry point for one Docker-backed Agent phase."""
+AGENT_STATE_DIRS = (
+    "skills", ".memory", ".tasks", ".mailboxes", ".worktrees",
+    ".task_outputs", ".transcripts",
+)
+
+
+def prepare_agent_state(case_dir: Path, state_root: Path):
+    """Create a fresh per-case Harness state tree from eval-only fixtures."""
+    if state_root.exists():
+        shutil.rmtree(state_root)
+    state_root.mkdir(parents=True)
+    for dirname in AGENT_STATE_DIRS:
+        (state_root / dirname).mkdir(parents=True, exist_ok=True)
+    fixture_root = case_dir / "agent_state"
+    if fixture_root.is_dir():
+        symlinks = [path for path in fixture_root.rglob("*") if path.is_symlink()]
+        if symlinks:
+            raise ValueError(
+                f"agent state fixture may not contain symlinks: {symlinks[0]}")
+        for source in fixture_root.iterdir():
+            target = state_root / source.name
+            if source.is_symlink():
+                raise ValueError(f"agent state fixture may not be a symlink: {source}")
+            if source.is_dir():
+                shutil.copytree(source, target, dirs_exist_ok=True, symlinks=False)
+            elif source.is_file():
+                shutil.copy2(source, target, follow_symlinks=False)
+
+
+def _copy_runtime_artifact(runtime_root: Path, name: str, target: Path):
+    source = runtime_root / name
+    if source.is_file():
+        shutil.copy2(source, target)
+
+
+def _model_broker_process(payload: dict):
+    """Killable host process that owns model credentials and provider I/O."""
+    model_client = (
+        ScriptedEvalClient(payload["case_name"])
+        if payload["scripted"]
+        else get_model_client(payload["model_provider"])
+    )
+    broker = ModelBroker(
+        payload["ipc_root"],
+        payload["nonce"],
+        model_client,
+        case_deadline=payload["case_deadline"],
+    )
+    broker.serve_forever()
+
+
+def _run_docker_agent_phase(
+    *,
+    task: str,
+    case_name: str,
+    agent_workspace: Path,
+    agent_state: Path,
+    runtime_root: Path,
+    ipc_root: Path,
+    trace_path: Path,
+    timeline_path: Path,
+    timeline_md_path: Path,
+    metadata_path: Path,
+    final_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    scripted: bool,
+    config: EvalExecutionConfig,
+    case_deadline: float,
+) -> tuple[dict, str, dict]:
+    """Run the full Agent Runtime in a one-shot container."""
+    nonce = uuid.uuid4().hex
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    ipc_root.mkdir(parents=True, exist_ok=True)
+    (ipc_root / "requests").mkdir(parents=True, exist_ok=True)
+    (ipc_root / "responses").mkdir(parents=True, exist_ok=True)
+    remaining = remaining_timeout(case_deadline)
+    input_payload = {
+        "task": task,
+        "workspace": "/workspace",
+        "state_root": "/state",
+        "runtime_root": "/runtime",
+        "ipc_root": "/broker",
+        "broker_nonce": nonce,
+        "model": "scripted-eval" if scripted else MODEL,
+        "request_timeout": min(
+            float(os.getenv("MODEL_REQUEST_TIMEOUT", "30")), remaining),
+        "case_timeout_seconds": remaining,
+        "cleanup_grace": CLEANUP_GRACE_SECONDS,
+        "tool_policy": DOCKER_EVAL_TOOL_POLICY,
+    }
+    write_text(runtime_root / "input.json", json.dumps(input_payload, indent=2))
+    try:
+        prepare_docker_disposable_paths(
+            runtime_root.parent, agent_workspace, agent_state, runtime_root, ipc_root)
+    except BaseException:
+        for path in (ipc_root, agent_state):
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                pass
+        raise
+
+    broker_context = multiprocessing.get_context("spawn")
+    broker_process = broker_context.Process(
+        target=_model_broker_process,
+        args=({
+            "ipc_root": str(ipc_root),
+            "nonce": nonce,
+            "case_name": case_name,
+            "scripted": scripted,
+            "model_provider": MODEL_PROVIDER,
+            "case_deadline": case_deadline,
+        },),
+        name=f"codepilot-model-broker-{case_name}",
+    )
+    try:
+        broker_process.start()
+    except (OSError, RuntimeError) as exc:
+        for path in (ipc_root, agent_state):
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                pass
+        raise SandboxError(
+            f"Model Broker failed to start: {type(exc).__name__}: {exc}") from exc
+    runner = DockerAgentRunner(
+        image=config.docker_image,
+        case_name=case_name,
+        memory=config.docker_memory,
+        cpus=config.docker_cpus,
+        pids_limit=config.docker_pids_limit,
+        timeout=remaining,
+        operation_deadline=case_deadline,
+        cleanup_deadline=case_deadline + CLEANUP_GRACE_SECONDS,
+    )
+    proc = subprocess.CompletedProcess([], 1, "", "Agent did not start")
+    metadata = {}
+    broker_stopped = False
+    unexpected_error = None
+    try:
+        proc, metadata = runner.run(
+            agent_workspace=agent_workspace,
+            agent_state=agent_state,
+            runtime_root=runtime_root,
+            ipc_root=ipc_root,
+        )
+    except SandboxError as exc:
+        metadata = {
+            "execution_backend": "docker",
+            "docker_image": config.docker_image,
+            "container_started": runner.container_started,
+            "container_exit_code": runner.container_exit_code,
+            "container_timed_out": runner.timed_out,
+            "container_cleanup_succeeded": runner.cleanup_succeeded,
+            "resource_limits": runner.resource_limits,
+            "sandbox_error": str(exc),
+            "container_entrypoint": "python -m codepilot_s20.eval_container_entry",
+        }
+        proc = subprocess.CompletedProcess([], 125, "", str(exc))
+    except BaseException as exc:
+        unexpected_error = exc
+    finally:
+        broker_cleanup_deadline = case_deadline + CLEANUP_GRACE_SECONDS
+        if broker_process.is_alive():
+            broker_process.terminate()
+            broker_process.join(remaining_timeout(broker_cleanup_deadline))
+        if broker_process.is_alive():
+            broker_process.kill()
+            broker_process.join(remaining_timeout(broker_cleanup_deadline))
+        broker_stopped = not broker_process.is_alive()
+
+    if unexpected_error is not None:
+        for path in (ipc_root, agent_state):
+            try:
+                shutil.rmtree(path)
+            except OSError:
+                pass
+        raise unexpected_error
+
+    write_text(stdout_path, proc.stdout or "")
+    write_text(stderr_path, proc.stderr or "")
+    for name, target in (
+        ("trace.jsonl", trace_path),
+        ("timeline.jsonl", timeline_path),
+        ("timeline.md", timeline_md_path),
+        ("metadata.json", metadata_path),
+        ("final.md", final_path),
+    ):
+        _copy_runtime_artifact(runtime_root, name, target)
+
+    result_payload = {}
+    result_path = runtime_root / "result.json"
+    if result_path.is_file():
+        try:
+            result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            result_payload = {"ok": False, "error": f"invalid Agent result: {exc}"}
+    if not result_payload:
+        if metadata.get("container_timed_out"):
+            error = "CaseTimeoutError: Agent container exceeded the case deadline"
+        else:
+            error = (proc.stderr or f"Agent container exited {proc.returncode}").strip()
+        result_payload = {"ok": False, "error": error}
+
+    run_info = result_payload.get("run_info", {})
+    command_metadata = run_info.get("execution", {}) if isinstance(run_info, dict) else {}
+    broker_stats = {}
+    broker_stats_path = ipc_root / "broker_stats.json"
+    if broker_stats_path.is_file():
+        try:
+            broker_stats = json.loads(broker_stats_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            broker_stats = {}
+    metadata.update({
+        "model_broker_calls": broker_stats.get("call_count", 0),
+        "model_broker_error": broker_stats.get("last_error", ""),
+        "model_broker_stopped": broker_stopped,
+        "model_broker_exit_code": broker_process.exitcode,
+        "model_broker_ipc_cleaned": False,
+        "command_execution_count": command_metadata.get("command_execution_count", 0),
+        "tool_policy": DOCKER_EVAL_TOOL_POLICY,
+    })
+    try:
+        shutil.rmtree(ipc_root)
+        metadata["model_broker_ipc_cleaned"] = not ipc_root.exists()
+    except OSError:
+        metadata["model_broker_ipc_cleaned"] = False
+    try:
+        shutil.rmtree(agent_state)
+        metadata["agent_state_cleaned"] = not agent_state.exists()
+    except OSError:
+        metadata["agent_state_cleaned"] = False
+
+    error = "" if result_payload.get("ok") else str(
+        result_payload.get("error") or f"Agent container exited {proc.returncode}")
+    if proc.returncode != 0 and not error:
+        error = f"Agent container exited {proc.returncode}"
+    if not broker_stopped and not error:
+        error = "ModelBrokerCleanupError: host broker process did not stop"
+    return run_info, error, metadata
+
+
+def _isolated_local_agent_process(payload: dict, result_connection):
+    """Compatibility child-process entry for killable local-only tests."""
     config = EvalExecutionConfig(**payload["execution_config"])
     executor = None
     deadline = payload["case_deadline"]
@@ -820,7 +1069,7 @@ def _docker_agent_process(payload: dict, result_connection):
                 model_provider="scripted" if payload["scripted"] else None,
                 model="scripted-eval" if payload["scripted"] else None,
                 command_executor=executor,
-                tool_policy=DOCKER_EVAL_TOOL_POLICY,
+                tool_policy=payload.get("tool_policy"),
                 case_deadline=deadline,
                 trace_storage_root=payload["trace_storage_root"],
             )
@@ -855,7 +1104,11 @@ def _run_isolated_agent_phase(
     config: EvalExecutionConfig,
     case_deadline: float | None = None,
 ) -> tuple[dict, str, dict]:
-    """Run the complete host Agent loop in a killable per-case process."""
+    """Run the explicit local compatibility Agent in a killable process."""
+    if config.backend != "local":
+        raise ValueError(
+            "_run_isolated_agent_phase is local-only; Docker must use the "
+            "one-shot eval_container_entry path")
     container_name = (
         f"codepilot-agent-{DockerCommandExecutor._safe_name(case_name)}-"
         f"{uuid.uuid4().hex[:10]}"
@@ -872,6 +1125,7 @@ def _run_isolated_agent_phase(
         "scripted": scripted,
         "container_name": container_name,
         "case_deadline": case_deadline,
+        "tool_policy": None,
         "execution_config": {
             "backend": config.backend,
             "docker_image": config.docker_image,
@@ -884,7 +1138,7 @@ def _run_isolated_agent_phase(
     context = multiprocessing.get_context("spawn")
     result_connection, child_connection = context.Pipe(duplex=False)
     process = context.Process(
-        target=_docker_agent_process,
+        target=_isolated_local_agent_process,
         args=(payload, child_connection),
         name=f"codepilot-eval-{case_name}",
     )
@@ -1039,7 +1293,13 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
     trusted_eval_root = case_output / "trusted_eval"
     agent_workspace = case_output / "agent_workspace"
     grading_workspace = case_output / "grading_workspace"
+    agent_state = case_output / "agent_state"
+    agent_runtime = case_output / "agent_runtime"
+    broker_ipc = case_output / "broker_ipc"
     trace_path = case_output / "trace.jsonl"
+    timeline_path = case_output / "timeline.jsonl"
+    timeline_md_path = case_output / "timeline.md"
+    run_metadata_path = case_output / "metadata.json"
     stdout_path = case_output / "stdout.txt"
     stderr_path = case_output / "stderr.txt"
     final_path = case_output / "final.md"
@@ -1056,7 +1316,19 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
     original_snapshot = workspace_snapshot(trusted_case_dir / "workspace")
     copy_case_workspace(trusted_case_dir, agent_workspace)
     if execution_config.backend == "docker":
-        prepare_docker_disposable_paths(case_output, agent_workspace)
+        try:
+            prepare_agent_state(trusted_case_dir, agent_state)
+            agent_runtime.mkdir(parents=True, exist_ok=True)
+            broker_ipc.mkdir(parents=True, exist_ok=True)
+            prepare_docker_disposable_paths(
+                case_output, agent_workspace, agent_state, agent_runtime, broker_ipc)
+        except BaseException:
+            for disposable in (agent_state, broker_ipc):
+                try:
+                    shutil.rmtree(disposable)
+                except OSError:
+                    pass
+            raise
     require_case_time(case_deadline, "workspace preparation")
     task = (trusted_case_dir / "task.md").read_text(encoding="utf-8")
     command_executor = None
@@ -1064,11 +1336,18 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
     agent_error = ""
     run_info = {}
     if execution_config.backend == "docker":
-        run_info, agent_error, execution_metadata = _run_isolated_agent_phase(
+        run_info, agent_error, execution_metadata = _run_docker_agent_phase(
             task=task,
             case_name=case_name,
             agent_workspace=agent_workspace,
+            agent_state=agent_state,
+            runtime_root=agent_runtime,
+            ipc_root=broker_ipc,
             trace_path=trace_path,
+            timeline_path=timeline_path,
+            timeline_md_path=timeline_md_path,
+            metadata_path=run_metadata_path,
+            final_path=final_path,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             scripted=scripted,
@@ -1264,6 +1543,12 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
 
     if execution_config.backend == "docker":
         agent_cleanup = execution_metadata.get("container_cleanup_succeeded")
+        agent_phase_cleanup = (
+            agent_cleanup is True
+            and execution_metadata.get("model_broker_stopped") is True
+            and execution_metadata.get("model_broker_ipc_cleaned") is True
+            and execution_metadata.get("agent_state_cleaned") is True
+        )
         grader_attempted = grader_execution.get("status") != "not_started"
         grader_cleanup = (grader_execution.get("cleanup_succeeded")
                           if grader_attempted else None)
@@ -1271,19 +1556,21 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             "agent_container_started": execution_metadata.get("container_started", False),
             "agent_container_exit_code": execution_metadata.get("container_exit_code"),
             "agent_container_cleanup_succeeded": agent_cleanup,
+            "agent_phase_cleanup_succeeded": agent_phase_cleanup,
             "grader_container_started": (grader_execution.get("container_started")
                                            if grader_attempted else None),
             "grader_container_exit_code": (grader_execution.get("container_exit_code")
                                              if grader_attempted else None),
             "grader_container_cleanup_succeeded": grader_cleanup,
             "all_container_cleanup_succeeded": (
-                agent_cleanup is True and grader_cleanup is True),
+                agent_phase_cleanup is True and grader_cleanup is True),
         }
     else:
         lifecycle = {
             "agent_container_started": None,
             "agent_container_exit_code": None,
             "agent_container_cleanup_succeeded": None,
+            "agent_phase_cleanup_succeeded": True,
             "grader_container_started": None,
             "grader_container_exit_code": None,
             "grader_container_cleanup_succeeded": None,
@@ -1311,6 +1598,9 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
         "trusted_violations": trusted_violations,
         "trusted_case": str(trusted_case_dir),
         "trace": str(trace_path),
+        "timeline": str(timeline_path),
+        "timeline_markdown": str(timeline_md_path),
+        "run_metadata": str(run_metadata_path),
         "transcript": str(transcript_path),
         "stdout": str(stdout_path),
         "stderr": str(stderr_path),
@@ -1424,6 +1714,20 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
         "command_execution_count": sum(
             result.get("command_execution_count", 0) for result in results
         ),
+        "model_broker_calls": sum(
+            result.get("model_broker_calls", 0) for result in results
+        ),
+        "model_broker_stopped": (
+            None if execution_config.backend != "docker" else bool(results) and all(
+                result.get("model_broker_stopped") is True for result in results)),
+        "model_broker_ipc_cleaned": (
+            None if execution_config.backend != "docker" else bool(results) and all(
+                result.get("model_broker_ipc_cleaned") is True for result in results)),
+        "container_entrypoint": (
+            "python -m codepilot_s20.eval_container_entry"
+            if execution_config.backend == "docker" else None),
+        "tool_policy": (
+            DOCKER_EVAL_TOOL_POLICY if execution_config.backend == "docker" else None),
         "resource_limits": configured_resource_limits(execution_config),
         "interrupted": interrupted,
         "interrupt_reason": interrupt_reason,
@@ -1473,6 +1777,9 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
         "submitted_changes": [],
         "trusted_violations": [],
         "trace": str(run_root / case.name / "trace.jsonl"),
+        "timeline": str(run_root / case.name / "timeline.jsonl"),
+        "timeline_markdown": str(run_root / case.name / "timeline.md"),
+        "run_metadata": str(run_root / case.name / "metadata.json"),
         "transcript": str(run_root / case.name / "transcript.md"),
         "stdout": str(run_root / case.name / "stdout.txt"),
         "stderr": str(run_root / case.name / "stderr.txt"),
@@ -1493,6 +1800,14 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
         "grader_container_cleanup_succeeded": None,
         "all_container_cleanup_succeeded": False if execution_config.backend == "docker" else True,
         "command_execution_count": 0,
+        "model_broker_calls": 0,
+        "model_broker_stopped": False if execution_config.backend == "docker" else None,
+        "model_broker_ipc_cleaned": False if execution_config.backend == "docker" else None,
+        "container_entrypoint": (
+            "python -m codepilot_s20.eval_container_entry"
+            if execution_config.backend == "docker" else None),
+        "tool_policy": (
+            DOCKER_EVAL_TOOL_POLICY if execution_config.backend == "docker" else None),
         "resource_limits": configured_resource_limits(execution_config),
         "grader_execution": {
             "status": "not_started" if execution_config.backend == "docker" else "not_applicable",
@@ -1521,8 +1836,10 @@ def main() -> int:
                         help="Per model HTTP request timeout in seconds. Default: 30.")
     parser.add_argument("--scripted", action="store_true",
                         help="Use the deterministic local scripted client for offline harness smoke tests. By default evals call the configured model API.")
-    parser.add_argument("--execution", choices=("local", "docker"), default="local",
-                        help="Where agent bash commands and grading run. Default: local.")
+    parser.add_argument("--execution", choices=("local", "docker"), default="docker",
+                        help=("Run the full Agent Runtime and grader in Docker. "
+                              "Use local only as an explicit development compatibility mode. "
+                              "Default: docker."))
     parser.add_argument("--docker-image", default="codepilot-s20-eval:py311",
                         help="Eval sandbox image name.")
     parser.add_argument("--docker-build", action="store_true",
