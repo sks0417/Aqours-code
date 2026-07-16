@@ -1,0 +1,8 @@
+id: stress_inventory_reservation_consistency
+suite: stress
+difficulty: 5
+category: end_to_end_business_logic
+max_model_calls: 40
+forbidden_paths: [README.md, pyproject.toml, tests/**]
+expected_artifacts: [src/inventory_service/__init__.py, src/inventory_service/api.py, src/inventory_service/bootstrap.py, src/inventory_service/errors.py, src/inventory_service/idempotency_repository.py, src/inventory_service/inventory_repository.py, src/inventory_service/models.py, src/inventory_service/reservation_repository.py, src/inventory_service/serialization.py, src/inventory_service/service.py, src/inventory_service/state.py, src/inventory_service/validation.py]
+allowed_changes: [src/inventory_service/*.py]
