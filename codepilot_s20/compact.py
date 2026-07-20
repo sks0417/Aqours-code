@@ -43,61 +43,217 @@ def collect_tool_results(messages: list):
     return found
 
 
-def persist_large_output(tool_use_id: str, output: str) -> str:
-    if len(output) <= PERSIST_THRESHOLD:
+def collect_tool_result_messages(messages: list):
+    found = []
+    for mi, message in enumerate(messages):
+        content = message.get("content")
+        if message.get("role") != "user" or not isinstance(content, list):
+            continue
+        blocks = [block for block in content
+                  if isinstance(block, dict)
+                  and block.get("type") == "tool_result"]
+        if blocks:
+            found.append((mi, message, blocks))
+    return found
+
+
+def _block_field(block, name: str, default=None):
+    if isinstance(block, dict):
+        return block.get(name, default)
+    return getattr(block, name, default)
+
+
+def _collect_tool_uses(messages: list) -> dict[str, dict]:
+    uses = {}
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") != "assistant" or not isinstance(content, list):
+            continue
+        for block in content:
+            if block_type(block) != "tool_use":
+                continue
+            tool_use_id = _block_field(block, "id")
+            if not tool_use_id:
+                continue
+            tool_input = _block_field(block, "input", {})
+            uses[str(tool_use_id)] = {
+                "name": str(_block_field(block, "name", "")),
+                "input": tool_input if isinstance(tool_input, dict) else {},
+            }
+    return uses
+
+
+def _batch_counts_toward_recent(blocks: list, tool_uses: dict) -> bool:
+    """Return whether a result batch carries working-set evidence.
+
+    A pure todo update is control-plane state, not repository evidence. Unknown
+    tool results remain protected so schema drift cannot silently discard them.
+    Plain reminders and notifications are not tool-result batches and therefore
+    never reach this classifier.
+    """
+    for block in blocks:
+        tool_use = tool_uses.get(str(block.get("tool_use_id", "")))
+        if tool_use is None or tool_use["name"] != "todo_write":
+            return True
+    return False
+
+
+def _recent_read_working_set_indices(batches: list, tool_uses: dict,
+                                     max_paths: int) -> set[int]:
+    """Keep the newest bounded set of distinct file reads available.
+
+    Tool-result batches can be very uneven: one turn may read a dozen related
+    source files while the next reads one test. Protecting only a fixed number
+    of messages lets that one-file turn evict the repository working set. A
+    path bound preserves breadth without adding a summary model call or an
+    unbounded live prompt.
+    """
+    protected = set()
+    seen_paths = set()
+    for message_index, _, blocks in reversed(batches):
+        batch_paths = []
+        for block in reversed(blocks):
+            if len(str(block.get("content", ""))) <= 120:
+                continue
+            tool_use = tool_uses.get(str(block.get("tool_use_id", "")))
+            if not tool_use or tool_use["name"] != "read_file":
+                continue
+            path = _normalized_read_path(tool_use)
+            if path and path not in seen_paths and path not in batch_paths:
+                batch_paths.append(path)
+        if not batch_paths or len(seen_paths) >= max_paths:
+            continue
+        protected.add(message_index)
+        # A message is the atomic compaction unit, so retain every path in a
+        # selected wide batch even if it crosses the soft path bound.
+        seen_paths.update(batch_paths)
+    return protected
+
+
+def _normalized_read_path(tool_use: dict) -> str:
+    path = str(tool_use.get("input", {}).get("path", "")).replace("\\", "/")
+    while "//" in path:
+        path = path.replace("//", "/")
+    return path.rstrip("/")
+
+
+def _compact_duplicate_read_results(messages: list, batches: list,
+                                    tool_uses: dict, target_size: int):
+    """Compact older identical reads first while retaining the newest copy."""
+    seen: dict[tuple[str, str], str] = {}
+    duplicates = []
+    for _, _, blocks in reversed(batches):
+        for block in reversed(blocks):
+            tool_use_id = str(block.get("tool_use_id", ""))
+            tool_use = tool_uses.get(tool_use_id)
+            if not tool_use or tool_use["name"] != "read_file":
+                continue
+            path = _normalized_read_path(tool_use)
+            content = str(block.get("content", ""))
+            if not path or len(content) <= 120:
+                continue
+            key = (path, content)
+            newer_tool_use_id = seen.get(key)
+            if newer_tool_use_id is None:
+                seen[key] = tool_use_id
+                continue
+            duplicates.append((block, newer_tool_use_id))
+
+    for block, newer_tool_use_id in reversed(duplicates):
+        block["content"] = (
+            "[Duplicate read compacted. Identical content is retained in "
+            f"newer tool result {newer_tool_use_id}.]"
+        )
+        if estimate_size(messages) <= target_size:
+            break
+
+
+def persist_large_output(tool_use_id: str, output: str, *, force: bool = False,
+                         preview_chars: int | None = None) -> str:
+    if not force and len(output) <= PERSIST_THRESHOLD:
         return output
     TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
     if not path.exists():
-        path.write_text(output)
+        path.write_text(output, encoding="utf-8")
     lines = output.splitlines()
-    head = "\n".join(lines[:40])
-    tail = "\n".join(lines[-40:]) if len(lines) > 40 else ""
+    preview_chars = (PERSIST_PREVIEW_CHARS if preview_chars is None
+                     else max(0, int(preview_chars)))
+    head_chars = preview_chars // 2
+    tail_chars = preview_chars - head_chars
+    head = output[:head_chars] if head_chars else ""
+    tail = (output[-tail_chars:]
+            if tail_chars and len(output) > preview_chars else "")
     parts = [
         "<persisted-output>",
         f"Full output: {path}",
         f"Character count: {len(output)}",
         f"Line count: {len(lines)}",
-        "First lines:",
-        head or "(empty)",
     ]
+    if head:
+        parts.extend(["First output:", head])
     if tail:
-        parts.extend(["Last lines:", tail])
+        parts.extend(["Last output:", tail])
     parts.append("</persisted-output>")
     return "\n".join(parts)
 
 
-def tool_result_budget(messages: list, max_bytes: int = 200_000) -> list:
+def tool_result_budget(messages: list, max_bytes: int | None = None) -> list:
     if not messages:
         return messages
-    last = messages[-1]
-    content = last.get("content")
-    if last.get("role") != "user" or not isinstance(content, list):
+    max_bytes = TOOL_RESULT_BATCH_LIMIT if max_bytes is None else int(max_bytes)
+    batches = collect_tool_result_messages(messages)
+    if not batches:
         return messages
-    blocks = [(i, b) for i, b in enumerate(content)
-              if isinstance(b, dict) and b.get("type") == "tool_result"]
-    for _, block in blocks:
-        text = str(block.get("content", ""))
+    blocks = batches[-1][2]
+    originals = [(block, str(block.get("content", ""))) for block in blocks]
+    for block, text in originals:
         if len(text) > PERSIST_THRESHOLD:
             block["content"] = persist_large_output(
                 block.get("tool_use_id", "unknown"), text)
-    total = sum(len(str(b.get("content", ""))) for _, b in blocks)
+
+    def total_size():
+        return sum(len(str(block.get("content", ""))) for block in blocks)
+
+    total = total_size()
     if total <= max_bytes:
         return messages
-    for _, block in sorted(blocks,
-                           key=lambda pair: len(str(pair[1].get("content", ""))),
-                           reverse=True):
+
+    per_result_preview = max(0, max_bytes // max(1, len(blocks)) - 512)
+    for block, original in sorted(originals,
+                                  key=lambda pair: len(pair[1]),
+                                  reverse=True):
         if total <= max_bytes:
             break
-        text = str(block.get("content", ""))
-        block["content"] = persist_large_output(
-            block.get("tool_use_id", "unknown"), text)
-        total = sum(len(str(b.get("content", ""))) for _, b in blocks)
+        candidate = persist_large_output(
+            block.get("tool_use_id", "unknown"), original,
+            force=True, preview_chars=per_result_preview)
+        if len(candidate) < len(str(block.get("content", ""))):
+            block["content"] = candidate
+            total = total_size()
+
+    # Very wide tool batches may still exceed the budget after every result
+    # gets an equal preview. Drop previews oldest-first while retaining the
+    # persisted path and result identity for every block.
+    if total > max_bytes:
+        for block, original in originals:
+            if total <= max_bytes:
+                break
+            candidate = persist_large_output(
+                block.get("tool_use_id", "unknown"), original,
+                force=True, preview_chars=0)
+            if len(candidate) < len(str(block.get("content", ""))):
+                block["content"] = candidate
+                total = total_size()
     return messages
 
 
-def snip_compact(messages: list, max_messages: int = 50) -> list:
-    if len(messages) <= max_messages:
+def snip_compact(messages: list, max_messages: int | None = None,
+                 trigger_size: int | None = None) -> list:
+    max_messages = SNIP_MAX_MESSAGES if max_messages is None else int(max_messages)
+    trigger_size = (MICRO_COMPACT_TRIGGER if trigger_size is None
+                    else int(trigger_size))
+    if len(messages) <= max_messages or estimate_size(messages) <= trigger_size:
         return messages
     head_end, tail_start = 3, len(messages) - (max_messages - 3)
     if head_end > 0 and message_has_tool_use(messages[head_end - 1]):
@@ -115,13 +271,52 @@ def snip_compact(messages: list, max_messages: int = 50) -> list:
             + messages[tail_start:])
 
 
-def micro_compact(messages: list) -> list:
-    tool_results = collect_tool_results(messages)
-    if len(tool_results) <= KEEP_RECENT_TOOL_RESULTS:
+def _compacted_result_text(content) -> str:
+    text = str(content)
+    persisted_path = next(
+        (line for line in text.splitlines() if line.startswith("Full output: ")),
+        "",
+    )
+    marker = "[Earlier tool result compacted after it was consumed.]"
+    return f"{marker}\n{persisted_path}" if persisted_path else marker
+
+
+def micro_compact(messages: list, trigger_size: int | None = None,
+                  target_size: int | None = None) -> list:
+    trigger_size = (MICRO_COMPACT_TRIGGER if trigger_size is None
+                    else int(trigger_size))
+    target_size = (MICRO_COMPACT_TARGET if target_size is None
+                   else int(target_size))
+    if estimate_size(messages) <= trigger_size:
         return messages
-    for _, _, block in tool_results[:-KEEP_RECENT_TOOL_RESULTS]:
-        if len(str(block.get("content", ""))) > 120:
-            block["content"] = "[Earlier tool result compacted. Re-run if needed.]"
+    batches = collect_tool_result_messages(messages)
+    if not batches:
+        return messages
+    tool_uses = _collect_tool_uses(messages)
+
+    # Repeated reads are pure duplication. Reclaim them before sacrificing a
+    # different file or command result, including when both reads are recent.
+    _compact_duplicate_read_results(
+        messages, batches, tool_uses, target_size)
+    if estimate_size(messages) <= target_size:
+        return messages
+
+    working_batches = [batch for batch in batches
+                       if _batch_counts_toward_recent(batch[2], tool_uses)]
+    protected_indices = {
+        batch[0] for batch in working_batches[-KEEP_RECENT_TOOL_RESULT_MESSAGES:]
+    }
+    protected_indices.update(_recent_read_working_set_indices(
+        batches, tool_uses, KEEP_RECENT_READ_PATHS))
+    for message_index, _, blocks in batches:
+        if message_index in protected_indices:
+            continue
+        for block in blocks:
+            if len(str(block.get("content", ""))) > 120:
+                block["content"] = _compacted_result_text(
+                    block.get("content", ""))
+        if estimate_size(messages) <= target_size:
+            break
     return messages
 
 
@@ -138,7 +333,11 @@ def summarize_history(messages: list) -> str:
     conversation = json.dumps(messages, default=str)[:80000]
     prompt = ("Summarize this coding-agent conversation so work can continue. "
               "Preserve current goal, key findings, changed files, remaining work, "
-              "and user constraints.\n\n" + conversation)
+              "and user constraints. Preserve the inspected file/symbol map and "
+              "exact contract facts involving any/all/different/unchanged, "
+              "normalized or fingerprint fields, and exception/state branches. "
+              "Distinguish verified code facts from assumptions so compacted "
+              "history is not treated as proof.\n\n" + conversation)
     response = client.messages.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -157,29 +356,43 @@ def _record_compact_event(kind: str, transcript: Path, messages: list):
         pass
 
 
+def _history_and_recent_tail(messages: list, keep_tail: int):
+    tail_start = max(0, len(messages) - keep_tail)
+    if (tail_start > 0 and tail_start < len(messages)
+            and is_tool_result_message(messages[tail_start])
+            and message_has_tool_use(messages[tail_start - 1])):
+        tail_start -= 1
+    history, tail = messages[:tail_start], messages[tail_start:]
+    # A short conversation can still exceed the limit because of one huge
+    # prompt or response. Summarize it whole instead of preserving the cause.
+    if not history or estimate_size(tail) > int(CONTEXT_LIMIT * 0.6):
+        return messages, []
+    return history, tail
+
+
 def compact_history(messages: list) -> list:
     transcript = write_transcript(messages)
     _record_compact_event("automatic", transcript, messages)
     print(f"  \033[36m[compact] transcript saved: {transcript}\033[0m")
-    summary = summarize_history(messages)
-    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
+    history, tail = _history_and_recent_tail(
+        messages, COMPACT_KEEP_TAIL_MESSAGES)
+    summary = summarize_history(history)
+    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"},
+            *tail]
 
 
 def reactive_compact(messages: list) -> list:
     transcript = write_transcript(messages)
     _record_compact_event("reactive", transcript, messages)
     print(f"  \033[31m[reactive compact] transcript saved: {transcript}\033[0m")
-    tail_start = max(0, len(messages) - 5)
-    if (tail_start > 0 and tail_start < len(messages)
-            and is_tool_result_message(messages[tail_start])
-            and message_has_tool_use(messages[tail_start - 1])):
-        tail_start -= 1
+    history, tail = _history_and_recent_tail(
+        messages, COMPACT_KEEP_TAIL_MESSAGES)
     try:
-        summary = summarize_history(messages[:tail_start])
+        summary = summarize_history(history)
     except Exception:
         summary = "Earlier conversation was trimmed after a prompt-too-long error."
     return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"},
-            *messages[tail_start:]]
+            *tail]
 
 
 

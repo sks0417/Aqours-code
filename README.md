@@ -38,6 +38,10 @@ material for agents to repair, not part of the project unit test suite.
 
 ## Eval
 
+压力 Eval 暴露的 Harness 问题、根因、方案与验证状态统一维护在
+[`HARNESS_ISSUES.md`](HARNESS_ISSUES.md)。修复只有通过原始复现 case 后才标记为
+`Validated`。
+
 Install the dev dependencies before running evals so graders use the real
 pytest package from the controlled Python environment:
 
@@ -55,12 +59,28 @@ Host prepares a disposable case copy
 -> trusted tests produce the final summary
 ```
 
-The Agent container runs the normal `run_agent_task()` with all 28 built-in
+The Agent container runs the normal `run_agent_task()` with all 30 built-in
 tools, dynamic MCP tools, Skill, Memory, Task, Cron, Background, Subagent,
 Teammate, Protocol, and Worktree support. It receives only `/workspace`,
 per-case `/state`, `/runtime`, and the model forwarding directories. The host
 project, API keys, Docker socket, trusted grader, and grading workspace are not
 mounted. The container is network-disabled, non-root, and resource limited.
+
+For complex code changes, `todo_write` distinguishes execution steps
+(`kind=plan`) from external requirements (`kind=acceptance`). Completed
+acceptance items require concise evidence. The compact live prompt preserves
+only acceptance state across Context compression, and the Agent performs one
+bounded review before finalizing. Unverified requirements are surfaced in the
+final result instead of silently being treated as completed.
+
+Complex tasks also use a role-based delegation policy. An `explorer` receives a
+fresh, read-only context to map contracts and code paths before implementation;
+a `reviewer` independently audits the latest workspace revision before final;
+and an optional `worker` implements one bounded slice in an isolated Git
+worktree. Worker changes are committed by the Harness but remain outside the
+main workspace until the Lead calls `integrate_worktree`; overlapping Lead and
+Worker file changes are rejected without discarding the worktree. The Lead
+remains responsible for decomposition, integration, tests, and the final answer.
 
 The host-side Model Broker exists only so API keys stay on the host. It accepts
 schema-checked `messages.create` calls for the selected model and applies one
@@ -79,6 +99,13 @@ or grader files from becoming the source of truth.
 grading, and cleanup. Background work may run inside the Agent container; a
 one-shot Eval waits for it only until that deadline and injects completed output
 as `task_notification`. Interactive CLI sessions keep true background behavior.
+
+`--request-timeout` is the per-attempt Host Provider timeout. Docker Eval keeps
+API keys and one transient-error retry in the Host Model Broker. The container's
+IPC wait covers both Provider attempts, the 1-second retry delay, and a 5-second
+delivery grace (for example, a 60-second Provider timeout yields a 126-second
+IPC window). Every attempt consumes the case call and requested-token budgets,
+and all waits are still capped by `--docker-timeout`.
 
 Docker is the default. `--scripted` changes only the host-side model response;
 the complete Agent and Grader containers still run:

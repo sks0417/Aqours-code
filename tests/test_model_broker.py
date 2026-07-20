@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.error
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,10 +11,14 @@ from types import SimpleNamespace
 import pytest
 
 from codepilot_s20.model_broker import (
+    BrokerIpcTimeout,
     BrokerModelClient,
     BrokerProtocolError,
+    BrokerRemoteError,
     ModelBroker,
+    broker_ipc_wait_timeout,
 )
+from codepilot_s20 import recovery
 from codepilot_s20.eval_container_entry import main as container_entry_main
 from evals import run_eval
 
@@ -101,7 +107,207 @@ def test_broker_returns_model_errors_without_exposing_other_host_rpc(tmp_path):
         broker.stop()
 
     assert broker.call_count == 1
+    assert broker.retry_count == 0
     assert "model unavailable" in broker.last_error
+
+
+@pytest.mark.parametrize("first_error", [
+    urllib.error.URLError(TimeoutError("SSL handshake timed out")),
+    RuntimeError("Model request failed: HTTP 503: temporarily unavailable"),
+])
+def test_broker_retries_one_transient_provider_error_without_overlap(
+    tmp_path, first_error,
+):
+    class FlakyMessages(RecordingMessages):
+        def __init__(self):
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                if len(self.calls) == 1:
+                    raise first_error
+                return SimpleNamespace(
+                    content=[text_block("recovered")], stop_reason="end_turn")
+            finally:
+                self.active -= 1
+
+    nonce = uuid.uuid4().hex
+    messages = FlakyMessages()
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="case-model", max_calls=2, max_total_tokens=16000,
+        provider_timeout=0.1, max_provider_retries=1,
+        provider_retry_delay=0, delivery_grace=0.1,
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        response = client.messages.create(
+            model="case-model", messages=[], max_tokens=8000)
+    finally:
+        broker.stop()
+
+    assert response.content[0].text == "recovered"
+    assert len(messages.calls) == 2
+    assert messages.max_active == 1
+    assert broker.request_count == 1
+    assert broker.call_count == 2
+    assert broker.retry_count == 1
+    assert broker.requested_token_count == 16000
+    assert broker.rejected_count == 0
+    assert broker.last_error == ""
+    assert broker.last_provider_error
+
+
+@pytest.mark.parametrize(("max_calls", "max_total_tokens", "blocked_reason"), [
+    (1, 16000, "call_budget"),
+    (2, 8000, "token_budget"),
+])
+def test_broker_does_not_retry_when_attempt_budget_is_exhausted(
+    tmp_path, max_calls, max_total_tokens, blocked_reason,
+):
+    class TimeoutMessages:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            raise urllib.error.URLError(TimeoutError("handshake timed out"))
+
+    nonce = uuid.uuid4().hex
+    messages = TimeoutMessages()
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="case-model", max_calls=max_calls,
+        max_total_tokens=max_total_tokens,
+        provider_timeout=0.1, max_provider_retries=1,
+        provider_retry_delay=0, delivery_grace=0.1,
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        with pytest.raises(BrokerRemoteError) as caught:
+            client.messages.create(
+                model="case-model", messages=[], max_tokens=8000)
+    finally:
+        broker.stop()
+
+    assert caught.value.error_kind == "provider_timeout"
+    assert messages.calls == 1
+    assert broker.call_count == 1
+    assert broker.retry_count == 0
+    assert broker.retry_skipped_reason == blocked_reason
+
+
+def test_broker_does_not_retry_without_full_case_time_window(tmp_path):
+    class TimeoutMessages:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            raise urllib.error.URLError(TimeoutError("handshake timed out"))
+
+    nonce = uuid.uuid4().hex
+    messages = TimeoutMessages()
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="case-model", case_deadline=time.monotonic() + 0.5,
+        max_calls=2, max_total_tokens=16000,
+        provider_timeout=0.4, max_provider_retries=1,
+        provider_retry_delay=0, delivery_grace=0.2,
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        with pytest.raises(BrokerRemoteError) as caught:
+            client.messages.create(
+                model="case-model", messages=[], max_tokens=8000)
+    finally:
+        broker.stop()
+
+    assert caught.value.error_kind == "provider_timeout"
+    assert messages.calls == 1
+    assert broker.call_count == 1
+    assert broker.retry_count == 0
+    assert broker.retry_skipped_reason == "case_deadline"
+
+
+def test_broker_does_not_retry_permanent_provider_error(tmp_path):
+    class UnauthorizedMessages:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("Model request failed: HTTP 401: invalid key")
+
+    nonce = uuid.uuid4().hex
+    messages = UnauthorizedMessages()
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="case-model", max_calls=2, max_total_tokens=16000,
+        provider_timeout=0.1, max_provider_retries=1,
+        provider_retry_delay=0, delivery_grace=0.1,
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        with pytest.raises(BrokerRemoteError) as caught:
+            client.messages.create(
+                model="case-model", messages=[], max_tokens=8000)
+    finally:
+        broker.stop()
+
+    assert caught.value.error_kind == "provider_http_401"
+    assert messages.calls == 1
+    assert broker.call_count == 1
+    assert broker.retry_count == 0
+
+
+def test_agent_recovery_does_not_multiply_broker_managed_retries():
+    calls = 0
+
+    def fail():
+        nonlocal calls
+        calls += 1
+        raise BrokerRemoteError(
+            "provider_http_429", "rate limited", "request_1234567890")
+
+    with pytest.raises(BrokerRemoteError):
+        recovery.with_retry(fail, recovery.RecoveryState())
+
+    assert calls == 1
+
+
+def test_broker_client_classifies_missing_delivery_as_ipc_timeout(tmp_path):
+    nonce = uuid.uuid4().hex
+    client = BrokerModelClient(
+        tmp_path, nonce, request_timeout=0.05, poll_interval=0.005)
+
+    with pytest.raises(BrokerIpcTimeout, match="broker_ipc_timeout"):
+        client.messages.create(model="case-model", messages=[])
+
+    assert not list((tmp_path / "requests").glob("*.json"))
+    assert not list((tmp_path / "responses").glob("*.json"))
+
+
+def test_ipc_wait_window_covers_retry_backoff_and_delivery_grace():
+    assert broker_ipc_wait_timeout(
+        60, max_provider_retries=1, retry_delay=1, delivery_grace=5,
+    ) == 126
+    assert run_eval.model_broker_timeouts(60, 600) == (60, 126)
+    assert run_eval.model_broker_timeouts(60, 100) == (60, 100)
+
+
+@pytest.mark.parametrize(("message", "category"), [
+    ("BrokerIpcTimeout: broker_ipc_timeout: no response", "broker_ipc_timeout"),
+    ("provider_timeout: SSL handshake timed out", "provider_http_timeout"),
+    ("CaseTimeoutError: Agent container exceeded the case deadline", "case_timeout"),
+])
+def test_broker_transport_failures_have_distinct_categories(message, category):
+    assert run_eval.agent_failure_category(message) == category
 
 
 def test_broker_rejects_wrong_model_without_calling_host_client(tmp_path):
@@ -252,6 +458,7 @@ def test_noninteractive_container_entry_runs_normal_agent_through_broker(
         "broker_nonce": nonce,
         "model": "scripted-eval",
         "request_timeout": 2,
+        "broker_request_timeout": 7,
         "case_timeout_seconds": 10,
         "cleanup_grace": 1,
         "tool_policy": run_eval.DOCKER_EVAL_TOOL_POLICY,

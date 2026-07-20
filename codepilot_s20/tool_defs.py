@@ -20,7 +20,7 @@ from .protocol import (
     run_review_plan,
 )
 from .skills import load_skill
-from .subagent import spawn_subagent
+from .subagent import delegate_agent, spawn_subagent
 from .tool_handlers import (
     run_check_inbox,
     run_claim_task,
@@ -28,11 +28,13 @@ from .tool_handlers import (
     run_create_task,
     run_create_worktree,
     run_get_task,
+    run_integrate_worktree,
     run_keep_worktree,
     run_list_tasks,
     run_remove_worktree,
     run_send_message,
     run_spawn_teammate,
+    run_delegate_agent,
 )
 
 # ── Tool Definitions ──
@@ -62,19 +64,29 @@ BUILTIN_TOOLS = [
                                      "old_text": {"type": "string"},
                                      "new_text": {"type": "string"}},
                       "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
+    {"name": "glob", "description": ("Find files matching a glob pattern; ** "
+                                      "is recursive. Prefer one task-relevant "
+                                      "pattern and do not probe unrelated "
+                                      "language extensions."),
      "input_schema": {"type": "object",
                       "properties": {"pattern": {"type": "string"}},
                       "required": ["pattern"]}},
     {"name": "todo_write",
-     "description": "Create and manage a task list for the current session.",
+     "description": ("Create and manage implementation plan steps and contract "
+                     "acceptance criteria. Use kind=plan for work still to do and "
+                     "kind=acceptance for every externally required outcome, "
+                     "including error paths omitted by public tests. Completed "
+                     "acceptance items require concise evidence."),
      "input_schema": {"type": "object",
-                      "properties": {"todos": {"type": "array",
+                      "properties": {"todos": {"type": "array", "maxItems": 20,
                           "items": {"type": "object",
                                     "properties": {
-                                        "content": {"type": "string"},
+                                        "content": {"type": "string", "maxLength": 500},
                                         "status": {"type": "string",
-                                                   "enum": ["pending", "in_progress", "completed"]}},
+                                                   "enum": ["pending", "in_progress", "completed"]},
+                                        "kind": {"type": "string",
+                                                 "enum": ["plan", "acceptance"]},
+                                        "evidence": {"type": "string", "maxLength": 500}},
                                     "required": ["content", "status"]}}},
                       "required": ["todos"]}},
     {"name": "task",
@@ -84,6 +96,19 @@ BUILTIN_TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"description": {"type": "string"}},
                       "required": ["description"]}},
+    {"name": "delegate_agent",
+     "description": ("Delegate a bounded task to a fresh role context. explorer "
+                     "maps contracts/code read-only; reviewer independently audits "
+                     "final correctness read-only; worker edits only an isolated "
+                     "worktree and returns a commit that must be integrated."),
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "role": {"type": "string",
+                                   "enum": ["explorer", "reviewer", "worker"]},
+                          "prompt": {"type": "string"},
+                          "name": {"type": "string"},
+                          "task_id": {"type": "string"}},
+                      "required": ["role", "prompt"]}},
     {"name": "load_skill",
      "description": "Load the full content of a skill by name.",
      "input_schema": {"type": "object",
@@ -200,6 +225,14 @@ BUILTIN_TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"}},
                       "required": ["name"]}},
+    {"name": "integrate_worktree",
+     "description": ("Integrate a finalized worker worktree into the lead workspace. "
+                     "Refuses overlapping lead/worker file changes and preserves "
+                     "the worktree when integration cannot complete."),
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"},
+                                     "cleanup": {"type": "boolean"}},
+                      "required": ["name"]}},
     {"name": "connect_mcp",
      "description": "Connect to an MCP server (docs, deploy) and discover tools.",
      "input_schema": {"type": "object",
@@ -211,6 +244,7 @@ BUILTIN_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob,
     "todo_write": run_todo_write, "task": spawn_subagent,
+    "delegate_agent": run_delegate_agent,
     "load_skill": load_skill,
     "create_task": run_create_task, "list_tasks": run_list_tasks,
     "get_task": run_get_task,
@@ -226,6 +260,7 @@ BUILTIN_HANDLERS = {
     "create_worktree": run_create_worktree,
     "remove_worktree": run_remove_worktree,
     "keep_worktree": run_keep_worktree,
+    "integrate_worktree": run_integrate_worktree,
     "connect_mcp": run_connect_mcp,
 }
 

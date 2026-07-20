@@ -101,6 +101,15 @@ def test_budget_failure_preserves_broker_usage_metadata(tmp_path, monkeypatch):
         run_eval, "prepare_docker_disposable_paths",
         lambda *_args, **_kwargs: None,
     )
+    monkeypatch.setattr(
+        run_eval, "run_docker_grader",
+        lambda **_kwargs: (
+            passing_grader_result(),
+            subprocess.CompletedProcess([], 0, "{}", ""),
+            {"container_started": True, "container_exit_code": 0,
+             "cleanup_succeeded": True, "timed_out": False},
+        ),
+    )
 
     result = run_eval.run_case(
         run_eval.PROJECT_ROOT / "evals" / "cases" / "read_file_basic",
@@ -109,8 +118,90 @@ def test_budget_failure_preserves_broker_usage_metadata(tmp_path, monkeypatch):
             backend="docker", docker_image="eval:test"),
     )
 
+    assert result["passed"] is False
+    assert result["score"] == 0
     assert result["failure_category"] == "budget_exhausted"
+    assert result["diagnostic_score"] == 100
+    assert result["diagnostic_breakdown"] == dict(
+        run_eval.DEFAULT_BREAKDOWN_WEIGHTS)
+    assert result["diagnostic_grader"]["passed"] is True
+    assert result["grader_execution"]["status"] == "completed"
+    assert result["grader_container_cleanup_succeeded"] is True
     assert {key: result[key] for key in usage} == usage
+    summary = run_eval.build_summary(
+        started=time.time(), cases_dir=tmp_path, run_root=tmp_path,
+        mode="real-model", results=[result],
+        execution_config=run_eval.EvalExecutionConfig(backend="docker"),
+    )
+    assert summary["diagnostically_graded_cases"] == 1
+    assert summary["avg_diagnostic_score"] == 100
+
+
+def test_case_timeout_agent_failure_does_not_start_diagnostic_grader(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        run_eval, "_run_docker_agent_phase",
+        lambda **_kwargs: (
+            {}, "CaseTimeoutError: eval case deadline exceeded",
+            agent_metadata(overall_timed_out=True),
+        ),
+    )
+    monkeypatch.setattr(
+        run_eval, "run_docker_grader",
+        lambda **_kwargs: pytest.fail(
+            "case timeout must not start diagnostic grading"),
+    )
+    monkeypatch.setattr(
+        run_eval, "prepare_docker_disposable_paths",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = run_eval.run_case(
+        run_eval.PROJECT_ROOT / "evals" / "cases" / "read_file_basic",
+        tmp_path / "runs", scripted=True,
+        execution_config=run_eval.EvalExecutionConfig(
+            backend="docker", docker_image="eval:test"),
+    )
+
+    assert result["failure_category"] == "case_timeout"
+    assert result["diagnostic_score"] is None
+    assert result["grader_execution"]["status"] == "not_started"
+
+
+def test_agent_failure_with_unexpected_changes_skips_diagnostic_grader(
+    tmp_path, monkeypatch,
+):
+    def fake_agent(**kwargs):
+        Path(kwargs["agent_workspace"], "unexpected.txt").write_text(
+            "unsafe grading input", encoding="utf-8")
+        return (
+            {}, "BrokerProtocolError: model broker call limit exceeded",
+            agent_metadata(),
+        )
+
+    monkeypatch.setattr(run_eval, "_run_docker_agent_phase", fake_agent)
+    monkeypatch.setattr(
+        run_eval, "run_docker_grader",
+        lambda **_kwargs: pytest.fail(
+            "manifest violations must not start diagnostic grading"),
+    )
+    monkeypatch.setattr(
+        run_eval, "prepare_docker_disposable_paths",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = run_eval.run_case(
+        run_eval.PROJECT_ROOT / "evals" / "cases" / "read_file_basic",
+        tmp_path / "runs", scripted=True,
+        execution_config=run_eval.EvalExecutionConfig(
+            backend="docker", docker_image="eval:test"),
+    )
+
+    assert result["passed"] is False
+    assert result["diagnostic_score"] is None
+    assert result["unexpected_changes"] == ["unexpected.txt"]
+    assert result["grader_execution"]["status"] == "not_started"
 
 
 def test_stuck_grader_and_cleanup_end_within_deadline_plus_shared_grace(
@@ -176,7 +267,9 @@ def test_agent_cleanup_commands_share_one_absolute_deadline(tmp_path):
 
     assert elapsed < 0.3
     assert calls[0][0] == "inspect"
-    assert all(0 < timeout <= 0.12 for _kind, timeout in calls)
+    # Adding a small duration to a large Windows monotonic clock value can
+    # round the reconstructed interval a fraction above 0.12 seconds.
+    assert all(0 < timeout <= 0.12 + 1e-6 for _kind, timeout in calls)
     assert len(calls) <= 2
     assert executor.execution_metadata()["container_cleanup_succeeded"] is False
 

@@ -175,6 +175,26 @@ def _timeline_from_trace_event(event: dict):
                 "reason": event.get("reason", ""),
             }
         return None
+    if event_type == "background_routed":
+        return {
+            "type": "background_routed",
+            "ts": event.get("ts"),
+            "tool_use_id": event.get("tool_use_id", ""),
+            "command": event.get("command", ""),
+            "reason": event.get("reason", ""),
+        }
+    if event_type == "task_notification":
+        return {
+            "type": "task_notification",
+            "ts": event.get("ts"),
+            "task_id": event.get("task_id", ""),
+            "status": event.get("status", ""),
+            "command": event.get("command", ""),
+            "summary": event.get("summary", ""),
+            "injection": event.get("injection", ""),
+            "original_size": event.get("original_size", 0),
+            "truncated": bool(event.get("truncated", False)),
+        }
     if event_type == "error":
         return {
             "type": "error",
@@ -253,6 +273,40 @@ def _render_timeline_markdown(run_id: str, events: list[dict]) -> str:
                 "Guidance:",
                 "",
                 _format_markdown_value(event.get("reason", "")),
+                "",
+            ])
+        elif event_type == "background_routed":
+            lines.extend([
+                "## Background Task Routed",
+                "",
+                f"Tool use id: `{event.get('tool_use_id', '')}`",
+                "",
+                f"Reason: `{event.get('reason', '')}`",
+                "",
+                "Command:",
+                "",
+                _format_markdown_value(event.get("command", "")),
+                "",
+            ])
+        elif event_type == "task_notification":
+            truncation = "yes" if event.get("truncated") else "no"
+            lines.extend([
+                f"## Background Result: {event.get('task_id', '')}",
+                "",
+                f"Status: `{event.get('status', '')}`",
+                "",
+                f"Injected at: `{event.get('injection', '')}`",
+                "",
+                (f"Output size: `{event.get('original_size', 0)}` chars; "
+                 f"truncated: `{truncation}`"),
+                "",
+                "Command:",
+                "",
+                _format_markdown_value(event.get("command", "")),
+                "",
+                "Output:",
+                "",
+                _format_markdown_value(event.get("summary", "")),
                 "",
             ])
         elif event_type == "error":
@@ -861,14 +915,18 @@ def record_hook(name: str, **payload):
     record_event("hook", name=name, **payload)
 
 
-def record_llm_request(*, model: str, max_tokens: int, message_count: int, tool_count: int):
+def record_llm_request(*, model: str, max_tokens: int, message_count: int,
+                       tool_count: int, purpose: str = "lead",
+                       agent_role: str = ""):
     record_event("llm_request", model=model, max_tokens=max_tokens,
-                 message_count=message_count, tool_count=tool_count)
+                 message_count=message_count, tool_count=tool_count,
+                 purpose=purpose, agent_role=agent_role)
 
 
-def record_llm_response(response):
+def record_llm_response(response, *, purpose: str = "lead", agent_role: str = ""):
     record_event("llm_response", stop_reason=getattr(response, "stop_reason", None),
-                 content=_truncate(_content_text(getattr(response, "content", ""))))
+                 content=_truncate(_content_text(getattr(response, "content", ""))),
+                 purpose=purpose, agent_role=agent_role)
 
 
 def record_tool_use(block):

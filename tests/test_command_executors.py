@@ -156,8 +156,22 @@ def test_eval_image_build_uses_project_root_and_installs_runtime_and_git(tmp_pat
         encoding="utf-8")
     assert "FROM python:3.11.9-slim-bookworm" in dockerfile
     assert "apt-get install --no-install-recommends --yes git" in dockerfile
-    assert "python -m pip install --no-cache-dir /opt/codepilot-src" in dockerfile
+    assert "PIP_DEFAULT_TIMEOUT=60" in dockerfile
+    assert "PIP_RETRIES=8" in dockerfile
+    assert "--mount=type=cache,target=/root/.cache/pip,sharing=locked" in dockerfile
+    assert "python -m pip install --no-cache-dir --no-deps /opt/codepilot-src" in dockerfile
     assert "COPY codepilot_s20 /opt/codepilot-src/codepilot_s20" in dockerfile
+    assert "--trusted-host" not in dockerfile
+
+    dependency_copy = dockerfile.index(
+        "COPY evals/docker/requirements.lock /tmp/requirements.lock")
+    dependency_install = dockerfile.index(
+        "python -m pip install --requirement /tmp/requirements.lock")
+    source_copy = dockerfile.index(
+        "COPY codepilot_s20 /opt/codepilot-src/codepilot_s20")
+    runtime_install = dockerfile.index(
+        "python -m pip install --no-cache-dir --no-deps /opt/codepilot-src")
+    assert dependency_copy < dependency_install < source_copy < runtime_install
 
 
 def test_windows_mount_is_one_argument_not_colon_delimited():
@@ -535,7 +549,7 @@ def test_docker_eval_integration_smoke(tmp_path):
         event for event in run_eval.read_trace_events(Path(tests_result["trace"]))
         if event.get("type") == "tool_policy"
     ]
-    assert len(policy_events[-1]["allowed_tools"]) == 28
+    assert len(policy_events[-1]["allowed_tools"]) == 30
     assert policy_events[-1]["disabled_tools"] == []
 
     smoke_case = tmp_path / "_docker_bash_write_smoke"

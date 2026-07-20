@@ -1,4 +1,5 @@
 from .runtime_state import *
+from .agent_profiles import get_agent_profile
 
 # ── Teammate Thread ──
 
@@ -13,8 +14,13 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     # runtime restoration can never make a sandboxed eval fall back to local.
     teammate_command_executor = COMMAND_EXECUTOR
     stop_event = threading.Event()
-    system = (f"You are '{name}', a {role}. "
-              f"Use tools to complete tasks. "
+    role_profile = get_agent_profile(role)
+    profile_instructions = (
+        role_profile.instructions if role_profile else
+        "Use tools to complete the assigned task and report concrete results."
+    )
+    system = (f"You are '{name}', role: {role}. "
+              f"{profile_instructions} "
               f"If a task has a worktree, work in that directory.")
 
     def handle_inbox_message(name: str, msg: dict, messages: list):
@@ -52,6 +58,12 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
         def _run_write(path: str, content: str) -> str:
             return run_write(path, content, cwd=_wt_cwd())
+
+        def _run_edit(path: str, old_text: str, new_text: str) -> str:
+            return run_edit(path, old_text, new_text, cwd=_wt_cwd())
+
+        def _run_glob(pattern: str) -> str:
+            return run_glob(pattern, cwd=_wt_cwd())
 
         def _run_list_tasks():
             tasks = list_tasks()
@@ -92,6 +104,16 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                               "properties": {"path": {"type": "string"},
                                              "content": {"type": "string"}},
                               "required": ["path", "content"]}},
+            {"name": "edit_file", "description": "Replace exact text once.",
+             "input_schema": {"type": "object",
+                              "properties": {"path": {"type": "string"},
+                                             "old_text": {"type": "string"},
+                                             "new_text": {"type": "string"}},
+                              "required": ["path", "old_text", "new_text"]}},
+            {"name": "glob", "description": "Find files by glob pattern.",
+             "input_schema": {"type": "object",
+                              "properties": {"pattern": {"type": "string"}},
+                              "required": ["pattern"]}},
             {"name": "send_message",
              "description": "Send message to another agent.",
              "input_schema": {"type": "object",
@@ -121,13 +143,26 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
         sub_handlers = {
             "bash": _run_bash, "read_file": _run_read,
-            "write_file": _run_write,
+            "write_file": _run_write, "edit_file": _run_edit,
+            "glob": _run_glob,
             "send_message": lambda to, content: (BUS.send(name, to, content),
                                                   "Sent")[1],
             "list_tasks": _run_list_tasks,
             "claim_task": _run_claim_task,
             "complete_task": _run_complete_task,
         }
+        if role_profile:
+            coordination = {"send_message"}
+            if role_profile.uses_worktree:
+                coordination.update({
+                    "submit_plan", "list_tasks", "claim_task", "complete_task",
+                })
+            allowed = set(role_profile.tool_names) | coordination
+            sub_tools = [tool for tool in sub_tools if tool["name"] in allowed]
+            sub_handlers = {
+                tool_name: handler for tool_name, handler in sub_handlers.items()
+                if tool_name in allowed
+            }
 
         while True:
             if stop_event.is_set():

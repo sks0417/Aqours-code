@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -26,6 +27,40 @@ def tool_block():
             "run_in_background": True,
         },
     )
+
+
+@pytest.mark.parametrize("command", [
+    "cd /workspace && python -m pytest tests/ -v 2>&1",
+    "PYTHONPATH=src python -m pytest -q",
+    "env FOO=1 cargo test",
+    "npm run build",
+    "docker build .",
+    "bash -lc 'pytest -q'",
+])
+def test_slow_command_classifier_recognizes_command_structure(command):
+    assert background.is_slow_operation("bash", {"command": command}) is True
+
+
+@pytest.mark.parametrize("command", [
+    "cat tests/test_public_api.py",
+    "rg test src/",
+    "grep -n 'def test_' tests/test_api.py",
+    "echo build",
+    "python /tmp/debug_test.py",
+    "python -c \"print('pytest')\"",
+    "cat << 'PY' > /tmp/debug.py\npython -m pytest -q\nPY\npython /tmp/debug.py",
+])
+def test_slow_command_classifier_ignores_arguments_paths_and_heredocs(command):
+    assert background.is_slow_operation("bash", {"command": command}) is False
+
+
+def test_explicit_background_request_has_priority_over_classifier():
+    tool_input = {
+        "command": "cat tests/test_public_api.py",
+        "run_in_background": True,
+    }
+    assert background.background_reason("bash", tool_input) == "explicit"
+    assert background.should_run_background("bash", tool_input) is True
 
 
 class ControlledExecutor(LocalCommandExecutor):
@@ -132,6 +167,26 @@ def test_final_answer_waits_past_old_window_and_reinjects_notification(
         and "2 passed" in str(message.get("content"))
         for message in third_messages
     )
+    trace_events = [
+        json.loads(line)
+        for line in Path(outcome["result"]["trace_path"]).read_text(
+            encoding="utf-8").splitlines()
+    ]
+    notification = next(
+        event for event in trace_events
+        if event.get("type") == "task_notification"
+    )
+    assert notification["task_id"].startswith("bg_")
+    assert notification["status"] == "completed"
+    assert notification["command"] == "python -m pytest -q"
+    assert notification["summary"].endswith("2 passed")
+    assert notification["injection"] == "final_wait"
+    timeline_markdown = (
+        Path(outcome["result"]["run_dir"]) / "timeline.md"
+    ).read_text(encoding="utf-8")
+    assert "## Background Result:" in timeline_markdown
+    assert "2 passed" in timeline_markdown
+    assert "Injected at: `final_wait`" in timeline_markdown
     assert background.background_workers_alive() is False
     assert not any(
         thread.name.startswith((

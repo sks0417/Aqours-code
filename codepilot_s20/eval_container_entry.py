@@ -79,10 +79,18 @@ def main(argv: list[str] | None = None) -> int:
 
     timeout = max(0.1, float(config["case_timeout_seconds"]))
     case_deadline = time.monotonic() + timeout
+    provider_timeout = max(0.1, float(config.get("request_timeout", 30)))
+    broker_request_timeout = max(
+        provider_timeout,
+        float(config.get("broker_request_timeout", provider_timeout)),
+    )
     os.environ["CODEPILOT_S20_WORKDIR"] = str(workspace)
     os.environ["MODEL_PROVIDER"] = "broker"
     os.environ["MODEL_ID"] = str(config["model"])
-    os.environ["MODEL_REQUEST_TIMEOUT"] = str(config.get("request_timeout", 30))
+    # Provider calls happen in the Host Broker and retain the configured
+    # per-attempt timeout. The container IPC client waits long enough for the
+    # Broker-owned retry and final response delivery.
+    os.environ["MODEL_REQUEST_TIMEOUT"] = str(provider_timeout)
     # python-dotenv searches the process cwd. Import the runtime from the
     # isolated non-workspace directory so a case-provided /workspace/.env can
     # never become process configuration.
@@ -98,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     client = BrokerModelClient(
         ipc_root,
         config["broker_nonce"],
-        request_timeout=float(config.get("request_timeout", 30)),
+        request_timeout=broker_request_timeout,
         case_deadline=case_deadline,
     )
     result_path = runtime_root / "result.json"

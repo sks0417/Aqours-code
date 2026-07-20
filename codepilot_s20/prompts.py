@@ -4,11 +4,11 @@ from .runtime_state import *
 
 ALL_TOOL_NAMES = [
     "bash", "read_file", "write_file", "edit_file", "glob", "todo_write",
-    "task", "load_skill", "compact", "create_task", "list_tasks", "get_task",
+    "task", "delegate_agent", "load_skill", "compact", "create_task", "list_tasks", "get_task",
     "claim_task", "complete_task", "schedule_cron", "schedule_once", "list_crons",
     "cancel_cron", "spawn_teammate", "send_message", "check_inbox",
     "request_shutdown", "request_plan", "review_plan", "create_worktree",
-    "remove_worktree", "keep_worktree", "connect_mcp",
+    "remove_worktree", "keep_worktree", "integrate_worktree", "connect_mcp",
 ]
 
 
@@ -31,8 +31,22 @@ PROMPT_SECTIONS = {
                       "glob and read_file over bash for inspection tasks. Do not "
                       "create temporary files just to count, sort, or inspect data. "
                       "For multi-step tasks with several file or tool operations, "
-                      "call todo_write before the first non-todo tool call and keep "
-                      "the todo list updated as work progresses. "
+                      "inspect the task and relevant README/source first when needed, "
+                      "then call todo_write before the first file change and keep the "
+                      "todo list updated as work progresses. For complex code changes "
+                      "grounded in a task, README, contract, or test suite, include "
+                      "short, concrete kind=acceptance items for externally observable "
+                      "requirements before editing. Plan items are implementation work "
+                      "still to perform; acceptance items are contract outcomes, so do "
+                      "not mark the only plan completed while edits/tests remain. Cover "
+                      "every task-relevant explicit contract clause, including negative "
+                      "error paths and normalized fields, not only failures visible in "
+                      "public tests. After editing starts, retain those "
+                      "requirements and add newly discovered ones instead of replacing "
+                      "them. "
+                      "Mark an acceptance item completed only after reviewing the "
+                      "final change and attach concise evidence. Public tests alone "
+                      "do not prove uncovered contract requirements. "
                       "If a tool result says 'Tool not run' with guidance, treat it "
                       "as a recoverable policy rejection: follow the guidance and "
                       "continue with a safer read-only approach. If a result starts "
@@ -41,6 +55,13 @@ PROMPT_SECTIONS = {
                       "use check_inbox to poll it, or launch a task/subagent solely "
                       "to wait. Continue independent work or finish the turn; its "
                       "task_notification will report the result."),
+    "multiagent": ("Multiagent roles: the lead owns task decomposition, integration, "
+                   "tests, and final claims. Use delegate_agent explorer for fresh "
+                   "read-only repository/contract mapping, reviewer for an independent "
+                   "read-only final audit, and worker only for one bounded implementation "
+                   "slice. A worker writes in an isolated worktree; inspect its result "
+                   "and call integrate_worktree before relying on those changes. Avoid "
+                   "delegating trivial work or sending the whole task to a worker."),
 }
 
 
@@ -72,6 +93,8 @@ def assemble_system_prompt(context: dict) -> str:
                 format_runtime_context_for_prompt(prompt_runtime),
                 PROMPT_SECTIONS["tool_strategy"],
                 PROMPT_SECTIONS["permissions"]]
+    if "delegate_agent" in allowed_tools:
+        sections.insert(-1, PROMPT_SECTIONS["multiagent"])
     if any(name in allowed_tools for name in ("schedule_cron", "schedule_once")):
         sections.insert(2, PROMPT_SECTIONS["scheduling"])
     sections.append(f"Current time: {datetime.now().isoformat(timespec='seconds')}")
@@ -91,6 +114,18 @@ def assemble_system_prompt(context: dict) -> str:
         sections.append(
             "Active teammate state:\n"
             + (", ".join(teammates) if teammates else "(none)"))
+    acceptance = context.get("acceptance_todos", [])
+    if acceptance:
+        lines = []
+        for item in acceptance:
+            status = item.get("status", "pending")
+            line = f"- [{status}] {item.get('content', '')}"
+            if item.get("evidence"):
+                line += f" | evidence: {item['evidence']}"
+            lines.append(line)
+        sections.append(
+            "Protected acceptance checklist (verify before final):\n"
+            + "\n".join(lines))
     return "\n\n".join(sections)
 
 

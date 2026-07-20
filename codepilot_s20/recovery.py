@@ -23,6 +23,11 @@ def with_retry(fn, state: RecoveryState):
             state.consecutive_529 = 0
             return result
         except Exception as e:
+            # Docker Broker retries Provider transport failures only after the
+            # previous Host request has ended. Retrying the logical IPC call
+            # again here could multiply attempts or overlap unknown IPC state.
+            if getattr(e, "retry_managed", False):
+                raise
             name = type(e).__name__.lower()
             msg = str(e).lower()
             if "ratelimit" in name or "429" in msg:

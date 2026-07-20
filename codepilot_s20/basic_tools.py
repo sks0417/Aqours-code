@@ -82,7 +82,7 @@ def run_glob(pattern: str, cwd: Path = None) -> str:
     try:
         base = cwd or WORKDIR
         results = []
-        for match in g.glob(pattern, root_dir=base):
+        for match in sorted(g.glob(pattern, root_dir=base, recursive=True)):
             if (base / match).resolve().is_relative_to(base):
                 results.append(match)
         return "\n".join(results) if results else "(no matches)"
@@ -99,6 +99,11 @@ def call_tool_handler(handler, args: dict, name: str) -> str:
         return f"Error: {e}"
 
 
+_MAX_TODO_ITEMS = 20
+_MAX_ACCEPTANCE_ITEMS = 12
+_MAX_TODO_TEXT = 500
+
+
 def _normalize_todos(todos):
     if isinstance(todos, str):
         try:
@@ -110,23 +115,65 @@ def _normalize_todos(todos):
                 return None, "Error: todos must be a list or JSON array string"
     if not isinstance(todos, list):
         return None, "Error: todos must be a list"
+    if len(todos) > _MAX_TODO_ITEMS:
+        return None, f"Error: todos may contain at most {_MAX_TODO_ITEMS} items"
+    normalized = []
     for i, todo in enumerate(todos):
         if not isinstance(todo, dict):
             return None, f"Error: todos[{i}] must be an object"
         if "content" not in todo or "status" not in todo:
             return None, f"Error: todos[{i}] missing 'content' or 'status'"
+        content = str(todo["content"]).strip()
+        if not content:
+            return None, f"Error: todos[{i}] content must not be empty"
+        if len(content) > _MAX_TODO_TEXT:
+            return None, (
+                f"Error: todos[{i}] content exceeds {_MAX_TODO_TEXT} characters")
         if todo["status"] not in ("pending", "in_progress", "completed"):
             return None, f"Error: todos[{i}] has invalid status '{todo['status']}'"
-    return todos, None
+        kind = str(todo.get("kind", "plan")).strip().lower()
+        if kind not in ("plan", "acceptance"):
+            return None, f"Error: todos[{i}] has invalid kind '{kind}'"
+        evidence = str(todo.get("evidence", "")).strip()
+        if len(evidence) > _MAX_TODO_TEXT:
+            return None, (
+                f"Error: todos[{i}] evidence exceeds {_MAX_TODO_TEXT} characters")
+        if kind == "acceptance" and todo["status"] == "completed" and not evidence:
+            return None, (
+                f"Error: todos[{i}] completed acceptance item requires evidence")
+        item = {
+            "content": content,
+            "status": todo["status"],
+            "kind": kind,
+        }
+        if evidence:
+            item["evidence"] = evidence
+        normalized.append(item)
+    acceptance_count = sum(
+        1 for todo in normalized if todo["kind"] == "acceptance")
+    if acceptance_count > _MAX_ACCEPTANCE_ITEMS:
+        return None, (
+            "Error: todos may contain at most "
+            f"{_MAX_ACCEPTANCE_ITEMS} acceptance items")
+    return normalized, None
 
 def run_todo_write(todos: list) -> str:
-    global CURRENT_TODOS
     todos, error = _normalize_todos(todos)
     if error:
         return error
-    CURRENT_TODOS = todos
+    # Mutate the shared runtime list instead of rebinding this module's copy;
+    # Agent finalization and prompt assembly read the same live state.
+    CURRENT_TODOS[:] = todos
+    acceptance = [todo for todo in CURRENT_TODOS
+                  if todo.get("kind") == "acceptance"]
+    unverified = [todo for todo in acceptance
+                  if todo.get("status") != "completed"]
     print(f"  \033[33m[todo] updated {len(CURRENT_TODOS)} item(s)\033[0m")
-    return f"Updated {len(CURRENT_TODOS)} todos"
+    detail = ""
+    if acceptance:
+        detail = (f" ({len(acceptance)} acceptance, "
+                  f"{len(unverified)} unverified)")
+    return f"Updated {len(CURRENT_TODOS)} todos{detail}"
 
 
 

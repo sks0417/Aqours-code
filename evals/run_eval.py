@@ -64,7 +64,13 @@ from codepilot_s20.config import (  # noqa: E402
     MODEL_PROVIDER,
     get_model_client,
 )
-from codepilot_s20.model_broker import ModelBroker  # noqa: E402
+from codepilot_s20.model_broker import (  # noqa: E402
+    DEFAULT_IPC_DELIVERY_GRACE,
+    DEFAULT_PROVIDER_RETRIES,
+    DEFAULT_PROVIDER_RETRY_DELAY,
+    ModelBroker,
+    broker_ipc_wait_timeout,
+)
 
 
 DEFAULT_BREAKDOWN_WEIGHTS = {
@@ -83,6 +89,9 @@ FAILURE_CATEGORIES = {
     "grader_error",
     "model_error",
     "api_timeout",
+    "provider_http_timeout",
+    "broker_ipc_timeout",
+    "case_timeout",
     "test_timeout",
     "command_timeout",
     "sandbox_error",
@@ -98,6 +107,22 @@ def remaining_timeout(deadline: float | None, configured: float | None = None) -
         return float(configured) if configured is not None else 0.0
     remaining = max(0.0, deadline - time.monotonic())
     return min(remaining, float(configured)) if configured is not None else remaining
+
+
+def model_broker_timeouts(request_timeout: float, remaining: float) -> tuple[float, float]:
+    """Return Provider and IPC timeouts within the shared case budget."""
+    remaining = max(0.1, float(remaining))
+    provider_timeout = min(max(0.1, float(request_timeout)), remaining)
+    ipc_timeout = min(
+        broker_ipc_wait_timeout(
+            provider_timeout,
+            max_provider_retries=DEFAULT_PROVIDER_RETRIES,
+            retry_delay=DEFAULT_PROVIDER_RETRY_DELAY,
+            delivery_grace=DEFAULT_IPC_DELIVERY_GRACE,
+        ),
+        remaining,
+    )
+    return provider_timeout, ipc_timeout
 
 
 def require_case_time(deadline: float | None, stage: str):
@@ -124,11 +149,12 @@ DOCKER_EVAL_TOOL_POLICY = {
     "name": "docker_eval_full_harness",
     "allowed_tools": [
         "bash", "read_file", "write_file", "edit_file", "glob", "todo_write",
-        "task", "load_skill", "compact", "create_task", "list_tasks",
+        "task", "delegate_agent", "load_skill", "compact", "create_task", "list_tasks",
         "get_task", "claim_task", "complete_task", "schedule_cron",
         "schedule_once", "list_crons", "cancel_cron", "spawn_teammate",
         "send_message", "check_inbox", "request_shutdown", "request_plan",
         "review_plan", "create_worktree", "remove_worktree", "keep_worktree",
+        "integrate_worktree",
         "connect_mcp",
     ],
     "disabled_tools": [],
@@ -971,6 +997,10 @@ def _model_broker_process(payload: dict):
         max_calls=payload["max_calls"],
         max_tokens_per_call=ESCALATED_MAX_TOKENS,
         max_total_tokens=payload["max_total_tokens"],
+        provider_timeout=payload["provider_timeout"],
+        max_provider_retries=DEFAULT_PROVIDER_RETRIES,
+        provider_retry_delay=DEFAULT_PROVIDER_RETRY_DELAY,
+        delivery_grace=DEFAULT_IPC_DELIVERY_GRACE,
     )
     broker.serve_forever()
 
@@ -1003,6 +1033,8 @@ def _run_docker_agent_phase(
     (ipc_root / "requests").mkdir(parents=True, exist_ok=True)
     (ipc_root / "responses").mkdir(parents=True, exist_ok=True)
     remaining = remaining_timeout(case_deadline)
+    provider_timeout, broker_request_timeout = model_broker_timeouts(
+        float(os.getenv("MODEL_REQUEST_TIMEOUT", "30")), remaining)
     input_payload = {
         "task": task,
         "workspace": "/workspace",
@@ -1011,8 +1043,11 @@ def _run_docker_agent_phase(
         "ipc_root": "/broker",
         "broker_nonce": nonce,
         "model": "scripted-eval" if scripted else MODEL,
-        "request_timeout": min(
-            float(os.getenv("MODEL_REQUEST_TIMEOUT", "30")), remaining),
+        # request_timeout remains the Provider timeout for backward-compatible
+        # runtime configuration. The container waits through one Broker-owned
+        # retry plus the final response delivery grace.
+        "request_timeout": provider_timeout,
+        "broker_request_timeout": broker_request_timeout,
         "case_timeout_seconds": remaining,
         "cleanup_grace": CLEANUP_GRACE_SECONDS,
         "tool_policy": DOCKER_EVAL_TOOL_POLICY,
@@ -1042,6 +1077,7 @@ def _run_docker_agent_phase(
             "max_calls": model_call_budget,
             "max_total_tokens": model_token_budget,
             "case_deadline": case_deadline,
+            "provider_timeout": provider_timeout,
         },),
         name=f"codepilot-model-broker-{case_name}",
     )
@@ -1144,8 +1180,12 @@ def _run_docker_agent_phase(
         except (OSError, json.JSONDecodeError):
             broker_stats = {}
     metadata.update({
+        "model_broker_requests": broker_stats.get("request_count", 0),
         "model_broker_calls": broker_stats.get("call_count", 0),
         "model_broker_rejected_calls": broker_stats.get("rejected_count", 0),
+        "model_broker_retries": broker_stats.get("retry_count", 0),
+        "model_broker_provider_errors": broker_stats.get(
+            "provider_error_count", 0),
         "model_broker_requested_tokens": broker_stats.get(
             "requested_token_count", 0),
         "model_broker_call_budget": broker_stats.get(
@@ -1155,6 +1195,14 @@ def _run_docker_agent_phase(
         "model_broker_max_tokens_per_call": broker_stats.get(
             "max_tokens_per_call", ESCALATED_MAX_TOKENS),
         "model_broker_error": broker_stats.get("last_error", ""),
+        "model_broker_error_kind": broker_stats.get("last_error_kind", ""),
+        "model_broker_last_provider_error": broker_stats.get(
+            "last_provider_error", ""),
+        "model_broker_retry_skipped_reason": broker_stats.get(
+            "retry_skipped_reason", ""),
+        "model_broker_provider_timeout": broker_stats.get(
+            "provider_timeout", provider_timeout),
+        "model_broker_ipc_timeout": broker_request_timeout,
         "model_broker_stopped": broker_stopped,
         "model_broker_exit_code": broker_process.exitcode,
         "model_broker_ipc_cleaned": False,
@@ -1576,6 +1624,20 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
         "container_exit_code": None,
         "resource_limits": {},
     }
+    diagnostic_grader_result = None
+    grading_attempted = False
+    agent_category = agent_failure_category(agent_error) if agent_error else None
+    manifest_violations = sorted(set(
+        change_manifest["unexpected_changes"]
+        + change_manifest["forbidden_changes"]
+    ))
+    diagnostic_grading_allowed = bool(
+        agent_error
+        and agent_category not in {"case_timeout", "sandbox_error"}
+        and not execution_metadata.get("sandbox_error")
+        and not execution_metadata.get("overall_timed_out")
+        and not manifest_violations
+    )
     if trusted_violations:
         grader_result = failure_result(
             reason="trusted case inputs were modified: " + ", ".join(trusted_violations),
@@ -1592,13 +1654,14 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             )
         except Exception:
             pass
-    elif agent_error:
+    elif agent_error and not diagnostic_grading_allowed:
         grader_result = failure_result(
             reason=f"agent failed before grading: {agent_error}",
-            failure_category=agent_failure_category(agent_error),
+            failure_category=agent_category,
         )
         grader_proc = subprocess.CompletedProcess([], 1, "", grader_result["reason"])
     else:
+        grading_attempted = True
         try:
             require_case_time(case_deadline, "grading workspace preparation")
             create_grading_workspace(
@@ -1647,6 +1710,9 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
                     and grader_execution["status"] != "not_started"):
                 grader_execution["status"] = "failed"
 
+    if diagnostic_grading_allowed and grading_attempted:
+        diagnostic_grader_result = grader_result
+
     write_text(grader_stdout_path, grader_proc.stdout or "")
     write_text(grader_stderr_path, grader_proc.stderr or "")
 
@@ -1656,7 +1722,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             "passed": False,
             "score": 0,
             "reason": f"agent failed: {agent_error}",
-            "failure_category": agent_failure_category(agent_error),
+            "failure_category": agent_category,
         }, subprocess.CompletedProcess([], 1, "", ""))
     elif execution_metadata.get("sandbox_error"):
         grader_result = failure_result(
@@ -1673,10 +1739,9 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             reason="agent bash command timed out and the sandbox was terminated",
             failure_category="command_timeout",
         )
-    elif change_manifest["unexpected_changes"] or change_manifest["forbidden_changes"]:
-        violations = sorted(set(change_manifest["unexpected_changes"] + change_manifest["forbidden_changes"]))
+    elif manifest_violations:
         grader_result = failure_result(
-            reason="unexpected or forbidden changes: " + ", ".join(violations),
+            reason="unexpected or forbidden changes: " + ", ".join(manifest_violations),
             failure_category="constraint_violation",
         )
 
@@ -1755,6 +1820,13 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
         "stderr": str(stderr_path),
         "final": str(final_path),
         "grader": grader_result,
+        "diagnostic_score": (
+            diagnostic_grader_result["score"]
+            if diagnostic_grader_result is not None else None),
+        "diagnostic_breakdown": (
+            diagnostic_grader_result["breakdown"]
+            if diagnostic_grader_result is not None else None),
+        "diagnostic_grader": diagnostic_grader_result,
         "run": run_info,
         **execution_metadata,
         "grader_execution": grader_execution,
@@ -1815,10 +1887,15 @@ def agent_failure_category(agent_error: str) -> str:
             or "model broker token budget exceeded" in lowered
             or "broker token budget exceeded" in lowered):
         return "budget_exhausted"
-    if "casetimeouterror" in lowered or "agent case exceeded" in lowered:
-        return "tool_loop"
+    if ("casetimeouterror" in lowered or "agent case exceeded" in lowered
+            or "case_timeout" in lowered or "case deadline" in lowered):
+        return "case_timeout"
     if "sandboxerror" in lowered or "docker sandbox" in lowered or "docker daemon" in lowered:
         return "sandbox_error"
+    if "broker_ipc_timeout" in lowered:
+        return "broker_ipc_timeout"
+    if "provider_timeout" in lowered:
+        return "provider_http_timeout"
     if "timeout" in lowered or "timed out" in lowered:
         return "api_timeout"
     if "urlerror" in lowered or "model request failed" in lowered or "missing api key" in lowered:
@@ -1833,6 +1910,10 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
     execution_config = execution_config or EvalExecutionConfig()
     total_cases = len(results)
     passed_count = sum(1 for result in results if result["passed"])
+    diagnostic_results = [
+        result for result in results
+        if result.get("diagnostic_score") is not None
+    ]
     return {
         "started_at": started,
         "finished_at": time.time(),
@@ -1876,6 +1957,12 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
         "model_broker_calls": sum(
             result.get("model_broker_calls", 0) for result in results
         ),
+        "model_broker_requests": sum(
+            result.get("model_broker_requests", 0) for result in results
+        ),
+        "model_broker_retries": sum(
+            result.get("model_broker_retries", 0) for result in results
+        ),
         "model_broker_stopped": (
             None if execution_config.backend != "docker" else bool(results) and all(
                 result.get("model_broker_stopped") is True for result in results)),
@@ -1898,6 +1985,12 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
         "failed": total_cases - passed_count,
         "pass_rate": passed_count / total_cases if total_cases else 0,
         "avg_score": sum(result["score"] for result in results) / total_cases if total_cases else 0,
+        "diagnostically_graded_cases": len(diagnostic_results),
+        "avg_diagnostic_score": (
+            sum(result["diagnostic_score"] for result in diagnostic_results)
+            / len(diagnostic_results)
+            if diagnostic_results else None
+        ),
         "avg_model_calls": sum(
             result["metrics"].get("trusted_model_calls") or 0
             for result in results
@@ -1950,6 +2043,9 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
         "stderr": str(run_root / case.name / "stderr.txt"),
         "final": str(run_root / case.name / "final.md"),
         "grader": result,
+        "diagnostic_score": None,
+        "diagnostic_breakdown": None,
+        "diagnostic_grader": None,
         "run": {},
         "execution_backend": execution_config.backend,
         "docker_image": execution_config.docker_image if execution_config.backend == "docker" else None,
@@ -1966,6 +2062,8 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
         "all_container_cleanup_succeeded": False if execution_config.backend == "docker" else True,
         "command_execution_count": 0,
         "model_broker_calls": 0,
+        "model_broker_requests": 0,
+        "model_broker_retries": 0,
         "model_broker_stopped": False if execution_config.backend == "docker" else None,
         "model_broker_ipc_cleaned": False if execution_config.backend == "docker" else None,
         "container_entrypoint": (
@@ -2088,9 +2186,14 @@ def main() -> int:
             results.append(result)
             status = "PASS" if result["passed"] else "FAIL"
             reason = f" reason={result['reason']}" if result.get("reason") else ""
+            diagnostic = (
+                f" diagnostic_score={result['diagnostic_score']}"
+                if result.get("diagnostic_score") is not None else ""
+            )
             print(
                 f"[eval] done  {index}/{len(cases)} {case.name} {status} "
-                f"score={result['score']} elapsed={time.time() - case_started:.1f}s{reason}",
+                f"score={result['score']}{diagnostic} "
+                f"elapsed={time.time() - case_started:.1f}s{reason}",
                 flush=True,
             )
         except KeyboardInterrupt:

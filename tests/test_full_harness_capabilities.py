@@ -11,6 +11,8 @@ bootstrap()
 from codepilot_s20 import (
     agent_loop,
     background,
+    basic_tools,
+    context,
     mcp,
     prompts,
     protocol,
@@ -67,6 +69,37 @@ def test_case_skill_and_mcp_dynamic_tool_are_live_in_full_policy(tmp_path, monke
         assert "CASE MEMORY" in prompt
     finally:
         mcp.mcp_clients.clear()
+
+
+def test_acceptance_checklist_survives_as_compact_live_prompt_state(monkeypatch):
+    contract = "Every failed reservation leaves inventory unchanged"
+    basic_tools.CURRENT_TODOS.clear()
+    try:
+        assert basic_tools.run_todo_write([{
+            "content": "Implement rollback",
+            "status": "in_progress",
+            "kind": "plan",
+        }, {
+            "content": contract,
+            "status": "pending",
+            "kind": "acceptance",
+        }]).startswith("Updated 2 todos")
+
+        live_context = context.update_context({}, [])
+        monkeypatch.setattr(
+            prompts, "TOOL_POLICY", run_eval.DOCKER_EVAL_TOOL_POLICY)
+        prompt = prompts.assemble_system_prompt(live_context)
+    finally:
+        basic_tools.CURRENT_TODOS.clear()
+
+    assert live_context["acceptance_todos"] == [{
+        "content": contract,
+        "status": "pending",
+        "kind": "acceptance",
+    }]
+    assert "Protected acceptance checklist" in prompt
+    assert f"[pending] {contract}" in prompt
+    assert "Implement rollback" not in prompt
 
 
 def test_persistent_task_protocol_and_worktree_use_case_state(tmp_path, monkeypatch):

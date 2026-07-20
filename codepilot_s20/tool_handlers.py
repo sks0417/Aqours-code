@@ -11,6 +11,13 @@ def run_remove_worktree(name: str, discard_changes: bool = False) -> str:
 def run_keep_worktree(name: str) -> str:
     return keep_worktree(name)
 
+def run_integrate_worktree(name: str, cleanup: bool = True) -> str:
+    return integrate_worktree(name, cleanup)
+
+def run_delegate_agent(role: str, prompt: str, name: str = "",
+                       task_id: str = "") -> str:
+    return delegate_agent(role, prompt, name, task_id)
+
 
 # ── Basic tool handlers ──
 

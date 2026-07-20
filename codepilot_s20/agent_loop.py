@@ -7,11 +7,14 @@ import shutil as _shutil
 import os as _os
 import time as _time
 from .command_executor import CaseTimeoutError as _CaseTimeoutError
+from .agent_profiles import assess_task_complexity, complex_delegation_briefing
 
 # ── Agent Loop ──
 
 rounds_since_todo = 0
 agent_lock = threading.Lock()
+_MUTATING_FILE_TOOLS = {"write_file", "edit_file"}
+_MAIN_MUTATION_TOOLS = _MUTATING_FILE_TOOLS | {"integrate_worktree"}
 
 
 def _message_text(content) -> str:
@@ -63,6 +66,150 @@ def requires_initial_todo(messages: list) -> bool:
     return action_count >= 3 and (has_connector or has_number) and (has_multi_marker or has_number)
 
 
+def requires_acceptance_todos(messages: list) -> bool:
+    """Identify code tasks whose external requirements need a final audit."""
+    text = _latest_user_instruction(messages).lower()
+    if not text:
+        return False
+    change_markers = (
+        "fix", "implement", "repair", "refactor", "debug", "modify code",
+        "修复", "实现", "改代码", "重构", "调试",
+    )
+    requirement_markers = (
+        "contract", "requirement", "readme", "test", "public api", "preserve",
+        "bug", "consistency", "behavior", "acceptance",
+        "契约", "要求", "测试", "接口", "保持", "错误", "一致性", "行为", "验收",
+    )
+    requirement_count = sum(
+        1 for marker in requirement_markers if marker in text)
+    return any(marker in text for marker in change_markers) and requirement_count >= 2
+
+
+def _acceptance_items() -> list[dict]:
+    return [todo for todo in CURRENT_TODOS
+            if todo.get("kind") == "acceptance"]
+
+
+def _acceptance_gate_items(required: bool) -> list[dict]:
+    items = _acceptance_items()
+    if required and not items:
+        return [{
+            "kind": "acceptance",
+            "status": "pending",
+            "content": "Extract acceptance criteria from the task/README",
+        }]
+    return [todo for todo in items if todo.get("status") != "completed"]
+
+
+def _acceptance_review_message(
+    items: list[dict], changed_files: set[str], read_budget: int,
+) -> str:
+    lines = "\n".join(
+        f"- [{item.get('status', 'pending')}] {item.get('content', '')}"
+        for item in items[:12]
+    ) or "- (no acceptance criteria were recorded)"
+    changed = "\n".join(
+        f"- {path}" for path in sorted(changed_files)
+    ) or "- (no file changes were recorded)"
+    return (
+        "<acceptance_review>Your final answer is paused for one fresh contract "
+        "audit. Re-read the original task and the relevant README/contract with "
+        "read_file once, then review only the changed files listed below once. "
+        "Do not glob, re-read tests, scan the whole repository, or re-read an "
+        "unchanged dependency unless a specific uncovered requirement requires "
+        "it. The audit has a strict budget of at most "
+        f"{read_budget} read_file calls. Rely on prior context and existing test "
+        "notifications. Compare every task-relevant explicit requirement with "
+        "the changed code and tests. Treat the current checklist as potentially "
+        "incomplete: look for omitted error paths, words such as any/different/"
+        "unchanged, and every field named in normalized data. For a derived "
+        "value such as a fingerprint, normalized key, hash, or serialized "
+        "payload, inspect its producer function and enumerate every contract "
+        "field; checking only the caller or comparison site is not evidence. "
+        "For any/all requirements, inspect every named exception or state "
+        "branch. Public tests alone do not prove requirements they do not "
+        "cover. Add any missing "
+        "kind=acceptance items, fix uncovered gaps, and call todo_write again "
+        "after this audit with concise evidence before producing final.\n"
+        "Changed files to review:\n"
+        f"{changed}\n"
+        "Current checklist:\n"
+        f"{lines}\n</acceptance_review>"
+    )
+
+
+def _acceptance_review_followup_message() -> str:
+    return (
+        "<acceptance_review>The final contract audit has not been recorded. "
+        "Before final, use todo_write to record the audited acceptance checklist "
+        "and evidence, including any requirements omitted from the earlier list."
+        "</acceptance_review>"
+    )
+
+
+def _append_acceptance_warning(content: list, items: list[dict]):
+    lines = "\n".join(
+        f"- {item.get('content', '')}" for item in items[:8])
+    content.append({
+        "type": "text",
+        "text": (
+            "\n\n[Acceptance review incomplete]\n"
+            "The following requirements were not verified with evidence:\n"
+            f"{lines}"
+        ),
+    })
+
+
+def _append_contract_audit_warning(content: list):
+    content.append({
+        "type": "text",
+        "text": (
+            "\n\n[Acceptance review incomplete]\n"
+            "The required final contract audit was not recorded with todo_write; "
+            "the completion claim may omit task/README requirements."
+        ),
+    })
+
+
+def _tool_json(output) -> dict:
+    if isinstance(output, dict):
+        return output
+    try:
+        value = json.loads(str(output))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _explorer_gate_message(assessment: dict) -> str:
+    reasons = ", ".join(assessment.get("reasons", [])) or "broad repository scope"
+    return (
+        "Tool not run: this task needs independent discovery before implementation "
+        f"({reasons}). Call delegate_agent with role=explorer and a focused prompt "
+        "to map the task/README contract, relevant code paths, and risks. Use its "
+        "returned map to make the plan, then continue."
+    )
+
+
+def _reviewer_gate_message(changed_files: set[str], revision: int) -> str:
+    changed = ", ".join(sorted(changed_files)) or "the current workspace changes"
+    return (
+        "<multiagent_review>Final output is paused. Call delegate_agent with "
+        "role=reviewer for an independent, read-only contract audit of revision "
+        f"{revision}. Ask it to inspect {changed}, compare the final behavior with "
+        "the original task/README, and return verdict=pass or concrete gaps. Fix "
+        "gaps before final; any later main-workspace mutation makes a prior pass "
+        "stale.</multiagent_review>"
+    )
+
+
+def _append_multiagent_warning(content: list, message: str):
+    content.append({
+        "type": "text",
+        "text": f"\n\n[Multiagent review incomplete]\n{message}",
+    })
+
+
 def _context_stats(messages: list) -> dict:
     return {
         "message_count": len(messages),
@@ -91,8 +238,8 @@ def _run_context_stage(stage: str, messages: list, func) -> list:
 def prepare_context(messages: list) -> list:
     # Every LLM turn enters through the same context budget pipeline.
     messages[:] = _run_context_stage("tool_result_budget", messages, tool_result_budget)
-    messages[:] = _run_context_stage("snip_compact", messages, snip_compact)
     messages[:] = _run_context_stage("micro_compact", messages, micro_compact)
+    messages[:] = _run_context_stage("snip_compact", messages, snip_compact)
     if estimate_size(messages) > CONTEXT_LIMIT:
         before = _context_stats(messages)
         messages[:] = compact_history(messages)
@@ -113,14 +260,31 @@ def build_user_content(results: list[dict]) -> list[dict]:
     # Tool results and completed background notifications are both returned to
     # the model as user-side content, matching the tool_result feedback loop.
     content = list(results)
-    for note in collect_background_results():
+    notes = collect_background_results()
+    _record_background_notifications(notes, "tool_result_batch")
+    for note in notes:
         content.append({"type": "text", "text": note})
     return content
+
+
+def _record_background_notifications(notes: list, injection: str):
+    for note in notes:
+        record_event(
+            "task_notification",
+            injection=injection,
+            task_id=getattr(note, "task_id", ""),
+            status=getattr(note, "status", ""),
+            command=getattr(note, "command", ""),
+            summary=getattr(note, "summary", str(note)),
+            original_size=getattr(note, "original_size", len(str(note))),
+            truncated=bool(getattr(note, "truncated", False)),
+        )
 
 
 def inject_background_notifications(messages: list):
     notes = collect_background_results()
     if notes:
+        _record_background_notifications(notes, "loop_start")
         messages.append({"role": "user", "content": [
             {"type": "text", "text": note} for note in notes]})
 
@@ -146,9 +310,84 @@ def tool_rejection_text(output) -> str:
     return text
 
 
-def todo_required_message() -> str:
-    return ("Tool not run: this multi-step task needs an initial todo list. "
-            "Call todo_write first with a short plan, then continue with the requested tools.")
+def todo_required_message(acceptance_required: bool = False) -> str:
+    message = ("Tool not run: before changing files, this multi-step task needs "
+               "a todo list. Inspect the task/README with read-only tools first "
+               "if needed, then call todo_write with a short plan")
+    if acceptance_required:
+        message += (" and concrete kind=acceptance items extracted from those "
+                    "requirements")
+    return message + ", then continue with the file change."
+
+
+def acceptance_required_message() -> str:
+    return (
+        "Tool not run: before changing files, add concrete kind=acceptance "
+        "items from the task/README requirements with todo_write. Read-only "
+        "contract discovery may continue first."
+    )
+
+
+def _todo_state_summary() -> str:
+    acceptance = _acceptance_items()
+    unverified = [todo for todo in acceptance
+                  if todo.get("status") != "completed"]
+    detail = ""
+    if acceptance:
+        detail = (f" ({len(acceptance)} acceptance, "
+                  f"{len(unverified)} unverified)")
+    return f"Updated {len(CURRENT_TODOS)} todos{detail}"
+
+
+def _reconcile_locked_acceptance(previous_todos: list[dict]) -> tuple[list[str], str | None]:
+    """Keep established contract items without turning wording drift into a retry."""
+    previous = [dict(todo) for todo in previous_todos
+                if todo.get("kind") == "acceptance"]
+    current = [todo for todo in CURRENT_TODOS
+               if todo.get("kind") == "acceptance"]
+    if not previous:
+        return [], None
+
+    previous_contents = {todo.get("content") for todo in previous}
+    current_contents = {todo.get("content") for todo in current}
+    notices = []
+
+    # Models often rephrase an item while keeping the same list shape. Treat
+    # that as a status/evidence update and retain the stable contract wording.
+    if len(previous) == len(current):
+        for index, old_item in enumerate(previous):
+            old_content = old_item.get("content")
+            if old_content in current_contents:
+                continue
+            candidate = current[index]
+            candidate_content = candidate.get("content")
+            if candidate_content in previous_contents:
+                continue
+            candidate["content"] = old_content
+            current_contents.discard(candidate_content)
+            current_contents.add(old_content)
+            notices.append(f"kept wording: {old_content}")
+
+    current_contents = {
+        todo.get("content") for todo in CURRENT_TODOS
+        if todo.get("kind") == "acceptance"
+    }
+    restored = [todo for todo in previous
+                if todo.get("content") not in current_contents]
+    if restored:
+        CURRENT_TODOS.extend(dict(todo) for todo in restored)
+        notices.extend(
+            f"restored omitted item: {todo.get('content')}" for todo in restored)
+
+    acceptance_count = sum(
+        1 for todo in CURRENT_TODOS if todo.get("kind") == "acceptance")
+    if len(CURRENT_TODOS) > 20 or acceptance_count > 12:
+        CURRENT_TODOS[:] = [dict(todo) for todo in previous_todos]
+        return [], (
+            "Error: todo update exceeds limits after preserving locked "
+            "acceptance items; keep existing criteria and add fewer new items"
+        )
+    return notices, None
 
 
 def stop_after_permission_denied(messages: list, reason: str):
@@ -218,8 +457,37 @@ def agent_loop(messages: list, context: dict):
     tools, handlers = assemble_tool_pool()
     state = RecoveryState()
     max_tokens = DEFAULT_MAX_TOKENS
-    todo_required = requires_initial_todo(messages)
+    # Todos are scoped to one user/cron turn. Live acceptance state remains
+    # available through every context compaction inside this loop.
+    CURRENT_TODOS.clear()
+    acceptance_required = requires_acceptance_todos(messages)
+    todo_required = requires_initial_todo(messages) or acceptance_required
     todo_started = False
+    acceptance_locked = False
+    acceptance_review_prompted = False
+    acceptance_review_todo_updated = False
+    acceptance_review_followup_prompted = False
+    changed_file_paths: set[str] = set()
+    lead_read_paths: set[str] = set()
+    audit_read_paths: set[str] = set()
+    audit_read_budget = 0
+    root_task = str(CURRENT_ROOT_TASK or _latest_user_instruction(messages))
+    complexity = assess_task_complexity(root_task)
+    multiagent_enabled = "delegate_agent" in handlers
+    multiagent_required = (
+        multiagent_enabled
+        and complexity["level"] == "complex"
+        and complexity.get("implementation_task", False)
+    )
+    explorer_completed = False
+    mutation_revision = 0
+    reviewer_revision = -1
+    reviewer_gate_prompts = 0
+    if multiagent_required:
+        messages.append({
+            "role": "user", "content": complex_delegation_briefing(complexity),
+        })
+        record_event("multiagent_policy", decision="required", **complexity)
 
     while True:
         _check_case_deadline()
@@ -285,6 +553,7 @@ def agent_loop(messages: list, context: dict):
             # by the time this branch is reached.
             notes = collect_background_results()
             if notes:
+                _record_background_notifications(notes, "final_wait")
                 messages.append({"role": "user", "content": [
                     {"type": "text", "text": note} for note in notes]})
                 continue
@@ -300,6 +569,74 @@ def agent_loop(messages: list, context: dict):
             notification_wait = 2.0 if remaining is None else max(0, min(2.0, remaining))
             if wait_for_imminent_once(notification_wait):
                 continue
+            if multiagent_required and reviewer_revision != mutation_revision:
+                if reviewer_gate_prompts < 2:
+                    messages.append({
+                        "role": "user",
+                        "content": _reviewer_gate_message(
+                            changed_file_paths, mutation_revision),
+                    })
+                    reviewer_gate_prompts += 1
+                    record_event(
+                        "multiagent_gate", decision="reviewer_required",
+                        mutation_revision=mutation_revision,
+                        reviewer_revision=reviewer_revision,
+                        prompt_count=reviewer_gate_prompts,
+                    )
+                    continue
+                _append_multiagent_warning(
+                    response.content,
+                    "No reviewer pass was recorded for the latest workspace revision.",
+                )
+                record_event(
+                    "multiagent_gate", decision="reviewer_missing_final",
+                    mutation_revision=mutation_revision,
+                )
+            if acceptance_required and not acceptance_review_prompted:
+                checklist = _acceptance_items()
+                audit_read_paths.clear()
+                audit_read_budget = max(
+                    4, min(8, len(changed_file_paths) + 3))
+                messages.append({
+                    "role": "user",
+                    "content": _acceptance_review_message(
+                        checklist, changed_file_paths, audit_read_budget),
+                })
+                acceptance_review_prompted = True
+                record_event(
+                    "acceptance_gate", decision="review",
+                    checklist_count=len(checklist),
+                    changed_file_count=len(changed_file_paths),
+                    read_budget=audit_read_budget,
+                    unresolved_count=sum(
+                        1 for item in checklist
+                        if item.get("status") != "completed"),
+                )
+                continue
+            if (acceptance_required and acceptance_review_prompted
+                    and not acceptance_review_todo_updated):
+                if not acceptance_review_followup_prompted:
+                    messages.append({
+                        "role": "user",
+                        "content": _acceptance_review_followup_message(),
+                    })
+                    acceptance_review_followup_prompted = True
+                    record_event(
+                        "acceptance_gate", decision="review_followup",
+                    )
+                    continue
+                _append_contract_audit_warning(response.content)
+                record_event(
+                    "acceptance_gate", decision="audit_incomplete_final",
+                )
+            unresolved_acceptance = _acceptance_gate_items(acceptance_required)
+            if unresolved_acceptance:
+                _append_acceptance_warning(
+                    response.content, unresolved_acceptance)
+                record_event(
+                    "acceptance_gate", decision="incomplete_final",
+                    unresolved_count=len(unresolved_acceptance),
+                )
             record_hook("Stop")
             trigger_hooks("Stop", messages)
             finish_run(extract_text(response.content))
@@ -314,8 +651,38 @@ def agent_loop(messages: list, context: dict):
             print(f"\033[36m> {block.name}\033[0m")
             record_tool_use(block)
 
-            if todo_required and not todo_started and block.name not in ("todo_write", "compact"):
-                output = todo_required_message()
+            mutation_requested = block.name in _MAIN_MUTATION_TOOLS
+            delegated_role = (
+                str(block.input.get("role", "")).strip().lower()
+                if block.name == "delegate_agent" else ""
+            )
+            worker_requested = delegated_role == "worker"
+            implementation_requested = mutation_requested or worker_requested
+            if (implementation_requested and multiagent_required
+                    and not explorer_completed):
+                output = _explorer_gate_message(complexity)
+                record_event(
+                    "multiagent_gate", decision="explorer_required",
+                    tool=block.name, tool_use_id=block.id,
+                )
+                results.append({"type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": output})
+                record_tool_result(block.id, block.name, output)
+                continue
+            if implementation_requested and todo_required and not todo_started:
+                output = todo_required_message(acceptance_required)
+                record_event("todo_gate", tool=block.name,
+                             tool_use_id=block.id, input=block.input,
+                             reason=output)
+                results.append({"type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": output})
+                record_tool_result(block.id, block.name, output)
+                continue
+            if (implementation_requested and acceptance_required
+                    and not _acceptance_items()):
+                output = acceptance_required_message()
                 record_event("todo_gate", tool=block.name,
                              tool_use_id=block.id, input=block.input,
                              reason=output)
@@ -325,12 +692,83 @@ def agent_loop(messages: list, context: dict):
                 record_tool_result(block.id, block.name, output)
                 continue
 
+            audit_active = (
+                acceptance_review_prompted
+                and not acceptance_review_todo_updated
+            )
+            if audit_active and block.name == "glob":
+                output = (
+                    "Tool not run: final contract audit is scoped to the "
+                    "original task/README and recorded changed files; repository "
+                    "glob scans are disabled. Use prior context, then update the "
+                    "acceptance checklist with todo_write."
+                )
+                record_event(
+                    "acceptance_gate", decision="audit_glob_blocked",
+                    tool=block.name, tool_use_id=block.id, input=block.input,
+                    reason=output,
+                )
+                results.append({"type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": output})
+                record_tool_result(block.id, block.name, output)
+                continue
+            if audit_active and block.name == "read_file":
+                audit_path = _os.path.normpath(
+                    str(block.input.get("path", "")).strip()
+                ).replace("\\", "/").lower()
+                if audit_path in audit_read_paths:
+                    output = (
+                        "Tool not run: this path was already read during the "
+                        "final contract audit. Use the retained result instead "
+                        "of re-reading it."
+                    )
+                    decision = "audit_read_deduplicated"
+                elif len(audit_read_paths) >= audit_read_budget:
+                    output = (
+                        "Tool not run: final contract audit read budget reached. "
+                        "Use the retained context and update the acceptance "
+                        "checklist with todo_write."
+                    )
+                    decision = "audit_read_budget_reached"
+                else:
+                    audit_read_paths.add(audit_path)
+                    output = ""
+                    decision = ""
+                if decision:
+                    record_event(
+                        "acceptance_gate", decision=decision,
+                        tool=block.name, tool_use_id=block.id,
+                        input=block.input, reason=output,
+                        read_count=len(audit_read_paths),
+                        read_budget=audit_read_budget,
+                    )
+                    results.append({"type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": output})
+                    record_tool_result(block.id, block.name, output)
+                    continue
+
             if block.name == "compact":
                 messages[:] = compact_history(messages)
-                messages.append({"role": "user",
-                                 "content": "[Compacted. Continue with summarized context.]"})
-                record_tool_result(block.id, block.name,
-                                   "[Compacted. Continue with summarized context.]")
+                output = "[Compacted. Continue with summarized context.]"
+                compact_tool_use_preserved = any(
+                    candidate.get("role") == "assistant"
+                    and any(block_type(item) == "tool_use"
+                            and ((item.get("id") if isinstance(item, dict)
+                                  else getattr(item, "id", None)) == block.id)
+                            for item in candidate.get("content", []))
+                    for candidate in messages
+                )
+                if compact_tool_use_preserved:
+                    messages.append({"role": "user", "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": output,
+                    }]})
+                else:
+                    messages.append({"role": "user", "content": output})
+                record_tool_result(block.id, block.name, output)
                 compacted_now = True
                 break
 
@@ -356,6 +794,17 @@ def agent_loop(messages: list, context: dict):
             record_hook("PreToolUse", tool=block.name, decision="allowed")
 
             if should_run_background(block.name, block.input):
+                routing_reason = (
+                    "explicit" if block.input.get("run_in_background")
+                    else "slow_command"
+                )
+                record_event(
+                    "background_routed",
+                    tool=block.name,
+                    tool_use_id=block.id,
+                    command=block.input.get("command", ""),
+                    reason=routing_reason,
+                )
                 bg_id = start_background_task(block, handlers)
                 output = (f"[Background task {bg_id} started] "
                           "Result will arrive as a task_notification. Do not "
@@ -369,16 +818,114 @@ def agent_loop(messages: list, context: dict):
                 continue
 
             handler = handlers.get(block.name)
+            todo_snapshot = (
+                [dict(todo) for todo in CURRENT_TODOS]
+                if block.name == "todo_write" and acceptance_locked else None
+            )
             output = call_tool_handler(handler, block.input, block.name)
+            if (block.name == "todo_write" and todo_snapshot is not None
+                    and not str(output).startswith("Error:")):
+                notices, reconciliation_error = _reconcile_locked_acceptance(
+                    todo_snapshot)
+                if reconciliation_error:
+                    output = reconciliation_error
+                elif notices:
+                    output = (_todo_state_summary()
+                              + "\nProtected acceptance criteria preserved: "
+                              + "; ".join(notices))
             trigger_hooks("PostToolUse", block, output)
             record_hook("PostToolUse", tool=block.name)
             print(str(output)[:300])
 
+            if block.name == "delegate_agent" and not str(output).startswith("Error:"):
+                delegation = _tool_json(output)
+                verdict = str(delegation.get("verdict", "")).lower()
+                if delegated_role == "explorer" and (
+                        delegation.get("status") == "completed"
+                        and verdict == "complete"):
+                    explorer_completed = True
+                    record_event(
+                        "multiagent_gate", decision="explorer_completed",
+                    )
+                elif delegated_role == "reviewer":
+                    if (delegation.get("status") == "completed"
+                            and verdict == "pass"):
+                        reviewer_revision = mutation_revision
+                        reviewer_gate_prompts = 0
+                        if acceptance_required:
+                            acceptance_review_prompted = True
+                            acceptance_review_todo_updated = False
+                            acceptance_review_followup_prompted = False
+                        record_event(
+                            "multiagent_gate", decision="reviewer_pass",
+                            mutation_revision=mutation_revision,
+                        )
+                    else:
+                        reviewer_revision = -1
+                        record_event(
+                            "multiagent_gate", decision="reviewer_gaps",
+                            verdict=verdict or "unknown",
+                            mutation_revision=mutation_revision,
+                        )
+
             if block.name == "todo_write":
                 rounds_since_todo = 0
-                todo_started = True
+                if not str(output).startswith("Error:"):
+                    todo_started = True
+                    if acceptance_review_prompted:
+                        acceptance_review_todo_updated = True
+                if (not str(output).startswith("Error:")
+                        and acceptance_required and not _acceptance_items()):
+                    output += (
+                        "\nAcceptance checklist required before the first file "
+                        "change; continue read-only contract discovery or add at "
+                        "least one kind=acceptance item.")
             else:
                 rounds_since_todo += 1
+                mutation_succeeded = (
+                    mutation_requested
+                    and not str(output).lower().startswith((
+                        "error:", "permission denied", "tool not run"))
+                )
+                integration = _tool_json(output) if block.name == "integrate_worktree" else {}
+                if block.name == "integrate_worktree":
+                    mutation_succeeded = integration.get("status") == "integrated"
+                if mutation_succeeded:
+                    acceptance_locked = True
+                    mutation_revision += 1
+                    reviewer_gate_prompts = 0
+                    if multiagent_required and acceptance_review_prompted:
+                        acceptance_review_prompted = False
+                        acceptance_review_todo_updated = False
+                        acceptance_review_followup_prompted = False
+                    changed_path = str(block.input.get("path", "")).strip()
+                    if changed_path:
+                        changed_file_paths.add(changed_path)
+                    for changed_path in integration.get("changed_files", []):
+                        if changed_path:
+                            changed_file_paths.add(str(changed_path))
+
+            if (block.name == "read_file"
+                    and not str(output).lower().startswith("error:")):
+                read_path = _os.path.normpath(
+                    str(block.input.get("path", "")).strip()
+                ).replace("\\", "/").lower()
+                if read_path:
+                    lead_read_paths.add(read_path)
+                if (multiagent_enabled and not multiagent_required
+                        and complexity.get("level") == "moderate"
+                        and complexity.get("implementation_task", False)
+                        and len(lead_read_paths) >= 8):
+                    multiagent_required = True
+                    complexity = dict(complexity)
+                    complexity["level"] = "complex"
+                    complexity["reasons"] = list(complexity.get("reasons", [])) + [
+                        "broad_runtime_read_set",
+                    ]
+                    record_event(
+                        "multiagent_policy", decision="escalated",
+                        read_path_count=len(lead_read_paths), **complexity,
+                    )
 
             results.append({"type": "tool_result",
                             "tool_use_id": block.id, "content": output})
@@ -539,7 +1086,8 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
     state_names = [
         "WORKDIR", "client", "MODEL_PROVIDER", "MODEL", "PRIMARY_MODEL",
         "COMMAND_EXECUTOR", "TOOL_POLICY", "CASE_DEADLINE",
-        "BACKGROUND_TASKS_ENABLED", "APPROVAL_MODE", *_WORKDIR_DERIVED_PATHS,
+        "CURRENT_ROOT_TASK", "BACKGROUND_TASKS_ENABLED", "APPROVAL_MODE",
+        *_WORKDIR_DERIVED_PATHS,
     ]
     old_state = {name: _runtime_value(name) for name in state_names}
     run = None
@@ -556,6 +1104,7 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
             _set_runtime_value("COMMAND_EXECUTOR", command_executor)
         _set_runtime_value("TOOL_POLICY", tool_policy)
         _set_runtime_value("CASE_DEADLINE", case_deadline)
+        _set_runtime_value("CURRENT_ROOT_TASK", task)
         if approval_mode is not None:
             if approval_mode not in {"interactive", "non_interactive"}:
                 raise ValueError(f"unsupported approval mode: {approval_mode}")
