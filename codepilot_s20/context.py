@@ -23,6 +23,9 @@ def update_context(
     if allow_memory and memory_index.exists():
         memories = memory_index.read_text()[:2000]
     todos = runtime.state.todos if runtime is not None else CURRENT_TODOS
+    working_memory = (
+        runtime.state.knowledge.as_dict() if runtime is not None else {}
+    )
     return {
         "memories": memories,
         "connected_mcp": list(mcp_clients.keys()) if allow_mcp else [],
@@ -33,6 +36,11 @@ def update_context(
             dict(todo) for todo in todos
             if todo.get("kind") == "acceptance"
         ],
+        "working_memory": working_memory,
+        "working_memory_prompt": (
+            runtime.state.knowledge.prompt_view()
+            if runtime is not None else ""
+        ),
     }
 
 

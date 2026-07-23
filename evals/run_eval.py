@@ -14,6 +14,8 @@ import time
 import uuid
 import fnmatch
 import hashlib
+import statistics
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -488,12 +490,15 @@ def trace_metrics(trace_path: Path) -> dict:
     events = read_trace_events(trace_path)
     duplicate_tool_calls = 0
     previous_tool_signature = None
+    tool_counts = Counter()
     for event in events:
         if event.get("type") != "tool_use":
             continue
+        tool_name = str(event.get("tool") or event.get("name") or "")
+        tool_counts[tool_name] += 1
         tool_input = event.get("input") if isinstance(event.get("input"), dict) else {}
         signature = (
-            str(event.get("tool") or event.get("name") or ""),
+            tool_name,
             json.dumps(tool_input, sort_keys=True, ensure_ascii=False),
         )
         if signature == previous_tool_signature:
@@ -511,6 +516,14 @@ def trace_metrics(trace_path: Path) -> dict:
             and event.get("decision") == "blocked"
         ),
         "duplicate_tool_calls": duplicate_tool_calls,
+        "tool_counts": dict(sorted(tool_counts.items())),
+        "read_file_calls": tool_counts.get("read_file", 0),
+        "model_trace_actual_total_tokens": sum(
+            int(event.get("usage", {}).get("total_tokens") or 0)
+            for event in events
+            if event.get("type") == "llm_response"
+            and isinstance(event.get("usage"), dict)
+        ),
         "event_count": len(events),
     }
 
@@ -1969,6 +1982,13 @@ def grouped_stats(results: list[dict], key_fn) -> dict:
             "avg_tool_calls": sum(
                 item["metrics"].get("tool_calls", 0) for item in items
             ) / total if total else 0,
+            "median_read_file_calls": (
+                statistics.median(
+                    item["metrics"].get("read_file_calls", 0)
+                    for item in items
+                )
+                if items else 0
+            ),
             "avg_runtime_sec": sum(item["metrics"].get("runtime_sec", 0) for item in items) / total if total else 0,
             "metered_cases": len(metered),
             "avg_actual_tokens": (
@@ -2122,6 +2142,13 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
         "avg_tool_calls": sum(
             result["metrics"].get("tool_calls", 0) for result in results
         ) / total_cases if total_cases else 0,
+        "median_read_file_calls": (
+            statistics.median(
+                result["metrics"].get("read_file_calls", 0)
+                for result in results
+            )
+            if results else 0
+        ),
         "avg_runtime_sec": sum(result["metrics"].get("runtime_sec", 0) for result in results) / total_cases if total_cases else 0,
         "metered_cases": len(metered_results),
         "actual_input_tokens": sum(

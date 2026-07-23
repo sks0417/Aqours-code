@@ -1,4 +1,5 @@
 from .runtime_state import *
+from .knowledge import content_digest
 from .runtime import AgentRuntime
 
 # ── Lead Worktree Tools ──
@@ -12,8 +13,30 @@ def run_remove_worktree(name: str, discard_changes: bool = False) -> str:
 def run_keep_worktree(name: str) -> str:
     return keep_worktree(name)
 
-def run_integrate_worktree(name: str, cleanup: bool = True) -> str:
-    return integrate_worktree(name, cleanup)
+def run_integrate_worktree(
+    name: str,
+    cleanup: bool = True,
+    runtime: AgentRuntime | None = None,
+) -> str:
+    output = integrate_worktree(name, cleanup)
+    if runtime is None:
+        return output
+    try:
+        result = json.loads(output)
+    except (TypeError, json.JSONDecodeError):
+        return output
+    if result.get("status") != "integrated":
+        return output
+    for changed_path in result.get("changed_files", []):
+        file_path = runtime.paths.workdir / str(changed_path)
+        digest = (
+            content_digest(file_path.read_bytes())
+            if file_path.is_file() else ""
+        )
+        runtime.state.knowledge.invalidate_file(
+            str(changed_path), digest=digest, modified=True,
+        )
+    return output
 
 def run_delegate_agent(role: str, prompt: str, name: str = "",
                        task_id: str = "",

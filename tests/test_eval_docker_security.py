@@ -249,6 +249,7 @@ def test_docker_full_prompt_uses_only_case_memory_skills_and_state(
     class Messages:
         def create(self, **kwargs):
             captured["system"] = kwargs["system"]
+            captured["tools"] = kwargs["tools"]
             captured["memory_dir"] = context.MEMORY_DIR
             captured["memory_index"] = context.MEMORY_INDEX
             return SimpleNamespace(content=[text_block("done")], stop_reason="end_turn")
@@ -273,13 +274,14 @@ def test_docker_full_prompt_uses_only_case_memory_skills_and_state(
     assert "HOST_TEAM_SECRET_52CD" not in prompt
     assert "CASE_MEMORY_VISIBLE" in prompt
     assert "CASE_SKILL_VISIBLE" in prompt
-    assert "create_worktree" in prompt
-    assert "spawn_teammate" in prompt
-    assert "load_skill" in prompt
+    tool_names = {tool["name"] for tool in captured["tools"]}
+    assert {"create_worktree", "spawn_teammate", "load_skill"} <= tool_names
+    assert "create_worktree" not in prompt
+    assert "spawn_teammate" not in prompt
     assert "Memory context:" in prompt
     assert "MCP state:" in prompt
     assert "Active teammate state:" in prompt
-    assert "Available tools (full descriptions):" in prompt
+    assert "API tool definitions and input schemas" in prompt
     assert "- OS: Linux" in prompt
     assert "- Shell: /bin/sh" in prompt
     assert "- Working directory: /workspace" in prompt
@@ -383,7 +385,8 @@ def test_eval_trace_storage_is_separate_and_exposes_normal_process_metrics(
     metrics = run_eval.trace_metrics(exported_trace)
     assert set(metrics) == {
         "tool_calls", "llm_requests", "permission_blocks",
-        "duplicate_tool_calls", "event_count",
+        "duplicate_tool_calls", "tool_counts", "read_file_calls",
+        "model_trace_actual_total_tokens", "event_count",
     }
     assert metrics["event_count"] > 0
 

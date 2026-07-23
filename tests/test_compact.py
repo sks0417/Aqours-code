@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
 from codepilot_s20 import agent_loop, compact
+from codepilot_s20.command_executor import LocalCommandExecutor
+from codepilot_s20.runtime import AgentRuntime
 
 
 def tool_exchange(name: str, contents: list[str], *,
@@ -79,6 +81,40 @@ def test_distinct_read_working_set_has_a_bounded_path_limit(monkeypatch):
     assert result_contents(messages[4]) == [contents[1]]
     assert result_contents(messages[6]) == [contents[2]]
     assert result_contents(messages[8]) == [contents[3]]
+
+
+def test_run_knowledge_expands_protection_for_a_wide_valid_working_set(
+    tmp_path, monkeypatch,
+):
+    runtime = AgentRuntime.create(
+        workdir=tmp_path,
+        model_client=SimpleNamespace(messages=object()),
+        command_executor=LocalCommandExecutor(),
+        model_provider="test",
+        model="test",
+    )
+    messages = [{"role": "user", "content": "inspect wide repository"}]
+    for index in range(18):
+        path = f"src/module_{index}.py"
+        content = f"source {index}\n" + ("x" * 300)
+        runtime.state.knowledge.observe_file(
+            path, f"def symbol_{index}():\n    return {index}\n",
+        )
+        messages.extend(tool_exchange(
+            f"read_{index}", [content], paths=[path],
+        ))
+    monkeypatch.setattr(compact, "KEEP_RECENT_READ_PATHS", 12)
+
+    compact.micro_compact(
+        messages, trigger_size=1, target_size=1, runtime=runtime,
+    )
+
+    assert all(
+        result_contents(messages[2 + index * 2]) == [
+            f"source {index}\n" + ("x" * 300)
+        ]
+        for index in range(18)
+    )
 
 
 def test_wide_source_batch_survives_narrow_followup_reads(monkeypatch):

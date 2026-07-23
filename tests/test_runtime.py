@@ -1,7 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from codepilot_s20 import agent_loop, basic_tools, context, prompts
+from codepilot_s20 import agent_loop, basic_tools, context, mcp, prompts
 from codepilot_s20.command_executor import LocalCommandExecutor
 from codepilot_s20.runtime import AgentRuntime
 
@@ -96,8 +96,12 @@ def test_context_and_prompt_read_runtime_owned_paths_and_policy(tmp_path):
     assert str(runtime.paths.workdir) in prompt
     assert "RUNTIME_MEMORY" in prompt
     assert "preserve behavior" in prompt
-    assert "- read_file:" in prompt
-    assert "- bash:" not in prompt
+    tool_names = {
+        tool["name"] for tool in mcp.assemble_tool_pool(runtime)[0]
+    }
+    assert tool_names == {"read_file", "todo_write"}
+    assert "API tool definitions and input schemas" in prompt
+    assert "Read file contents." not in prompt
 
 
 def test_run_agent_task_constructs_and_passes_explicit_runtime(

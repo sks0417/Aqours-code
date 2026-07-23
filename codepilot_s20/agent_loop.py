@@ -251,6 +251,39 @@ def _reviewer_findings(output: str) -> list[dict]:
         if isinstance(findings, list) else []
 
 
+def _ingest_delegation_knowledge(
+    delegation: dict,
+    role: str,
+    runtime: AgentRuntime | None,
+) -> None:
+    if runtime is None or role not in {"explorer", "reviewer", "general"}:
+        return
+    result = delegation.get("result", {})
+    if not isinstance(result, dict):
+        return
+    checked = result.get("files_checked", [])
+    if not isinstance(checked, list):
+        checked = [checked] if checked else []
+    observed_paths = []
+    for raw_path in checked[:20]:
+        path = str(raw_path).strip()
+        candidate = (runtime.paths.workdir / path).resolve()
+        if (not path or not candidate.is_relative_to(runtime.paths.workdir)
+                or not candidate.is_file()):
+            continue
+        runtime.state.knowledge.observe_file(path, candidate.read_bytes())
+        observed_paths.append(path)
+    requirements = result.get("requirements", [])
+    if role == "explorer" and isinstance(requirements, list):
+        for index, requirement in enumerate(requirements[:12], 1):
+            runtime.state.knowledge.record_contract(
+                f"explorer:{index}",
+                str(requirement),
+                observed_paths,
+                role="explorer",
+            )
+
+
 def _register_reviewer_findings(
     findings: list[dict], revision: int | None = None,
     runtime: AgentRuntime | None = None,
@@ -304,6 +337,11 @@ def _register_reviewer_findings(
         finding_count=len(findings), registered_count=len(registered),
         updateable_ids=registered_ids,
     )
+    if runtime is not None:
+        runtime.state.knowledge.record_reviewer_findings(
+            findings, revision_number,
+        )
+        runtime.state.knowledge.sync_acceptance(current_todos)
     return "; ".join(registered)
 
 
@@ -364,7 +402,10 @@ def prepare_context(
         "tool_result_budget", messages,
         lambda value: tool_result_budget(value, runtime=runtime),
     )
-    messages[:] = _run_context_stage("micro_compact", messages, micro_compact)
+    messages[:] = _run_context_stage(
+        "micro_compact", messages,
+        lambda value: micro_compact(value, runtime=runtime),
+    )
     messages[:] = _run_context_stage("snip_compact", messages, snip_compact)
     if estimate_size(messages) > CONTEXT_LIMIT:
         before = _context_stats(messages)
@@ -539,6 +580,8 @@ def _reconcile_locked_acceptance(
         1 for todo in current_todos if todo.get("kind") == "acceptance")
     if len(current_todos) > 20 or acceptance_count > 12:
         current_todos[:] = [dict(todo) for todo in previous_todos]
+        if runtime is not None:
+            runtime.state.knowledge.sync_acceptance(current_todos)
         return [], (
             "Error: todo update exceeds limits after preserving locked "
             "acceptance items; keep existing criteria and add fewer new items. "
@@ -546,6 +589,8 @@ def _reconcile_locked_acceptance(
             + ", ".join(
                 str(todo.get("id")) for todo in previous if todo.get("id"))
         )
+    if runtime is not None:
+        runtime.state.knowledge.sync_acceptance(current_todos)
     return notices, None
 
 
@@ -674,6 +719,8 @@ def agent_loop(
     # available through every context compaction inside this loop.
     current_todos = _runtime_todos(runtime)
     current_todos.clear()
+    if runtime is not None:
+        runtime.state.knowledge.clear()
     acceptance_required = requires_acceptance_todos(messages)
     todo_required = requires_initial_todo(messages) or acceptance_required
     todo_started = False
@@ -980,6 +1027,9 @@ def agent_loop(
                     if reviewer_attached:
                         reviewer_cached_result = str(reviewer_output)
                     delegation = _tool_json(reviewer_output)
+                    _ingest_delegation_knowledge(
+                        delegation, "reviewer", runtime,
+                    )
                     verdict = str(delegation.get("verdict", "")).lower()
                     findings = _reviewer_findings(reviewer_output)
                     if findings:
@@ -1293,6 +1343,9 @@ def agent_loop(
                     and not str(output).startswith("Error:")):
                 delegation = _tool_json(output)
                 verdict = str(delegation.get("verdict", "")).lower()
+                _ingest_delegation_knowledge(
+                    delegation, delegated_role, runtime,
+                )
                 if delegated_role == "explorer":
                     explorer_attempted = True
                     explorer_cached_result = str(output)

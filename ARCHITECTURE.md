@@ -46,6 +46,46 @@ not add another module-global per-run value.
 6. A migration step must preserve the existing full test suite and Docker Eval
    smoke before another subsystem is moved.
 
+## Tool registry
+
+`tool_defs.py` builds one canonical `TOOL_REGISTRY` of `ToolSpec` records.
+Each record owns its API description/schema, handler, safety policy, background
+policy, role access, and runtime-binding metadata.
+
+- The Lead projection remains the same 30 built-in tools.
+- General, Explorer, Reviewer, Worker, and Teammate projections use the same
+  registry.
+- `BUILTIN_TOOLS` and `BUILTIN_HANDLERS` are derived compatibility views.
+- Dynamic MCP schemas are still appended by `assemble_tool_pool()`.
+- API schemas are authoritative, so the system prompt no longer repeats all
+  tool descriptions.
+
+The fixed empty-context system prompt plus 30-tool JSON payload is guarded
+below 12,000 characters. Capability-group lazy exposure is deferred; this phase
+does not remove any Lead tool.
+
+## RunKnowledge working memory
+
+`RunState.knowledge` is deterministic working memory for one Agent run. It is
+not long-term Memory and is never retrieved by embeddings. It retains:
+
+- read paths with SHA-256 digest, monotonic file version, read count, and
+  current/stale evidence state;
+- Python symbols confirmed by parsing an observed file version;
+- contracts derived from Acceptance and bounded Explorer evidence;
+- modified paths and recent test commands/results;
+- Acceptance status/evidence and structured Reviewer findings.
+
+Evidence records carry their source file versions. `write_file`, `edit_file`,
+and successful `integrate_worktree` invalidate only records linked to changed
+paths. A later read confirms the new file version but does not silently revive
+contract or Reviewer evidence from an older version.
+
+Context injects a bounded `RunKnowledge` view on every model call. Message
+compaction can therefore remove raw exchanges without deleting structured
+state. Full state remains in `AgentRuntime`; compacted messages contain only a
+short retention marker to avoid duplicating it.
+
 ## Remaining migration order
 
 1. Move Trace ownership from `CURRENT_TRACE` to `RuntimeServices`.

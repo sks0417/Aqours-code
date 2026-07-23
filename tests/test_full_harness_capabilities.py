@@ -65,8 +65,13 @@ def test_case_skill_and_mcp_dynamic_tool_are_live_in_full_policy(tmp_path, monke
             "memories": "CASE MEMORY", "connected_mcp": ["docs"],
             "active_teammates": [],
         })
-        assert "mcp__docs__search" in prompt
-        assert "Search documentation" in prompt
+        assert "mcp__docs__search" not in prompt
+        assert "Search documentation" not in prompt
+        docs_schema = next(
+            tool for tool in tools if tool["name"] == "mcp__docs__search"
+        )
+        assert docs_schema["description"] == "Search documentation. (readOnly)"
+        assert "API tool definitions and input schemas" in prompt
         assert "CASE MEMORY" in prompt
     finally:
         mcp.mcp_clients.clear()

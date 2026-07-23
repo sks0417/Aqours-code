@@ -1887,3 +1887,34 @@ python evals/run_eval.py --execution docker --docker-build --request-timeout 60 
 ```
 
 真实模型复测会消耗额度，必须显式执行，不作为普通单元测试的一部分。
+## Phase 3 Working Memory verification note (2026-07-23)
+
+HARN-001 remains **In progress**. The Runtime now owns deterministic
+`RunKnowledge` for file versions/digests, parsed symbols, contracts, modified
+files, tests, Acceptance, and Reviewer findings. Context injects a bounded view
+on every turn, and Compact no longer has to preserve those facts only through
+raw messages. File tools and successful Worktree integration invalidate
+evidence by changed path and version.
+
+This implementation is covered by unit/integration tests, but HARN-001 must not
+be marked closed until paired real-model
+`stress_distributed_ledger_recovery` runs demonstrate all three criteria:
+
+- median `read_file` calls below 45;
+- pass rate no lower than the paired baseline;
+- metered median token use at least 15% lower.
+
+Use `evals/compare_phase3.py` for the comparison. Missing provider usage is a
+failed verification, not a zero-token success.
+
+The first paired measurement after this implementation used three baseline and
+three candidate ledger runs. Baseline medians were 82 reads and 558,164 actual
+tokens with 0/3 passes. Candidate medians were 67 reads and 550,619 actual
+tokens with 1/3 passes. Pass rate improved, but reads remained above 45 and
+token reduction was only 1.35%, so HARN-001 remains open.
+
+A follow-up experiment that retained up to 28,000 characters of raw read
+evidence across every full compact was rejected after one real run: 57 reads,
+690,818 tokens, and a failed `exactly_once` outcome. That strategy was removed;
+the retained implementation keeps structured RunKnowledge outside message
+history without pinning a second copy of raw file contents into every prompt.

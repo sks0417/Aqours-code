@@ -779,3 +779,5 @@ def test_turns_and_tool_calls_remain_trace_metrics_without_loop_limits(tmp_path)
     assert result["final_answer"] == "done after two tools"
     assert metrics["llm_requests"] == 3
     assert metrics["tool_calls"] == 2
+    assert metrics["read_file_calls"] == 2
+    assert metrics["tool_counts"]["read_file"] == 2

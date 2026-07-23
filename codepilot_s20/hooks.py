@@ -80,7 +80,11 @@ def _request_interactive_approval(prompt: str) -> bool:
 def permission_hook(block):
     # The permission layer sees the raw tool_use before dispatch. It can deny,
     # ask the user, or allow execution to continue.
-    if block.name == "bash":
+    try:
+        safety_policy = get_tool_spec(block.name).safety_policy
+    except (KeyError, NameError):
+        safety_policy = "standard"
+    if safety_policy == "command_guard":
         command = block.input.get("command", "")
         if _looks_like_delete_command(command):
             if _looks_like_temp_cleanup(command):
@@ -102,7 +106,7 @@ def permission_hook(block):
             print(f"  {command}")
             if not _request_interactive_approval("  Allow? [y/N] "):
                 return "Permission denied by user"
-    if block.name in ("write_file", "edit_file"):
+    if safety_policy == "workspace_write":
         path = block.input.get("path", "")
         try:
             safe_path(path)

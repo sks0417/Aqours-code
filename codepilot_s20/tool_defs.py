@@ -1,7 +1,7 @@
 from .runtime_state import *
 from collections.abc import Callable
-from functools import partial
 from .runtime import AgentRuntime
+from .tool_registry import ToolRegistry, ToolSpec
 from .basic_tools import (
     run_bash,
     run_edit,
@@ -42,9 +42,9 @@ from .tool_handlers import (
 
 # ── Tool Definitions ──
 
-# The model sees tool schemas; Python executes handlers. S20 keeps both tables
-# explicit so every added capability is visible in one place.
-BUILTIN_TOOLS = [
+# These compact declarations are consumed once below to build ToolSpec objects.
+# TOOL_REGISTRY is the only public/authoritative lookup surface.
+_TOOL_SCHEMAS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object",
                       "properties": {"command": {"type": "string"},
@@ -253,9 +253,14 @@ BUILTIN_TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"}},
                       "required": ["name"]}},
+    {"name": "submit_plan",
+     "description": "Submit a plan for Lead approval.",
+     "input_schema": {"type": "object",
+                      "properties": {"plan": {"type": "string"}},
+                      "required": ["plan"]}},
 ]
 
-BUILTIN_HANDLERS = {
+_TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob,
     "todo_write": run_todo_write, "task": spawn_subagent,
@@ -279,6 +284,54 @@ BUILTIN_HANDLERS = {
     "connect_mcp": run_connect_mcp,
 }
 
+_LEAD = frozenset({"lead"})
+_ROLE_ACCESS = {
+    "bash": frozenset({"lead", "worker", "teammate"}),
+    "read_file": frozenset({
+        "lead", "general", "explorer", "reviewer", "worker", "teammate",
+    }),
+    "write_file": frozenset({"lead", "worker", "teammate"}),
+    "edit_file": frozenset({"lead", "worker", "teammate"}),
+    "glob": frozenset({"lead", "general", "worker", "teammate"}),
+    "send_message": frozenset({"lead", "teammate"}),
+    "list_tasks": frozenset({"lead", "teammate"}),
+    "claim_task": frozenset({"lead", "teammate"}),
+    "complete_task": frozenset({"lead", "teammate"}),
+    "submit_plan": frozenset({"teammate"}),
+}
+_RUNTIME_AWARE = frozenset({
+    "bash", "read_file", "write_file", "edit_file", "glob", "todo_write",
+    "load_skill", "task", "delegate_agent", "integrate_worktree",
+})
+_SAFETY_POLICIES = {
+    "bash": "command_guard",
+    "write_file": "workspace_write",
+    "edit_file": "workspace_write",
+    "remove_worktree": "destructive_confirmation",
+    "integrate_worktree": "workspace_integration",
+}
+_BACKGROUND_POLICIES = {"bash": "slow_or_explicit"}
+
+TOOL_REGISTRY = ToolRegistry(
+    ToolSpec(
+        name=tool["name"],
+        description=tool["description"],
+        schema=tool["input_schema"],
+        handler=_TOOL_HANDLERS.get(tool["name"]),
+        safety_policy=_SAFETY_POLICIES.get(tool["name"], "standard"),
+        background_policy=_BACKGROUND_POLICIES.get(
+            tool["name"], "foreground",
+        ),
+        allowed_roles=_ROLE_ACCESS.get(tool["name"], _LEAD),
+        runtime_aware=tool["name"] in _RUNTIME_AWARE,
+    )
+    for tool in _TOOL_SCHEMAS
+)
+
+# Compatibility exports are derived views, not independent definitions.
+BUILTIN_TOOLS = TOOL_REGISTRY.schemas_for_role("lead")
+BUILTIN_HANDLERS = TOOL_REGISTRY.handlers_for_role("lead")
+
 
 def builtin_handlers(
     runtime: AgentRuntime | None = None,
@@ -289,21 +342,31 @@ def builtin_handlers(
     Binding here lets the main Agent stop discovering workspace, deadline,
     executor, and Todo state through module globals.
     """
-    handlers = dict(BUILTIN_HANDLERS)
-    if runtime is None:
-        return handlers
-    handlers.update({
-        "bash": partial(run_bash, runtime=runtime),
-        "read_file": partial(run_read, runtime=runtime),
-        "write_file": partial(run_write, runtime=runtime),
-        "edit_file": partial(run_edit, runtime=runtime),
-        "glob": partial(run_glob, runtime=runtime),
-        "todo_write": partial(run_todo_write, runtime=runtime),
-        "load_skill": partial(load_skill, runtime=runtime),
-        "task": partial(spawn_subagent, runtime=runtime),
-        "delegate_agent": partial(run_delegate_agent, runtime=runtime),
-    })
-    return handlers
+    return TOOL_REGISTRY.handlers_for_role("lead", runtime)
+
+
+def tool_schemas_for_role(role: str) -> list[dict]:
+    return TOOL_REGISTRY.schemas_for_role(role)
+
+
+def tool_schemas_for_names(names, *, role: str) -> list[dict]:
+    return TOOL_REGISTRY.schemas_for_names(names, role=role)
+
+
+def tool_handlers_for_names(
+    names,
+    *,
+    role: str,
+    runtime: AgentRuntime | None = None,
+    **handler_kwargs,
+) -> dict[str, Callable]:
+    return TOOL_REGISTRY.handlers_for_names(
+        names, role=role, runtime=runtime, **handler_kwargs,
+    )
+
+
+def get_tool_spec(name: str) -> ToolSpec:
+    return TOOL_REGISTRY.get(name)
 
 
 

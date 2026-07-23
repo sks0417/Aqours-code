@@ -43,6 +43,12 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
     def run():
         wt_ctx = {"path": None}
+        registered_handlers = {
+            tool_name: get_tool_spec(tool_name).handler
+            for tool_name in (
+                "bash", "read_file", "write_file", "edit_file", "glob",
+            )
+        }
 
         def _wt_cwd():
             # Once a task with a worktree is claimed, all teammate file tools
@@ -50,20 +56,33 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             p = wt_ctx["path"]
             return Path(p) if p else None
 
-        def _run_bash(command: str) -> str:
-            return run_bash(command, cwd=_wt_cwd(), executor=teammate_command_executor)
+        def _run_bash(
+            command: str, run_in_background: bool = False,
+        ) -> str:
+            return registered_handlers["bash"](
+                command, cwd=_wt_cwd(), executor=teammate_command_executor,
+                run_in_background=run_in_background,
+            )
 
-        def _run_read(path: str) -> str:
-            return run_read(path, cwd=_wt_cwd())
+        def _run_read(
+            path: str, limit: int | None = None, offset: int = 0,
+        ) -> str:
+            return registered_handlers["read_file"](
+                path, limit=limit, offset=offset, cwd=_wt_cwd(),
+            )
 
         def _run_write(path: str, content: str) -> str:
-            return run_write(path, content, cwd=_wt_cwd())
+            return registered_handlers["write_file"](
+                path, content, cwd=_wt_cwd(),
+            )
 
         def _run_edit(path: str, old_text: str, new_text: str) -> str:
-            return run_edit(path, old_text, new_text, cwd=_wt_cwd())
+            return registered_handlers["edit_file"](
+                path, old_text, new_text, cwd=_wt_cwd(),
+            )
 
         def _run_glob(pattern: str) -> str:
-            return run_glob(pattern, cwd=_wt_cwd())
+            return registered_handlers["glob"](pattern, cwd=_wt_cwd())
 
         def _run_list_tasks():
             tasks = list_tasks()
@@ -88,59 +107,6 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             return result
 
         messages = [{"role": "user", "content": prompt}]
-        sub_tools = [
-            {"name": "bash", "description": "Run a shell command.",
-             "input_schema": {"type": "object",
-                              "properties": {"command": {"type": "string"}},
-                              "required": ["command"]}},
-            {"name": "read_file", "description": "Read file.",
-             "input_schema": {"type": "object",
-                              "properties": {"path": {"type": "string"},
-                                             "limit": {"type": "integer"},
-                                             "offset": {"type": "integer"}},
-                              "required": ["path"]}},
-            {"name": "write_file", "description": "Write file.",
-             "input_schema": {"type": "object",
-                              "properties": {"path": {"type": "string"},
-                                             "content": {"type": "string"}},
-                              "required": ["path", "content"]}},
-            {"name": "edit_file", "description": "Replace exact text once.",
-             "input_schema": {"type": "object",
-                              "properties": {"path": {"type": "string"},
-                                             "old_text": {"type": "string"},
-                                             "new_text": {"type": "string"}},
-                              "required": ["path", "old_text", "new_text"]}},
-            {"name": "glob", "description": "Find files by glob pattern.",
-             "input_schema": {"type": "object",
-                              "properties": {"pattern": {"type": "string"}},
-                              "required": ["pattern"]}},
-            {"name": "send_message",
-             "description": "Send message to another agent.",
-             "input_schema": {"type": "object",
-                              "properties": {"to": {"type": "string"},
-                                             "content": {"type": "string"}},
-                              "required": ["to", "content"]}},
-            {"name": "submit_plan",
-             "description": "Submit a plan for Lead approval.",
-             "input_schema": {"type": "object",
-                              "properties": {"plan": {"type": "string"}},
-                              "required": ["plan"]}},
-            {"name": "list_tasks",
-             "description": "List all tasks.",
-             "input_schema": {"type": "object", "properties": {},
-                              "required": []}},
-            {"name": "claim_task",
-             "description": "Claim a pending task.",
-             "input_schema": {"type": "object",
-                              "properties": {"task_id": {"type": "string"}},
-                              "required": ["task_id"]}},
-            {"name": "complete_task",
-             "description": "Mark an in-progress task as completed.",
-             "input_schema": {"type": "object",
-                              "properties": {"task_id": {"type": "string"}},
-                              "required": ["task_id"]}},
-        ]
-
         sub_handlers = {
             "bash": _run_bash, "read_file": _run_read,
             "write_file": _run_write, "edit_file": _run_edit,
@@ -151,6 +117,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             "claim_task": _run_claim_task,
             "complete_task": _run_complete_task,
         }
+        allowed = set(TOOL_REGISTRY.names_for_role("teammate"))
         if role_profile:
             coordination = {"send_message"}
             if role_profile.uses_worktree:
@@ -158,11 +125,11 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                     "submit_plan", "list_tasks", "claim_task", "complete_task",
                 })
             allowed = set(role_profile.tool_names) | coordination
-            sub_tools = [tool for tool in sub_tools if tool["name"] in allowed]
             sub_handlers = {
                 tool_name: handler for tool_name, handler in sub_handlers.items()
                 if tool_name in allowed
             }
+        sub_tools = tool_schemas_for_names(allowed, role="teammate")
 
         while True:
             if stop_event.is_set():

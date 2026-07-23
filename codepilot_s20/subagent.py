@@ -8,35 +8,6 @@ from .command_executor import CaseTimeoutError as _CaseTimeoutError
 
 # ── Subagent Tool ──
 
-SUB_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object",
-                      "properties": {"command": {"type": "string"}},
-                      "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object",
-                      "properties": {"path": {"type": "string"},
-                                     "limit": {"type": "integer"},
-                                     "offset": {"type": "integer"}},
-                      "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object",
-                      "properties": {"path": {"type": "string"},
-                                     "content": {"type": "string"}},
-                      "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object",
-                      "properties": {"path": {"type": "string"},
-                                     "old_text": {"type": "string"},
-                                     "new_text": {"type": "string"}},
-                      "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object",
-                      "properties": {"pattern": {"type": "string"}},
-                      "required": ["pattern"]}},
-]
-
-
 def extract_text(content) -> str:
     if not isinstance(content, list):
         return str(content)
@@ -101,24 +72,21 @@ def _request_with_deadline(*, system: str, messages: list, tools: list,
 
 def _role_handlers(
     cwd: Path,
+    tool_names,
+    role: str,
     runtime: AgentRuntime | None = None,
 ) -> dict:
     pinned_executor = (
         runtime.services.command_executor if runtime is not None
         else COMMAND_EXECUTOR
     )
-    return {
-        "bash": lambda command: run_bash(
-            command, cwd=cwd, executor=pinned_executor, runtime=runtime),
-        "read_file": lambda path, limit=None, offset=0: run_read(
-            path, limit=limit, offset=offset, cwd=cwd, runtime=runtime),
-        "write_file": lambda path, content: run_write(
-            path, content, cwd=cwd, runtime=runtime),
-        "edit_file": lambda path, old_text, new_text: run_edit(
-            path, old_text, new_text, cwd=cwd, runtime=runtime),
-        "glob": lambda pattern: run_glob(
-            pattern, cwd=cwd, runtime=runtime),
-    }
+    return tool_handlers_for_names(
+        tool_names,
+        role=role,
+        runtime=runtime,
+        cwd=cwd,
+        executor=pinned_executor,
+    )
 
 
 def _parse_role_result(text: str, role: str) -> dict:
@@ -287,12 +255,14 @@ def run_role_agent(
     profile = get_agent_profile(role)
     if profile is None:
         return {"verdict": "blocked", "summary": f"unknown role: {role}"}
-    tools = [tool for tool in SUB_TOOLS if tool["name"] in profile.tool_names]
     role_runtime = (
         runtime.child(workdir=cwd, root_task=runtime.state.root_task)
         if runtime is not None else None
     )
-    handlers = _role_handlers(cwd, role_runtime)
+    tools = tool_schemas_for_names(profile.tool_names, role=profile.name)
+    handlers = _role_handlers(
+        cwd, profile.tool_names, profile.name, role_runtime,
+    )
     runtime_policy = (
         role_runtime.config.tool_policy if role_runtime is not None else None
     )

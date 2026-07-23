@@ -139,7 +139,11 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
 
 
 def background_reason(tool_name: str, tool_input: dict) -> str | None:
-    if not BACKGROUND_TASKS_ENABLED or tool_name != "bash":
+    try:
+        policy = get_tool_spec(tool_name).background_policy
+    except (KeyError, NameError):
+        policy = "foreground"
+    if not BACKGROUND_TASKS_ENABLED or policy != "slow_or_explicit":
         return None
     if bool(tool_input.get("run_in_background")):
         return "explicit"

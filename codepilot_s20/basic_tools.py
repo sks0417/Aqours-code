@@ -1,6 +1,7 @@
 from .runtime_state import *
 from .command_executor import CaseTimeoutError
 from .command_safety import looks_like_delete_command
+from .knowledge import content_digest, normalize_knowledge_path
 from .runtime import AgentRuntime
 import re
 
@@ -35,6 +36,22 @@ def safe_path(
     return path
 
 
+def _record_runtime_mutation(
+    runtime: AgentRuntime | None,
+    path: str,
+    file_path: Path,
+) -> None:
+    if runtime is None:
+        return
+    digest = runtime.state.knowledge.files.get(normalize_knowledge_path(path))
+    current_digest = content_digest(file_path.read_bytes())
+    if digest is not None and digest.digest == current_digest:
+        return
+    runtime.state.knowledge.invalidate_file(
+        path, digest=current_digest, modified=True,
+    )
+
+
 def run_bash(command: str, cwd: Path = None,
              run_in_background: bool = False, timeout: float = 120,
              executor=None, runtime: AgentRuntime | None = None) -> str:
@@ -59,6 +76,13 @@ def run_bash(command: str, cwd: Path = None,
         result = selected_executor.execute(
             command, _runtime_workdir(runtime, cwd), effective_timeout)
         out = (result["stdout"] + result["stderr"]).strip()
+        if runtime is not None:
+            runtime.state.knowledge.record_test(
+                command,
+                exit_code=result.get("exit_code"),
+                timed_out=bool(result["timed_out"]),
+                result=out or "(no output)",
+            )
         if result["timed_out"]:
             return f"Error: Timeout ({timeout:g}s)" + (f"\n{out[:50000]}" if out else "")
         return out[:50000] if out else "(no output)"
@@ -72,7 +96,11 @@ def run_read(path: str, limit: int | None = None,
              offset: int = 0, cwd: Path = None,
              runtime: AgentRuntime | None = None) -> str:
     try:
-        lines = safe_path(path, cwd, runtime).read_text().splitlines()
+        file_path = safe_path(path, cwd, runtime)
+        raw = file_path.read_bytes()
+        lines = raw.decode(errors="replace").splitlines()
+        if runtime is not None:
+            runtime.state.knowledge.observe_file(path, raw)
         offset = max(int(offset or 0), 0)
         limit = int(limit) if limit is not None else None
         lines = lines[offset:]
@@ -89,6 +117,7 @@ def run_write(path: str, content: str, cwd: Path = None,
         fp = safe_path(path, cwd, runtime)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
+        _record_runtime_mutation(runtime, path, fp)
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -102,6 +131,7 @@ def run_edit(path: str, old_text: str, new_text: str,
         if old_text not in text:
             return f"Error: text not found in {path}"
         fp.write_text(text.replace(old_text, new_text, 1))
+        _record_runtime_mutation(runtime, path, fp)
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -246,6 +276,8 @@ def run_todo_write(
     # Agent finalization and prompt assembly read the same live state.
     current_todos = _runtime_todos(runtime)
     current_todos[:] = todos
+    if runtime is not None:
+        runtime.state.knowledge.sync_acceptance(current_todos)
     acceptance = [todo for todo in current_todos
                   if todo.get("kind") == "acceptance"]
     unverified = [todo for todo in acceptance

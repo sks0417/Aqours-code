@@ -81,6 +81,17 @@ per-case `/state`, `/runtime`, and the model forwarding directories. The host
 project, API keys, Docker socket, trusted grader, and grading workspace are not
 mounted. The container is network-disabled, non-root, and resource limited.
 
+The 30 built-ins and every role-specific projection come from one `ToolSpec`
+registry. API schemas are the authoritative tool descriptions, so the system
+prompt no longer duplicates them. A regression budget keeps the fixed prompt
+plus 30-tool schema below 12,000 characters without hiding any Lead tool.
+
+Each run also owns deterministic `RunKnowledge`: file digests/versions,
+confirmed Python symbols and contracts, modified paths, recent test results,
+Acceptance state, and Reviewer findings. Context compaction preserves this
+state independently of raw messages. File mutations invalidate only evidence
+bound to the changed path.
+
 For complex code changes, `todo_write` distinguishes execution steps
 (`kind=plan`) from external requirements (`kind=acceptance`). Completed
 acceptance items require concise evidence. The compact live prompt preserves
@@ -183,6 +194,23 @@ python evals/run_eval.py --scripted --execution docker --docker-build
 python evals/run_eval.py --execution docker --case mini_auth_service_security_fix
 python evals/run_eval.py --execution docker --docker-build --request-timeout 60 --case stress_distributed_ledger_recovery --docker-timeout 900
 ```
+
+Phase 3 paired summaries can be checked without hand-calculating medians:
+
+```powershell
+python evals/compare_phase3.py `
+  --baseline path/to/baseline-1/summary.json `
+  --baseline path/to/baseline-2/summary.json `
+  --candidate path/to/candidate-1/summary.json `
+  --candidate path/to/candidate-2/summary.json
+```
+
+Each argument may also point directly to a persisted
+`evals/results/runs/<run-id>` directory, so historical runs remain comparable
+after the top-level `summary.json` is replaced by a newer Eval.
+
+The comparison passes only when ledger median `read_file` calls are below 45,
+pass rate does not fall, and metered median tokens fall by at least 15%.
 
 Current Trace/timeline diagnostics share the runtime schema and tolerate
 malformed JSONL while reporting its line number:

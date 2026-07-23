@@ -295,7 +295,8 @@ def _compacted_result_text(content) -> str:
 
 
 def micro_compact(messages: list, trigger_size: int | None = None,
-                  target_size: int | None = None) -> list:
+                  target_size: int | None = None,
+                  runtime: AgentRuntime | None = None) -> list:
     trigger_size = (MICRO_COMPACT_TRIGGER if trigger_size is None
                     else int(trigger_size))
     target_size = (MICRO_COMPACT_TARGET if target_size is None
@@ -319,8 +320,15 @@ def micro_compact(messages: list, trigger_size: int | None = None,
     protected_indices = {
         batch[0] for batch in working_batches[-KEEP_RECENT_TOOL_RESULT_MESSAGES:]
     }
+    knowledge_paths = (
+        sum(
+            1 for record in runtime.state.knowledge.files.values()
+            if record.evidence_valid
+        )
+        if runtime is not None else 0
+    )
     protected_indices.update(_recent_read_working_set_indices(
-        batches, tool_uses, KEEP_RECENT_READ_PATHS))
+        batches, tool_uses, max(KEEP_RECENT_READ_PATHS, knowledge_paths)))
     for message_index, _, blocks in batches:
         if message_index in protected_indices:
             continue
@@ -428,6 +436,24 @@ def _record_compact_event(
         pass
 
 
+def _working_memory_notice(runtime: AgentRuntime | None) -> str:
+    if runtime is None:
+        return ""
+    knowledge = runtime.state.knowledge
+    valid_files = sum(
+        1 for item in knowledge.files.values() if item.evidence_valid
+    )
+    stale_files = len(knowledge.files) - valid_files
+    return (
+        "\n\n[RunKnowledge retained outside raw message history: "
+        f"{valid_files} valid files, {stale_files} stale files, "
+        f"{len(knowledge.modified_files)} modified files, "
+        f"{len(knowledge.recent_tests)} recent tests, "
+        f"{len(knowledge.reviewer_findings)} reviewer findings. "
+        "The authoritative structured state is injected on every turn.]"
+    )
+
+
 def _history_and_recent_tail(messages: list, keep_tail: int):
     tail_start = max(0, len(messages) - keep_tail)
     if (tail_start > 0 and tail_start < len(messages)
@@ -451,7 +477,9 @@ def compact_history(
         runtime.services.model_client if runtime is not None else client
     )
     if allow_model_summary is None:
-        allow_model_summary, budget = can_spend_optional_calls(model_client, 1)
+        allow_model_summary, budget = can_spend_optional_calls(
+            model_client, 1,
+        )
     else:
         budget = {}
     summary_mode = "model" if allow_model_summary else "deterministic"
@@ -473,8 +501,11 @@ def compact_history(
             **{key: value for key, value in budget.items()
                if key != "available"},
         )
-    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"},
-            *tail]
+    summary += _working_memory_notice(runtime)
+    return [
+        {"role": "user", "content": f"[Compacted]\n\n{summary}"},
+        *tail,
+    ]
 
 
 def reactive_compact(
@@ -508,8 +539,11 @@ def reactive_compact(
             **{key: value for key, value in budget.items()
                if key != "available"},
         )
-    return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"},
-            *tail]
+    summary += _working_memory_notice(runtime)
+    return [
+        {"role": "user", "content": f"[Reactive compact]\n\n{summary}"},
+        *tail,
+    ]
 
 
 
