@@ -300,6 +300,7 @@ def test_completed_acceptance_todo_requires_evidence():
             "evidence": "rollback test passes",
         }])
         assert output == "Updated 1 todos (1 acceptance, 0 unverified)"
+        assert basic_tools.CURRENT_TODOS[0]["id"] == "accept:1"
 
         oversized = basic_tools.run_todo_write([
             {"content": f"contract {index}", "status": "pending",

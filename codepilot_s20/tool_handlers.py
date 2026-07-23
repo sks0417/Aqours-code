@@ -1,4 +1,5 @@
 from .runtime_state import *
+from .runtime import AgentRuntime
 
 # ── Lead Worktree Tools ──
 
@@ -15,8 +16,9 @@ def run_integrate_worktree(name: str, cleanup: bool = True) -> str:
     return integrate_worktree(name, cleanup)
 
 def run_delegate_agent(role: str, prompt: str, name: str = "",
-                       task_id: str = "") -> str:
-    return delegate_agent(role, prompt, name, task_id)
+                       task_id: str = "",
+                       runtime: AgentRuntime | None = None) -> str:
+    return delegate_agent(role, prompt, name, task_id, runtime)
 
 
 # ── Basic tool handlers ──

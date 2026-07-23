@@ -1,0 +1,16 @@
+id: stress_distributed_ledger_recovery
+suite: stress
+difficulty: 6
+category: cross_component_consistency_and_recovery
+max_model_calls: 50
+score_runtime_target_sec: 240
+score_runtime_hard_limit_sec: 900
+score_llm_call_target: 18
+score_llm_call_hard_limit: 50
+score_tool_call_target: 45
+score_tool_call_hard_limit: 140
+score_token_target: 450000
+score_token_hard_limit: 2200000
+forbidden_paths: [README.md, pyproject.toml, tests/**]
+expected_artifacts: [src/ledger_service/__init__.py, src/ledger_service/api.py, src/ledger_service/bootstrap.py, src/ledger_service/errors.py, src/ledger_service/models.py, src/ledger_service/validation.py, src/ledger_service/fingerprint.py, src/ledger_service/serialization.py, src/ledger_service/service.py, src/ledger_service/repositories/event_store.py, src/ledger_service/repositories/idempotency.py, src/ledger_service/repositories/balances.py, src/ledger_service/repositories/sequences.py, src/ledger_service/repositories/receipts.py, src/ledger_service/repositories/checkpoints.py, src/ledger_service/recovery/checksum.py, src/ledger_service/recovery/replayer.py, src/ledger_service/reporting.py, src/ledger_service/notifications.py, src/ledger_service/metrics.py]
+allowed_changes: [src/ledger_service/*.py, src/ledger_service/repositories/*.py, src/ledger_service/recovery/*.py]

@@ -1,4 +1,5 @@
 from .runtime_state import *
+from .runtime import AgentRuntime
 
 # ── MCP System ──
 
@@ -98,14 +99,19 @@ def connect_mcp(name: str) -> str:
             f"Discovered {len(mcp_client.tools)} tools: {', '.join(tool_names)}")
 
 
-def assemble_tool_pool() -> tuple[list[dict], dict]:
+def assemble_tool_pool(
+    runtime: AgentRuntime | None = None,
+) -> tuple[list[dict], dict]:
     """Merge builtin tools + all MCP tools into one pool."""
-    policy = TOOL_POLICY if isinstance(TOOL_POLICY, dict) else None
+    runtime_policy = runtime.config.tool_policy if runtime is not None else None
+    policy = (runtime_policy if isinstance(runtime_policy, dict)
+              else TOOL_POLICY if isinstance(TOOL_POLICY, dict) else None)
     allowed = (set(policy["allowed_tools"])
                if policy and "allowed_tools" in policy else None)
     tools = [tool for tool in BUILTIN_TOOLS
              if allowed is None or tool.get("name") in allowed]
-    handlers = {name: handler for name, handler in BUILTIN_HANDLERS.items()
+    base_handlers = builtin_handlers(runtime)
+    handlers = {name: handler for name, handler in base_handlers.items()
                 if allowed is None or name in allowed}
     clients = mcp_clients.items() if not policy or policy.get("allow_mcp") else ()
     for server_name, mcp_client in clients:

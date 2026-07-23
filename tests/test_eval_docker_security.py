@@ -197,7 +197,8 @@ def test_workdir_derived_paths_follow_agent_workspace_and_restore(tmp_path, monk
     before = runtime_snapshot()
     observed = {}
 
-    def inspect_loop(messages, _context):
+    def inspect_loop(messages, _context, runtime):
+        observed["explicit_runtime"] = runtime
         observed.update(runtime_snapshot())
         messages.append({"role": "assistant", "content": [text_block("done")]})
 
@@ -339,7 +340,11 @@ def test_docker_policy_subagent_prompt_uses_container_runtime(tmp_path, monkeypa
     monkeypatch.setattr(subagent, "client", SimpleNamespace(messages=Messages()))
     monkeypatch.setattr(subagent, "MODEL", "scripted")
 
-    assert subagent.spawn_subagent("inspect") == "done"
+    delegation = json.loads(subagent.spawn_subagent("inspect"))
+    assert delegation["role"] == "explorer"
+    assert delegation["result"]["summary"].startswith("done")
+    assert delegation["result"]["verdict"] == "blocked"
+    assert delegation["routed_from"] == "task"
     prompt = captured["system"]
     assert "- OS: Linux" in prompt
     assert "- Shell: /bin/sh" in prompt
@@ -360,7 +365,7 @@ def test_eval_trace_storage_is_separate_and_exposes_normal_process_metrics(
     trusted_runtime = tmp_path / "agent_runtime"
     exported_trace = tmp_path / "trace.jsonl"
 
-    def finish_immediately(messages, _context):
+    def finish_immediately(messages, _context, _runtime):
         messages.append({"role": "assistant", "content": [text_block("done")]})
 
     monkeypatch.setattr(agent_loop, "agent_loop", finish_immediately)
@@ -377,7 +382,8 @@ def test_eval_trace_storage_is_separate_and_exposes_normal_process_metrics(
     assert (trusted_runtime / ".codepilot" / "run_index.json").exists()
     metrics = run_eval.trace_metrics(exported_trace)
     assert set(metrics) == {
-        "tool_calls", "llm_requests", "permission_blocks", "event_count",
+        "tool_calls", "llm_requests", "permission_blocks",
+        "duplicate_tool_calls", "event_count",
     }
     assert metrics["event_count"] > 0
 
@@ -568,7 +574,7 @@ def test_cleanup_failure_does_not_block_runtime_restoration(tmp_path, monkeypatc
         def stop(self):
             raise RuntimeError("stop cleanup failed")
 
-    def finish_immediately(messages, _context):
+    def finish_immediately(messages, _context, _runtime):
         messages.append({"role": "assistant", "content": [text_block("done")]})
 
     monkeypatch.setattr(agent_loop, "agent_loop", finish_immediately)

@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from codepilot_s20 import basic_tools, hooks, message_bus, protocol
 
 
@@ -36,3 +38,23 @@ def test_run_bash_blocks_delete_command_even_without_hook(tmp_path):
     output = basic_tools.run_bash("Remove-Item -Recurse -Force .", cwd=tmp_path)
     assert output == "Permission denied: delete commands are disabled for bash"
     assert tmp_path.exists()
+
+
+@pytest.mark.parametrize("command", [
+    "python -c \"assert 'Confirm raises'\"",
+    "python -c \"message = 'perform rollback'; print(message)\"",
+    "Write-Output 'rm temporary is documentation, not a command'",
+])
+def test_delete_detection_ignores_command_words_inside_arguments(command):
+    assert hooks._looks_like_delete_command(command) is False
+    assert hooks.permission_hook(_bash_block(command)) is None
+
+
+@pytest.mark.parametrize("command", [
+    "echo safe && rm -rf build",
+    "Get-Content paths.txt | Remove-Item",
+    "cmd /c del /q artifact.txt",
+    "powershell -Command \"Remove-Item artifact.txt\"",
+])
+def test_delete_detection_checks_each_shell_command_position(command):
+    assert hooks._looks_like_delete_command(command) is True

@@ -23,9 +23,9 @@ OUTCOME_GROUPS = {
     "idempotency_conflict": (6, "test_idempotency_conflict.py"),
     "cancellation_and_state": (10, "test_cancellation_state.py"),
 }
-REGRESSION_POINTS = 5
-API_COMPATIBILITY_POINTS = 10
-PROTECTED_INPUT_POINTS = 5
+REGRESSION_POINTS = 10
+API_COMPATIBILITY_POINTS = 2.5
+PROTECTED_INPUT_POINTS = 2.5
 
 IMPLEMENTATION_FILES = (
     "src/inventory_service/__init__.py",
@@ -100,6 +100,8 @@ def assess_code_quality(workspace: Path) -> tuple[float, dict]:
     syntax_errors = []
     suspicious = []
     discovered_architecture: dict[str, list[str]] = {}
+    oversized_functions = []
+    unsafe_dynamic_calls = []
 
     for relative in IMPLEMENTATION_FILES:
         path = workspace / relative
@@ -116,6 +118,21 @@ def assess_code_quality(workspace: Path) -> tuple[float, dict]:
             compile(tree, relative, "exec")
         except (SyntaxError, ValueError) as exc:
             syntax_errors.append(f"{relative}: {exc}")
+            tree = None
+        if tree is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    end_lineno = getattr(node, "end_lineno", node.lineno)
+                    if end_lineno - node.lineno + 1 > 80:
+                        oversized_functions.append(
+                            f"{relative}:{node.name}:{end_lineno - node.lineno + 1}")
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"eval", "exec"}
+                ):
+                    unsafe_dynamic_calls.append(
+                        f"{relative}:{node.lineno}:{node.func.id}")
 
     architecture_missing = []
     for filename, expected_names in EXPECTED_ARCHITECTURE.items():
@@ -142,13 +159,17 @@ def assess_code_quality(workspace: Path) -> tuple[float, dict]:
     if not suspicious:
         points += 4
     if not architecture_missing:
-        points += 5
+        points += 6
+    if not oversized_functions and not unsafe_dynamic_calls:
+        points += 4
     return points, {
         "missing_files": missing,
         "syntax_errors": syntax_errors,
         "suspicious_test_coupling": suspicious,
         "architecture_missing": architecture_missing,
         "architecture_symbols": discovered_architecture,
+        "oversized_functions": oversized_functions,
+        "unsafe_dynamic_calls": unsafe_dynamic_calls,
     }
 
 
@@ -190,32 +211,6 @@ def trace_process_metrics(trace_path: Path) -> dict:
         "permission_blocks": permission_blocks,
         "compact_calls": compact_calls,
     }
-
-
-def process_score(metrics: dict) -> float:
-    points = 0.0
-    if metrics["test_run_count"] >= 1:
-        points += 10
-    if metrics["test_run_count"] >= 2:
-        points += 5
-    if metrics["exploration_call_count"] >= 4:
-        points += 5
-    return points
-
-
-def efficiency_score(metrics: dict, test_results: list[dict]) -> float:
-    points = 0.0
-    if 1 <= metrics["tool_calls"] <= 80:
-        points += 4
-    elif 1 <= metrics["tool_calls"] <= 120:
-        points += 2
-    if metrics["permission_blocks"] == 0:
-        points += 2
-    if metrics["compact_calls"] <= 1:
-        points += 1
-    if not any(result.get("timed_out") for result in test_results):
-        points += 3
-    return points
 
 
 def main() -> int:
@@ -277,19 +272,21 @@ def main() -> int:
         constraints_points += PROTECTED_INPUT_POINTS
 
     trace_metrics = trace_process_metrics(Path(args.trace))
-    process_points = process_score(trace_metrics)
     code_quality_points, code_quality_metrics = assess_code_quality(workspace)
-    efficiency_points = efficiency_score(trace_metrics, all_test_results)
 
     breakdown = {
-        "outcome_correctness": outcome_points,
-        "constraints": constraints_points,
-        "process_quality": process_points,
+        "functional_correctness": outcome_points + constraints_points,
         "code_quality": code_quality_points,
-        "efficiency": efficiency_points,
+        # The host harness fills these dimensions from wall-clock and Provider
+        # usage, which are deliberately unavailable to the trusted case grader.
+        "runtime_efficiency": 0,
+        "token_cost": 0,
     }
-    score = sum(breakdown.values())
-    passed = score == 100 and not failed_groups and not protected_changes
+    api_compatible = (
+        api_compatibility.get("returncode") == 0
+        and not api_compatibility.get("timed_out")
+    )
+    passed = not failed_groups and api_compatible and not protected_changes
 
     reasons = []
     if failed_groups:
@@ -298,16 +295,8 @@ def main() -> int:
         reasons.append("public API or exception compatibility failed")
     if protected_changes:
         reasons.append("protected files changed: " + ", ".join(protected_changes))
-    if process_points < 20:
-        reasons.append(
-            "process evidence incomplete "
-            f"(tests={trace_metrics['test_run_count']}, "
-            f"exploration={trace_metrics['exploration_call_count']})"
-        )
-    if code_quality_points < 15:
+    if code_quality_points < 20:
         reasons.append("deterministic source quality checks failed")
-    if efficiency_points < 10:
-        reasons.append("efficiency checks were not fully satisfied")
 
     if protected_changes or api_compatibility.get("returncode") != 0:
         category = "constraint_violation"

@@ -71,15 +71,14 @@ from codepilot_s20.model_broker import (  # noqa: E402
     ModelBroker,
     broker_ipc_wait_timeout,
 )
+from evals.scoring import (  # noqa: E402
+    BREAKDOWN_WEIGHTS,
+    PROFILE_METADATA_KEYS,
+    apply_harness_scoring,
+)
 
 
-DEFAULT_BREAKDOWN_WEIGHTS = {
-    "outcome_correctness": 40,
-    "constraints": 15,
-    "process_quality": 20,
-    "code_quality": 15,
-    "efficiency": 10,
-}
+DEFAULT_BREAKDOWN_WEIGHTS = dict(BREAKDOWN_WEIGHTS)
 FAILURE_CATEGORIES = {
     None,
     "test_failure",
@@ -142,6 +141,9 @@ RUNTIME_IGNORE_PATTERNS = [
     "*/__pycache__/**",
     "*.pyc",
 ]
+CASE_COPY_IGNORE = shutil.ignore_patterns(
+    ".pytest_cache", "__pycache__", "*.pyc", "*.pyo",
+)
 TAMPER_ENTRY_NAMES = {"pytest.py", "conftest.py", "sitecustomize.py", "usercustomize.py"}
 TRUSTED_ROOT_FILES = {"task.md", "metadata.yaml", "grader.py"}
 TRUSTED_DIRS = {"workspace", "grader_tests", "agent_state"}
@@ -413,7 +415,10 @@ def parse_scalar(value, default=None):
     try:
         return int(text)
     except ValueError:
-        return text
+        try:
+            return float(text)
+        except ValueError:
+            return text
 
 
 def parse_list(value) -> list:
@@ -440,6 +445,7 @@ def load_metadata(case_dir: Path) -> dict:
         "expected_artifacts": [],
         "allowed_changes": [],
         "scripted_supported": False,
+        **{metadata_key: None for metadata_key in PROFILE_METADATA_KEYS.values()},
     }
     if not path.exists():
         return metadata
@@ -456,6 +462,7 @@ def load_metadata(case_dir: Path) -> dict:
         elif key in {
             "difficulty", "max_model_calls",
             "max_model_tokens", "scripted_supported",
+            *PROFILE_METADATA_KEYS.values(),
         }:
             metadata[key] = parse_scalar(value)
         else:
@@ -479,6 +486,19 @@ def read_trace_events(trace_path: Path) -> list[dict]:
 
 def trace_metrics(trace_path: Path) -> dict:
     events = read_trace_events(trace_path)
+    duplicate_tool_calls = 0
+    previous_tool_signature = None
+    for event in events:
+        if event.get("type") != "tool_use":
+            continue
+        tool_input = event.get("input") if isinstance(event.get("input"), dict) else {}
+        signature = (
+            str(event.get("tool") or event.get("name") or ""),
+            json.dumps(tool_input, sort_keys=True, ensure_ascii=False),
+        )
+        if signature == previous_tool_signature:
+            duplicate_tool_calls += 1
+        previous_tool_signature = signature
     return {
         "tool_calls": sum(
             1 for event in events if event.get("type") == "tool_use"),
@@ -490,6 +510,7 @@ def trace_metrics(trace_path: Path) -> dict:
             and event.get("name") == "PreToolUse"
             and event.get("decision") == "blocked"
         ),
+        "duplicate_tool_calls": duplicate_tool_calls,
         "event_count": len(events),
     }
 
@@ -692,7 +713,7 @@ def copy_case_workspace(case_dir: Path, destination: Path):
         source,
         destination,
         symlinks=True,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        ignore=CASE_COPY_IGNORE,
     )
 
 
@@ -737,6 +758,7 @@ def copy_trusted_case(case_dir: Path, trusted_eval_root: Path, case_name: str) -
         shutil.rmtree(trusted_eval_root)
     trusted_case.mkdir(parents=True, exist_ok=True)
     shutil.copy2(PROJECT_ROOT / "evals" / "grader_common.py", trusted_eval_root / "grader_common.py")
+    shutil.copy2(PROJECT_ROOT / "evals" / "scoring.py", trusted_eval_root / "scoring.py")
     for filename in TRUSTED_ROOT_FILES:
         source = case_dir / filename
         if source.exists():
@@ -748,7 +770,7 @@ def copy_trusted_case(case_dir: Path, trusted_eval_root: Path, case_name: str) -
                 source,
                 trusted_case / dirname,
                 symlinks=True,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+                ignore=CASE_COPY_IGNORE,
             )
     return trusted_case
 
@@ -1032,6 +1054,7 @@ def _run_docker_agent_phase(
     ipc_root.mkdir(parents=True, exist_ok=True)
     (ipc_root / "requests").mkdir(parents=True, exist_ok=True)
     (ipc_root / "responses").mkdir(parents=True, exist_ok=True)
+    (ipc_root / "stats").mkdir(parents=True, exist_ok=True)
     remaining = remaining_timeout(case_deadline)
     provider_timeout, broker_request_timeout = model_broker_timeouts(
         float(os.getenv("MODEL_REQUEST_TIMEOUT", "30")), remaining)
@@ -1042,6 +1065,8 @@ def _run_docker_agent_phase(
         "runtime_root": "/runtime",
         "ipc_root": "/broker",
         "broker_nonce": nonce,
+        "model_call_budget": model_call_budget,
+        "broker_max_provider_retries": DEFAULT_PROVIDER_RETRIES,
         "model": "scripted-eval" if scripted else MODEL,
         # request_timeout remains the Provider timeout for backward-compatible
         # runtime configuration. The container waits through one Broker-owned
@@ -1171,9 +1196,17 @@ def _run_docker_agent_phase(
         result_payload = {"ok": False, "error": error}
 
     run_info = result_payload.get("run_info", {})
-    command_metadata = run_info.get("execution", {}) if isinstance(run_info, dict) else {}
+    command_metadata = result_payload.get("execution")
+    command_metadata_source = "result"
+    if not isinstance(command_metadata, dict):
+        command_metadata = (
+            run_info.get("execution", {}) if isinstance(run_info, dict) else {})
+        command_metadata_source = (
+            "run_info" if isinstance(command_metadata, dict) and command_metadata
+            else "unknown")
+    command_count_known = "command_execution_count" in command_metadata
     broker_stats = {}
-    broker_stats_path = ipc_root / "broker_stats.json"
+    broker_stats_path = ipc_root / "stats" / "broker_stats.json"
     if broker_stats_path.is_file():
         try:
             broker_stats = json.loads(broker_stats_path.read_text(encoding="utf-8"))
@@ -1188,6 +1221,20 @@ def _run_docker_agent_phase(
             "provider_error_count", 0),
         "model_broker_requested_tokens": broker_stats.get(
             "requested_token_count", 0),
+        "model_broker_actual_input_tokens": broker_stats.get(
+            "actual_input_token_count"),
+        "model_broker_actual_output_tokens": broker_stats.get(
+            "actual_output_token_count"),
+        "model_broker_actual_cache_creation_input_tokens": broker_stats.get(
+            "actual_cache_creation_input_token_count"),
+        "model_broker_actual_cache_read_input_tokens": broker_stats.get(
+            "actual_cache_read_input_token_count"),
+        "model_broker_actual_total_tokens": broker_stats.get(
+            "actual_total_token_count"),
+        "model_broker_usage_responses": broker_stats.get(
+            "usage_response_count", 0),
+        "model_broker_usage_missing_responses": broker_stats.get(
+            "usage_missing_response_count", 0),
         "model_broker_call_budget": broker_stats.get(
             "max_calls", model_call_budget),
         "model_broker_token_budget": broker_stats.get(
@@ -1206,7 +1253,11 @@ def _run_docker_agent_phase(
         "model_broker_stopped": broker_stopped,
         "model_broker_exit_code": broker_process.exitcode,
         "model_broker_ipc_cleaned": False,
+        # Keep the legacy numeric field for old consumers while making an old
+        # or malformed result schema distinguishable from a true zero.
         "command_execution_count": command_metadata.get("command_execution_count", 0),
+        "command_execution_count_known": command_count_known,
+        "command_execution_metadata_source": command_metadata_source,
         "tool_policy": DOCKER_EVAL_TOOL_POLICY,
     })
     try:
@@ -1526,6 +1577,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
 
     agent_error = ""
     run_info = {}
+    agent_started = time.perf_counter()
     if execution_config.backend == "docker":
         run_info, agent_error, execution_metadata = _run_docker_agent_phase(
             task=task,
@@ -1570,6 +1622,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             write_text(stdout_path, stdout_buffer.getvalue())
             write_text(stderr_path, stderr_buffer.getvalue())
         execution_metadata = command_executor.execution_metadata()
+    agent_duration_sec = time.perf_counter() - agent_started
 
     if not stdout_path.exists():
         write_text(stdout_path, "")
@@ -1751,9 +1804,37 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
         "trusted_model_calls": (
             execution_metadata.get("model_broker_calls")
             if execution_config.backend == "docker" else None),
+        "model_broker_retries": execution_metadata.get(
+            "model_broker_retries", 0),
+        "model_broker_provider_errors": execution_metadata.get(
+            "model_broker_provider_errors", 0),
+        "model_broker_requested_tokens": execution_metadata.get(
+            "model_broker_requested_tokens"),
+        "model_broker_actual_input_tokens": execution_metadata.get(
+            "model_broker_actual_input_tokens"),
+        "model_broker_actual_output_tokens": execution_metadata.get(
+            "model_broker_actual_output_tokens"),
+        "model_broker_actual_cache_creation_input_tokens": execution_metadata.get(
+            "model_broker_actual_cache_creation_input_tokens"),
+        "model_broker_actual_cache_read_input_tokens": execution_metadata.get(
+            "model_broker_actual_cache_read_input_tokens"),
+        "model_broker_actual_total_tokens": execution_metadata.get(
+            "model_broker_actual_total_tokens"),
+        "model_broker_usage_responses": execution_metadata.get(
+            "model_broker_usage_responses", 0),
+        "model_broker_usage_missing_responses": execution_metadata.get(
+            "model_broker_usage_missing_responses", 0),
+        "agent_runtime_sec": round(agent_duration_sec, 3),
         "runtime_sec": round(duration_ms / 1000, 3),
         "trusted_violations": trusted_violations,
     }
+    grader_result = apply_harness_scoring(
+        grader_result,
+        metrics,
+        metadata=metadata,
+        simulated=scripted,
+    )
+    metrics = grader_result["metrics"]
 
     if execution_config.backend == "docker":
         agent_cleanup = execution_metadata.get("container_cleanup_succeeded")
@@ -1766,6 +1847,19 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
         grader_attempted = grader_execution.get("status") != "not_started"
         grader_cleanup = (grader_execution.get("cleanup_succeeded")
                           if grader_attempted else None)
+        started_cleanup_values = []
+        if execution_metadata.get("container_started") is True:
+            started_cleanup_values.append(agent_phase_cleanup)
+        if grader_execution.get("container_started") is True:
+            started_cleanup_values.append(grader_cleanup)
+        started_cleanup_succeeded = all(
+            value is True for value in started_cleanup_values)
+        lifecycle_complete = (
+            execution_metadata.get("container_started") is True
+            and (execution_metadata.get("container_exit_code") is not None
+                 or execution_metadata.get("container_timed_out") is True)
+            and grader_execution.get("status") == "completed"
+        )
         lifecycle = {
             "agent_container_started": execution_metadata.get("container_started", False),
             "agent_container_exit_code": execution_metadata.get("container_exit_code"),
@@ -1778,6 +1872,9 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             "grader_container_cleanup_succeeded": grader_cleanup,
             "all_container_cleanup_succeeded": (
                 agent_phase_cleanup is True and grader_cleanup is True),
+            "all_started_containers_cleanup_succeeded": (
+                started_cleanup_succeeded),
+            "lifecycle_complete": lifecycle_complete,
         }
     else:
         lifecycle = {
@@ -1789,6 +1886,8 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             "grader_container_exit_code": None,
             "grader_container_cleanup_succeeded": None,
             "all_container_cleanup_succeeded": True,
+            "all_started_containers_cleanup_succeeded": True,
+            "lifecycle_complete": True,
         }
 
     return {
@@ -1854,6 +1953,10 @@ def grouped_stats(results: list[dict], key_fn) -> dict:
     for key, items in sorted(groups.items()):
         total = len(items)
         passed = sum(1 for item in items if item["passed"])
+        metered = [
+            item for item in items
+            if item["metrics"].get("model_broker_usage_responses", 0) > 0
+        ]
         stats[key] = {
             "total_cases": total,
             "passed": passed,
@@ -1867,6 +1970,12 @@ def grouped_stats(results: list[dict], key_fn) -> dict:
                 item["metrics"].get("tool_calls", 0) for item in items
             ) / total if total else 0,
             "avg_runtime_sec": sum(item["metrics"].get("runtime_sec", 0) for item in items) / total if total else 0,
+            "metered_cases": len(metered),
+            "avg_actual_tokens": (
+                sum(item["metrics"].get("model_broker_actual_total_tokens", 0)
+                    for item in metered) / len(metered)
+                if metered else None
+            ),
         }
     return stats
 
@@ -1914,6 +2023,10 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
         result for result in results
         if result.get("diagnostic_score") is not None
     ]
+    metered_results = [
+        result for result in results
+        if result["metrics"].get("model_broker_usage_responses", 0) > 0
+    ]
     return {
         "started_at": started,
         "finished_at": time.time(),
@@ -1945,6 +2058,17 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
         "all_container_cleanup_succeeded": (
             True if execution_config.backend != "docker" else bool(results) and all(
                 result.get("all_container_cleanup_succeeded") is True for result in results)),
+        "all_started_containers_cleanup_succeeded": (
+            True if execution_config.backend != "docker" else bool(results) and all(
+                result.get(
+                    "all_started_containers_cleanup_succeeded",
+                    result.get("all_container_cleanup_succeeded"),
+                ) is True
+                for result in results)),
+        "lifecycle_complete": (
+            True if execution_config.backend != "docker" else bool(results) and all(
+                result.get("lifecycle_complete", True) is True
+                for result in results)),
         "agent_container_exit_code": next(
             (result.get("agent_container_exit_code") for result in reversed(results)
              if result.get("agent_container_exit_code") is not None), None),
@@ -1999,6 +2123,42 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
             result["metrics"].get("tool_calls", 0) for result in results
         ) / total_cases if total_cases else 0,
         "avg_runtime_sec": sum(result["metrics"].get("runtime_sec", 0) for result in results) / total_cases if total_cases else 0,
+        "metered_cases": len(metered_results),
+        "actual_input_tokens": sum(
+            result["metrics"].get("model_broker_actual_input_tokens", 0)
+            for result in metered_results
+        ),
+        "actual_output_tokens": sum(
+            result["metrics"].get("model_broker_actual_output_tokens", 0)
+            for result in metered_results
+        ),
+        "actual_cache_creation_input_tokens": sum(
+            result["metrics"].get(
+                "model_broker_actual_cache_creation_input_tokens", 0)
+            for result in metered_results
+        ),
+        "actual_cache_read_input_tokens": sum(
+            result["metrics"].get(
+                "model_broker_actual_cache_read_input_tokens", 0)
+            for result in metered_results
+        ),
+        "actual_total_tokens": sum(
+            result["metrics"].get("model_broker_actual_total_tokens", 0)
+            for result in metered_results
+        ),
+        "avg_actual_tokens": (
+            sum(result["metrics"].get("model_broker_actual_total_tokens", 0)
+                for result in metered_results) / len(metered_results)
+            if metered_results else None
+        ),
+        "avg_runtime_efficiency_score": (
+            sum((result.get("breakdown") or {}).get("runtime_efficiency", 0)
+                for result in results) / total_cases if total_cases else 0
+        ),
+        "avg_token_cost_score": (
+            sum((result.get("breakdown") or {}).get("token_cost", 0)
+                for result in results) / total_cases if total_cases else 0
+        ),
         "suites": grouped_stats(results, lambda result: result["metadata"].get("suite", "unknown")),
         "difficulty": grouped_stats(results, lambda result: result["metadata"].get("difficulty", "unknown")),
         "failure_categories": failure_category_counts(results),
@@ -2060,7 +2220,11 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
         "grader_container_exit_code": None,
         "grader_container_cleanup_succeeded": None,
         "all_container_cleanup_succeeded": False if execution_config.backend == "docker" else True,
+        "all_started_containers_cleanup_succeeded": True,
+        "lifecycle_complete": False if execution_config.backend == "docker" else True,
         "command_execution_count": 0,
+        "command_execution_count_known": False,
+        "command_execution_metadata_source": "unknown",
         "model_broker_calls": 0,
         "model_broker_requests": 0,
         "model_broker_retries": 0,
@@ -2190,10 +2354,17 @@ def main() -> int:
                 f" diagnostic_score={result['diagnostic_score']}"
                 if result.get("diagnostic_score") is not None else ""
             )
+            actual_tokens = result["metrics"].get(
+                "model_broker_actual_total_tokens")
+            token_text = (
+                f" actual_tokens={actual_tokens}"
+                if result["metrics"].get("model_broker_usage_responses", 0) > 0
+                else " actual_tokens=unavailable"
+            )
             print(
                 f"[eval] done  {index}/{len(cases)} {case.name} {status} "
                 f"score={result['score']}{diagnostic} "
-                f"elapsed={time.time() - case_started:.1f}s{reason}",
+                f"elapsed={time.time() - case_started:.1f}s{token_text}{reason}",
                 flush=True,
             )
         except KeyboardInterrupt:

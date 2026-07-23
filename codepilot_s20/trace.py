@@ -924,9 +924,18 @@ def record_llm_request(*, model: str, max_tokens: int, message_count: int,
 
 
 def record_llm_response(response, *, purpose: str = "lead", agent_role: str = ""):
+    usage = getattr(response, "usage", None)
+    usage_payload = {}
+    for name in (
+        "input_tokens", "output_tokens", "cache_creation_input_tokens",
+        "cache_read_input_tokens", "total_tokens",
+    ):
+        value = getattr(usage, name, None)
+        if value is not None:
+            usage_payload[name] = value
     record_event("llm_response", stop_reason=getattr(response, "stop_reason", None),
                  content=_truncate(_content_text(getattr(response, "content", ""))),
-                 purpose=purpose, agent_role=agent_role)
+                 purpose=purpose, agent_role=agent_role, usage=usage_payload)
 
 
 def record_tool_use(block):

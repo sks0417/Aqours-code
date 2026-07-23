@@ -3,7 +3,8 @@ FROM python:3.11.9-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-    PYTHONNOUSERSITE=1
+    PYTHONNOUSERSITE=1 \
+    PYTHONPATH=/opt/codepilot-src
 
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes git ca-certificates \
@@ -24,10 +25,8 @@ RUN groupadd --gid 10001 eval \
     && touch /inputs/trace.jsonl /inputs/final.md /inputs/stdout.txt /inputs/stderr.txt \
     && chown -R 10001:10001 /workspace /state /runtime /broker /trusted_eval /grading_workspace /inputs
 
-COPY pyproject.toml README.md /opt/codepilot-src/
 COPY codepilot_s20 /opt/codepilot-src/codepilot_s20
-RUN python -m pip install --no-cache-dir --no-deps /opt/codepilot-src \
-    && rm -rf /opt/codepilot-src
+RUN python -c "import codepilot_s20.eval_container_entry"
 
 WORKDIR /workspace
 USER 10001:10001

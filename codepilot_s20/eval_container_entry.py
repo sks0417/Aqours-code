@@ -108,8 +108,11 @@ def main(argv: list[str] | None = None) -> int:
         config["broker_nonce"],
         request_timeout=broker_request_timeout,
         case_deadline=case_deadline,
+        max_calls=config.get("model_call_budget"),
+        max_provider_retries=config.get("broker_max_provider_retries", 0),
     )
     result_path = runtime_root / "result.json"
+    command_executor = LocalCommandExecutor()
     try:
         result = run_agent_task(
             str(config["task"]),
@@ -118,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
             model_client=client,
             model_provider="broker",
             model=str(config["model"]),
-            command_executor=LocalCommandExecutor(),
+            command_executor=command_executor,
             tool_policy=config.get("tool_policy"),
             case_deadline=case_deadline,
             cleanup_grace=float(config.get("cleanup_grace", 2.0)),
@@ -132,10 +135,18 @@ def main(argv: list[str] | None = None) -> int:
         _copy_artifact(run_dir / "timeline.md", runtime_root / "timeline.md")
         _copy_artifact(run_dir / "metadata.json", runtime_root / "metadata.json")
         _copy_artifact(result.get("final_path"), runtime_root / "final.md")
-        _atomic_write_json(result_path, {"ok": True, "run_info": result})
+        _atomic_write_json(result_path, {
+            "ok": True,
+            "run_info": result,
+            "execution": command_executor.execution_metadata(),
+        })
         return 0
     except BaseException as exc:
-        payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        payload = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "execution": command_executor.execution_metadata(),
+        }
         try:
             _atomic_write_json(result_path, payload)
         except OSError:

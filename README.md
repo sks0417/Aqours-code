@@ -6,6 +6,16 @@ Function-parity split of learn-claude-code s20 with multi-provider model adapter
 
 - Python 3.10 or newer
 
+## Runtime ownership
+
+Each CLI or non-interactive execution now creates an explicit `AgentRuntime`
+containing immutable configuration, runtime-owned paths, mutable task state,
+and external services. Prompt/Context assembly, core tools, compaction, and the
+bounded role runtime receive this object directly. `runtime_state.py` remains
+only as an incremental compatibility adapter for Background/Cron/Teammate and
+older call sites. The ownership rules and remaining migration order are in
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ## Install
 
 ```powershell
@@ -42,6 +52,11 @@ material for agents to repair, not part of the project unit test suite.
 [`HARNESS_ISSUES.md`](HARNESS_ISSUES.md)。修复只有通过原始复现 case 后才标记为
 `Validated`。
 
+`stress_inventory_reservation_consistency` 是中型跨文件回归；
+`stress_distributed_ledger_recovery` 是 difficulty 6 综合能力 case，覆盖跨 partition 原子写入、
+exactly-once、分区序列和 checkpoint+tail recovery。后者按独立 outcome group 给部分分，不要求调用
+subagent/multiagent；角色是否有价值必须从 Lead calls/reads、通过率、耗时和 actual tokens 的对照证明。
+
 Install the dev dependencies before running evals so graders use the real
 pytest package from the controlled Python environment:
 
@@ -72,22 +87,61 @@ acceptance items require concise evidence. The compact live prompt preserves
 only acceptance state across Context compression, and the Agent performs one
 bounded review before finalizing. Unverified requirements are surfaced in the
 final result instead of silently being treated as completed.
+Acceptance items have stable IDs. Reviewer findings use revision-scoped IDs
+such as `review:r3:f1`, so the Lead can update status and evidence without
+copying generated wording or consuming another checklist slot.
 
-Complex tasks also use a role-based delegation policy. An `explorer` receives a
-fresh, read-only context to map contracts and code paths before implementation;
-a `reviewer` independently audits the latest workspace revision before final;
-and an optional `worker` implements one bounded slice in an isolated Git
-worktree. Worker changes are committed by the Harness but remain outside the
-main workspace until the Lead calls `integrate_worktree`; overlapping Lead and
-Worker file changes are rejected without discarding the worktree. The Lead
-remains responsible for decomposition, integration, tests, and the final answer.
+Complex tasks also receive role-based orchestration capabilities. Static
+complexity adds only an advisory; it does not force an Explorer, and observed
+read pressure is telemetry rather than an automatic trigger. An `explorer` can use a
+fresh, read-only context to map contracts and code paths. On the first final
+attempt for a changed complex revision, the Harness runs one bounded `reviewer`
+automatically when the shared model budget permits and attaches its result to
+the same pre-final contract audit, avoiding a second Lead round just to request
+review. Reviewer output is capped to five short structured findings. Its final
+synthesis uses a fresh, tool-free evidence packet so an unfinished tool intent
+cannot leak into the JSON result. Invalid or truncated JSON retains explicit
+actionable concerns, while a purely malformed result stays blocked without
+creating a fake acceptance finding. Real findings become pending acceptance work
+that must be resolved or rejected with code evidence. An optional `worker`
+implements one bounded slice in an automatically managed Git worktree.
+Worker changes are committed by the Harness but remain outside the main
+workspace until the Lead calls `integrate_worktree`; overlapping Lead and Worker
+file changes are rejected without discarding the worktree. The Lead remains
+responsible for decomposition, integration, tests, and the final answer.
+
+The legacy `task` tool is now only a compatibility entry into the same bounded
+role runtime. Delegated inspection is routed to `explorer`, implementation to a
+`worker` worktree, final correctness audit to `reviewer`, and a small unmatched
+question to a read-only `general` helper. Routing uses generic action intent, not
+case names or repository paths. Every route shares model-call accounting,
+deadlines, Trace events, finalization reserve, structured results, and per-role
+unique read-path limits; exact repeated reads inside one delegation are reused.
+Failures and budget skips return a structured blocked result so the Lead can
+continue directly instead of treating role success as a gate.
+When the tail reserve cannot afford an automatic Reviewer, Trace records
+`reviewer_status=skipped_budget`; no blocked envelope is presented as an
+attached independent review.
 
 The host-side Model Broker exists only so API keys stay on the host. It accepts
 schema-checked `messages.create` calls for the selected model and applies one
 case-wide call budget and requested-token budget. These budgets cover the main
-Agent and all nested agents together. Main-Agent LLM rounds and tool calls are
-not execution budgets; Trace records them as `llm_requests` and `tool_calls`
-for reporting and process/efficiency grading.
+Agent, nested roles, retries, and model-generated compact summaries together.
+The container reads the Broker's live non-secret counters through a read-only
+Docker stats mount and reserves 20% of
+the call budget, bounded to 4-8 calls, for final fixes, targeted verification,
+and the final response. A new role is not started unless its bounded worst-case
+rounds leave that reserve intact. In the reserve, automatic compaction uses a
+deterministic checkpoint built from the root task, live acceptance state, and
+recent messages instead of another model call. Compact-summary requests now
+appear in Trace with `purpose=compact_summary`. When exactly one call remains,
+tools are disabled and that call is forced to produce the final response; a
+request beyond the Broker limit is never issued. Main-Agent LLM rounds and tool
+calls are not execution budgets; Trace records them as `llm_requests` and
+`tool_calls` for reporting and continuous efficiency grading. Successful
+Provider responses also contribute actual input, output, cache-creation, and
+cache-read token counters; requested `max_tokens` remains a budget guard and is
+never presented as actual consumption.
 
 After the Agent exits, the runner verifies the trusted case did not change,
 creates `grading_workspace` from the original workspace, and applies only
@@ -95,10 +149,24 @@ creates `grading_workspace` from the original workspace, and applies only
 trace/final/stdout/stderr inputs read-only. This prevents modified public tests
 or grader files from becoming the source of truth.
 
+Eval reports `passed` independently from its continuous 100-point score. The
+trusted case Grader owns functional correctness (50 points) and deterministic
+code quality (20); the host Harness adds runtime efficiency (15) and actual
+token cost (15), because only the host can observe wall time and Provider usage.
+Lower-is-better dimensions use explicit per-case target and hard-limit values
+from `metadata.yaml`. A passing solution can therefore score below 100, while a
+fast empty failure cannot earn operational credit because those points are
+gated by its functional-correctness ratio. Raw metrics and ungated operational
+points remain in `metrics.scoring` for audit and later threshold calibration.
+
 `--docker-timeout` is the wall-clock deadline for preparation, Agent execution,
 grading, and cleanup. Background work may run inside the Agent container; a
 one-shot Eval waits for it only until that deadline and injects completed output
 as `task_notification`. Interactive CLI sessions keep true background behavior.
+Lifecycle reporting separates `all_started_containers_cleanup_succeeded` from
+`lifecycle_complete`, so a grader that never started is not misreported as a
+container leak. Command metadata similarly exposes whether a zero execution
+count is known or came from an older/missing result schema.
 
 `--request-timeout` is the per-attempt Host Provider timeout. Docker Eval keeps
 API keys and one transient-error retry in the Host Model Broker. The container's
@@ -113,6 +181,15 @@ the complete Agent and Grader containers still run:
 ```powershell
 python evals/run_eval.py --scripted --execution docker --docker-build
 python evals/run_eval.py --execution docker --case mini_auth_service_security_fix
+python evals/run_eval.py --execution docker --docker-build --request-timeout 60 --case stress_distributed_ledger_recovery --docker-timeout 900
+```
+
+Current Trace/timeline diagnostics share the runtime schema and tolerate
+malformed JSONL while reporting its line number:
+
+```powershell
+python analyze_trace.py evals/results/runs/<run-id>/<case>
+python analyze_timeline.py evals/results/runs/<run-id>/<case>
 ```
 
 The disposable Git baseline trusts only `/workspace` and

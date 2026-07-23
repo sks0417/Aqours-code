@@ -1,69 +1,59 @@
 #!/usr/bin/env python3
-"""Analyze trace.jsonl entries from the 5000-file test."""
+"""Analyze a current CodePilot trace.jsonl and its optional timeline."""
+from __future__ import annotations
+
 import argparse
-import json
 from pathlib import Path
 
+from codepilot_s20.trace_analysis import (
+    analyze_events,
+    format_counts,
+    format_event,
+    read_jsonl,
+    safe_preview,
+)
 
-def parse_args():
+
+def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run_dir", type=Path, help="Path to a .codepilot run directory")
-    return parser.parse_args()
+    parser.add_argument("run_dir", type=Path, help="Path to a CodePilot run directory")
+    return parser.parse_args(argv)
 
 
-RUN_DIR = parse_args().run_dir
+def _print_summary(events: list[dict], issues: list[str]):
+    summary = analyze_events(events)
+    print("\n=== Aggregate ===")
+    print(f"Events: {summary['event_count']}")
+    print(f"Event types: {format_counts(summary['event_types'])}")
+    print(f"Tools: {format_counts(summary['tools'])}")
+    print(f"Compact events: {summary['compact_events']}")
+    print(f"Errors: {summary['errors']}; permission denials: {summary['permission_denials']}")
+    print(f"Repeated reads: {format_counts(summary['repeated_read_paths'])}")
+    if summary["test_commands"]:
+        print("Test commands:")
+        for command in summary["test_commands"]:
+            print(f"  - {safe_preview(command, 180)}")
+    if issues:
+        print("Parse issues:")
+        for issue in issues:
+            print(f"  - {issue}")
 
-with (RUN_DIR / "trace.jsonl").open("r", encoding="utf-8", errors="replace") as f:
-    lines = f.read().strip().split('\n')
 
-print(f"Total trace entries: {len(lines)}")
+def main(argv: list[str] | None = None) -> int:
+    run_dir = parse_args(argv).run_dir
+    trace_path = run_dir / "trace.jsonl"
+    events, issues = read_jsonl(trace_path)
+    print(f"=== {trace_path} ===")
+    for index, event in enumerate(events):
+        print(format_event(index, event))
+    _print_summary(events, issues)
 
-for i, line in enumerate(lines):
-    try:
-        obj = json.loads(line)
-        t = obj.get('type', '?')
-        ts = obj.get('ts', 0)
-        tool = obj.get('tool', '')
-        
-        if t == 'user_prompt':
-            prompt = obj.get('prompt', '')[:150]
-            print(f"\n[{i:3d}] {t:20s} | ts={ts} | {prompt}")
-        elif t == 'llm_request':
-            mc = obj.get('message_count', 0)
-            tc = obj.get('tool_count', 0)
-            print(f"[{i:3d}] {t:20s} | ts={ts} | messages={mc} tools={tc}")
-        elif t == 'llm_response':
-            stop = obj.get('stop_reason', '?')
-            print(f"[{i:3d}] {t:20s} | ts={ts} | stop={stop}")
-        elif t == 'tool_use':
-            inp = obj.get('input', {})
-            cmd = str(inp.get('command', inp.get('pattern', '')))[:120]
-            tid = obj.get('tool_use_id', '')
-            print(f"[{i:3d}] {t:20s} | ts={ts} | {tool:15s} | {tid[:30]} | {cmd}")
-        elif t == 'tool_result':
-            result_str = str(obj.get('result', ''))
-            is_err = obj.get('isError', False)
-            print(f"[{i:3d}] {t:20s} | ts={ts} | {tool:15s} | err={is_err} | len={len(result_str)}")
-        elif t == 'hook':
-            name = obj.get('name', '')
-            decision = obj.get('decision', '')
-            stage = obj.get('stage', '')
-            print(f"[{i:3d}] {t:20s} | ts={ts} | {name:15s} | {stage:8s} | {decision}")
-        elif t == 'error':
-            err = obj.get('error', '')[:200]
-            print(f"\n[{i:3d}] ERROR | ts={ts} | {err}")
-        else:
-            rest = json.dumps(obj, ensure_ascii=False)[:150]
-            print(f"[{i:3d}] {t:20s} | ts={ts} | {rest}")
-    except Exception as e:
-        print(f"[{i:3d}] Parse error: {e} | line[:200]={line[:200]}")
+    timeline_path = run_dir / "timeline.jsonl"
+    if timeline_path.is_file():
+        timeline_events, timeline_issues = read_jsonl(timeline_path)
+        print(f"\nTimeline: {len(timeline_events)} events, {len(timeline_issues)} parse issue(s)")
+    return 1 if issues else 0
 
-# Check timeline.jsonl raw content
-print("\n\n=== timeline.jsonl raw entries ===")
-with (RUN_DIR / "timeline.jsonl").open("r", encoding="utf-8", errors="replace") as f:
-    tlines = f.read().strip().split('\n')
-print(f"Total timeline entries: {len(tlines)}")
-for i, line in enumerate(tlines):
-    if not line.strip():
-        continue
-    print(f"[{i}] {line[:300]}")
+
+if __name__ == "__main__":
+    raise SystemExit(main())

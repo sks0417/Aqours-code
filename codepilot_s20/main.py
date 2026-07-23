@@ -12,7 +12,18 @@ def main():
         cron_autorun_loop,
         print_turn_assistants,
     )
-    from .config import MODEL, MODEL_PROVIDER, WORKDIR
+    from .config import (
+        APPROVAL_MODE,
+        BACKGROUND_TASKS_ENABLED,
+        COMMAND_EXECUTOR,
+        FALLBACK_MODEL,
+        MODEL,
+        MODEL_PROVIDER,
+        PRIMARY_MODEL,
+        TOOL_POLICY,
+        WORKDIR,
+        client,
+    )
     from .context import update_context
     from .cron import start_scheduler
     from .hooks import trigger_hooks
@@ -20,15 +31,28 @@ def main():
     from .subagent import extract_text
     from .terminal import PROMPT
     from .trace import finish_run, record_hook, start_run
+    from .runtime import AgentRuntime
 
     start_scheduler()
     terminal.CLI_ACTIVE = True
     print("s20: comprehensive agent")
     print("Enter a question, press Enter to send. Type q to quit.\n")
+    runtime = AgentRuntime.create(
+        workdir=WORKDIR,
+        model_client=client,
+        command_executor=COMMAND_EXECUTOR,
+        model_provider=MODEL_PROVIDER,
+        model=MODEL,
+        primary_model=PRIMARY_MODEL,
+        fallback_model=FALLBACK_MODEL,
+        tool_policy=TOOL_POLICY,
+        approval_mode=APPROVAL_MODE,
+        background_tasks_enabled=BACKGROUND_TASKS_ENABLED,
+    )
     history = []
-    context = update_context({}, [])
+    context = update_context({}, [], runtime)
     threading.Thread(target=cron_autorun_loop,
-                     args=(history, context), daemon=True).start()
+                     args=(history, context, runtime), daemon=True).start()
     while True:
         try:
             query = input(PROMPT)
@@ -41,9 +65,10 @@ def main():
         trigger_hooks("UserPromptSubmit", query)
         turn_start = len(history)
         history.append({"role": "user", "content": query})
+        runtime.state.root_task = query
         with agent_lock:
-            agent_loop(history, context)
-            context = update_context(context, history)
+            agent_loop(history, context, runtime)
+            context = update_context(context, history, runtime)
             print_turn_assistants(history, turn_start)
             final_text = ""
             for msg in reversed(history[turn_start:]):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,12 +94,13 @@ def test_acceptance_checklist_survives_as_compact_live_prompt_state(monkeypatch)
         basic_tools.CURRENT_TODOS.clear()
 
     assert live_context["acceptance_todos"] == [{
+        "id": "accept:1",
         "content": contract,
         "status": "pending",
         "kind": "acceptance",
     }]
     assert "Protected acceptance checklist" in prompt
-    assert f"[pending] {contract}" in prompt
+    assert f"[accept:1 pending] {contract}" in prompt
     assert "Implement rollback" not in prompt
 
 
@@ -149,7 +151,10 @@ def test_subagent_and_teammate_have_bounded_full_runtime_lifecycle(monkeypatch):
     client = TextClient()
     monkeypatch.setattr(subagent, "client", client)
     monkeypatch.setattr(subagent, "MODEL", "scripted")
-    assert subagent.spawn_subagent("finish") == "sub-runtime-done"
+    delegation = json.loads(subagent.spawn_subagent("finish"))
+    assert delegation["role"] == "general"
+    assert delegation["result"]["summary"] == "sub-runtime-done"
+    assert delegation["routed_from"] == "task"
 
     monkeypatch.setattr(teammate, "client", client)
     monkeypatch.setattr(teammate, "MODEL", "scripted")

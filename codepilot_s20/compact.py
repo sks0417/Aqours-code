@@ -1,4 +1,6 @@
 from .runtime_state import *
+from .model_budget import can_spend_optional_calls
+from .runtime import AgentRuntime
 
 # ── Context Compaction ──
 
@@ -169,11 +171,16 @@ def _compact_duplicate_read_results(messages: list, batches: list,
 
 
 def persist_large_output(tool_use_id: str, output: str, *, force: bool = False,
-                         preview_chars: int | None = None) -> str:
+                         preview_chars: int | None = None,
+                         runtime: AgentRuntime | None = None) -> str:
     if not force and len(output) <= PERSIST_THRESHOLD:
         return output
-    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
+    results_dir = (
+        runtime.paths.tool_results_dir if runtime is not None
+        else TOOL_RESULTS_DIR
+    )
+    results_dir.mkdir(parents=True, exist_ok=True)
+    path = results_dir / f"{tool_use_id}.txt"
     if not path.exists():
         path.write_text(output, encoding="utf-8")
     lines = output.splitlines()
@@ -198,7 +205,11 @@ def persist_large_output(tool_use_id: str, output: str, *, force: bool = False,
     return "\n".join(parts)
 
 
-def tool_result_budget(messages: list, max_bytes: int | None = None) -> list:
+def tool_result_budget(
+    messages: list,
+    max_bytes: int | None = None,
+    runtime: AgentRuntime | None = None,
+) -> list:
     if not messages:
         return messages
     max_bytes = TOOL_RESULT_BATCH_LIMIT if max_bytes is None else int(max_bytes)
@@ -210,7 +221,8 @@ def tool_result_budget(messages: list, max_bytes: int | None = None) -> list:
     for block, text in originals:
         if len(text) > PERSIST_THRESHOLD:
             block["content"] = persist_large_output(
-                block.get("tool_use_id", "unknown"), text)
+                block.get("tool_use_id", "unknown"), text,
+                runtime=runtime)
 
     def total_size():
         return sum(len(str(block.get("content", ""))) for block in blocks)
@@ -227,7 +239,8 @@ def tool_result_budget(messages: list, max_bytes: int | None = None) -> list:
             break
         candidate = persist_large_output(
             block.get("tool_use_id", "unknown"), original,
-            force=True, preview_chars=per_result_preview)
+            force=True, preview_chars=per_result_preview,
+            runtime=runtime)
         if len(candidate) < len(str(block.get("content", ""))):
             block["content"] = candidate
             total = total_size()
@@ -241,7 +254,7 @@ def tool_result_budget(messages: list, max_bytes: int | None = None) -> list:
                 break
             candidate = persist_large_output(
                 block.get("tool_use_id", "unknown"), original,
-                force=True, preview_chars=0)
+                force=True, preview_chars=0, runtime=runtime)
             if len(candidate) < len(str(block.get("content", ""))):
                 block["content"] = candidate
                 total = total_size()
@@ -320,16 +333,26 @@ def micro_compact(messages: list, trigger_size: int | None = None,
     return messages
 
 
-def write_transcript(messages: list) -> Path:
-    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+def write_transcript(
+    messages: list,
+    runtime: AgentRuntime | None = None,
+) -> Path:
+    transcript_dir = (
+        runtime.paths.transcript_dir if runtime is not None
+        else TRANSCRIPT_DIR
+    )
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    path = transcript_dir / f"transcript_{int(time.time())}.jsonl"
     with path.open("w") as f:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     return path
 
 
-def summarize_history(messages: list) -> str:
+def summarize_history(
+    messages: list,
+    runtime: AgentRuntime | None = None,
+) -> str:
     conversation = json.dumps(messages, default=str)[:80000]
     prompt = ("Summarize this coding-agent conversation so work can continue. "
               "Preserve current goal, key findings, changed files, remaining work, "
@@ -338,17 +361,66 @@ def summarize_history(messages: list) -> str:
               "normalized or fingerprint fields, and exception/state branches. "
               "Distinguish verified code facts from assumptions so compacted "
               "history is not treated as proof.\n\n" + conversation)
-    response = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=2000)
+    summary_messages = [{"role": "user", "content": prompt}]
+    model = runtime.config.model if runtime is not None else MODEL
+    model_client = (
+        runtime.services.model_client if runtime is not None else client
+    )
+    record_llm_request(
+        model=model, max_tokens=2000, message_count=1, tool_count=0,
+        purpose="compact_summary", agent_role="",
+    )
+    try:
+        response = model_client.messages.create(
+            model=model,
+            messages=summary_messages,
+            max_tokens=2000)
+    except Exception as exc:
+        record_event(
+            "compact_summary_error", error_type=type(exc).__name__,
+            error=str(exc)[:1000],
+        )
+        raise
+    record_llm_response(response, purpose="compact_summary", agent_role="")
     return extract_text(response.content) or "(empty summary)"
 
 
-def _record_compact_event(kind: str, transcript: Path, messages: list):
+def _deterministic_history_summary(
+    runtime: AgentRuntime | None = None,
+) -> str:
+    root_task = str(
+        runtime.state.root_task if runtime is not None else CURRENT_ROOT_TASK or ""
+    ).strip()
+    root_section = root_task[:5000] or "(root task unavailable)"
+    todo_lines = []
+    todos = runtime.state.todos if runtime is not None else CURRENT_TODOS
+    for todo in list(todos)[:12]:
+        content = str(todo.get("content", ""))[:240]
+        evidence = str(todo.get("evidence", ""))[:240]
+        todo_id = str(todo.get("id", "todo"))[:100]
+        line = (
+            f"- [{todo_id} {todo.get('status', 'pending')}] "
+            f"{todo.get('kind', 'plan')}: {content}"
+        )
+        if evidence:
+            line += f" | evidence: {evidence}"
+        todo_lines.append(line)
+    todos = "\n".join(todo_lines) or "- (no live todos)"
+    return (
+        "Model-generated history summary was skipped to preserve the finalization "
+        "call reserve. Continue from the authoritative root task, live checklist, "
+        "and recent messages. Do not restart repository exploration.\n\n"
+        f"Root task:\n{root_section}\n\nLive checklist:\n{todos}"
+    )
+
+
+def _record_compact_event(
+    kind: str, transcript: Path, messages: list, *, summary_mode: str = "model",
+):
     try:
         record_event("compact",
                      kind=kind,
+                     summary_mode=summary_mode,
                      transcript=str(transcript),
                      message_count=len(messages),
                      estimated_size=estimate_size(messages))
@@ -370,27 +442,72 @@ def _history_and_recent_tail(messages: list, keep_tail: int):
     return history, tail
 
 
-def compact_history(messages: list) -> list:
-    transcript = write_transcript(messages)
-    _record_compact_event("automatic", transcript, messages)
+def compact_history(
+    messages: list, *, allow_model_summary: bool | None = None,
+    reason: str = "", runtime: AgentRuntime | None = None,
+) -> list:
+    transcript = write_transcript(messages, runtime)
+    model_client = (
+        runtime.services.model_client if runtime is not None else client
+    )
+    if allow_model_summary is None:
+        allow_model_summary, budget = can_spend_optional_calls(model_client, 1)
+    else:
+        budget = {}
+    summary_mode = "model" if allow_model_summary else "deterministic"
+    _record_compact_event(
+        "automatic", transcript, messages, summary_mode=summary_mode)
     print(f"  \033[36m[compact] transcript saved: {transcript}\033[0m")
     history, tail = _history_and_recent_tail(
         messages, COMPACT_KEEP_TAIL_MESSAGES)
-    summary = summarize_history(history)
+    if allow_model_summary:
+        summary = (
+            summarize_history(history, runtime)
+            if runtime is not None else summarize_history(history)
+        )
+    else:
+        summary = _deterministic_history_summary(runtime)
+        record_event(
+            "model_budget_guard", decision="deterministic_compact",
+            reason=reason or "finalization_reserve",
+            **{key: value for key, value in budget.items()
+               if key != "available"},
+        )
     return [{"role": "user", "content": f"[Compacted]\n\n{summary}"},
             *tail]
 
 
-def reactive_compact(messages: list) -> list:
-    transcript = write_transcript(messages)
-    _record_compact_event("reactive", transcript, messages)
+def reactive_compact(
+    messages: list,
+    runtime: AgentRuntime | None = None,
+) -> list:
+    transcript = write_transcript(messages, runtime)
+    model_client = (
+        runtime.services.model_client if runtime is not None else client
+    )
+    allow_model_summary, budget = can_spend_optional_calls(model_client, 1)
+    summary_mode = "model" if allow_model_summary else "deterministic"
+    _record_compact_event(
+        "reactive", transcript, messages, summary_mode=summary_mode)
     print(f"  \033[31m[reactive compact] transcript saved: {transcript}\033[0m")
     history, tail = _history_and_recent_tail(
         messages, COMPACT_KEEP_TAIL_MESSAGES)
-    try:
-        summary = summarize_history(history)
-    except Exception:
-        summary = "Earlier conversation was trimmed after a prompt-too-long error."
+    if allow_model_summary:
+        try:
+            summary = (
+                summarize_history(history, runtime)
+                if runtime is not None else summarize_history(history)
+            )
+        except Exception:
+            summary = "Earlier conversation was trimmed after a prompt-too-long error."
+    else:
+        summary = _deterministic_history_summary(runtime)
+        record_event(
+            "model_budget_guard", decision="deterministic_reactive_compact",
+            reason="finalization_reserve",
+            **{key: value for key, value in budget.items()
+               if key != "available"},
+        )
     return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"},
             *tail]
 

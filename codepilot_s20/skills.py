@@ -1,4 +1,5 @@
 from .runtime_state import *
+from .runtime import AgentRuntime
 
 # ── Skill Loading ──
 
@@ -18,11 +19,12 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     return meta, parts[2].strip()
 
 
-def scan_skills():
+def scan_skills(runtime: AgentRuntime | None = None):
     SKILL_REGISTRY.clear()
-    if not SKILLS_DIR.exists():
+    skills_dir = runtime.paths.skills_dir if runtime is not None else SKILLS_DIR
+    if not skills_dir.exists():
         return
-    for directory in sorted(SKILLS_DIR.iterdir()):
+    for directory in sorted(skills_dir.iterdir()):
         if not directory.is_dir():
             continue
         manifest = directory / "SKILL.md"
@@ -39,10 +41,10 @@ def scan_skills():
         }
 
 
-def list_skills() -> str:
+def list_skills(runtime: AgentRuntime | None = None) -> str:
     # Scan lazily from the current runtime SKILLS_DIR. Restricted eval policies
     # never call this function, so host skill manifests are not read at import.
-    scan_skills()
+    scan_skills(runtime)
     if not SKILL_REGISTRY:
         return "(no skills found)"
     return "\n".join(
@@ -50,8 +52,8 @@ def list_skills() -> str:
         for skill in SKILL_REGISTRY.values())
 
 
-def load_skill(name: str) -> str:
-    scan_skills()
+def load_skill(name: str, runtime: AgentRuntime | None = None) -> str:
+    scan_skills(runtime)
     skill = SKILL_REGISTRY.get(name)
     if not skill:
         available = ", ".join(SKILL_REGISTRY.keys()) or "(none)"

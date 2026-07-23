@@ -251,6 +251,32 @@ def test_pytest_cache_is_ignored_as_agent_runtime_output(tmp_path):
     )
 
 
+def test_case_copy_ignores_local_test_and_python_caches(tmp_path):
+    case = tmp_path / "case"
+    workspace = case / "workspace"
+    grader_tests = case / "grader_tests"
+    (workspace / ".pytest_cache").mkdir(parents=True)
+    (workspace / "__pycache__").mkdir()
+    grader_tests.mkdir(parents=True)
+    (grader_tests / ".pytest_cache").mkdir()
+    (workspace / "keep.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (workspace / ".pytest_cache" / "nodeids").write_text("[]", encoding="utf-8")
+    (workspace / "__pycache__" / "keep.pyc").write_bytes(b"cache")
+    (grader_tests / "test_hidden.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+    (grader_tests / ".pytest_cache" / "nodeids").write_text("[]", encoding="utf-8")
+
+    agent = tmp_path / "agent"
+    run_eval.copy_case_workspace(case, agent)
+    trusted = run_eval.copy_trusted_case(case, tmp_path / "trusted_eval", "case")
+
+    assert (agent / "keep.py").is_file()
+    assert not (agent / ".pytest_cache").exists()
+    assert not (agent / "__pycache__").exists()
+    assert (trusted / "grader_tests" / "test_hidden.py").is_file()
+    assert not (trusted / "workspace" / ".pytest_cache").exists()
+    assert not (trusted / "grader_tests" / ".pytest_cache").exists()
+
+
 def test_runner_constraint_violation_overrides_passing_grader(tmp_path, monkeypatch):
     case_dir = tmp_path / "case"
     workspace = case_dir / "workspace"

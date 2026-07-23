@@ -1,4 +1,7 @@
 from .runtime_state import *
+from collections.abc import Callable
+from functools import partial
+from .runtime import AgentRuntime
 from .basic_tools import (
     run_bash,
     run_edit,
@@ -76,35 +79,44 @@ BUILTIN_TOOLS = [
                      "acceptance criteria. Use kind=plan for work still to do and "
                      "kind=acceptance for every externally required outcome, "
                      "including error paths omitted by public tests. Completed "
-                     "acceptance items require concise evidence."),
+                     "acceptance items require concise evidence. Existing "
+                     "acceptance items have stable IDs; update one by sending "
+                     "its id, status, and evidence without copying its content."),
      "input_schema": {"type": "object",
                       "properties": {"todos": {"type": "array", "maxItems": 20,
                           "items": {"type": "object",
                                     "properties": {
+                                        "id": {"type": "string", "maxLength": 100},
                                         "content": {"type": "string", "maxLength": 500},
                                         "status": {"type": "string",
                                                    "enum": ["pending", "in_progress", "completed"]},
                                         "kind": {"type": "string",
                                                  "enum": ["plan", "acceptance"]},
                                         "evidence": {"type": "string", "maxLength": 500}},
-                                    "required": ["content", "status"]}}},
+                                    "required": ["status"]}}},
                       "required": ["todos"]}},
     {"name": "task",
-     "description": ("Launch a focused subagent for independent delegated work. "
-                     "Returns only its final summary. Do not use it merely to wait "
-                     "for a background task_notification."),
+     "description": ("Compatibility entry for one focused delegation. The harness "
+                     "routes inspection to explorer, implementation to an isolated "
+                     "worker worktree, final audit to reviewer, and a small unmatched "
+                     "question to a read-only general helper. Returns a structured "
+                     "envelope; worker changes require integrate_worktree. Do not use "
+                     "it merely to wait for a background task_notification."),
      "input_schema": {"type": "object",
                       "properties": {"description": {"type": "string"}},
                       "required": ["description"]}},
     {"name": "delegate_agent",
-     "description": ("Delegate a bounded task to a fresh role context. explorer "
+     "description": ("Delegate a bounded task to a fresh role context. general "
+                     "answers one small read-only question; explorer "
                      "maps contracts/code read-only; reviewer independently audits "
                      "final correctness read-only; worker edits only an isolated "
-                     "worktree and returns a commit that must be integrated."),
+                     "worktree and returns a commit that must be integrated. For "
+                     "worker, this tool automatically creates and owns the Task and "
+                     "Worktree; do not create them first."),
      "input_schema": {"type": "object",
                       "properties": {
                           "role": {"type": "string",
-                                   "enum": ["explorer", "reviewer", "worker"]},
+                                   "enum": ["general", "explorer", "reviewer", "worker"]},
                           "prompt": {"type": "string"},
                           "name": {"type": "string"},
                           "task_id": {"type": "string"}},
@@ -119,7 +131,9 @@ BUILTIN_TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"focus": {"type": "string"}},
                       "required": []}},
-    {"name": "create_task", "description": "Create a task.",
+    {"name": "create_task",
+     "description": ("Low-level manual task API. Do not call this before "
+                     "delegate_agent(role=worker), which creates its own task."),
      "input_schema": {"type": "object",
                       "properties": {"subject": {"type": "string"},
                                      "description": {"type": "string"},
@@ -209,7 +223,8 @@ BUILTIN_TOOLS = [
                                      "feedback": {"type": "string"}},
                       "required": ["request_id", "approve"]}},
     {"name": "create_worktree",
-     "description": "Create an isolated git worktree.",
+     "description": ("Low-level manual worktree API. Do not call this before "
+                     "delegate_agent(role=worker), which creates its own worktree."),
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"},
                                      "task_id": {"type": "string"}},
@@ -263,6 +278,32 @@ BUILTIN_HANDLERS = {
     "integrate_worktree": run_integrate_worktree,
     "connect_mcp": run_connect_mcp,
 }
+
+
+def builtin_handlers(
+    runtime: AgentRuntime | None = None,
+) -> dict[str, Callable]:
+    """Return handlers bound to one runtime where the tool supports it.
+
+    The static table remains as a compatibility surface for older callers.
+    Binding here lets the main Agent stop discovering workspace, deadline,
+    executor, and Todo state through module globals.
+    """
+    handlers = dict(BUILTIN_HANDLERS)
+    if runtime is None:
+        return handlers
+    handlers.update({
+        "bash": partial(run_bash, runtime=runtime),
+        "read_file": partial(run_read, runtime=runtime),
+        "write_file": partial(run_write, runtime=runtime),
+        "edit_file": partial(run_edit, runtime=runtime),
+        "glob": partial(run_glob, runtime=runtime),
+        "todo_write": partial(run_todo_write, runtime=runtime),
+        "load_skill": partial(load_skill, runtime=runtime),
+        "task": partial(spawn_subagent, runtime=runtime),
+        "delegate_agent": partial(run_delegate_agent, runtime=runtime),
+    })
+    return handlers
 
 
 

@@ -113,7 +113,11 @@ def _tools_to_openai(tools: list[dict]) -> list[dict]:
     return [{"type": "function", "function": {"name": tool["name"], "description": tool.get("description", ""), "parameters": tool.get("input_schema") or tool.get("parameters") or {}}} for tool in tools or []]
 
 
-def _openai_message_to_response(message: dict, finish_reason: str | None):
+def _openai_message_to_response(
+    message: dict,
+    finish_reason: str | None,
+    usage: dict | None = None,
+):
     content = []
     text = message.get("content")
     if text:
@@ -129,7 +133,12 @@ def _openai_message_to_response(message: dict, finish_reason: str | None):
     stop_reason = "tool_use" if message.get("tool_calls") else "end_turn"
     if finish_reason == "length":
         stop_reason = "max_tokens"
-    return SimpleNamespace(content=content, stop_reason=stop_reason)
+    usage_object = SimpleNamespace(**usage) if isinstance(usage, dict) else None
+    return SimpleNamespace(
+        content=content,
+        stop_reason=stop_reason,
+        usage=usage_object,
+    )
 
 
 class OpenAICompatibleMessages:
@@ -158,7 +167,11 @@ class OpenAICompatibleMessages:
             detail = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Model request failed: HTTP {exc.code}: {detail[:2000]}") from exc
         choice = data["choices"][0]
-        return _openai_message_to_response(choice.get("message", {}), choice.get("finish_reason"))
+        return _openai_message_to_response(
+            choice.get("message", {}),
+            choice.get("finish_reason"),
+            data.get("usage"),
+        )
 
 
 class OpenAICompatibleClient:

@@ -10,12 +10,34 @@ class AgentProfile:
     description: str
     instructions: str
     tool_names: tuple[str, ...]
-    max_rounds: int
+    max_tool_rounds: int
+    max_read_paths: int
+    max_tool_calls: int
+    max_response_tokens: int
     read_only: bool = True
     uses_worktree: bool = False
 
 
 AGENT_PROFILES = {
+    "general": AgentProfile(
+        name="general",
+        description=(
+            "Small read-only helper for one focused question that does not need "
+            "repository-wide exploration, implementation, or final review."
+        ),
+        instructions=(
+            "Answer one bounded delegated question. Stay read-only and inspect "
+            "only the few files needed for the answer; do not scan the repository "
+            "or behave like an implementation worker. Return JSON only with keys "
+            "verdict, summary, evidence, files_checked, remaining_questions. "
+            "verdict must be complete or blocked."
+        ),
+        tool_names=("glob", "read_file"),
+        max_tool_rounds=2,
+        max_read_paths=8,
+        max_tool_calls=10,
+        max_response_tokens=4000,
+    ),
     "explorer": AgentProfile(
         name="explorer",
         description=(
@@ -23,15 +45,22 @@ AGENT_PROFILES = {
             "and producer-to-consumer relationships before implementation."
         ),
         instructions=(
-            "Stay read-only. Inspect the task, repository guidance, and the "
-            "smallest relevant source/test set. Trace real execution paths and "
+            "Stay read-only. The Harness supplies a repository manifest; do not "
+            "rediscover languages or file layout. In the single tool round, read "
+            "task-relevant guidance/README plus the smallest relevant source set. "
+            "Do not scan every source or test file merely because the lead asks "
+            "for a complete map; use at most eight high-value paths. "
+            "Trace real execution paths and "
             "derived values from producer through consumer. Distinguish verified "
             "facts from assumptions. Return JSON only with keys verdict, summary, "
             "requirements, code_map, risks, files_checked. verdict must be "
             "complete or blocked. Do not propose broad rewrites and do not edit."
         ),
-        tool_names=("glob", "read_file"),
-        max_rounds=5,
+        tool_names=("read_file",),
+        max_tool_rounds=1,
+        max_read_paths=8,
+        max_tool_calls=8,
+        max_response_tokens=4000,
     ),
     "reviewer": AgentProfile(
         name="reviewer",
@@ -41,16 +70,24 @@ AGENT_PROFILES = {
         ),
         instructions=(
             "Review independently from the implementing agent. Re-read the task "
-            "and relevant contract, inspect changed files plus only direct "
+            "and relevant contract even if the lead prompt names only its expected "
+            "fixes; the root task is authoritative and the lead may not narrow it. "
+            "Inspect the complete changed-file set plus only direct "
             "dependencies needed to verify them, and look for behavior regressions, "
             "missing fields, failure branches, atomicity, idempotency, state "
-            "transitions, and API compatibility when relevant. Return JSON only "
-            "with keys verdict, summary, findings, files_checked, missing_evidence. "
+            "transitions, and API compatibility when relevant. Report at most five "
+            "actionable findings; each finding has severity, requirement, file, "
+            "symbol, and concise evidence. Return a compact JSON object only with "
+            "keys verdict, summary, findings, files_checked, missing_evidence. "
             "verdict must be pass, gaps, or blocked. A pass requires concrete code "
-            "evidence, not only public test success. Do not edit files."
+            "evidence and an empty findings list, not only public test success. Do "
+            "not narrate chain-of-thought, use Markdown, or edit files."
         ),
-        tool_names=("glob", "read_file"),
-        max_rounds=5,
+        tool_names=("read_file",),
+        max_tool_rounds=2,
+        max_read_paths=16,
+        max_tool_calls=20,
+        max_response_tokens=8000,
     ),
     "worker": AgentProfile(
         name="worker",
@@ -68,7 +105,10 @@ AGENT_PROFILES = {
             "changes_ready, no_changes, or blocked."
         ),
         tool_names=("glob", "read_file", "write_file", "edit_file", "bash"),
-        max_rounds=10,
+        max_tool_rounds=6,
+        max_read_paths=20,
+        max_tool_calls=48,
+        max_response_tokens=8000,
         read_only=False,
         uses_worktree=True,
     ),
@@ -84,6 +124,64 @@ def agent_profile_catalog() -> str:
         f"- {profile.name}: {profile.description}"
         for profile in AGENT_PROFILES.values()
     )
+
+
+def _has_intent_marker(text: str, marker: str) -> bool:
+    if marker.isascii():
+        return bool(re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(marker)}(?![A-Za-z0-9_])",
+            text,
+        ))
+    return marker in text
+
+
+def classify_delegation_intent(text: str) -> dict:
+    """Route a legacy/general delegation by requested work, not case identity."""
+    normalized = " ".join(str(text or "").lower().split())
+    mutation_markers = (
+        "implement", "modify", "edit", "write", "create", "add", "remove",
+        "rename", "refactor", "repair", "fix", "patch", "update",
+        "实现", "修改", "编辑", "编写", "创建", "新增", "删除", "重构", "修复",
+    )
+    review_markers = (
+        "review", "audit", "final review", "review the changes", "find bugs",
+        "regression risk", "correctness review", "security review",
+        "审查", "审计", "复核", "检查改动", "检查最终", "回归风险", "找漏洞",
+    )
+    exploration_markers = (
+        "read", "inspect", "analyze", "investigate", "locate", "find",
+        "trace", "map", "understand", "explain", "search", "identify",
+        "阅读", "分析", "定位", "查找", "调查", "追踪", "梳理", "映射", "理解",
+    )
+
+    mutation_hits = [
+        marker for marker in mutation_markers
+        if _has_intent_marker(normalized, marker)
+    ]
+    review_hits = [
+        marker for marker in review_markers
+        if _has_intent_marker(normalized, marker)
+    ]
+    exploration_hits = [
+        marker for marker in exploration_markers
+        if _has_intent_marker(normalized, marker)
+    ]
+    # A request to both inspect and change code is implementation work. The
+    # worker may inspect inside its worktree before editing. Pure review takes
+    # precedence over exploration because it has stricter evidence semantics.
+    if mutation_hits:
+        role, hits = "worker", mutation_hits
+    elif review_hits:
+        role, hits = "reviewer", review_hits
+    elif exploration_hits:
+        role, hits = "explorer", exploration_hits
+    else:
+        role, hits = "general", []
+    return {
+        "role": role,
+        "reason": f"{role}_intent" if hits else "no_specialized_intent",
+        "matched_markers": hits[:6],
+    }
 
 
 def assess_task_complexity(text: str) -> dict:
@@ -169,14 +267,17 @@ def complex_delegation_briefing(assessment: dict) -> str:
     reasons = ", ".join(assessment.get("reasons", [])) or "broad task scope"
     return (
         "<multiagent_policy level=\"complex\">This task was classified as "
-        f"complex ({reasons}). Before the first implementation mutation, use "
-        "delegate_agent(role=\"explorer\") to obtain an independent contract and "
-        "code-path map, then rely on that result instead of repeating its broad "
-        "reads. Delegate a worker only for a bounded implementation slice; workers "
-        "write in isolated worktrees and their changes do not reach the main "
-        "workspace until integrate_worktree is called. Before final, use a fresh "
-        "delegate_agent(role=\"reviewer\") after the latest main-workspace change. "
-        "A reviewer pass is required and becomes stale after another mutation. The "
-        "lead owns decomposition, integration, tests, and the final answer."
+        f"complex ({reasons}). Consider one early Explorer delegation only when "
+        "an independent repository map is likely to replace broad Lead reads. "
+        "Give it a focused question and reuse its verified paths and evidence; "
+        "do not duplicate the same exploration in both contexts. Explorer is "
+        "advisory and non-gating. Delegate a Worker only for one "
+        "bounded implementation slice. delegate_agent(worker) owns Task and "
+        "Worktree creation; do not call create_task/create_worktree first. Worker "
+        "changes reach the main workspace only through integrate_worktree. After "
+        "the final code change, the harness may run one pre-final reviewer "
+        "automatically. Do not duplicate that review. Reviewer findings inform "
+        "the lead but do not own final authority. "
+        "The lead owns decomposition, integration, tests, and the final answer."
         "</multiagent_policy>"
     )

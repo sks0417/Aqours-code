@@ -188,13 +188,12 @@ def test_faulty_workspace_exposes_core_defects_and_receives_partial_score(
 ):
     assert original_result["passed"] is False
     assert 0 < original_result["score"] < 100
-    assert original_result["score"] == 67
+    assert original_result["score"] == 32
     assert original_result["breakdown"] == {
-        "outcome_correctness": 7,
-        "constraints": 15,
-        "process_quality": 20,
-        "code_quality": 15,
-        "efficiency": 10,
+        "functional_correctness": 12,
+        "code_quality": 20,
+        "runtime_efficiency": 0,
+        "token_cost": 0,
     }
     groups = original_result["metrics"]["outcome_groups"]
     assert groups["atomic_reservation"]["returncode"] != 0
@@ -211,20 +210,25 @@ def test_outcome_groups_award_independent_partial_credit(tmp_path, original_resu
     result = run_case_grader(workspace, tmp_path / "artifacts")
 
     assert original_result["score"] < result["score"] < 100
-    assert result["breakdown"]["outcome_correctness"] == 19
+    assert result["breakdown"]["functional_correctness"] == 24
     groups = result["metrics"]["outcome_groups"]
     assert groups["atomic_reservation"]["returncode"] == 0
     assert groups["idempotency_conflict"]["returncode"] != 0
 
 
-def test_controlled_correct_implementation_passes_all_trusted_tests_and_scores_100(
+def test_controlled_correct_implementation_passes_without_requiring_score_100(
     correct_workspace_and_result,
 ):
     _workspace, result, _root = correct_workspace_and_result
 
     assert result["passed"] is True
-    assert result["score"] == 100
-    assert result["breakdown"] == run_eval.DEFAULT_BREAKDOWN_WEIGHTS
+    assert result["score"] == 70
+    assert result["breakdown"] == {
+        "functional_correctness": 50,
+        "code_quality": 20,
+        "runtime_efficiency": 0,
+        "token_cost": 0,
+    }
     assert result["metrics"]["failed_outcome_groups"] == []
     assert all(
         group["returncode"] == 0
@@ -258,7 +262,7 @@ def test_protected_change_is_rejected_and_not_applied_to_clean_room(tmp_path):
     direct_result = run_case_grader(agent, tmp_path / "direct-artifacts")
     assert direct_result["passed"] is False
     assert direct_result["failure_category"] == "constraint_violation"
-    assert direct_result["breakdown"]["constraints"] == 10
+    assert direct_result["breakdown"]["functional_correctness"] == 9.5
     assert direct_result["metrics"]["protected_changes"] == ["README.md"]
 
 
@@ -290,7 +294,7 @@ def test_scoring_is_repeatable_and_uses_no_network_randomness(
     ]
     source_text = "\n".join(path.read_text(encoding="utf-8") for path in implementation_and_tests)
 
-    assert second["score"] == first["score"] == 100
+    assert second["score"] == first["score"] == 70
     assert second["breakdown"] == first["breakdown"]
     assert second["metrics"]["failed_outcome_groups"] == []
     assert "requests" not in source_text

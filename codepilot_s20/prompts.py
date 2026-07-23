@@ -1,4 +1,5 @@
 from .runtime_state import *
+from .runtime import AgentRuntime
 
 # ── Prompt Assembly ──
 
@@ -56,23 +57,38 @@ PROMPT_SECTIONS = {
                       "to wait. Continue independent work or finish the turn; its "
                       "task_notification will report the result."),
     "multiagent": ("Multiagent roles: the lead owns task decomposition, integration, "
-                   "tests, and final claims. Use delegate_agent explorer for fresh "
-                   "read-only repository/contract mapping, reviewer for an independent "
-                   "read-only final audit, and worker only for one bounded implementation "
-                   "slice. A worker writes in an isolated worktree; inspect its result "
-                   "and call integrate_worktree before relying on those changes. Avoid "
-                   "delegating trivial work or sending the whole task to a worker."),
+                    "tests, and final claims. Use at most one explorer for fresh read-only "
+                   "contract/code mapping. For complex changes, the harness may attach "
+                   "one independent pre-final reviewer result automatically; do not call "
+                   "a duplicate reviewer for that revision. Resolve every structured "
+                   "finding or reject it with concrete code evidence even when the outer "
+                   "verdict is incomplete. Do not repeat role "
+                   "repository reads in the lead context by default. Use worker only for "
+                   "one bounded implementation slice. delegate_agent(worker) automatically "
+                   "owns Task and Worktree creation, so do not call create_task or "
+                   "create_worktree first. A worker commit reaches the main workspace only "
+                   "after integrate_worktree. Avoid delegating trivial work or sending the "
+                    "whole task to a worker. When the finalization budget notice appears, "
+                    "do not start any new role; use retained evidence for direct fixes, "
+                    "targeted verification, and final. The compatibility task tool uses "
+                    "the same bounded role runtime and automatically routes by delegated "
+                    "intent; it is not an unrestricted second implementation path."),
 }
 
 
-def assemble_system_prompt(context: dict) -> str:
+def assemble_system_prompt(
+    context: dict,
+    runtime: AgentRuntime | None = None,
+) -> str:
     # The system prompt is rebuilt each turn from live context. This is where
     # memory, skill catalog, MCP state, and active teammates become visible.
-    policy = TOOL_POLICY if isinstance(TOOL_POLICY, dict) else {}
+    runtime_policy = runtime.config.tool_policy if runtime is not None else None
+    policy = (runtime_policy if isinstance(runtime_policy, dict)
+              else TOOL_POLICY if isinstance(TOOL_POLICY, dict) else {})
     allowed_tools = (policy["allowed_tools"]
                      if "allowed_tools" in policy else ALL_TOOL_NAMES)
     try:
-        live_tools, _ = assemble_tool_pool()
+        live_tools, _ = assemble_tool_pool(runtime)
     except (NameError, AttributeError):
         live_tools = [tool for tool in BUILTIN_TOOLS
                       if tool.get("name") in allowed_tools]
@@ -86,7 +102,8 @@ def assemble_system_prompt(context: dict) -> str:
         f"- {name}: {descriptions.get(name, '')}" for name in displayed_tools)
     if policy.get("allow_mcp", True):
         tool_section += " MCP tools are prefixed mcp__{server}__{tool}."
-    prompt_runtime = resolve_prompt_runtime_context(policy, WORKDIR)
+    workdir = runtime.paths.workdir if runtime is not None else WORKDIR
+    prompt_runtime = resolve_prompt_runtime_context(policy, workdir)
     sections = [PROMPT_SECTIONS["identity"],
                 tool_section,
                 f"Working directory: {prompt_runtime['workdir']}",
@@ -99,7 +116,7 @@ def assemble_system_prompt(context: dict) -> str:
         sections.insert(2, PROMPT_SECTIONS["scheduling"])
     sections.append(f"Current time: {datetime.now().isoformat(timespec='seconds')}")
     if policy.get("allow_skill_context", True) and "load_skill" in allowed_tools:
-        sections.append("Skills catalog:\n" + list_skills() +
+        sections.append("Skills catalog:\n" + list_skills(runtime) +
                         "\nUse load_skill(name) when a skill is relevant.")
     if policy.get("allow_memory_context", True):
         sections.append(
@@ -119,13 +136,15 @@ def assemble_system_prompt(context: dict) -> str:
         lines = []
         for item in acceptance:
             status = item.get("status", "pending")
-            line = f"- [{status}] {item.get('content', '')}"
+            item_id = item.get("id", "acceptance")
+            line = f"- [{item_id} {status}] {item.get('content', '')}"
             if item.get("evidence"):
                 line += f" | evidence: {item['evidence']}"
             lines.append(line)
         sections.append(
             "Protected acceptance checklist (verify before final):\n"
-            + "\n".join(lines))
+            + "\n".join(lines)
+            + "\nUpdate an existing item by id; its original content need not be repeated.")
     return "\n\n".join(sections)
 
 

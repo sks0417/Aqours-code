@@ -119,9 +119,11 @@ def test_full_agent_container_is_one_shot_entrypoint_with_isolated_mounts(tmp_pa
               if value == "--mount"]
     assert {mount.split("target=", 1)[1].split(",", 1)[0] for mount in mounts} == {
         "/workspace", "/state", "/runtime", "/broker/requests",
-        "/broker/responses",
+        "/broker/responses", "/broker/stats",
     }
     assert next(mount for mount in mounts if "target=/broker/responses" in mount).endswith(
+        ",readonly")
+    assert next(mount for mount in mounts if "target=/broker/stats" in mount).endswith(
         ",readonly")
     joined = " ".join(args)
     for forbidden in (
@@ -159,7 +161,9 @@ def test_eval_image_build_uses_project_root_and_installs_runtime_and_git(tmp_pat
     assert "PIP_DEFAULT_TIMEOUT=60" in dockerfile
     assert "PIP_RETRIES=8" in dockerfile
     assert "--mount=type=cache,target=/root/.cache/pip,sharing=locked" in dockerfile
-    assert "python -m pip install --no-cache-dir --no-deps /opt/codepilot-src" in dockerfile
+    assert "PYTHONPATH=/opt/codepilot-src" in dockerfile
+    assert 'python -c "import codepilot_s20.eval_container_entry"' in dockerfile
+    assert "pip install --no-cache-dir --no-deps /opt/codepilot-src" not in dockerfile
     assert "COPY codepilot_s20 /opt/codepilot-src/codepilot_s20" in dockerfile
     assert "--trusted-host" not in dockerfile
 
@@ -169,9 +173,9 @@ def test_eval_image_build_uses_project_root_and_installs_runtime_and_git(tmp_pat
         "python -m pip install --requirement /tmp/requirements.lock")
     source_copy = dockerfile.index(
         "COPY codepilot_s20 /opt/codepilot-src/codepilot_s20")
-    runtime_install = dockerfile.index(
-        "python -m pip install --no-cache-dir --no-deps /opt/codepilot-src")
-    assert dependency_copy < dependency_install < source_copy < runtime_install
+    runtime_import_check = dockerfile.index(
+        'python -c "import codepilot_s20.eval_container_entry"')
+    assert dependency_copy < dependency_install < source_copy < runtime_import_check
 
 
 def test_windows_mount_is_one_argument_not_colon_delimited():
@@ -386,7 +390,7 @@ def test_agent_exception_and_keyboard_interrupt_always_stop_and_restore(tmp_path
     for error in (RuntimeError("boom"), KeyboardInterrupt()):
         executor = LifecycleExecutor()
 
-        def fail_loop(_messages, _context, error=error):
+        def fail_loop(_messages, _context, _runtime=None, error=error):
             raise error
 
         monkeypatch.setattr(agent_loop, "agent_loop", fail_loop)

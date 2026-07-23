@@ -229,6 +229,7 @@ def test_compact_history_keeps_recent_tool_exchange_paired(tmp_path, monkeypatch
 
 def test_summary_prompt_preserves_contract_producers_and_assumptions(monkeypatch):
     captured = {}
+    trace_calls = []
 
     class Messages:
         def create(self, **kwargs):
@@ -239,6 +240,14 @@ def test_summary_prompt_preserves_contract_producers_and_assumptions(monkeypatch
 
     monkeypatch.setattr(
         compact, "client", SimpleNamespace(messages=Messages()))
+    monkeypatch.setattr(
+        compact, "record_llm_request",
+        lambda **fields: trace_calls.append(("request", fields)),
+    )
+    monkeypatch.setattr(
+        compact, "record_llm_response",
+        lambda response, **fields: trace_calls.append(("response", fields)),
+    )
 
     result = compact.summarize_history([
         {"role": "user", "content": "fingerprint includes quantity"}
@@ -249,3 +258,54 @@ def test_summary_prompt_preserves_contract_producers_and_assumptions(monkeypatch
     assert "inspected file/symbol map" in prompt
     assert "normalized or fingerprint fields" in prompt
     assert "verified code facts from assumptions" in prompt
+    assert trace_calls == [
+        ("request", {
+            "model": compact.MODEL,
+            "max_tokens": 2000,
+            "message_count": 1,
+            "tool_count": 0,
+            "purpose": "compact_summary",
+            "agent_role": "",
+        }),
+        ("response", {"purpose": "compact_summary", "agent_role": ""}),
+    ]
+
+
+def test_compact_uses_deterministic_checkpoint_in_finalization_reserve(
+    tmp_path, monkeypatch,
+):
+    class BudgetedClient:
+        def __init__(self):
+            self.messages = self
+            self.calls = []
+
+        def budget_snapshot(self):
+            return {
+                "max_calls": 40,
+                "call_count": 34,
+                "max_provider_retries": 1,
+            }
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            raise AssertionError("model summary must not consume the tail reserve")
+
+    client = BudgetedClient()
+    monkeypatch.setattr(compact, "client", client)
+    monkeypatch.setattr(compact, "TRANSCRIPT_DIR", tmp_path / "transcripts")
+    monkeypatch.setattr(compact, "CURRENT_ROOT_TASK", "Fix the contract")
+    monkeypatch.setattr(compact, "CURRENT_TODOS", [{
+        "content": "Quantity is fingerprinted",
+        "status": "in_progress",
+        "kind": "acceptance",
+    }])
+    messages = [
+        {"role": "user", "content": "old context " + ("x" * 1000)}
+        for _ in range(8)
+    ]
+
+    result = compact.compact_history(messages)
+
+    assert client.calls == []
+    assert "finalization call reserve" in result[0]["content"]
+    assert "Quantity is fingerprinted" in result[0]["content"]

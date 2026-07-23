@@ -167,11 +167,66 @@ def _message_value(value):
     return str(value)
 
 
-def _response_payload(response) -> dict:
+def _usage_field(usage, *names: str) -> int:
+    for name in names:
+        if isinstance(usage, dict):
+            value = usage.get(name)
+        else:
+            value = getattr(usage, name, None)
+        if isinstance(value, bool):
+            continue
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _response_usage(response) -> dict:
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    if usage is None:
+        return {}
+
+    input_tokens = _usage_field(usage, "input_tokens", "prompt_tokens")
+    output_tokens = _usage_field(usage, "output_tokens", "completion_tokens")
+    cache_creation_tokens = _usage_field(
+        usage, "cache_creation_input_tokens", "cache_write_tokens")
+    cache_read_tokens = _usage_field(
+        usage, "cache_read_input_tokens", "cached_input_tokens")
+    prompt_details = (
+        usage.get("prompt_tokens_details")
+        if isinstance(usage, dict)
+        else getattr(usage, "prompt_tokens_details", None)
+    )
+    if not cache_read_tokens and prompt_details is not None:
+        cache_read_tokens = _usage_field(prompt_details, "cached_tokens")
+    explicit_total = _usage_field(usage, "total_tokens")
+    total_tokens = explicit_total or sum((
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    ))
     return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation_tokens,
+        "cache_read_input_tokens": cache_read_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _response_payload(response) -> dict:
+    payload = {
         "content": _message_value(getattr(response, "content", [])),
         "stop_reason": getattr(response, "stop_reason", None),
     }
+    usage = _response_usage(response)
+    if usage:
+        payload["usage"] = usage
+    return payload
 
 
 def _response_object(payload: dict):
@@ -193,9 +248,11 @@ def _response_object(payload: dict):
             ))
         else:
             raise BrokerProtocolError(f"unsupported broker content block: {kind}")
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
     return SimpleNamespace(
         content=blocks,
         stop_reason=payload.get("stop_reason") or "end_turn",
+        usage=SimpleNamespace(**usage),
     )
 
 
@@ -275,13 +332,57 @@ class BrokerModelClient:
         request_timeout: float = 30,
         case_deadline: float | None = None,
         poll_interval: float = 0.02,
+        max_calls: int | None = None,
+        max_provider_retries: int = 0,
     ):
         self.ipc_root = Path(ipc_root).resolve()
         self.nonce = _validate_token(nonce, "nonce")
         self.request_timeout = float(request_timeout)
         self.case_deadline = case_deadline
         self.poll_interval = float(poll_interval)
+        self.max_calls = int(max_calls) if max_calls is not None else 0
+        self.max_provider_retries = max(0, int(max_provider_retries))
+        self._logical_request_count = 0
         self.messages = self
+
+    def budget_snapshot(self) -> dict:
+        """Read the Broker's live, non-secret budget counters."""
+        payload = None
+        # The nested location is mounted read-only into Docker. Keep the root
+        # fallback for older local callers and previously created fixtures.
+        for stats_path in (
+            self.ipc_root / "stats" / "broker_stats.json",
+            self.ipc_root / "broker_stats.json",
+        ):
+            try:
+                payload = json.loads(stats_path.read_text(encoding="utf-8"))
+                break
+            except (OSError, json.JSONDecodeError):
+                continue
+        if (not isinstance(payload, dict)
+                or payload.get("version") != PROTOCOL_VERSION
+                or payload.get("nonce") != self.nonce):
+            if self.max_calls > 0:
+                return {
+                    "source": "configured_fallback",
+                    "request_count": self._logical_request_count,
+                    "call_count": self._logical_request_count,
+                    "max_calls": self.max_calls,
+                    "max_provider_retries": self.max_provider_retries,
+                }
+            return {}
+        allowed = {
+            "request_count", "call_count", "rejected_count", "retry_count",
+            "requested_token_count", "max_calls", "max_tokens_per_call",
+            "max_total_tokens", "max_provider_retries",
+            "actual_input_token_count", "actual_output_token_count",
+            "actual_cache_creation_input_token_count",
+            "actual_cache_read_input_token_count", "actual_total_token_count",
+            "usage_response_count", "usage_missing_response_count",
+        }
+        snapshot = {key: payload[key] for key in allowed if key in payload}
+        snapshot["source"] = "broker_stats"
+        return snapshot
 
     def create(self, *, model: str, messages: list, system=None, tools=None,
                max_tokens: int = 8000, **kwargs):
@@ -312,6 +413,9 @@ class BrokerModelClient:
             "method": "messages.create",
             "params": params,
         }
+        # This is a conservative fallback when the live stats mount is briefly
+        # unavailable. Broker stats supersede it as soon as they can be read.
+        self._logical_request_count += 1
         _atomic_write_json(request_path, request)
         deadline = time.monotonic() + self.request_timeout
         if self.case_deadline is not None:
@@ -399,6 +503,13 @@ class ModelBroker:
         self.call_count = 0
         self.rejected_count = 0
         self.requested_token_count = 0
+        self.actual_input_token_count = 0
+        self.actual_output_token_count = 0
+        self.actual_cache_creation_input_token_count = 0
+        self.actual_cache_read_input_token_count = 0
+        self.actual_total_token_count = 0
+        self.usage_response_count = 0
+        self.usage_missing_response_count = 0
         self.retry_count = 0
         self.provider_error_count = 0
         self.last_error = ""
@@ -414,6 +525,7 @@ class ModelBroker:
     def start(self):
         (self.ipc_root / "requests").mkdir(parents=True, exist_ok=True)
         (self.ipc_root / "responses").mkdir(parents=True, exist_ok=True)
+        (self.ipc_root / "stats").mkdir(parents=True, exist_ok=True)
         self._thread = threading.Thread(
             target=self.serve_forever,
             name=f"codepilot-model-broker-{self.nonce[:8]}",
@@ -426,6 +538,7 @@ class ModelBroker:
         """Serve synchronously; eval orchestration runs this in a killable process."""
         (self.ipc_root / "requests").mkdir(parents=True, exist_ok=True)
         (self.ipc_root / "responses").mkdir(parents=True, exist_ok=True)
+        (self.ipc_root / "stats").mkdir(parents=True, exist_ok=True)
         self._write_stats()
         self._serve()
 
@@ -450,7 +563,7 @@ class ModelBroker:
 
     def _write_stats(self):
         try:
-            _atomic_write_json(self.ipc_root / "broker_stats.json", {
+            _atomic_write_json(self.ipc_root / "stats" / "broker_stats.json", {
                 "version": PROTOCOL_VERSION,
                 "nonce": self.nonce,
                 "allowed_model": self.allowed_model,
@@ -458,6 +571,15 @@ class ModelBroker:
                 "call_count": self.call_count,
                 "rejected_count": self.rejected_count,
                 "requested_token_count": self.requested_token_count,
+                "actual_input_token_count": self.actual_input_token_count,
+                "actual_output_token_count": self.actual_output_token_count,
+                "actual_cache_creation_input_token_count": (
+                    self.actual_cache_creation_input_token_count),
+                "actual_cache_read_input_token_count": (
+                    self.actual_cache_read_input_token_count),
+                "actual_total_token_count": self.actual_total_token_count,
+                "usage_response_count": self.usage_response_count,
+                "usage_missing_response_count": self.usage_missing_response_count,
                 "retry_count": self.retry_count,
                 "provider_error_count": self.provider_error_count,
                 "max_calls": self.max_calls,
@@ -530,7 +652,21 @@ class ModelBroker:
         while True:
             self._reserve_provider_attempt(requested_tokens)
             try:
-                return self._call_provider_once(params)
+                response = self._call_provider_once(params)
+                usage = _response_usage(response)
+                if usage:
+                    self.actual_input_token_count += usage["input_tokens"]
+                    self.actual_output_token_count += usage["output_tokens"]
+                    self.actual_cache_creation_input_token_count += (
+                        usage["cache_creation_input_tokens"])
+                    self.actual_cache_read_input_token_count += (
+                        usage["cache_read_input_tokens"])
+                    self.actual_total_token_count += usage["total_tokens"]
+                    self.usage_response_count += 1
+                else:
+                    self.usage_missing_response_count += 1
+                self._write_stats()
+                return response
             except Exception as exc:
                 error_kind = _provider_error_kind(exc)
                 self.provider_error_count += 1

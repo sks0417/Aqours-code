@@ -1,4 +1,5 @@
 from .runtime_state import *
+from .command_safety import looks_like_delete_command
 
 # ── Hooks + Permission Pipeline ──
 
@@ -21,17 +22,11 @@ def trigger_hooks(event: str, *args):
 
 
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
-DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
-
-
-DELETE_COMMANDS = (
-    "remove-item", "rmdir", "rd ", "del ", "erase ", "rm ", "unlink",
-)
+DESTRUCTIVE = ["> /etc/", "chmod 777"]
 
 
 def _looks_like_delete_command(command: str) -> bool:
-    lowered = f" {command.lower()} "
-    return any(token in lowered for token in DELETE_COMMANDS)
+    return looks_like_delete_command(command)
 
 
 def _looks_like_temp_cleanup(command: str) -> bool:

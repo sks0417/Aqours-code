@@ -44,6 +44,45 @@ class RecordingMessages:
         )
 
 
+class UsageMessages:
+    def create(self, **_kwargs):
+        return SimpleNamespace(
+            content=[text_block("metered")],
+            stop_reason="end_turn",
+            usage=SimpleNamespace(
+                input_tokens=120,
+                output_tokens=30,
+                cache_creation_input_tokens=10,
+                cache_read_input_tokens=40,
+            ),
+        )
+
+
+def test_broker_records_actual_provider_usage_and_forwards_it(tmp_path):
+    nonce = uuid.uuid4().hex
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=UsageMessages()),
+        allowed_model="scripted",
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        response = client.messages.create(
+            model="scripted", messages=[], max_tokens=8000)
+        snapshot = client.budget_snapshot()
+    finally:
+        broker.stop()
+
+    assert response.usage.input_tokens == 120
+    assert response.usage.total_tokens == 200
+    assert snapshot["actual_input_token_count"] == 120
+    assert snapshot["actual_output_token_count"] == 30
+    assert snapshot["actual_cache_creation_input_token_count"] == 10
+    assert snapshot["actual_cache_read_input_token_count"] == 40
+    assert snapshot["actual_total_token_count"] == 200
+    assert snapshot["usage_response_count"] == 1
+    assert snapshot["usage_missing_response_count"] == 0
+
+
 def test_broker_round_trip_supports_only_messages_create_and_cleans_files(tmp_path):
     nonce = uuid.uuid4().hex
     messages = RecordingMessages()
@@ -487,3 +526,52 @@ def test_noninteractive_container_entry_runs_normal_agent_through_broker(
     assert (runtime / "final.md").is_file()
     assert "OPENAI_API_KEY" not in os.environ
     assert (workspace / ".git").is_dir()
+
+
+def test_container_entry_failure_preserves_command_execution_metadata(
+    tmp_path, monkeypatch,
+):
+    from codepilot_s20 import agent_loop
+
+    workspace = tmp_path / "workspace"
+    state = tmp_path / "state"
+    runtime = tmp_path / "runtime"
+    ipc = tmp_path / "ipc"
+    for path in (workspace, state, runtime, ipc):
+        path.mkdir()
+    config = {
+        "task": "run then fail",
+        "workspace": str(workspace),
+        "state_root": str(state),
+        "runtime_root": str(runtime),
+        "ipc_root": str(ipc),
+        "broker_nonce": uuid.uuid4().hex,
+        "model": "scripted-eval",
+        "request_timeout": 2,
+        "broker_request_timeout": 7,
+        "case_timeout_seconds": 10,
+        "cleanup_grace": 1,
+        "tool_policy": run_eval.DOCKER_EVAL_TOOL_POLICY,
+    }
+    config_path = runtime / "input.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    def fail_after_command(*_args, **kwargs):
+        executor = kwargs["command_executor"]
+        result = executor.execute(
+            'python -c "print(123)"', workspace, timeout=5)
+        assert result["timed_out"] is False
+        raise RuntimeError("simulated broker failure")
+
+    monkeypatch.setattr(agent_loop, "run_agent_task", fail_after_command)
+    old_cwd = Path.cwd()
+    try:
+        exit_code = container_entry_main(["--config", str(config_path)])
+    finally:
+        os.chdir(old_cwd)
+
+    assert exit_code == 1
+    payload = json.loads((runtime / "result.json").read_text(encoding="utf-8"))
+    assert payload["ok"] is False
+    assert "simulated broker failure" in payload["error"]
+    assert payload["execution"]["command_execution_count"] == 1

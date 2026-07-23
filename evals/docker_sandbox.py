@@ -128,6 +128,10 @@ class DockerAgentRunner:
             bind_mount(ipc_root / "requests", "/broker/requests"),
             bind_mount(
                 ipc_root / "responses", "/broker/responses", readonly=True),
+            # Broker counters are written with atomic replacement. Mount the
+            # containing directory so the container observes every replacement
+            # instead of pinning one file inode.
+            bind_mount(ipc_root / "stats", "/broker/stats", readonly=True),
         ]
         args = [
             "docker", "run", "--name", self.container_name,

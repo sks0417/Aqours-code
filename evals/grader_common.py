@@ -8,14 +8,10 @@ import sys
 import time
 from pathlib import Path
 
-
-BREAKDOWN_WEIGHTS = {
-    "outcome_correctness": 40,
-    "constraints": 15,
-    "process_quality": 20,
-    "code_quality": 15,
-    "efficiency": 10,
-}
+try:
+    from .scoring import BREAKDOWN_WEIGHTS
+except ImportError:  # Trusted grader copy imports modules from its root.
+    from scoring import BREAKDOWN_WEIGHTS
 
 
 def make_breakdown(passed: bool, overrides: dict | None = None) -> dict:

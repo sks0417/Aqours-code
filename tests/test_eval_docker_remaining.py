@@ -167,6 +167,8 @@ def test_case_timeout_agent_failure_does_not_start_diagnostic_grader(
     assert result["failure_category"] == "case_timeout"
     assert result["diagnostic_score"] is None
     assert result["grader_execution"]["status"] == "not_started"
+    assert result["all_started_containers_cleanup_succeeded"] is True
+    assert result["lifecycle_complete"] is False
 
 
 def test_agent_failure_with_unexpected_changes_skips_diagnostic_grader(
@@ -423,6 +425,8 @@ def test_grader_not_started_is_explicit_and_not_cleanup_success(tmp_path):
     assert result["grader_container_started"] is None
     assert result["grader_container_cleanup_succeeded"] is None
     assert result["all_container_cleanup_succeeded"] is False
+    assert result["all_started_containers_cleanup_succeeded"] is True
+    assert result["lifecycle_complete"] is False
 
 
 def test_default_scripted_mode_selects_only_supported_smoke_cases(
