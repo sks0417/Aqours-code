@@ -138,18 +138,42 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
     )
 
 
-def background_reason(tool_name: str, tool_input: dict) -> str | None:
-    try:
-        policy = get_tool_spec(tool_name).background_policy
-    except (KeyError, NameError):
-        policy = "foreground"
-    if not BACKGROUND_TASKS_ENABLED or policy != "slow_or_explicit":
-        return None
+def _foreground_policy(_tool_name: str, _tool_input: dict) -> str | None:
+    return None
+
+
+def _slow_or_explicit_policy(
+    tool_name: str,
+    tool_input: dict,
+) -> str | None:
     if bool(tool_input.get("run_in_background")):
         return "explicit"
     if is_slow_operation(tool_name, tool_input):
         return "slow_command"
     return None
+
+
+BACKGROUND_POLICY_ROUTERS = {
+    "foreground": _foreground_policy,
+    "slow_or_explicit": _slow_or_explicit_policy,
+}
+
+
+def has_background_policy_router(policy: str) -> bool:
+    return policy in BACKGROUND_POLICY_ROUTERS
+
+
+def background_reason(tool_name: str, tool_input: dict) -> str | None:
+    try:
+        policy = get_tool_spec(tool_name).background_policy
+    except (KeyError, NameError):
+        policy = "foreground"
+    if not BACKGROUND_TASKS_ENABLED:
+        return None
+    router = BACKGROUND_POLICY_ROUTERS.get(policy)
+    if router is None:
+        return None
+    return router(tool_name, tool_input)
 
 
 def should_run_background(tool_name: str, tool_input: dict) -> bool:

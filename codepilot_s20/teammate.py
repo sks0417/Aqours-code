@@ -1,9 +1,47 @@
 from .runtime_state import *
 from .agent_profiles import get_agent_profile
+from .runtime import AgentRuntime
+from .tool_registry import (
+    delegated_policy_for_role,
+    effective_tool_names,
+)
 
 # ── Teammate Thread ──
 
-def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+def effective_teammate_tool_names(
+    role: str,
+    runtime: AgentRuntime | None = None,
+) -> tuple[str, ...]:
+    role_profile = get_agent_profile(role)
+    requested = set()
+    if role_profile:
+        coordination = {"send_message"}
+        if role_profile.uses_worktree:
+            coordination.update({
+                "submit_plan", "list_tasks", "claim_task", "complete_task",
+            })
+        requested = set(role_profile.tool_names) | coordination
+    parent_policy = runtime.config.tool_policy if runtime is not None else None
+    return effective_tool_names(
+        TOOL_REGISTRY,
+        requested,
+        role="teammate",
+        parent_policy=parent_policy,
+        environment_policy=(
+            TOOL_POLICY if isinstance(TOOL_POLICY, dict) else None
+        ),
+        delegated_policy=delegated_policy_for_role(
+            parent_policy, "teammate",
+        ),
+    )
+
+
+def spawn_teammate_thread(
+    name: str,
+    role: str,
+    prompt: str,
+    runtime: AgentRuntime | None = None,
+) -> str:
     if name in active_teammates:
         return f"Teammate '{name}' already exists"
 
@@ -12,7 +50,14 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     protocol_ctx = {"waiting_plan": None}
     # An async teammate may outlive the lead run. Pin its bash backend now so
     # runtime restoration can never make a sandboxed eval fall back to local.
-    teammate_command_executor = COMMAND_EXECUTOR
+    teammate_command_executor = (
+        runtime.services.command_executor
+        if runtime is not None else COMMAND_EXECUTOR
+    )
+    teammate_runtime = (
+        runtime.child(root_task=runtime.state.root_task)
+        if runtime is not None else None
+    )
     stop_event = threading.Event()
     role_profile = get_agent_profile(role)
     profile_instructions = (
@@ -62,6 +107,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             return registered_handlers["bash"](
                 command, cwd=_wt_cwd(), executor=teammate_command_executor,
                 run_in_background=run_in_background,
+                runtime=teammate_runtime,
             )
 
         def _run_read(
@@ -69,20 +115,24 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         ) -> str:
             return registered_handlers["read_file"](
                 path, limit=limit, offset=offset, cwd=_wt_cwd(),
+                runtime=teammate_runtime,
             )
 
         def _run_write(path: str, content: str) -> str:
             return registered_handlers["write_file"](
-                path, content, cwd=_wt_cwd(),
+                path, content, cwd=_wt_cwd(), runtime=teammate_runtime,
             )
 
         def _run_edit(path: str, old_text: str, new_text: str) -> str:
             return registered_handlers["edit_file"](
                 path, old_text, new_text, cwd=_wt_cwd(),
+                runtime=teammate_runtime,
             )
 
         def _run_glob(pattern: str) -> str:
-            return registered_handlers["glob"](pattern, cwd=_wt_cwd())
+            return registered_handlers["glob"](
+                pattern, cwd=_wt_cwd(), runtime=teammate_runtime,
+            )
 
         def _run_list_tasks():
             tasks = list_tasks()
@@ -117,18 +167,11 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             "claim_task": _run_claim_task,
             "complete_task": _run_complete_task,
         }
-        allowed = set(TOOL_REGISTRY.names_for_role("teammate"))
-        if role_profile:
-            coordination = {"send_message"}
-            if role_profile.uses_worktree:
-                coordination.update({
-                    "submit_plan", "list_tasks", "claim_task", "complete_task",
-                })
-            allowed = set(role_profile.tool_names) | coordination
-            sub_handlers = {
-                tool_name: handler for tool_name, handler in sub_handlers.items()
-                if tool_name in allowed
-            }
+        allowed = set(effective_teammate_tool_names(role, runtime))
+        sub_handlers = {
+            tool_name: handler for tool_name, handler in sub_handlers.items()
+            if tool_name in allowed
+        }
         sub_tools = tool_schemas_for_names(allowed, role="teammate")
 
         while True:

@@ -1,5 +1,5 @@
 from .runtime_state import *
-from .knowledge import content_digest
+from .knowledge import workspace_mutation_reconciliation
 from .runtime import AgentRuntime
 
 # ── Lead Worktree Tools ──
@@ -18,24 +18,10 @@ def run_integrate_worktree(
     cleanup: bool = True,
     runtime: AgentRuntime | None = None,
 ) -> str:
-    output = integrate_worktree(name, cleanup)
-    if runtime is None:
-        return output
-    try:
-        result = json.loads(output)
-    except (TypeError, json.JSONDecodeError):
-        return output
-    if result.get("status") != "integrated":
-        return output
-    for changed_path in result.get("changed_files", []):
-        file_path = runtime.paths.workdir / str(changed_path)
-        digest = (
-            content_digest(file_path.read_bytes())
-            if file_path.is_file() else ""
-        )
-        runtime.state.knowledge.invalidate_file(
-            str(changed_path), digest=digest, modified=True,
-        )
+    knowledge = runtime.state.knowledge if runtime is not None else None
+    workdir = runtime.paths.workdir if runtime is not None else WORKDIR
+    with workspace_mutation_reconciliation(knowledge, workdir):
+        output = integrate_worktree(name, cleanup)
     return output
 
 def run_delegate_agent(role: str, prompt: str, name: str = "",
@@ -82,8 +68,13 @@ def run_complete_task(task_id: str) -> str:
     except FileNotFoundError:
         return f"Error: task {task_id} not found"
 
-def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
-    return spawn_teammate_thread(name, role, prompt)
+def run_spawn_teammate(
+    name: str,
+    role: str,
+    prompt: str,
+    runtime: AgentRuntime | None = None,
+) -> str:
+    return spawn_teammate_thread(name, role, prompt, runtime=runtime)
 
 def run_send_message(to: str, content: str) -> str:
     BUS.send("lead", to, content)

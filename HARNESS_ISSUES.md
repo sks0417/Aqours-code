@@ -1918,3 +1918,20 @@ evidence across every full compact was rejected after one real run: 57 reads,
 690,818 tokens, and a failed `exactly_once` outcome. That strategy was removed;
 the retained implementation keeps structured RunKnowledge outside message
 history without pinning a second copy of raw file contents into every prompt.
+
+### Principle hardening (2026-07-24)
+
+Tool projection now intersects Registry role access, AgentProfile tools, parent
+Runtime policy, and environment policy for synchronous roles and asynchronous
+Teammates. Registry schemas are recursively immutable, and every declared
+Safety/Background policy has an executable dispatcher.
+
+RunKnowledge now reconciles actual before/after Workspace fingerprints for
+file tools, foreground/background Bash, and Worktree integration under a
+thread-safe mutation boundary. Evidence uses `verified`, `stale`, and
+`unbound`; TestKnowledge records Workspace-at-run state separately from
+explicit source coverage.
+
+Status remains **Implemented, not Validated**. Focused and full pytest passed,
+but no real-model Eval was run for this change, as required. HARN-001 remains
+open until the existing paired ledger exit criteria pass.

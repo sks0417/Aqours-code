@@ -1,7 +1,7 @@
 from .runtime_state import *
 from .command_executor import CaseTimeoutError
 from .command_safety import looks_like_delete_command
-from .knowledge import content_digest, normalize_knowledge_path
+from .knowledge import snapshot_workspace, workspace_mutation_reconciliation
 from .runtime import AgentRuntime
 import re
 
@@ -36,22 +36,6 @@ def safe_path(
     return path
 
 
-def _record_runtime_mutation(
-    runtime: AgentRuntime | None,
-    path: str,
-    file_path: Path,
-) -> None:
-    if runtime is None:
-        return
-    digest = runtime.state.knowledge.files.get(normalize_knowledge_path(path))
-    current_digest = content_digest(file_path.read_bytes())
-    if digest is not None and digest.digest == current_digest:
-        return
-    runtime.state.knowledge.invalidate_file(
-        path, digest=current_digest, modified=True,
-    )
-
-
 def run_bash(command: str, cwd: Path = None,
              run_in_background: bool = False, timeout: float = 120,
              executor=None, runtime: AgentRuntime | None = None) -> str:
@@ -73,8 +57,11 @@ def run_bash(command: str, cwd: Path = None,
             or (runtime.services.command_executor if runtime is not None else None)
             or COMMAND_EXECUTOR
         )
-        result = selected_executor.execute(
-            command, _runtime_workdir(runtime, cwd), effective_timeout)
+        workdir = _runtime_workdir(runtime, cwd)
+        knowledge = runtime.state.knowledge if runtime is not None else None
+        with workspace_mutation_reconciliation(knowledge, workdir):
+            result = selected_executor.execute(
+                command, workdir, effective_timeout)
         out = (result["stdout"] + result["stderr"]).strip()
         if runtime is not None:
             runtime.state.knowledge.record_test(
@@ -82,6 +69,7 @@ def run_bash(command: str, cwd: Path = None,
                 exit_code=result.get("exit_code"),
                 timed_out=bool(result["timed_out"]),
                 result=out or "(no output)",
+                workspace_fingerprints=snapshot_workspace(workdir),
             )
         if result["timed_out"]:
             return f"Error: Timeout ({timeout:g}s)" + (f"\n{out[:50000]}" if out else "")
@@ -114,10 +102,12 @@ def run_read(path: str, limit: int | None = None,
 def run_write(path: str, content: str, cwd: Path = None,
               runtime: AgentRuntime | None = None) -> str:
     try:
-        fp = safe_path(path, cwd, runtime)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
-        _record_runtime_mutation(runtime, path, fp)
+        workdir = _runtime_workdir(runtime, cwd)
+        knowledge = runtime.state.knowledge if runtime is not None else None
+        with workspace_mutation_reconciliation(knowledge, workdir):
+            fp = safe_path(path, cwd, runtime)
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(content)
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -126,12 +116,14 @@ def run_write(path: str, content: str, cwd: Path = None,
 def run_edit(path: str, old_text: str, new_text: str,
              cwd: Path = None, runtime: AgentRuntime | None = None) -> str:
     try:
-        fp = safe_path(path, cwd, runtime)
-        text = fp.read_text()
-        if old_text not in text:
-            return f"Error: text not found in {path}"
-        fp.write_text(text.replace(old_text, new_text, 1))
-        _record_runtime_mutation(runtime, path, fp)
+        workdir = _runtime_workdir(runtime, cwd)
+        knowledge = runtime.state.knowledge if runtime is not None else None
+        with workspace_mutation_reconciliation(knowledge, workdir):
+            fp = safe_path(path, cwd, runtime)
+            text = fp.read_text()
+            if old_text not in text:
+                return f"Error: text not found in {path}"
+            fp.write_text(text.replace(old_text, new_text, 1))
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -239,6 +231,32 @@ def _normalize_todos(todos, runtime: AgentRuntime | None = None):
             "status": todo["status"],
             "kind": kind,
         }
+        raw_sources = todo.get(
+            "evidence_sources",
+            existing.get("evidence_sources", {}) if existing else {},
+        )
+        if raw_sources is None:
+            raw_sources = {}
+        if not isinstance(raw_sources, dict):
+            return None, (
+                f"Error: todos[{i}] evidence_sources must be an object"
+            )
+        evidence_sources = {}
+        for source_kind in ("files", "tests", "reviewer_findings"):
+            values = raw_sources.get(source_kind, [])
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, list) or not all(
+                isinstance(value, str) and value.strip() for value in values
+            ):
+                return None, (
+                    f"Error: todos[{i}] evidence_sources.{source_kind} "
+                    "must be a list of non-empty strings"
+                )
+            if values:
+                evidence_sources[source_kind] = [
+                    value.strip() for value in values[:20]
+                ]
         if not todo_id:
             matched = existing_by_content.get(content)
             if matched and matched.get("id"):
@@ -256,6 +274,8 @@ def _normalize_todos(todos, runtime: AgentRuntime | None = None):
             item["id"] = todo_id
         if evidence:
             item["evidence"] = evidence
+        if evidence_sources:
+            item["evidence_sources"] = evidence_sources
         normalized.append(item)
     acceptance_count = sum(
         1 for todo in normalized if todo["kind"] == "acceptance")

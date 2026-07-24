@@ -89,8 +89,12 @@ plus 30-tool schema below 12,000 characters without hiding any Lead tool.
 Each run also owns deterministic `RunKnowledge`: file digests/versions,
 confirmed Python symbols and contracts, modified paths, recent test results,
 Acceptance state, and Reviewer findings. Context compaction preserves this
-state independently of raw messages. File mutations invalidate only evidence
-bound to the changed path.
+state independently of raw messages. Workspace writes from file tools,
+foreground/background Bash, and Worktree integration are detected from
+before/after fingerprints and invalidate only evidence bound to changed paths.
+Evidence is `verified`, `stale`, or `unbound`; text without explicit file,
+test, or Reviewer provenance is never verified. Test workspace snapshots are
+not presented as source coverage.
 
 For complex code changes, `todo_write` distinguishes execution steps
 (`kind=plan`) from external requirements (`kind=acceptance`). Completed

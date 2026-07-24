@@ -2,6 +2,10 @@ from .runtime_state import *
 from .agent_profiles import classify_delegation_intent, get_agent_profile
 from .model_budget import can_spend_optional_calls
 from .runtime import AgentRuntime
+from .tool_registry import (
+    delegated_policy_for_role,
+    effective_tool_names,
+)
 import os as _os
 import time as _time
 from .command_executor import CaseTimeoutError as _CaseTimeoutError
@@ -259,9 +263,26 @@ def run_role_agent(
         runtime.child(workdir=cwd, root_task=runtime.state.root_task)
         if runtime is not None else None
     )
-    tools = tool_schemas_for_names(profile.tool_names, role=profile.name)
+    parent_policy = (
+        runtime.config.tool_policy if runtime is not None else None
+    )
+    environment_policy = (
+        TOOL_POLICY if isinstance(TOOL_POLICY, dict) else None
+    )
+    delegated_policy = delegated_policy_for_role(
+        parent_policy, profile.name,
+    )
+    effective_names = effective_tool_names(
+        TOOL_REGISTRY,
+        profile.tool_names,
+        role=profile.name,
+        parent_policy=parent_policy,
+        environment_policy=environment_policy,
+        delegated_policy=delegated_policy,
+    )
+    tools = tool_schemas_for_names(effective_names, role=profile.name)
     handlers = _role_handlers(
-        cwd, profile.tool_names, profile.name, role_runtime,
+        cwd, effective_names, profile.name, role_runtime,
     )
     runtime_policy = (
         role_runtime.config.tool_policy if role_runtime is not None else None

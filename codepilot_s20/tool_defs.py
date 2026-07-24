@@ -75,11 +75,13 @@ _TOOL_SCHEMAS = [
                       "properties": {"pattern": {"type": "string"}},
                       "required": ["pattern"]}},
     {"name": "todo_write",
-     "description": ("Create and manage implementation plan steps and contract "
+                     "description": ("Create and manage implementation plan steps and contract "
                      "acceptance criteria. Use kind=plan for work still to do and "
                      "kind=acceptance for every externally required outcome, "
                      "including error paths omitted by public tests. Completed "
-                     "acceptance items require concise evidence. Existing "
+                     "acceptance items require concise evidence plus explicit "
+                     "evidence_sources bound to files, tests, or Reviewer "
+                     "findings. Existing "
                      "acceptance items have stable IDs; update one by sending "
                      "its id, status, and evidence without copying its content."),
      "input_schema": {"type": "object",
@@ -92,7 +94,23 @@ _TOOL_SCHEMAS = [
                                                    "enum": ["pending", "in_progress", "completed"]},
                                         "kind": {"type": "string",
                                                  "enum": ["plan", "acceptance"]},
-                                        "evidence": {"type": "string", "maxLength": 500}},
+                                        "evidence": {"type": "string", "maxLength": 500},
+                                        "evidence_sources": {
+                                            "type": "object",
+                                            "properties": {
+                                                "files": {
+                                                    "type": "array",
+                                                    "items": {"type": "string"},
+                                                    "maxItems": 20},
+                                                "tests": {
+                                                    "type": "array",
+                                                    "items": {"type": "string"},
+                                                    "maxItems": 20},
+                                                "reviewer_findings": {
+                                                    "type": "array",
+                                                    "items": {"type": "string"},
+                                                    "maxItems": 20}},
+                                            "additionalProperties": False}},
                                     "required": ["status"]}}},
                       "required": ["todos"]}},
     {"name": "task",
@@ -301,7 +319,8 @@ _ROLE_ACCESS = {
 }
 _RUNTIME_AWARE = frozenset({
     "bash", "read_file", "write_file", "edit_file", "glob", "todo_write",
-    "load_skill", "task", "delegate_agent", "integrate_worktree",
+    "load_skill", "task", "delegate_agent", "spawn_teammate",
+    "integrate_worktree",
 })
 _SAFETY_POLICIES = {
     "bash": "command_guard",

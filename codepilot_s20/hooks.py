@@ -1,5 +1,7 @@
 from .runtime_state import *
 from .command_safety import looks_like_delete_command
+from pathlib import Path
+import re
 
 # ── Hooks + Permission Pipeline ──
 
@@ -77,6 +79,84 @@ def _request_interactive_approval(prompt: str) -> bool:
     return input(prompt).strip().lower() in ("y", "yes")
 
 
+def _standard_policy(_block):
+    return None
+
+
+def _command_guard_policy(block):
+    command = block.input.get("command", "")
+    if _looks_like_delete_command(command):
+        if _looks_like_temp_cleanup(command):
+            return recoverable_tool_rejection(
+                "Tool not run: bash delete commands are disabled.",
+                ("Continue without deleting files. Avoid temp files for "
+                 "read-only analysis; use glob/read_file or a read-only "
+                 "cmd command instead. Do not retry a delete command."),
+            )
+        return "Permission denied: delete commands are disabled for bash"
+    for pattern in DENY_LIST:
+        if pattern in command:
+            return f"Permission denied: '{pattern}' is on the deny list"
+    if any(token in command for token in DESTRUCTIVE):
+        if APPROVAL_MODE != "interactive":
+            return noninteractive_permission_denial(
+                "destructive bash command requires interactive approval")
+        print(f"\n\033[33m[permission] destructive command\033[0m")
+        print(f"  {command}")
+        if not _request_interactive_approval("  Allow? [y/N] "):
+            return "Permission denied by user"
+    return None
+
+
+def _workspace_write_policy(block):
+    path = block.input.get("path", "")
+    try:
+        safe_path(path)
+    except Exception:
+        return f"Permission denied: path escapes workspace: {path}"
+    return None
+
+
+def _destructive_confirmation_policy(block):
+    if not bool(block.input.get("discard_changes")):
+        return None
+    if APPROVAL_MODE != "interactive":
+        return noninteractive_permission_denial(
+            "discarding Worktree changes requires interactive approval")
+    name = str(block.input.get("name", ""))
+    print(
+        "\n\033[33m[permission] discard Worktree changes\033[0m"
+        f"\n  {name}"
+    )
+    if not _request_interactive_approval("  Allow? [y/N] "):
+        return "Permission denied by user"
+    return None
+
+
+def _workspace_integration_policy(block):
+    name = str(block.input.get("name", "")).strip()
+    if not name or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        return "Permission denied: invalid Worktree name"
+    root = Path(WORKTREES_DIR).resolve()
+    target = (root / name).resolve()
+    if not target.is_relative_to(root):
+        return "Permission denied: Worktree escapes managed root"
+    return None
+
+
+SAFETY_POLICY_VALIDATORS = {
+    "standard": _standard_policy,
+    "command_guard": _command_guard_policy,
+    "workspace_write": _workspace_write_policy,
+    "destructive_confirmation": _destructive_confirmation_policy,
+    "workspace_integration": _workspace_integration_policy,
+}
+
+
+def has_safety_policy_validator(policy: str) -> bool:
+    return policy in SAFETY_POLICY_VALIDATORS
+
+
 def permission_hook(block):
     # The permission layer sees the raw tool_use before dispatch. It can deny,
     # ask the user, or allow execution to continue.
@@ -84,34 +164,15 @@ def permission_hook(block):
         safety_policy = get_tool_spec(block.name).safety_policy
     except (KeyError, NameError):
         safety_policy = "standard"
-    if safety_policy == "command_guard":
-        command = block.input.get("command", "")
-        if _looks_like_delete_command(command):
-            if _looks_like_temp_cleanup(command):
-                return recoverable_tool_rejection(
-                    "Tool not run: bash delete commands are disabled.",
-                    ("Continue without deleting files. Avoid temp files for "
-                     "read-only analysis; use glob/read_file or a read-only "
-                     "cmd command instead. Do not retry a delete command."),
-                )
-            return "Permission denied: delete commands are disabled for bash"
-        for pattern in DENY_LIST:
-            if pattern in command:
-                return f"Permission denied: '{pattern}' is on the deny list"
-        if any(token in command for token in DESTRUCTIVE):
-            if APPROVAL_MODE != "interactive":
-                return noninteractive_permission_denial(
-                    "destructive bash command requires interactive approval")
-            print(f"\n\033[33m[permission] destructive command\033[0m")
-            print(f"  {command}")
-            if not _request_interactive_approval("  Allow? [y/N] "):
-                return "Permission denied by user"
-    if safety_policy == "workspace_write":
-        path = block.input.get("path", "")
-        try:
-            safe_path(path)
-        except Exception:
-            return f"Permission denied: path escapes workspace: {path}"
+    validator = SAFETY_POLICY_VALIDATORS.get(safety_policy)
+    if validator is None:
+        return (
+            "Permission denied: tool declares an unsupported safety policy "
+            f"'{safety_policy}'"
+        )
+    rejected = validator(block)
+    if rejected is not None:
+        return rejected
     if block.name.startswith("mcp__") and "deploy" in block.name:
         if APPROVAL_MODE != "interactive":
             return noninteractive_permission_denial(
