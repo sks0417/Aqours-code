@@ -4,7 +4,12 @@ import json
 
 import analyze_timeline
 import analyze_trace
-from codepilot_s20.trace_analysis import analyze_events, read_jsonl, safe_preview
+from codepilot_s20.trace_analysis import (
+    analyze_events,
+    post_compact_redundant_reads,
+    read_jsonl,
+    safe_preview,
+)
 
 
 def _write_jsonl(path, rows, malformed=False):
@@ -66,3 +71,32 @@ def test_safe_preview_redacts_common_secret_assignments():
     assert "bearer-value" not in preview
     assert "abc123" not in preview
     assert preview.count("[REDACTED]") == 2
+
+
+def test_post_compact_redundant_read_metric_uses_digest_and_overlap():
+    events = [
+        {"type": "read_observation", "path": "src/a.py", "digest": "d1",
+         "range_start": 0, "range_end": 200, "limit": None,
+         "compact_generation": 0},
+        # Same path/digest and overlap after compact: redundant.
+        {"type": "read_observation", "path": "src\\a.py", "digest": "d1",
+         "range_start": 100, "range_end": 250, "limit": 150,
+         "compact_generation": 1},
+        # Precise edit read is intentionally excluded.
+        {"type": "read_observation", "path": "src/a.py", "digest": "d1",
+         "range_start": 120, "range_end": 150, "limit": 30,
+         "compact_generation": 1},
+        # A modified digest is a new version.
+        {"type": "read_observation", "path": "src/a.py", "digest": "d2",
+         "range_start": 0, "range_end": 200, "limit": None,
+         "compact_generation": 1},
+        # A non-overlapping range is useful new information.
+        {"type": "read_observation", "path": "src/a.py", "digest": "d1",
+         "range_start": 300, "range_end": 400, "limit": 100,
+         "compact_generation": 1},
+    ]
+
+    result = post_compact_redundant_reads(events)
+
+    assert result["count"] == 1
+    assert result["details"][0]["range_start"] == 100

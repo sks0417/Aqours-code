@@ -368,10 +368,23 @@ def _finalization_budget_message(snapshot: dict) -> str:
     )
 
 
-def _context_stats(messages: list) -> dict:
+def _context_stats(
+    messages: list,
+    *,
+    system: str = "",
+    tools: list | None = None,
+    dynamic: dict | None = None,
+) -> dict:
+    estimated_size = estimate_context_size(
+        messages,
+        system=system,
+        tools=tools,
+        dynamic=dynamic,
+    )
     return {
         "message_count": len(messages),
-        "estimated_size": estimate_size(messages),
+        "estimated_size": estimated_size,
+        "estimated_tokens": estimate_context_tokens(estimated_size),
     }
 
 
@@ -396,6 +409,8 @@ def _run_context_stage(stage: str, messages: list, func) -> list:
 def prepare_context(
     messages: list,
     runtime: AgentRuntime | None = None,
+    context: dict | None = None,
+    tools: list | None = None,
 ) -> list:
     # Every LLM turn enters through the same context budget pipeline.
     messages[:] = _run_context_stage(
@@ -406,14 +421,53 @@ def prepare_context(
         "micro_compact", messages,
         lambda value: micro_compact(value, runtime=runtime),
     )
-    messages[:] = _run_context_stage("snip_compact", messages, snip_compact)
-    if estimate_size(messages) > CONTEXT_LIMIT:
-        before = _context_stats(messages)
+    # snip_compact is intentionally not part of the pre-summary path: unique
+    # history may only be removed after semantic extraction.
+    budget_context = (
+        context
+        if context is not None
+        else (
+            update_context({}, messages, runtime)
+            if runtime is not None else update_context({}, messages)
+        )
+    )
+    budget_tools = tools
+    if budget_tools is None:
+        budget_tools, _ = (
+            assemble_tool_pool(runtime)
+            if runtime is not None else assemble_tool_pool()
+        )
+    system = (
+        assemble_system_prompt(budget_context, runtime)
+        if runtime is not None else assemble_system_prompt(budget_context)
+    )
+    before = _context_stats(messages, system=system, tools=budget_tools)
+    record_event(
+        "context_budget",
+        message_count=before["message_count"],
+        estimated_size=before["estimated_size"],
+        estimated_tokens=before["estimated_tokens"],
+        system_size=len(system),
+        tool_schema_size=estimate_size(budget_tools),
+    )
+    if before["estimated_size"] > CONTEXT_LIMIT:
         messages[:] = (
             compact_history(messages, runtime=runtime)
             if runtime is not None else compact_history(messages)
         )
-        after = _context_stats(messages)
+        refreshed_context = (
+            update_context(budget_context, messages, runtime)
+            if runtime is not None else update_context(budget_context, messages)
+        )
+        refreshed_system = (
+            assemble_system_prompt(refreshed_context, runtime)
+            if runtime is not None else assemble_system_prompt(refreshed_context)
+        )
+        after = _context_stats(
+            messages,
+            system=refreshed_system,
+            tools=budget_tools,
+        )
         record_event(
             "context_compact",
             stage="compact_history",
@@ -422,6 +476,8 @@ def prepare_context(
             after_messages=after["message_count"],
             before_size=before["estimated_size"],
             after_size=after["estimated_size"],
+            before_tokens=before["estimated_tokens"],
+            after_tokens=after["estimated_tokens"],
         )
     return messages
 
@@ -647,7 +703,7 @@ def call_llm(messages: list, context: dict, tools: list,
              runtime: AgentRuntime | None = None):
     remaining = _remaining_case_time(runtime)
     if remaining is not None and remaining <= 0:
-        raise _CaseTimeoutError("eval case deadline exceeded")
+        _check_case_deadline(runtime)
     system = (
         assemble_system_prompt(context, runtime)
         if runtime is not None else assemble_system_prompt(context)
@@ -721,6 +777,7 @@ def agent_loop(
     current_todos.clear()
     if runtime is not None:
         runtime.state.knowledge.clear()
+        runtime.state.semantic_memory.clear(runtime.state.root_task)
     acceptance_required = requires_acceptance_todos(messages)
     todo_required = requires_initial_todo(messages) or acceptance_required
     todo_started = False
@@ -862,13 +919,18 @@ def agent_loop(
             )
 
         if runtime is not None:
-            prepare_context(messages, runtime)
             context = update_context(context, messages, runtime)
             tools, handlers = assemble_tool_pool(runtime)
+            prepare_context(messages, runtime, context, tools)
+            context = update_context(context, messages, runtime)
         else:
-            prepare_context(messages)
             context = update_context(context, messages)
             tools, handlers = assemble_tool_pool()
+            # Keep the legacy entry point one-argument compatible for embedders
+            # that replace prepare_context, while the function itself rebuilds
+            # the same context/tool request components for budgeting.
+            prepare_context(messages)
+            context = update_context(context, messages)
         if force_final_response:
             tools = []
 

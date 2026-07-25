@@ -330,9 +330,62 @@ def test_context_and_compact_retain_run_knowledge(tmp_path, monkeypatch):
         runtime=runtime,
     )
     assert runtime.state.knowledge.files["service.py"].evidence_valid is True
-    assert "RunKnowledge retained outside raw message history" in json.dumps(
+    assert "RunKnowledge retained outside raw message history" not in json.dumps(
         result,
     )
+    assert "RunKnowledge" in prompts.assemble_system_prompt(
+        context.update_context({}, result, runtime), runtime,
+    )
+
+
+def test_digest_change_stales_only_matching_semantic_card_and_reread_does_not_revive(
+    tmp_path,
+):
+    (tmp_path / "a.py").write_text("value = 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("value = 2\n", encoding="utf-8")
+    runtime = make_runtime(tmp_path)
+    basic_tools.run_read("a.py", runtime=runtime)
+    basic_tools.run_read("b.py", runtime=runtime)
+    a_digest = runtime.state.knowledge.files["a.py"].digest
+    b_digest = runtime.state.knowledge.files["b.py"].digest
+    runtime.state.semantic_memory.merge({
+        "task": {"goal": "", "constraints": [], "definition_of_done": []},
+        "progress": {"completed": [], "current_focus": "", "remaining": []},
+        "files": [
+            {
+                "path": "a.py", "digest": a_digest, "stale": False,
+                "purpose": "A", "key_symbols": [], "key_behaviors": [],
+                "important_conditions": [], "relationships": [],
+                "relevant_ranges": [], "short_snippets": [],
+                "conclusions": [], "uncertainties": [],
+            },
+            {
+                "path": "b.py", "digest": b_digest, "stale": False,
+                "purpose": "B", "key_symbols": [], "key_behaviors": [],
+                "important_conditions": [], "relationships": [],
+                "relevant_ranges": [], "short_snippets": [],
+                "conclusions": [], "uncertainties": [],
+            },
+        ],
+        "decisions": [], "rejected_approaches": [], "failures": [],
+        "open_questions": [], "next_actions": [],
+    })
+
+    basic_tools.run_write("a.py", "value = 3\n", runtime=runtime)
+    cards = {
+        card["path"]: card
+        for card in runtime.state.semantic_memory.as_dict()["files"]
+    }
+    assert cards["a.py"]["stale"] is True
+    assert cards["b.py"]["stale"] is False
+
+    basic_tools.run_read("a.py", runtime=runtime)
+    cards = {
+        card["path"]: card
+        for card in runtime.state.semantic_memory.as_dict()["files"]
+    }
+    assert cards["a.py"]["digest"] == a_digest
+    assert cards["a.py"]["stale"] is True
 
 
 def test_successful_worktree_integration_invalidates_changed_paths_only(

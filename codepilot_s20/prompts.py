@@ -63,6 +63,17 @@ def assemble_system_prompt(
                 tool_section,
                 f"Working directory: {prompt_runtime['workdir']}",
                 format_runtime_context_for_prompt(prompt_runtime)]
+    root_task = str(context.get("root_task", "")).strip()
+    if root_task:
+        sections.append(
+            "Original task and hard constraints (authoritative):\n"
+            + root_task[:6000]
+        )
+    semantic_memory = str(
+        context.get("semantic_memory_prompt", "")
+    ).strip()
+    if semantic_memory:
+        sections.append(semantic_memory)
     working_memory = str(context.get("working_memory_prompt", "")).strip()
     if working_memory:
         sections.append(working_memory)

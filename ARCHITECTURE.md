@@ -85,7 +85,54 @@ The fixed empty-context system prompt plus 30-tool JSON payload is guarded
 below 12,000 characters. Capability-group lazy exposure is deferred; this phase
 does not remove any Lead tool.
 
-## RunKnowledge working memory
+## Context lifecycle and session semantic memory
+
+Every model turn is budgeted as one assembled request: system prompt, API tool
+schemas, messages, and dynamic prompt state. When that request crosses the
+context limit, the lifecycle is:
+
+```text
+oversized Tool Result persistence + identical read deduplication
+-> choose complete outgoing messages / Tool exchanges
+-> one existing Full Compact model call emits validated JSON
+-> merge semantic_memory_delta into SessionSemanticMemory
+-> remove only the raw history that the extractor saw
+-> retain a bounded conversation checkpoint and recent complete exchanges
+```
+
+`snip_compact` no longer deletes middle history before semantic extraction.
+Input selection is performed in complete messages or complete Tool-use/result
+pairs and prefers task-relevant, recent units. Anything that does not fit is
+left in raw context rather than partially truncated. Invalid JSON gets one
+bounded repair attempt when model budget permits, followed by a deterministic
+fallback.
+
+`RunState.semantic_memory` is the single canonical semantic continuation state.
+It is distinct from evidence:
+
+- task goal, constraints, and definition of done;
+- completed/current/remaining progress;
+- bounded file cards keyed by normalized path plus content digest, including
+  purpose, symbols, behaviors, conditions, relationships, relevant ranges,
+  short snippets, conclusions, and uncertainties;
+- decisions, rejected approaches, failures, open questions, and next actions.
+
+Observations with the same path/digest merge. A mutation marks only cards for
+that path stale; rereading a new digest does not revive an old card. The state
+holds at most 24 file cards and its canonical prompt view is capped at 12,000
+characters. Raw Tool Results are not retained in proportion to the number of
+files read. The full semantic state is injected only through the system prompt;
+the compact message carries only a small conversation checkpoint.
+
+Semantic memory records what the model understood. It is not verified proof
+and cannot replace tests, Acceptance evidence, or final validation.
+
+**Status: Implemented.** Structured compaction, bounded merging, stale-card
+invalidation, request-wide budgeting, pairing, fallback behavior, and the
+post-compact redundant-read metric are covered by local regression tests. It
+is not `Validated`: no paid real-model paired Eval was run for this change.
+
+## RunKnowledge verification state
 
 `RunState.knowledge` is deterministic working memory for one Agent run. It is
 not long-term Memory and is never retrieved by embeddings. It retains:
@@ -122,15 +169,13 @@ command never implicitly validates every modified source file.
 A later read confirms the new file version but does not silently revive
 Contract, Acceptance, or Reviewer evidence from an older version.
 
-Context injects a bounded `RunKnowledge` view on every model call. Message
-compaction can therefore remove raw exchanges without deleting structured
-state. Full state remains in `AgentRuntime`; compacted messages contain only a
-short retention marker to avoid duplicating it.
+Context injects a bounded `RunKnowledge` freshness/test view on every model
+call. Full proof state remains in `AgentRuntime`; it is not copied into
+`SessionSemanticMemory` or the compact checkpoint.
 
-**Status: Implemented.** The deterministic behavior and regression suite are
-passing locally. It is not `Validated`: no real-model Eval was run for this
-hardening change, and Working Memory must retain that status until the paired
-ledger pass-rate/read/token exit criteria are all met.
+**Status: Implemented.** The deterministic proof behavior and regression suite
+are passing locally. It is not `Validated`: Working Memory must retain that
+status until the paired ledger pass-rate/read/token exit criteria are all met.
 
 ## Remaining migration order
 

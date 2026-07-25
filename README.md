@@ -96,6 +96,16 @@ Evidence is `verified`, `stale`, or `unbound`; text without explicit file,
 test, or Reviewer provenance is never verified. Test workspace snapshots are
 not presented as source coverage.
 
+Context continuation uses a separate, bounded `SessionSemanticMemory`. Full
+Compact sees complete outgoing messages and Tool exchanges before they are
+removed, emits validated structured JSON, and merges file responsibilities,
+behaviors, relationships, constraints, decisions, progress, and open questions
+into one canonical state. File cards are keyed by normalized path plus digest,
+and only the changed path becomes stale. The system prompt receives at most
+12,000 characters of this state; compact messages contain only a small
+checkpoint, so the same semantics are not injected twice. This feature is
+`Implemented`, not `Validated`, until the paid paired Eval criteria below pass.
+
 For complex code changes, `todo_write` distinguishes execution steps
 (`kind=plan`) from external requirements (`kind=acceptance`). Completed
 acceptance items require concise evidence. The compact live prompt preserves
@@ -223,6 +233,11 @@ malformed JSONL while reporting its line number:
 python analyze_trace.py evals/results/runs/<run-id>/<case>
 python analyze_timeline.py evals/results/runs/<run-id>/<case>
 ```
+
+Eval summaries also report `post_compact_redundant_reads`. A read counts only
+when it occurs after Compact, has the same normalized path and unchanged
+digest as an earlier observation, and requests the same or an overlapping
+range. Narrow edit-preparation reads and reads after a file change are excluded.
 
 The disposable Git baseline trusts only `/workspace` and
 `/state/.worktrees/*` through process-local configuration, which keeps Windows

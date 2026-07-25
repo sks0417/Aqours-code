@@ -73,6 +73,9 @@ from codepilot_s20.model_broker import (  # noqa: E402
     ModelBroker,
     broker_ipc_wait_timeout,
 )
+from codepilot_s20.trace_analysis import (  # noqa: E402
+    post_compact_redundant_reads,
+)
 from evals.scoring import (  # noqa: E402
     BREAKDOWN_WEIGHTS,
     PROFILE_METADATA_KEYS,
@@ -504,6 +507,7 @@ def trace_metrics(trace_path: Path) -> dict:
         if signature == previous_tool_signature:
             duplicate_tool_calls += 1
         previous_tool_signature = signature
+    redundant_reads = post_compact_redundant_reads(events)
     return {
         "tool_calls": sum(
             1 for event in events if event.get("type") == "tool_use"),
@@ -518,6 +522,8 @@ def trace_metrics(trace_path: Path) -> dict:
         "duplicate_tool_calls": duplicate_tool_calls,
         "tool_counts": dict(sorted(tool_counts.items())),
         "read_file_calls": tool_counts.get("read_file", 0),
+        "post_compact_redundant_reads": redundant_reads["count"],
+        "post_compact_redundant_read_details": redundant_reads["details"],
         "model_trace_actual_total_tokens": sum(
             int(event.get("usage", {}).get("total_tokens") or 0)
             for event in events

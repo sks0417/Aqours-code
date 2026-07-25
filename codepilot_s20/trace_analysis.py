@@ -76,6 +76,42 @@ def safe_preview(value: object, limit: int = 120) -> str:
     return text
 
 
+def post_compact_redundant_reads(events: list[dict]) -> dict:
+    """Count unchanged overlapping reads after a semantic compact.
+
+    A bounded narrow read is treated as edit preparation, not redundancy.
+    Digest changes naturally split file versions and therefore never match.
+    """
+    prior: dict[tuple[str, str], list[tuple[int, int]]] = {}
+    details = []
+    for event in events:
+        if event.get("type") != "read_observation":
+            continue
+        path = str(event.get("path", "")).replace("\\", "/").rstrip("/")
+        digest = str(event.get("digest", ""))
+        if not path or not digest:
+            continue
+        start = max(0, int(event.get("range_start", event.get("offset", 0)) or 0))
+        end = max(start, int(event.get("range_end", start) or start))
+        limit = event.get("limit")
+        generation = int(event.get("compact_generation", 0) or 0)
+        key = (path, digest)
+        earlier = prior.setdefault(key, [])
+        is_narrow_edit_read = limit is not None and int(limit) <= 80
+        overlaps = any(start < old_end and old_start < end
+                       for old_start, old_end in earlier)
+        if generation > 0 and overlaps and not is_narrow_edit_read:
+            details.append({
+                "path": path,
+                "digest": digest,
+                "range_start": start,
+                "range_end": end,
+                "compact_generation": generation,
+            })
+        earlier.append((start, end))
+    return {"count": len(details), "details": details}
+
+
 def analyze_events(events: list[dict]) -> dict:
     type_counts = Counter(str(event.get("type", "unknown")) for event in events)
     tool_counts = Counter()
@@ -104,6 +140,7 @@ def analyze_events(events: list[dict]) -> dict:
                 or (event_type == "hook"
                     and str(event.get("decision", "")).lower() == "blocked")):
             permission_denials += 1
+    redundant = post_compact_redundant_reads(events)
     return {
         "event_count": len(events),
         "event_types": dict(sorted(type_counts.items())),
@@ -118,6 +155,8 @@ def analyze_events(events: list[dict]) -> dict:
             + type_counts.get("context_compact", 0)),
         "errors": error_count,
         "permission_denials": permission_denials,
+        "post_compact_redundant_reads": redundant["count"],
+        "post_compact_redundant_read_details": redundant["details"],
     }
 
 

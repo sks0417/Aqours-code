@@ -386,6 +386,8 @@ def test_eval_trace_storage_is_separate_and_exposes_normal_process_metrics(
     assert set(metrics) == {
         "tool_calls", "llm_requests", "permission_blocks",
         "duplicate_tool_calls", "tool_counts", "read_file_calls",
+        "post_compact_redundant_reads",
+        "post_compact_redundant_read_details",
         "model_trace_actual_total_tokens", "event_count",
     }
     assert metrics["event_count"] > 0

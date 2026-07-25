@@ -26,7 +26,14 @@ def update_context(
     working_memory = (
         runtime.state.knowledge.as_dict() if runtime is not None else {}
     )
+    semantic_memory = (
+        runtime.state.semantic_memory.as_dict() if runtime is not None else {}
+    )
     return {
+        "root_task": (
+            runtime.state.root_task if runtime is not None
+            else CURRENT_ROOT_TASK or ""
+        ),
         "memories": memories,
         "connected_mcp": list(mcp_clients.keys()) if allow_mcp else [],
         "active_teammates": list(active_teammates.keys()) if allow_teammates else [],
@@ -37,6 +44,11 @@ def update_context(
             if todo.get("kind") == "acceptance"
         ],
         "working_memory": working_memory,
+        "semantic_memory": semantic_memory,
+        "semantic_memory_prompt": (
+            runtime.state.semantic_memory.prompt_view()
+            if runtime is not None else ""
+        ),
         "working_memory_prompt": (
             runtime.state.knowledge.prompt_view()
             if runtime is not None else ""

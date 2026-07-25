@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from .knowledge import RunKnowledge
+from .semantic_memory import SessionSemanticMemory
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,9 @@ class RunState:
     changed_files: set[str] = field(default_factory=set)
     lead_read_counts: dict[str, int] = field(default_factory=dict)
     knowledge: RunKnowledge = field(default_factory=RunKnowledge)
+    semantic_memory: SessionSemanticMemory = field(
+        default_factory=SessionSemanticMemory,
+    )
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

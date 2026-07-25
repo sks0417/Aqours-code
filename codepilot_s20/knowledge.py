@@ -128,12 +128,15 @@ def snapshot_workspace(workdir: str | Path) -> dict[str, str]:
 def workspace_mutation_reconciliation(
     knowledge: "RunKnowledge | None",
     workdir: str | Path,
+    semantic_memory=None,
 ):
     """Reconcile actual filesystem changes around a mutating operation."""
     if knowledge is None:
         yield
         return
-    with knowledge.mutation_boundary(workdir):
+    with knowledge.mutation_boundary(
+        workdir, semantic_memory=semantic_memory,
+    ):
         yield
 
 
@@ -286,7 +289,7 @@ class RunKnowledge:
             return tuple(changed)
 
     @contextmanager
-    def mutation_boundary(self, workdir: str | Path):
+    def mutation_boundary(self, workdir: str | Path, semantic_memory=None):
         """Serialize snapshot/execute/reconcile windows across worker threads."""
         with self._mutation_lock:
             before = snapshot_workspace(workdir)
@@ -294,7 +297,12 @@ class RunKnowledge:
                 yield
             finally:
                 after = snapshot_workspace(workdir)
-                self.reconcile_workspace(before, after)
+                changed = self.reconcile_workspace(before, after)
+                if semantic_memory is not None:
+                    for path in changed:
+                        semantic_memory.mark_file_stale(
+                            path, after.get(path, ""),
+                        )
 
     def _invalidate_linked_evidence(self, path: str, version: int) -> None:
         for collection in (
