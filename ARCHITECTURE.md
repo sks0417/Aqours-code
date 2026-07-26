@@ -85,75 +85,55 @@ The fixed empty-context system prompt plus 30-tool JSON payload is guarded
 below 12,000 characters. Capability-group lazy exposure is deferred; this phase
 does not remove any Lead tool.
 
-## Context lifecycle and session semantic memory
+## Context lifecycle and compaction
 
-Every model turn is budgeted as one assembled request: system prompt, API tool
-schemas, messages, and dynamic prompt state. When that request crosses the
-context limit, the lifecycle is:
+Every model turn is budgeted as one assembled request: rebuilt system prompt,
+API tool schemas, dynamic runtime state, and messages. Ordinary turns leave
+history untouched. At 85% of the configured context budget, the lifecycle is:
 
 ```text
-oversized Tool Result persistence + identical read deduplication
--> partition complete outgoing messages / Tool exchanges into bounded chunks
--> Full Compact calls emit validated JSON and acknowledge each Tool Result
--> merge semantic_memory_delta into SessionSemanticMemory
--> remove only the raw history that the extractor saw
--> retain a bounded conversation checkpoint and recent complete exchanges
+assemble the complete current request
+-> persist and preview only individually oversized Tool Results
+-> choose a recent raw suffix by token estimate, at complete Tool boundaries
+-> summarize the older prefix into one Markdown continuation checkpoint
+-> assemble checkpoint + unchanged recent tail
+-> verify the complete next request fits the target
 ```
 
-`snip_compact` no longer deletes middle history before semantic extraction.
-Input partitioning is performed in complete messages or complete
-Tool-use/result pairs. Oversized text/result content is divided into bounded
-semantic-extraction chunks while repeating the matching Tool-use envelope.
-Each structured result must acknowledge every Tool Result in its batch.
-Anything not successfully extracted remains raw. Invalid JSON gets one bounded
-repair attempt when model budget permits; deterministic fallback is explicitly
-incomplete and therefore cannot authorize raw-history deletion.
+The checkpoint is an ordinary internal user message marked
+`[Context checkpoint]`. A later compact includes the old checkpoint in the
+older prefix and replaces it with one new cumulative checkpoint; summaries do
+not stack. The summary is free-form Markdown. There is no JSON schema, semantic
+merge, file-card state, Tool-result acknowledgement protocol, or deterministic
+semantic fallback.
 
-`RunState.semantic_memory` is the single canonical semantic continuation state.
-It is distinct from evidence:
+The recent tail is selected by an estimated token budget, not by a fixed number
+of results. Assistant Tool-use and matching user Tool-result messages are one
+atomic history unit and cannot be cut apart. The latest human instruction is
+retained verbatim even when a long tool run pushes it outside the suffix.
+Checkpoint-boundary user messages are safely merged so provider role ordering
+remains valid.
 
-- task goal, constraints, and definition of done;
-- completed/current/remaining progress;
-- bounded file cards keyed by normalized path plus content digest, including
-  purpose, symbols, behaviors, conditions, relationships, relevant ranges,
-  short snippets, conclusions, and uncertainties;
-- decisions, rejected approaches, failures, open questions, and next actions.
+If a summary call fails or returns empty text, the original history is kept. If
+the summary request itself overflows, at most two retries drop one complete
+oldest history unit at a time; the full pre-compact transcript remains on disk.
+If a successful summary still cannot fit, the tail budget is reduced once and
+the expanded older prefix is summarized again. A remaining overflow raises a
+diagnostic `ContextCompactionError`.
 
-Observations with the same path/digest merge. A mutation marks only cards for
-that path stale; rereading a new digest does not revive an old card. Every
-successful read is also recorded as an immutable `tool_use_id -> normalized
-path/digest/range` observation. Compact file cards cite those IDs, and Runtime
-overrides model-provided digest/stale values using the observation plus current
-Workspace digest. Missing or conflicting provenance becomes `unknown` and
-stale.
+An individual exceptional Tool Result is written to the runtime tool-results
+directory. Live history retains its source Tool ID, full path, character/line
+counts, and bounded head/tail preview. Normal Tool Results are never silently
+trimmed at the beginning of an Agent round.
 
-Current-state fields converge: `current_focus` replaces, while `remaining`,
-`open_questions`, and `next_actions` are complete snapshots. Completed work is
-removed from remaining. Historical decisions/failures/rejected approaches use
-bounded deduplicating append. A file card may explicitly supersede semantic
-fields for the same path/digest. The original Runtime-owned goal is immutable.
+Compact trace records reason, before/after messages and token estimates,
+summarized prefix size, raw-tail size, summary length, outcome, and oversized
+result handling. Successful compaction increments a small runtime generation
+counter used only by the post-compact redundant-read metric.
 
-The state holds at most 24 file cards and its canonical prompt view is capped
-at 12,000 characters. Capacity eviction protects focus-relevant cards before
-less relevant cards. Raw Tool Results are not retained in proportion to the
-number of files read. Oversized results are persisted for provenance without
-replacing their live raw content before extraction. The full semantic state is
-injected only through the system prompt; the compact message carries only a
-small conversation checkpoint.
-
-Automatic and reactive Compact recompute the complete assembled request after
-each pass, including rebuilt System Prompt/semantic state and Tool schemas.
-They must fit the explicit target plus output reserve. Remaining oversized raw
-history is processed again with a bounded iteration/call guard; an impossible
-fixed prompt/schema budget raises a diagnostic `ContextCompactionError`.
-
-Semantic memory records what the model understood. It is not verified proof
-and cannot replace tests, Acceptance evidence, or final validation.
-
-**Status: Implemented.** Structured compaction, bounded merging, stale-card
-invalidation, request-wide budgeting, pairing, fallback behavior, and the
-post-compact redundant-read metric are covered by local regression tests. It
-is not `Validated`: no paid real-model paired Eval was run for this change.
+**Status: Implemented, not Validated.** Local tests cover the lightweight
+checkpoint/tail behavior. No paid real-model stress or paired Eval was run for
+this change.
 
 ## RunKnowledge verification state
 
@@ -192,9 +172,10 @@ command never implicitly validates every modified source file.
 A later read confirms the new file version but does not silently revive
 Contract, Acceptance, or Reviewer evidence from an older version.
 
-Context injects a bounded `RunKnowledge` freshness/test view on every model
-call. Full proof state remains in `AgentRuntime`; it is not copied into
-`SessionSemanticMemory` or the compact checkpoint.
+`RunKnowledge` remains internal to `AgentRuntime` for Acceptance, tests, and
+Reviewer evidence. It is not injected wholesale into model Context and
+compaction neither reads nor merges it. Current Acceptance todos are still
+rebuilt dynamically in the system prompt.
 
 **Status: Implemented.** The deterministic proof behavior and regression suite
 are passing locally. It is not `Validated`: Working Memory must retain that

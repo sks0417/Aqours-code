@@ -3,7 +3,6 @@ from .command_executor import CaseTimeoutError
 from .command_safety import looks_like_delete_command
 from .knowledge import (
     normalize_knowledge_path,
-    ReadObservation,
     snapshot_workspace,
     workspace_mutation_reconciliation,
 )
@@ -64,12 +63,7 @@ def run_bash(command: str, cwd: Path = None,
         )
         workdir = _runtime_workdir(runtime, cwd)
         knowledge = runtime.state.knowledge if runtime is not None else None
-        semantic = (
-            runtime.state.semantic_memory if runtime is not None else None
-        )
-        with workspace_mutation_reconciliation(
-            knowledge, workdir, semantic,
-        ):
+        with workspace_mutation_reconciliation(knowledge, workdir):
             result = selected_executor.execute(
                 command, workdir, effective_timeout)
         out = (result["stdout"] + result["stderr"]).strip()
@@ -102,23 +96,9 @@ def run_read(path: str, limit: int | None = None,
         limit = int(limit) if limit is not None else None
         if runtime is not None:
             record = runtime.state.knowledge.observe_file(path, raw)
-            runtime.state.semantic_memory.observe_file(path, record.digest)
             end = len(lines) if limit is None else min(
                 len(lines), offset + max(0, limit),
             )
-            if _tool_use_id:
-                runtime.state.read_observations[str(_tool_use_id)] = (
-                    ReadObservation(
-                        tool_use_id=str(_tool_use_id),
-                        path=normalize_knowledge_path(path),
-                        digest=record.digest,
-                        offset=offset,
-                        limit=limit,
-                        range_start=offset,
-                        range_end=end,
-                        total_lines=len(lines),
-                    )
-                )
             record_event(
                 "read_observation",
                 tool_use_id=str(_tool_use_id),
@@ -128,7 +108,9 @@ def run_read(path: str, limit: int | None = None,
                 limit=limit,
                 range_start=offset,
                 range_end=end,
-                compact_generation=runtime.state.semantic_memory.compact_count,
+                compact_generation=int(
+                    runtime.state.metadata.get("compact_generation", 0)
+                ),
             )
         lines = lines[offset:]
         if limit is not None and limit < len(lines):
@@ -143,12 +125,7 @@ def run_write(path: str, content: str, cwd: Path = None,
     try:
         workdir = _runtime_workdir(runtime, cwd)
         knowledge = runtime.state.knowledge if runtime is not None else None
-        semantic = (
-            runtime.state.semantic_memory if runtime is not None else None
-        )
-        with workspace_mutation_reconciliation(
-            knowledge, workdir, semantic,
-        ):
+        with workspace_mutation_reconciliation(knowledge, workdir):
             fp = safe_path(path, cwd, runtime)
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content)
@@ -162,12 +139,7 @@ def run_edit(path: str, old_text: str, new_text: str,
     try:
         workdir = _runtime_workdir(runtime, cwd)
         knowledge = runtime.state.knowledge if runtime is not None else None
-        semantic = (
-            runtime.state.semantic_memory if runtime is not None else None
-        )
-        with workspace_mutation_reconciliation(
-            knowledge, workdir, semantic,
-        ):
+        with workspace_mutation_reconciliation(knowledge, workdir):
             fp = safe_path(path, cwd, runtime)
             text = fp.read_text()
             if old_text not in text:

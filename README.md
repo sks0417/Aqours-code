@@ -88,29 +88,26 @@ plus 30-tool schema below 12,000 characters without hiding any Lead tool.
 
 Each run also owns deterministic `RunKnowledge`: file digests/versions,
 confirmed Python symbols and contracts, modified paths, recent test results,
-Acceptance state, and Reviewer findings. Context compaction preserves this
-state independently of raw messages. Workspace writes from file tools,
+Acceptance state, and Reviewer findings. It remains internal runtime evidence;
+Context compaction does not parse, merge, or inject it wholesale. Workspace writes from file tools,
 foreground/background Bash, and Worktree integration are detected from
 before/after fingerprints and invalidate only evidence bound to changed paths.
 Evidence is `verified`, `stale`, or `unbound`; text without explicit file,
 test, or Reviewer provenance is never verified. Test workspace snapshots are
 not presented as source coverage.
 
-Context continuation uses a separate, bounded `SessionSemanticMemory`. Full
-Compact sees complete outgoing messages and Tool exchanges before they are
-removed, partitions oversized results into bounded extraction chunks, emits
-validated structured JSON, and merges file responsibilities,
-behaviors, relationships, constraints, decisions, progress, and open questions
-into one canonical state. File cards are keyed by normalized path plus digest,
-using immutable read-time observations rather than a later Workspace lookup.
-Runtime overrides model digest/stale hints, and only the changed path becomes
-stale. Current work, questions, and next actions use replaceable snapshots
-rather than append-only logs. Automatic/reactive Compact verify the complete
-next request against a strict target and fail diagnostically when fixed prompt
-or schema state cannot fit. The system prompt receives at most
-12,000 characters of this state; compact messages contain only a small
-checkpoint, so the same semantics are not injected twice. This feature is
-`Implemented`, not `Validated`, until the paid paired Eval criteria below pass.
+Context continuation uses one cumulative Markdown checkpoint plus a small
+verbatim recent tail. At 85% of the assembled request budget, Compact selects
+the tail by estimated tokens while treating each Tool-use/result exchange as
+an atomic unit, then summarizes the older prefix. A later Compact folds the old
+checkpoint into one replacement checkpoint rather than stacking summaries.
+There is no JSON semantic state machine or per-file semantic card injection.
+Summary failure or empty output leaves raw history unchanged. Exceptional
+single Tool Results are persisted with a locatable head/tail preview; normal
+results are not trimmed on ordinary turns. Automatic and reactive Compact
+verify the complete assembled request against the target and trace their
+before/after budget. This feature is `Implemented`, not `Validated`, until the
+paid paired Eval criteria below pass.
 
 For complex code changes, `todo_write` distinguishes execution steps
 (`kind=plan`) from external requirements (`kind=acceptance`). Completed
@@ -162,9 +159,9 @@ The container reads the Broker's live non-secret counters through a read-only
 Docker stats mount and reserves 20% of
 the call budget, bounded to 4-8 calls, for final fixes, targeted verification,
 and the final response. A new role is not started unless its bounded worst-case
-rounds leave that reserve intact. In the reserve, automatic compaction uses a
-deterministic checkpoint built from the root task, live acceptance state, and
-recent messages instead of another model call. Compact-summary requests now
+rounds leave that reserve intact. In the reserve, automatic compaction is
+skipped when no summary call is available; it never fabricates a semantic
+fallback and never deletes raw history. Compact-summary requests
 appear in Trace with `purpose=compact_summary`. When exactly one call remains,
 tools are disabled and that call is forced to produce the final response; a
 request beyond the Broker limit is never issued. Main-Agent LLM rounds and tool

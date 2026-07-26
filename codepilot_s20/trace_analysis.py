@@ -77,7 +77,7 @@ def safe_preview(value: object, limit: int = 120) -> str:
 
 
 def post_compact_redundant_reads(events: list[dict]) -> dict:
-    """Count unchanged overlapping reads after a semantic compact.
+    """Count unchanged overlapping reads after a successful context compact.
 
     A bounded narrow read is treated as edit preparation, not redundancy.
     Digest changes naturally split file versions and therefore never match.

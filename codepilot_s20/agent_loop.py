@@ -431,17 +431,9 @@ def prepare_context(
     context: dict | None = None,
     tools: list | None = None,
 ) -> list:
-    # Every LLM turn enters through the same context budget pipeline.
-    messages[:] = _run_context_stage(
-        "tool_result_budget", messages,
-        lambda value: tool_result_budget(value, runtime=runtime),
-    )
-    messages[:] = _run_context_stage(
-        "micro_compact", messages,
-        lambda value: micro_compact(value, runtime=runtime),
-    )
-    # snip_compact is intentionally not part of the pre-summary path: unique
-    # history may only be removed after semantic extraction.
+    # History remains lossless on ordinary turns. Compaction happens only after
+    # the complete request (system, tools, dynamic context, messages) crosses
+    # the trigger.
     budget_context = (
         context
         if context is not None
@@ -469,22 +461,21 @@ def prepare_context(
         system_size=len(system),
         tool_schema_size=estimate_size(budget_tools),
     )
-    if before["estimated_size"] > CONTEXT_LIMIT:
+    compact_trigger = int(CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO)
+    if before["estimated_size"] > compact_trigger:
         sizer = _request_sizer(budget_context, budget_tools, runtime)
         messages[:] = (
             compact_history(
                 messages,
                 runtime=runtime,
-                target_context_budget=(
-                    CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
-                ),
+                reason="automatic",
+                target_context_budget=compact_trigger,
                 request_size_fn=sizer,
             )
             if runtime is not None else compact_history(
                 messages,
-                target_context_budget=(
-                    CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
-                ),
+                reason="automatic",
+                target_context_budget=compact_trigger,
                 request_size_fn=sizer,
             )
         )
@@ -810,8 +801,7 @@ def agent_loop(
     current_todos.clear()
     if runtime is not None:
         runtime.state.knowledge.clear()
-        runtime.state.semantic_memory.clear(runtime.state.root_task)
-        runtime.state.read_observations.clear()
+        runtime.state.metadata["compact_generation"] = 0
     acceptance_required = requires_acceptance_todos(messages)
     todo_required = requires_initial_todo(messages) or acceptance_required
     todo_started = False
@@ -985,15 +975,15 @@ def agent_loop(
                     reactive_compact(
                         messages,
                         runtime,
-                        target_context_budget=(
-                            CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
+                        target_context_budget=int(
+                            CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO
                         ),
                         request_size_fn=reactive_sizer,
                     )
                     if runtime is not None else reactive_compact(
                         messages,
-                        target_context_budget=(
-                            CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
+                        target_context_budget=int(
+                            CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO
                         ),
                         request_size_fn=reactive_sizer,
                     )
@@ -1364,15 +1354,17 @@ def agent_loop(
                     compact_history(
                         messages,
                         runtime=runtime,
-                        target_context_budget=(
-                            CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
+                        reason="manual",
+                        target_context_budget=int(
+                            CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO
                         ),
                         request_size_fn=compact_sizer,
                     )
                     if runtime is not None else compact_history(
                         messages,
-                        target_context_budget=(
-                            CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
+                        reason="manual",
+                        target_context_budget=int(
+                            CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO
                         ),
                         request_size_fn=compact_sizer,
                     )

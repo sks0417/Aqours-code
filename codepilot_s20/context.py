@@ -23,12 +23,6 @@ def update_context(
     if allow_memory and memory_index.exists():
         memories = memory_index.read_text()[:2000]
     todos = runtime.state.todos if runtime is not None else CURRENT_TODOS
-    working_memory = (
-        runtime.state.knowledge.as_dict() if runtime is not None else {}
-    )
-    semantic_memory = (
-        runtime.state.semantic_memory.as_dict() if runtime is not None else {}
-    )
     return {
         "root_task": (
             runtime.state.root_task if runtime is not None
@@ -43,16 +37,6 @@ def update_context(
             dict(todo) for todo in todos
             if todo.get("kind") == "acceptance"
         ],
-        "working_memory": working_memory,
-        "semantic_memory": semantic_memory,
-        "semantic_memory_prompt": (
-            runtime.state.semantic_memory.prompt_view()
-            if runtime is not None else ""
-        ),
-        "working_memory_prompt": (
-            runtime.state.knowledge.prompt_view()
-            if runtime is not None else ""
-        ),
     }
 
 

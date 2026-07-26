@@ -19,11 +19,8 @@ def run_integrate_worktree(
     runtime: AgentRuntime | None = None,
 ) -> str:
     knowledge = runtime.state.knowledge if runtime is not None else None
-    semantic = runtime.state.semantic_memory if runtime is not None else None
     workdir = runtime.paths.workdir if runtime is not None else WORKDIR
-    with workspace_mutation_reconciliation(
-        knowledge, workdir, semantic,
-    ):
+    with workspace_mutation_reconciliation(knowledge, workdir):
         output = integrate_worktree(name, cleanup)
     return output
 

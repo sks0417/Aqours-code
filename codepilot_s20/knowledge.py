@@ -69,20 +69,6 @@ class FileKnowledge:
     evidence_valid: bool = True
 
 
-@dataclass(frozen=True)
-class ReadObservation:
-    """Immutable file version observed by one concrete read_file result."""
-
-    tool_use_id: str
-    path: str
-    digest: str
-    offset: int
-    limit: int | None
-    range_start: int
-    range_end: int
-    total_lines: int
-
-
 @dataclass
 class EvidenceKnowledge:
     key: str
@@ -142,15 +128,12 @@ def snapshot_workspace(workdir: str | Path) -> dict[str, str]:
 def workspace_mutation_reconciliation(
     knowledge: "RunKnowledge | None",
     workdir: str | Path,
-    semantic_memory=None,
 ):
     """Reconcile actual filesystem changes around a mutating operation."""
     if knowledge is None:
         yield
         return
-    with knowledge.mutation_boundary(
-        workdir, semantic_memory=semantic_memory,
-    ):
+    with knowledge.mutation_boundary(workdir):
         yield
 
 
@@ -303,7 +286,7 @@ class RunKnowledge:
             return tuple(changed)
 
     @contextmanager
-    def mutation_boundary(self, workdir: str | Path, semantic_memory=None):
+    def mutation_boundary(self, workdir: str | Path):
         """Serialize snapshot/execute/reconcile windows across worker threads."""
         with self._mutation_lock:
             before = snapshot_workspace(workdir)
@@ -311,12 +294,7 @@ class RunKnowledge:
                 yield
             finally:
                 after = snapshot_workspace(workdir)
-                changed = self.reconcile_workspace(before, after)
-                if semantic_memory is not None:
-                    for path in changed:
-                        semantic_memory.mark_file_stale(
-                            path, after.get(path, ""),
-                        )
+                self.reconcile_workspace(before, after)
 
     def _invalidate_linked_evidence(self, path: str, version: int) -> None:
         for collection in (
@@ -575,71 +553,3 @@ class RunKnowledge:
                     for key, value in self.reviewer_findings.items()
                 },
             }
-
-    def prompt_view(self) -> str:
-        with self._lock:
-            lines = [
-                "RunKnowledge (authoritative for this run; stale or unbound "
-                "evidence must not be used as verified proof):"
-            ]
-            files = list(self.files.values())[-24:]
-            lines.append("Files:")
-            if not files:
-                lines.append("- (none read)")
-            for record in files:
-                state = "valid" if record.evidence_valid else "stale"
-                lines.append(
-                    f"- {record.path} v{record.version} {state} "
-                    f"sha256:{record.digest[:12]} reads:{record.read_count}"
-                )
-            valid_symbols = [
-                item for item in self.confirmed_symbols.values()
-                if item.evidence_valid
-            ][-30:]
-            if valid_symbols:
-                lines.append("Confirmed symbols:")
-                for item in valid_symbols:
-                    meta = item.metadata
-                    lines.append(
-                        f"- {meta.get('path', '')}:{meta.get('line', '?')} "
-                        f"{meta.get('kind', 'symbol')} {item.text}"
-                    )
-            if self.modified_files:
-                lines.append(
-                    "Modified files: "
-                    + ", ".join(sorted(self.modified_files)[-24:])
-                )
-            if self.recent_tests:
-                lines.append("Recent tests:")
-                for test in self.recent_tests[-3:]:
-                    state = (
-                        "workspace-changed:"
-                        + ",".join(test.workspace_changed_since_run)
-                        if test.workspace_changed_since_run
-                        else ("pass" if test.passed else "fail")
-                    )
-                    lines.append(
-                        f"- [{test.test_id} {state}] {test.command} | "
-                        f"{test.result[-300:]}"
-                    )
-            if self.acceptance:
-                lines.append("Acceptance:")
-                for item in list(self.acceptance.values())[-12:]:
-                    lines.append(
-                        f"- [{item['id']} {item['status']} "
-                        f"{item.get('evidence_state', EVIDENCE_UNBOUND)}] "
-                        f"{item['content'][:240]}"
-                    )
-            if self.reviewer_findings:
-                lines.append("Reviewer findings:")
-                for item in list(self.reviewer_findings.values())[-5:]:
-                    lines.append(
-                        f"- [{item.key} {item.evidence_state}] "
-                        f"{item.text[:240]}"
-                    )
-            lines.append(
-                "Do not re-read a valid unchanged file merely to rediscover "
-                "its path, version, symbols, acceptance state, or prior test "
-                "status."
-            )
-            return "\n".join(lines)

@@ -69,14 +69,6 @@ def assemble_system_prompt(
             "Original task and hard constraints (authoritative):\n"
             + root_task[:6000]
         )
-    semantic_memory = str(
-        context.get("semantic_memory_prompt", "")
-    ).strip()
-    if semantic_memory:
-        sections.append(semantic_memory)
-    working_memory = str(context.get("working_memory_prompt", "")).strip()
-    if working_memory:
-        sections.append(working_memory)
     sections.extend([
                 PROMPT_SECTIONS["tool_strategy"],
                 PROMPT_SECTIONS["permissions"],

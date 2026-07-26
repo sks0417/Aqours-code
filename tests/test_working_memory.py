@@ -9,9 +9,7 @@ from types import SimpleNamespace
 from codepilot_s20 import (
     background,
     basic_tools,
-    compact,
     context,
-    prompts,
     tool_handlers,
 )
 from codepilot_s20.command_executor import LocalCommandExecutor
@@ -313,7 +311,7 @@ def test_reread_does_not_revive_old_contract_acceptance_or_reviewer(tmp_path):
     ].evidence_state == "stale"
 
 
-def test_context_and_compact_retain_run_knowledge(tmp_path, monkeypatch):
+def test_run_knowledge_stays_internal_and_out_of_prompt_context(tmp_path):
     (tmp_path / "service.py").write_text(
         "def reserve():\n    return True\n", encoding="utf-8",
     )
@@ -321,86 +319,10 @@ def test_context_and_compact_retain_run_knowledge(tmp_path, monkeypatch):
     basic_tools.run_read("service.py", runtime=runtime)
     live = context.update_context({}, [], runtime)
 
-    assert live["working_memory"]["read_files"]["service.py"]["version"] == 1
-    system = prompts.assemble_system_prompt(live, runtime)
-    assert "RunKnowledge" in system
-    assert "service.py v1 valid" in system
-    assert "function reserve" in system
-
-    monkeypatch.setattr(compact, "record_event", lambda *args, **kwargs: None)
-    messages = [
-        {"role": "user", "content": "inspect service"},
-        {"role": "assistant", "content": "old result"},
-    ]
-    result = compact.compact_history(
-        messages,
-        allow_model_summary=False,
-        runtime=runtime,
-    )
     assert runtime.state.knowledge.files["service.py"].evidence_valid is True
-    assert "RunKnowledge retained outside raw message history" not in json.dumps(
-        result,
-    )
-    assert "RunKnowledge" in prompts.assemble_system_prompt(
-        context.update_context({}, result, runtime), runtime,
-    )
-
-
-def test_digest_change_stales_only_matching_semantic_card_and_reread_does_not_revive(
-    tmp_path,
-):
-    (tmp_path / "a.py").write_text("value = 1\n", encoding="utf-8")
-    (tmp_path / "b.py").write_text("value = 2\n", encoding="utf-8")
-    runtime = make_runtime(tmp_path)
-    basic_tools.run_read(
-        "a.py", runtime=runtime, _tool_use_id="read-a",
-    )
-    basic_tools.run_read(
-        "b.py", runtime=runtime, _tool_use_id="read-b",
-    )
-    a_digest = runtime.state.knowledge.files["a.py"].digest
-    b_digest = runtime.state.knowledge.files["b.py"].digest
-    runtime.state.semantic_memory.merge({
-        "task": {"goal": "", "constraints": [], "definition_of_done": []},
-        "progress": {"completed": [], "current_focus": "", "remaining": []},
-        "files": [
-                {
-                    "path": "a.py", "digest": a_digest, "stale": False,
-                    "source_tool_use_ids": ["read-a"],
-                    "purpose": "A", "key_symbols": [], "key_behaviors": [],
-                "important_conditions": [], "relationships": [],
-                "relevant_ranges": [], "short_snippets": [],
-                "conclusions": [], "uncertainties": [],
-            },
-                {
-                    "path": "b.py", "digest": b_digest, "stale": False,
-                    "source_tool_use_ids": ["read-b"],
-                "purpose": "B", "key_symbols": [], "key_behaviors": [],
-                "important_conditions": [], "relationships": [],
-                "relevant_ranges": [], "short_snippets": [],
-                "conclusions": [], "uncertainties": [],
-            },
-        ],
-        "decisions": [], "rejected_approaches": [], "failures": [],
-        "open_questions": [], "next_actions": [],
-    }, observations=runtime.state.read_observations,
-       current_digests={"a.py": a_digest, "b.py": b_digest})
-
-    basic_tools.run_write("a.py", "value = 3\n", runtime=runtime)
-    cards = {
-        card["path"]: card
-        for card in runtime.state.semantic_memory.as_dict()["files"]
-    }
-    assert cards["a.py"]["stale"] is True
-    assert cards["b.py"]["stale"] is False
-
-    basic_tools.run_read("a.py", runtime=runtime)
-    cards = {
-        card["path"]: card
-        for card in runtime.state.semantic_memory.as_dict()["files"]
-    }
-    assert cards["a.py"]["digest"] == a_digest
-    assert cards["a.py"]["stale"] is True
+    assert "working_memory" not in live
+    assert "semantic_memory" not in live
+    assert "service.py" not in json.dumps(live)
 
 
 def test_successful_worktree_integration_invalidates_changed_paths_only(
