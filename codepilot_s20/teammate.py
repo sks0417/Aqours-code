@@ -112,10 +112,12 @@ def spawn_teammate_thread(
 
         def _run_read(
             path: str, limit: int | None = None, offset: int = 0,
+            _tool_use_id: str = "",
         ) -> str:
             return registered_handlers["read_file"](
                 path, limit=limit, offset=offset, cwd=_wt_cwd(),
                 runtime=teammate_runtime,
+                _tool_use_id=_tool_use_id,
             )
 
         def _run_write(path: str, content: str) -> str:
@@ -227,8 +229,12 @@ def spawn_teammate_thread(
                                 match.group(1) if match else output)
                         else:
                             handler = sub_handlers.get(block.name)
-                            output = call_tool_handler(handler, block.input,
-                                                       block.name)
+                            output = call_tool_handler(
+                                handler,
+                                block.input,
+                                block.name,
+                                tool_use_id=block.id,
+                            )
                         results.append({"type": "tool_result",
                                         "tool_use_id": block.id,
                                         "content": str(output)})

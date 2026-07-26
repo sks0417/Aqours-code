@@ -401,7 +401,10 @@ def run_role_agent(
                         path_limit=profile.max_read_paths,
                     )
                 else:
-                    output = call_tool_handler(handler, block_input, block_name)
+                    output = call_tool_handler(
+                        handler, block_input, block_name,
+                        tool_use_id=block_id,
+                    )
                     executed_tool_calls += 1
                     read_paths.add(read_path)
                     read_cache.add(read_key)
@@ -410,7 +413,10 @@ def run_role_agent(
                             str(block_input.get("path", "")).strip())
                     trigger_hooks("PostToolUse", block, output)
             else:
-                output = call_tool_handler(handler, block_input, block_name)
+                output = call_tool_handler(
+                    handler, block_input, block_name,
+                    tool_use_id=block_id,
+                )
                 executed_tool_calls += 1
                 trigger_hooks("PostToolUse", block, output)
             output_text = str(output)

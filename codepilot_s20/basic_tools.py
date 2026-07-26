@@ -3,6 +3,7 @@ from .command_executor import CaseTimeoutError
 from .command_safety import looks_like_delete_command
 from .knowledge import (
     normalize_knowledge_path,
+    ReadObservation,
     snapshot_workspace,
     workspace_mutation_reconciliation,
 )
@@ -91,7 +92,8 @@ def run_bash(command: str, cwd: Path = None,
 
 def run_read(path: str, limit: int | None = None,
              offset: int = 0, cwd: Path = None,
-             runtime: AgentRuntime | None = None) -> str:
+             runtime: AgentRuntime | None = None,
+             _tool_use_id: str = "") -> str:
     try:
         file_path = safe_path(path, cwd, runtime)
         raw = file_path.read_bytes()
@@ -104,8 +106,22 @@ def run_read(path: str, limit: int | None = None,
             end = len(lines) if limit is None else min(
                 len(lines), offset + max(0, limit),
             )
+            if _tool_use_id:
+                runtime.state.read_observations[str(_tool_use_id)] = (
+                    ReadObservation(
+                        tool_use_id=str(_tool_use_id),
+                        path=normalize_knowledge_path(path),
+                        digest=record.digest,
+                        offset=offset,
+                        limit=limit,
+                        range_start=offset,
+                        range_end=end,
+                        total_lines=len(lines),
+                    )
+                )
             record_event(
                 "read_observation",
+                tool_use_id=str(_tool_use_id),
                 path=normalize_knowledge_path(path),
                 digest=record.digest,
                 offset=offset,
@@ -176,11 +192,20 @@ def run_glob(pattern: str, cwd: Path = None,
         return f"Error: {e}"
 
 
-def call_tool_handler(handler, args: dict, name: str) -> str:
+def call_tool_handler(
+    handler,
+    args: dict,
+    name: str,
+    *,
+    tool_use_id: str = "",
+) -> str:
     if not handler:
         return f"Unknown: {name}"
     try:
-        return handler(**(args or {}))
+        kwargs = dict(args or {})
+        if name == "read_file" and tool_use_id:
+            kwargs["_tool_use_id"] = str(tool_use_id)
+        return handler(**kwargs)
     except TypeError as e:
         return f"Error: {e}"
 

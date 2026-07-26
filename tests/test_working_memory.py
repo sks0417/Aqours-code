@@ -57,8 +57,8 @@ def test_file_mutation_invalidates_only_evidence_linked_to_that_file(tmp_path):
     (tmp_path / "a.py").write_text("def alpha():\n    return 1\n", encoding="utf-8")
     (tmp_path / "b.py").write_text("def beta():\n    return 2\n", encoding="utf-8")
     runtime = make_runtime(tmp_path)
-    basic_tools.run_read("a.py", runtime=runtime)
-    basic_tools.run_read("b.py", runtime=runtime)
+    basic_tools.run_read("a.py", runtime=runtime, _tool_use_id="read-a")
+    basic_tools.run_read("b.py", runtime=runtime, _tool_use_id="read-b")
     knowledge = runtime.state.knowledge
     knowledge.record_contract("contract:a", "alpha remains stable", ["a.py"])
     knowledge.record_reviewer_findings([{
@@ -112,12 +112,20 @@ def test_test_results_are_workspace_snapshots_not_coverage_claims(tmp_path):
     (tmp_path / "a.py").write_text("value = 1\n", encoding="utf-8")
     (tmp_path / "b.py").write_text("other = 1\n", encoding="utf-8")
     runtime = make_runtime(tmp_path, TestExecutor())
-    basic_tools.run_read("a.py", runtime=runtime)
-    basic_tools.run_read("b.py", runtime=runtime)
+    basic_tools.run_read(
+        "a.py", runtime=runtime, _tool_use_id="read-a",
+    )
+    basic_tools.run_read(
+        "b.py", runtime=runtime, _tool_use_id="read-b",
+    )
     basic_tools.run_write("a.py", "value = 2\n", runtime=runtime)
     basic_tools.run_write("b.py", "other = 2\n", runtime=runtime)
-    basic_tools.run_read("a.py", runtime=runtime)
-    basic_tools.run_read("b.py", runtime=runtime)
+    basic_tools.run_read(
+        "a.py", runtime=runtime, _tool_use_id="read-a",
+    )
+    basic_tools.run_read(
+        "b.py", runtime=runtime, _tool_use_id="read-b",
+    )
 
     assert basic_tools.run_bash(
         "python -m pytest tests/test_a.py -q", runtime=runtime,
@@ -344,23 +352,29 @@ def test_digest_change_stales_only_matching_semantic_card_and_reread_does_not_re
     (tmp_path / "a.py").write_text("value = 1\n", encoding="utf-8")
     (tmp_path / "b.py").write_text("value = 2\n", encoding="utf-8")
     runtime = make_runtime(tmp_path)
-    basic_tools.run_read("a.py", runtime=runtime)
-    basic_tools.run_read("b.py", runtime=runtime)
+    basic_tools.run_read(
+        "a.py", runtime=runtime, _tool_use_id="read-a",
+    )
+    basic_tools.run_read(
+        "b.py", runtime=runtime, _tool_use_id="read-b",
+    )
     a_digest = runtime.state.knowledge.files["a.py"].digest
     b_digest = runtime.state.knowledge.files["b.py"].digest
     runtime.state.semantic_memory.merge({
         "task": {"goal": "", "constraints": [], "definition_of_done": []},
         "progress": {"completed": [], "current_focus": "", "remaining": []},
         "files": [
-            {
-                "path": "a.py", "digest": a_digest, "stale": False,
-                "purpose": "A", "key_symbols": [], "key_behaviors": [],
+                {
+                    "path": "a.py", "digest": a_digest, "stale": False,
+                    "source_tool_use_ids": ["read-a"],
+                    "purpose": "A", "key_symbols": [], "key_behaviors": [],
                 "important_conditions": [], "relationships": [],
                 "relevant_ranges": [], "short_snippets": [],
                 "conclusions": [], "uncertainties": [],
             },
-            {
-                "path": "b.py", "digest": b_digest, "stale": False,
+                {
+                    "path": "b.py", "digest": b_digest, "stale": False,
+                    "source_tool_use_ids": ["read-b"],
                 "purpose": "B", "key_symbols": [], "key_behaviors": [],
                 "important_conditions": [], "relationships": [],
                 "relevant_ranges": [], "short_snippets": [],
@@ -369,7 +383,8 @@ def test_digest_change_stales_only_matching_semantic_card_and_reread_does_not_re
         ],
         "decisions": [], "rejected_approaches": [], "failures": [],
         "open_questions": [], "next_actions": [],
-    })
+    }, observations=runtime.state.read_observations,
+       current_digests={"a.py": a_digest, "b.py": b_digest})
 
     basic_tools.run_write("a.py", "value = 3\n", runtime=runtime)
     cards = {

@@ -98,10 +98,16 @@ not presented as source coverage.
 
 Context continuation uses a separate, bounded `SessionSemanticMemory`. Full
 Compact sees complete outgoing messages and Tool exchanges before they are
-removed, emits validated structured JSON, and merges file responsibilities,
+removed, partitions oversized results into bounded extraction chunks, emits
+validated structured JSON, and merges file responsibilities,
 behaviors, relationships, constraints, decisions, progress, and open questions
 into one canonical state. File cards are keyed by normalized path plus digest,
-and only the changed path becomes stale. The system prompt receives at most
+using immutable read-time observations rather than a later Workspace lookup.
+Runtime overrides model digest/stale hints, and only the changed path becomes
+stale. Current work, questions, and next actions use replaceable snapshots
+rather than append-only logs. Automatic/reactive Compact verify the complete
+next request against a strict target and fail diagnostically when fixed prompt
+or schema state cannot fit. The system prompt receives at most
 12,000 characters of this state; compact messages contain only a small
 checkpoint, so the same semantics are not injected twice. This feature is
 `Implemented`, not `Validated`, until the paid paired Eval criteria below pass.

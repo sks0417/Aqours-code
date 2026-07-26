@@ -133,7 +133,7 @@ def test_compact_tool_use_calls_compact_history(monkeypatch):
     monkeypatch.setattr(agent_loop, "client", fake_client)
     compact_calls = []
 
-    def fake_compact_history(messages):
+    def fake_compact_history(messages, **kwargs):
         compact_calls.append(list(messages))
         return [{"role": "user", "content": "compacted"}]
 
@@ -158,8 +158,10 @@ def test_compact_tool_preserves_tool_result_pair_when_recent_tail_is_kept(
     monkeypatch.setattr(agent_loop, "client", fake_client)
     monkeypatch.setattr(
         agent_loop, "compact_history",
-        lambda messages: [{"role": "user", "content": "checkpoint"},
-                          messages[-1]],
+        lambda messages, **kwargs: [
+            {"role": "user", "content": "checkpoint"},
+            messages[-1],
+        ],
     )
 
     messages = [{"role": "user", "content": "compact a long history"}]
@@ -609,8 +611,8 @@ def test_final_contract_audit_scopes_and_deduplicates_reads(
     )
     assert "service.py" in audit_prompt
     assert "at most 4 read_file calls" in audit_prompt
-    assert "inspect its producer function" in audit_prompt
-    assert "checking only the caller or comparison site is not evidence" in audit_prompt
+    assert "producer chain for derived values" in audit_prompt
+    assert "Checking only a caller or comparison site is not evidence" in audit_prompt
     by_id = {
         block["tool_use_id"]: block["content"]
         for message in messages

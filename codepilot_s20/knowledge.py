@@ -69,6 +69,20 @@ class FileKnowledge:
     evidence_valid: bool = True
 
 
+@dataclass(frozen=True)
+class ReadObservation:
+    """Immutable file version observed by one concrete read_file result."""
+
+    tool_use_id: str
+    path: str
+    digest: str
+    offset: int
+    limit: int | None
+    range_start: int
+    range_end: int
+    total_lines: int
+
+
 @dataclass
 class EvidenceKnowledge:
     key: str

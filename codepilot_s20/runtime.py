@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from .knowledge import RunKnowledge
+from .knowledge import ReadObservation, RunKnowledge
 from .semantic_memory import SessionSemanticMemory
 
 
@@ -74,6 +74,7 @@ class RunState:
     semantic_memory: SessionSemanticMemory = field(
         default_factory=SessionSemanticMemory,
     )
+    read_observations: dict[str, ReadObservation] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

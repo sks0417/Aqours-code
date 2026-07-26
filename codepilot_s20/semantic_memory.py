@@ -25,11 +25,14 @@ SEMANTIC_DELTA_KEYS = frozenset({
     "failures",
     "open_questions",
     "next_actions",
+    "processed_tool_use_ids",
 })
 FILE_CARD_KEYS = frozenset({
     "path",
     "digest",
     "stale",
+    "source_tool_use_ids",
+    "supersede_fields",
     "purpose",
     "key_symbols",
     "key_behaviors",
@@ -60,6 +63,7 @@ def empty_semantic_delta() -> dict[str, Any]:
         "failures": [],
         "open_questions": [],
         "next_actions": [],
+        "processed_tool_use_ids": [],
     }
 
 
@@ -78,8 +82,10 @@ def validate_semantic_delta(value: Any) -> dict[str, Any] | None:
             if isinstance(normalized[section][key], list):
                 if not isinstance(item, list):
                     return None
+                if any(not isinstance(entry, str) for entry in item):
+                    return None
                 normalized[section][key] = [
-                    str(entry) for entry in item if str(entry).strip()
+                    entry for entry in item if entry.strip()
                 ]
             elif not isinstance(item, str):
                 return None
@@ -91,15 +97,50 @@ def validate_semantic_delta(value: Any) -> dict[str, Any] | None:
     for raw in files:
         if not isinstance(raw, dict) or set(raw) - FILE_CARD_KEYS:
             return None
-        path = normalize_knowledge_path(str(raw.get("path", "")))
+        if (
+            not isinstance(raw.get("path", ""), str)
+            or not isinstance(raw.get("digest", ""), str)
+            or not isinstance(raw.get("stale", False), bool)
+            or not isinstance(raw.get("purpose", ""), str)
+        ):
+            return None
+        path = normalize_knowledge_path(raw.get("path", ""))
         if not path:
             return None
         card = {
             "path": path,
-            "digest": str(raw.get("digest", "")),
-            "stale": bool(raw.get("stale", False)),
+            "digest": raw.get("digest", ""),
+            "stale": raw.get("stale", False),
+            "source_tool_use_ids": [],
+            "supersede_fields": [],
             "purpose": str(raw.get("purpose", "")),
         }
+        source_ids = raw.get("source_tool_use_ids", [])
+        supersede_fields = raw.get("supersede_fields", [])
+        if (
+            not isinstance(source_ids, list)
+            or any(not isinstance(item, str) for item in source_ids)
+            or not isinstance(supersede_fields, list)
+            or any(not isinstance(item, str) for item in supersede_fields)
+        ):
+            return None
+        card["source_tool_use_ids"] = [
+            item for item in source_ids if item.strip()
+        ]
+        allowed_supersede = {
+            "purpose",
+            "key_symbols",
+            "key_behaviors",
+            "important_conditions",
+            "relationships",
+            "relevant_ranges",
+            "short_snippets",
+            "conclusions",
+            "uncertainties",
+        }
+        if any(item not in allowed_supersede for item in supersede_fields):
+            return None
+        card["supersede_fields"] = list(dict.fromkeys(supersede_fields))
         for key in (
             "key_symbols",
             "key_behaviors",
@@ -113,9 +154,12 @@ def validate_semantic_delta(value: Any) -> dict[str, Any] | None:
             item = raw.get(key, [])
             if isinstance(item, str):
                 item = [item]
-            if not isinstance(item, list):
+            if (
+                not isinstance(item, list)
+                or any(not isinstance(entry, str) for entry in item)
+            ):
                 return None
-            card[key] = [str(entry) for entry in item if str(entry).strip()]
+            card[key] = [entry for entry in item if entry.strip()]
         normalized["files"].append(card)
     for key in (
         "decisions",
@@ -123,12 +167,16 @@ def validate_semantic_delta(value: Any) -> dict[str, Any] | None:
         "failures",
         "open_questions",
         "next_actions",
+        "processed_tool_use_ids",
     ):
         incoming = value.get(key, [])
-        if not isinstance(incoming, list):
+        if (
+            not isinstance(incoming, list)
+            or any(not isinstance(entry, str) for entry in incoming)
+        ):
             return None
         normalized[key] = [
-            str(entry) for entry in incoming if str(entry).strip()
+            entry for entry in incoming if entry.strip()
         ]
     return normalized
 
@@ -144,6 +192,12 @@ def _merge_list(current: list[str], incoming, limit=MAX_LIST_ITEMS) -> list[str]
         if text and text not in merged:
             merged.append(text)
     return merged[-limit:]
+
+
+def _observation_value(observation, name: str, default=""):
+    if isinstance(observation, dict):
+        return observation.get(name, default)
+    return getattr(observation, name, default)
 
 
 @dataclass
@@ -200,19 +254,21 @@ class SessionSemanticMemory:
         self,
         delta: dict[str, Any],
         *,
-        digest_lookup: dict[str, str] | None = None,
+        observations: dict[str, Any] | None = None,
+        current_digests: dict[str, str] | None = None,
     ) -> None:
         normalized = validate_semantic_delta(delta)
         if normalized is None:
             raise ValueError("invalid semantic memory delta")
-        digests = {
+        current = {
             normalize_knowledge_path(path): str(digest)
-            for path, digest in (digest_lookup or {}).items()
+            for path, digest in (current_digests or {}).items()
         }
+        observation_map = observations or {}
         with self._lock:
             task = normalized["task"]
-            if task["goal"]:
-                self.task["goal"] = _short(task["goal"], 2000)
+            # The original goal belongs to the Runtime. A compact model may
+            # improve constraints/understanding but cannot rewrite it.
             self.task["constraints"] = _merge_list(
                 self.task["constraints"], task["constraints"],
             )
@@ -224,25 +280,64 @@ class SessionSemanticMemory:
             self.progress["completed"] = _merge_list(
                 self.progress["completed"], progress["completed"],
             )
-            if progress["current_focus"]:
-                self.progress["current_focus"] = _short(
-                    progress["current_focus"],
-                )
-            self.progress["remaining"] = _merge_list(
-                self.progress["remaining"], progress["remaining"],
+            self.progress["current_focus"] = _short(
+                progress["current_focus"],
             )
+            completed = set(self.progress["completed"])
+            # Current-state fields are snapshots, not historical logs.
+            self.progress["remaining"] = [
+                item for item in _merge_list([], progress["remaining"])
+                if item not in completed
+            ]
             for raw in normalized["files"]:
                 card = deepcopy(raw)
-                path = card["path"]
-                digest = card["digest"] or digests.get(path, "unknown")
+                source_ids = list(card.get("source_tool_use_ids", ()))
+                resolved = [
+                    observation_map[source_id]
+                    for source_id in source_ids
+                    if source_id in observation_map
+                ]
+                versions = {
+                    (
+                        normalize_knowledge_path(str(
+                            _observation_value(item, "path", "")
+                        )),
+                        str(_observation_value(item, "digest", "")),
+                    )
+                    for item in resolved
+                    if _observation_value(item, "path", "")
+                    and _observation_value(item, "digest", "")
+                }
+                if len(versions) == 1:
+                    path, digest = next(iter(versions))
+                else:
+                    path = card["path"]
+                    digest = "unknown"
+                stale = (
+                    digest == "unknown"
+                    or not current.get(path)
+                    or current.get(path) != digest
+                )
+                card["path"] = path
                 card["digest"] = digest
+                card["stale"] = stale
+                if digest == "unknown":
+                    card["uncertainties"] = _merge_list(
+                        card.get("uncertainties", []),
+                        [
+                            "Historical read version could not be bound to one "
+                            "runtime observation"
+                        ],
+                        10,
+                    )
                 identity = f"{path}@{digest}"
                 existing = self.files.get(identity)
                 if existing is None:
                     existing = {
                         "path": path,
                         "digest": digest,
-                        "stale": bool(card.get("stale", False)),
+                        "stale": stale,
+                        "source_tool_use_ids": [],
                         "purpose": "",
                         "key_symbols": [],
                         "key_behaviors": [],
@@ -254,9 +349,15 @@ class SessionSemanticMemory:
                         "uncertainties": [],
                     }
                     self.files[identity] = existing
+                existing["source_tool_use_ids"] = _merge_list(
+                    existing["source_tool_use_ids"], source_ids, 16,
+                )
+                supersede = set(card.get("supersede_fields", ()))
                 if card.get("purpose"):
                     existing["purpose"] = _short(card["purpose"])
-                existing["stale"] = bool(card.get("stale", False))
+                elif "purpose" in supersede:
+                    existing["purpose"] = ""
+                existing["stale"] = stale
                 for key in (
                     "key_symbols",
                     "key_behaviors",
@@ -266,35 +367,66 @@ class SessionSemanticMemory:
                     "conclusions",
                     "uncertainties",
                 ):
-                    existing[key] = _merge_list(
-                        existing[key], card.get(key, ()), 10,
+                    incoming = card.get(key, ())
+                    existing[key] = (
+                        _merge_list([], incoming, 10)
+                        if key in supersede
+                        else _merge_list(existing[key], incoming, 10)
                     )
-                existing["short_snippets"] = _merge_list(
-                    existing["short_snippets"],
-                    (_short(item, MAX_SNIPPET)
-                     for item in card.get("short_snippets", ())),
-                    4,
+                snippets = (
+                    _short(item, MAX_SNIPPET)
+                    for item in card.get("short_snippets", ())
+                )
+                existing["short_snippets"] = (
+                    _merge_list([], snippets, 4)
+                    if "short_snippets" in supersede
+                    else _merge_list(existing["short_snippets"], snippets, 4)
                 )
                 # A plain dict preserves insertion order. Reinsert a touched
                 # identity so the fixed card cap evicts least-recently merged
                 # cards, not whichever path happened to be observed first.
                 self.files[identity] = self.files.pop(identity)
-            while len(self.files) > MAX_FILE_CARDS:
-                oldest = next(iter(self.files))
-                del self.files[oldest]
             for key in (
                 "decisions",
                 "rejected_approaches",
                 "failures",
-                "open_questions",
-                "next_actions",
             ):
                 setattr(
                     self,
                     key,
                     _merge_list(getattr(self, key), normalized[key]),
                 )
+            self.open_questions = _merge_list(
+                [], normalized["open_questions"],
+            )
+            self.next_actions = _merge_list(
+                [], normalized["next_actions"],
+            )
+            self._trim_file_cards()
             self.compact_count += 1
+
+    def _trim_file_cards(self) -> None:
+        active_text = " ".join([
+            self.progress.get("current_focus", ""),
+            *self.progress.get("remaining", []),
+            *self.next_actions,
+        ]).lower()
+        while len(self.files) > MAX_FILE_CARDS:
+            candidates = []
+            for index, (identity, card) in enumerate(self.files.items()):
+                basename = card["path"].rsplit("/", 1)[-1].lower()
+                symbols = [str(item).lower()
+                           for item in card.get("key_symbols", ())]
+                relevance = int(bool(
+                    basename and basename in active_text
+                )) + sum(
+                    1 for symbol in symbols
+                    if len(symbol) >= 3 and symbol in active_text
+                )
+                freshness = 1 if not card.get("stale", True) else 0
+                candidates.append((relevance, freshness, index, identity))
+            _, _, _, evict = min(candidates)
+            del self.files[evict]
 
     def observe_file(self, path: str, digest: str) -> None:
         normalized = normalize_knowledge_path(path)

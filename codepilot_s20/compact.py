@@ -1,6 +1,7 @@
 import json
 import re
 import time
+from copy import deepcopy
 from pathlib import Path
 
 from .runtime_state import *
@@ -200,61 +201,18 @@ def tool_result_budget(
     batches = collect_tool_result_messages(messages)
     if not batches:
         return messages
-    # Persist every oversized result, not just the most recent batch. This is a
-    # deterministic, provenance-preserving reduction that is safe before
-    # semantic extraction.
+    # Persist every oversized result for provenance, but keep its complete
+    # in-memory content until semantic extraction succeeds. A persisted path
+    # and head/tail preview are not semantic preservation.
     for _, _, batch_blocks in batches:
         for block in batch_blocks:
             text = str(block.get("content", ""))
             if len(text) > PERSIST_THRESHOLD:
-                block["content"] = persist_large_output(
+                persist_large_output(
                     block.get("tool_use_id", "unknown"),
                     text,
                     runtime=runtime,
                 )
-
-    blocks = batches[-1][2]
-    originals = [(block, str(block.get("content", ""))) for block in blocks]
-    for block, text in originals:
-        if len(text) > PERSIST_THRESHOLD:
-            block["content"] = persist_large_output(
-                block.get("tool_use_id", "unknown"), text,
-                runtime=runtime)
-
-    def total_size():
-        return sum(len(str(block.get("content", ""))) for block in blocks)
-
-    total = total_size()
-    if total <= max_bytes:
-        return messages
-
-    per_result_preview = max(0, max_bytes // max(1, len(blocks)) - 512)
-    for block, original in sorted(originals,
-                                  key=lambda pair: len(pair[1]),
-                                  reverse=True):
-        if total <= max_bytes:
-            break
-        candidate = persist_large_output(
-            block.get("tool_use_id", "unknown"), original,
-            force=True, preview_chars=per_result_preview,
-            runtime=runtime)
-        if len(candidate) < len(str(block.get("content", ""))):
-            block["content"] = candidate
-            total = total_size()
-
-    # Very wide tool batches may still exceed the budget after every result
-    # gets an equal preview. Drop previews oldest-first while retaining the
-    # persisted path and result identity for every block.
-    if total > max_bytes:
-        for block, original in originals:
-            if total <= max_bytes:
-                break
-            candidate = persist_large_output(
-                block.get("tool_use_id", "unknown"), original,
-                force=True, preview_chars=0, runtime=runtime)
-            if len(candidate) < len(str(block.get("content", ""))):
-                block["content"] = candidate
-                total = total_size()
     return messages
 
 
@@ -307,8 +265,15 @@ def write_transcript(
     return path
 
 
-COMPACT_INPUT_LIMIT = 120000
+COMPACT_INPUT_LIMIT = 80000
+COMPACT_HISTORY_CHUNK_LIMIT = 60000
 CHECKPOINT_LIMIT = 1800
+COMPACT_OUTPUT_RESERVE_CHARS = 6000
+MAX_COMPACT_PASSES = 16
+
+
+class ContextCompactionError(RuntimeError):
+    """Raised when Compact cannot safely satisfy its request budget."""
 
 
 def _compact_output_schema() -> dict:
@@ -331,8 +296,12 @@ def _compact_output_schema() -> dict:
             },
             "files": [{
                 "path": "normalized path",
-                "digest": "provided digest or empty string",
+                "digest": "ignored model hint; runtime supplies authority",
                 "stale": False,
+                "source_tool_use_ids": ["read_file tool_use id"],
+                "supersede_fields": [
+                    "semantic field names whose prior value is replaced"
+                ],
                 "purpose": "string",
                 "key_symbols": ["string"],
                 "key_behaviors": ["string"],
@@ -348,6 +317,7 @@ def _compact_output_schema() -> dict:
             "failures": ["string"],
             "open_questions": ["string"],
             "next_actions": ["string"],
+            "processed_tool_use_ids": ["every tool result semantically processed"],
         },
     }
 
@@ -402,6 +372,7 @@ def _validate_compact_payload(value: dict | None) -> dict | None:
             ],
         },
         "semantic_memory_delta": delta,
+        "_transfer_complete": True,
     }
 
 
@@ -433,68 +404,36 @@ def _is_prior_checkpoint(unit: list[dict]) -> bool:
     )
 
 
-def _select_summary_history(
-    history: list,
-    *,
-    max_chars: int = COMPACT_INPUT_LIMIT,
-    task_text: str = "",
-) -> tuple[list, list]:
-    """Select complete relevant/recent units; retain every unselected unit."""
-    units = _history_units(history)
-    task_terms = {
-        term.lower()
-        for term in re.findall(r"[A-Za-z_][A-Za-z0-9_./-]{3,}", task_text)
-    }
-    ranked = []
-    for index, unit in enumerate(units):
-        text = json.dumps(unit, default=str, ensure_ascii=False)
-        unit_terms = {
-            term.lower()
-            for term in re.findall(r"[A-Za-z_][A-Za-z0-9_./-]{3,}", text)
-        }
-        relevance = len(task_terms & unit_terms)
-        ranked.append((relevance > 0, relevance, index, unit))
-    # Relevance wins first, then recency. Original ordering is restored below.
-    ranked.sort(reverse=True, key=lambda item: item[:3])
-    selected_indices = set()
-    used = 0
-    for _, _, index, unit in ranked:
-        if _is_prior_checkpoint(unit):
-            # Its semantic content already lives in the canonical state.
-            continue
-        size = estimate_size(unit)
-        if used + size <= max_chars:
-            selected_indices.add(index)
-            used += size
-    selected = [
-        unit for index, unit in enumerate(units)
-        if index in selected_indices
-    ]
-    retained = [
-        unit for index, unit in enumerate(units)
-        if index not in selected_indices and not _is_prior_checkpoint(unit)
-    ]
-    return (
-        [message for unit in selected for message in unit],
-        [message for unit in retained for message in unit],
-    )
-
-
-def _file_digest_lookup(
+def _history_observations(
     messages: list,
     runtime: AgentRuntime | None,
-) -> dict[str, str]:
+) -> dict[str, dict]:
     if runtime is None:
         return {}
-    paths = {
-        _normalized_read_path(tool)
-        for tool in _collect_tool_uses(messages).values()
-        if tool.get("name") == "read_file"
-    }
+    tool_ids = set(_collect_tool_uses(messages))
+    observations = runtime.state.read_observations
     return {
-        path: runtime.state.knowledge.files[path].digest
-        for path in paths
-        if path in runtime.state.knowledge.files
+        tool_use_id: {
+            "path": observation.path,
+            "digest": observation.digest,
+            "offset": observation.offset,
+            "limit": observation.limit,
+            "range_start": observation.range_start,
+            "range_end": observation.range_end,
+            "total_lines": observation.total_lines,
+        }
+        for tool_use_id, observation in observations.items()
+        if tool_use_id in tool_ids
+    }
+
+
+def _current_file_digests(runtime: AgentRuntime | None) -> dict[str, str]:
+    if runtime is None:
+        return {}
+    return {
+        path: record.digest
+        for path, record in runtime.state.knowledge.files.items()
+        if record.digest
     }
 
 
@@ -506,7 +445,11 @@ def _compact_prompt(
         runtime.state.root_task if runtime is not None
         else CURRENT_ROOT_TASK or ""
     )[:6000]
-    digests = _file_digest_lookup(messages, runtime)
+    observations = _history_observations(messages, runtime)
+    current_state = (
+        runtime.state.semantic_memory.as_dict()
+        if runtime is not None else {}
+    )
     return (
         "Convert only the outgoing raw conversation history below into a "
         "continuation checkpoint and a semantic-memory delta. Return JSON only "
@@ -518,11 +461,33 @@ def _compact_prompt(
         "open questions and next actions. Preserve only a few short exact "
         "snippets when reliable paraphrase would lose essential code or wording. "
         "Do not claim semantic memory is verified proof. Do not summarize a "
-        "prior compact checkpoint. Use a supplied file digest when available "
-        "and otherwise emit an empty digest.\n\n"
+        "prior compact checkpoint. For every file card, cite the read_file "
+        "tool_use id(s) that supplied its content. The runtime—not this output—"
+        "owns digest and stale; model values for those fields are ignored. "
+        "The original goal is immutable: copy it only for readability and do "
+        "not attempt to revise it. progress.remaining, open_questions, and "
+        "next_actions are complete current snapshots after applying this "
+        "history to Current semantic state. completed entries must not remain "
+        "in remaining. Use supersede_fields when a newer observation corrects "
+        "a semantic field on the same file version. decisions, failures, and "
+        "rejected approaches are bounded historical additions.\n\n"
+        "processed_tool_use_ids must list every tool_use id whose result appears "
+        "in this outgoing batch, but only after its content has been represented "
+        "in the checkpoint or semantic delta.\n\n"
         f"Original task:\n{root_task}\n\n"
-        "File digests:\n"
-        + json.dumps(digests, ensure_ascii=False, separators=(",", ":"))
+        "Current semantic state (reference for convergent updates; do not "
+        "summarize it again):\n"
+        + json.dumps(
+            current_state,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n\nRead observations captured at tool execution time:\n"
+        + json.dumps(
+            observations,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         + "\n\nRequired JSON shape:\n"
         + json.dumps(
             _compact_output_schema(),
@@ -571,10 +536,13 @@ def _fallback_semantic_payload(
 ) -> dict:
     from .semantic_memory import empty_semantic_delta
     delta = empty_semantic_delta()
-    delta["task"]["goal"] = str(
-        runtime.state.root_task if runtime is not None
-        else CURRENT_ROOT_TASK or ""
-    )[:2000]
+    if runtime is not None:
+        current_state = runtime.state.semantic_memory.as_dict()
+        delta["progress"]["remaining"] = list(
+            current_state["progress"]["remaining"]
+        )
+        delta["open_questions"] = list(current_state["open_questions"])
+        delta["next_actions"] = list(current_state["next_actions"])
     uses = _collect_tool_uses(messages)
     result_by_id = {
         str(block.get("tool_use_id", "")): block
@@ -592,8 +560,10 @@ def _fallback_semantic_payload(
             continue
         card = {
             "path": path,
-            "digest": _file_digest_lookup(messages, runtime).get(path, ""),
-            "stale": False,
+            "digest": "",
+            "stale": True,
+            "source_tool_use_ids": [tool_use_id],
+            "supersede_fields": [],
             "purpose": "Previously inspected during the task",
             "key_symbols": [],
             "key_behaviors": [],
@@ -648,6 +618,11 @@ def _fallback_semantic_payload(
             "remaining": [],
         },
         "semantic_memory_delta": delta,
+        "_transfer_complete": False,
+        "_transfer_failure": (
+            "Structured semantic extraction was unavailable; raw history must "
+            "be retained unless a caller explicitly accepts information loss."
+        ),
     }
 
 
@@ -745,8 +720,19 @@ def _coerce_compact_payload(
     history: list,
     runtime: AgentRuntime | None,
 ) -> dict:
-    validated = _validate_compact_payload(value) if isinstance(value, dict) else None
+    validated = None
+    if isinstance(value, dict):
+        validated = _validate_compact_payload({
+            key: value[key]
+            for key in ("conversation_checkpoint", "semantic_memory_delta")
+            if key in value
+        })
     if validated is not None:
+        if value.get("_transfer_complete") is False:
+            validated["_transfer_complete"] = False
+            validated["_transfer_failure"] = str(
+                value.get("_transfer_failure", "semantic transfer incomplete")
+            )
         return validated
     # Compatibility for injected/fake summary functions used by embedders and
     # older tests. It is a checkpoint only and must not masquerade as semantic
@@ -767,7 +753,11 @@ def _merge_semantic_payload(
         return
     runtime.state.semantic_memory.merge(
         payload["semantic_memory_delta"],
-        digest_lookup=_file_digest_lookup(history, runtime),
+        observations={
+            tool_use_id: runtime.state.read_observations[tool_use_id]
+            for tool_use_id in _history_observations(history, runtime)
+        },
+        current_digests=_current_file_digests(runtime),
     )
 
 
@@ -799,29 +789,192 @@ def _checkpoint_message(payload: dict, *, reactive: bool = False) -> dict:
     return {"role": "user", "content": f"{label}\n{rendered}"}
 
 
+def _split_text(value: str, max_chars: int) -> list[str]:
+    text = str(value)
+    return [
+        text[index:index + max_chars]
+        for index in range(0, len(text), max_chars)
+    ] or [""]
+
+
+def _split_oversized_unit(
+    unit: list[dict],
+    *,
+    max_chars: int,
+) -> list[list[dict]] | None:
+    """Split content while preserving complete Tool-use/result exchanges."""
+    if estimate_size(unit) <= max_chars:
+        return [unit]
+    if (
+        len(unit) == 2
+        and message_has_tool_use(unit[0])
+        and is_tool_result_message(unit[1])
+    ):
+        uses = {
+            str(_block_field(block, "id", "")): block
+            for block in unit[0].get("content", [])
+            if block_type(block) == "tool_use"
+        }
+        pieces = []
+        for result in unit[1].get("content", []):
+            if not isinstance(result, dict) or result.get("type") != "tool_result":
+                continue
+            tool_use_id = str(result.get("tool_use_id", ""))
+            use = uses.get(tool_use_id)
+            if use is None:
+                return None
+            overhead = estimate_size([
+                {"role": "assistant", "content": [use]},
+                {"role": "user", "content": [{
+                    **result, "content": "",
+                }]},
+            ])
+            chunk_size = max_chars - overhead - 300
+            if chunk_size < 1000:
+                return None
+            chunks = _split_text(str(result.get("content", "")), chunk_size)
+            for index, chunk in enumerate(chunks):
+                chunk_result = deepcopy(result)
+                chunk_result["content"] = (
+                    f"[semantic extraction chunk {index + 1}/{len(chunks)} "
+                    f"for tool result {tool_use_id}]\n{chunk}"
+                )
+                pieces.append([
+                    {"role": "assistant", "content": [deepcopy(use)]},
+                    {"role": "user", "content": [chunk_result]},
+                ])
+        return pieces or None
+    if len(unit) == 1 and isinstance(unit[0].get("content"), str):
+        message = unit[0]
+        overhead = estimate_size([{**message, "content": ""}])
+        chunk_size = max_chars - overhead - 200
+        if chunk_size < 1000:
+            return None
+        chunks = _split_text(message["content"], chunk_size)
+        return [[{
+            **message,
+            "content": (
+                f"[semantic extraction chunk {index + 1}/{len(chunks)}]\n"
+                f"{chunk}"
+            ),
+        }] for index, chunk in enumerate(chunks)]
+    return None
+
+
+def _extraction_batches(
+    history: list,
+    *,
+    max_chars: int = COMPACT_INPUT_LIMIT,
+) -> tuple[
+    list[tuple[list[dict], dict[int, int]]],
+    list[list[dict]],
+    dict[int, int],
+]:
+    """Return bounded batches, original units, and piece counts by unit."""
+    original_units = [
+        unit for unit in _history_units(history)
+        if not _is_prior_checkpoint(unit)
+    ]
+    pieces: list[tuple[int, list[dict]]] = []
+    piece_counts: dict[int, int] = {}
+    for unit_index, unit in enumerate(original_units):
+        split = _split_oversized_unit(unit, max_chars=max_chars)
+        if split is None:
+            piece_counts[unit_index] = 0
+            continue
+        piece_counts[unit_index] = len(split)
+        pieces.extend((unit_index, item) for item in split)
+    batches: list[tuple[list[dict], dict[int, int]]] = []
+    current_messages: list[dict] = []
+    current_units: dict[int, int] = {}
+    current_size = 0
+    for unit_index, piece in pieces:
+        piece_size = estimate_size(piece)
+        if current_messages and current_size + piece_size > max_chars:
+            batches.append((current_messages, current_units))
+            current_messages = []
+            current_units = {}
+            current_size = 0
+        current_messages.extend(piece)
+        current_units[unit_index] = current_units.get(unit_index, 0) + 1
+        current_size += piece_size
+    if current_messages:
+        batches.append((current_messages, current_units))
+    return batches, original_units, piece_counts
+
+
 def _compact_outgoing_history(
     history: list,
     *,
     allow_model_summary: bool,
     runtime: AgentRuntime | None,
 ) -> tuple[dict, list]:
-    task_text = str(
-        runtime.state.root_task if runtime is not None
-        else CURRENT_ROOT_TASK or ""
+    batches, units, piece_counts = _extraction_batches(
+        history,
+        max_chars=COMPACT_HISTORY_CHUNK_LIMIT,
     )
-    selected, retained = _select_summary_history(
-        history, task_text=task_text,
-    )
+    succeeded = {index: 0 for index in range(len(units))}
+    payload = _deterministic_history_summary([], runtime)
+    processed_batches = 0
     if allow_model_summary:
-        raw_payload = (
-            summarize_history(selected, runtime)
-            if runtime is not None else summarize_history(selected)
+        for batch, unit_piece_counts in batches:
+            if processed_batches >= MAX_COMPACT_PASSES:
+                break
+            model_client = (
+                runtime.services.model_client if runtime is not None else client
+            )
+            allowed, _ = can_spend_optional_calls(model_client, 1)
+            if not allowed:
+                break
+            raw_payload = (
+                summarize_history(batch, runtime)
+                if runtime is not None else summarize_history(batch)
+            )
+            current_payload = _coerce_compact_payload(
+                raw_payload, batch, runtime,
+            )
+            payload = current_payload
+            processed_batches += 1
+            expected_tool_ids = {
+                str(block.get("tool_use_id", ""))
+                for _, _, block in collect_tool_results(batch)
+                if str(block.get("tool_use_id", ""))
+            }
+            acknowledged_tool_ids = set(
+                current_payload["semantic_memory_delta"].get(
+                    "processed_tool_use_ids", ()
+                )
+            )
+            acknowledged = expected_tool_ids <= acknowledged_tool_ids
+            if (
+                current_payload.get("_transfer_complete") is True
+                and acknowledged
+            ):
+                _merge_semantic_payload(current_payload, batch, runtime)
+                for unit_index, count in unit_piece_counts.items():
+                    succeeded[unit_index] += count
+            elif expected_tool_ids and not acknowledged:
+                current_payload["_transfer_complete"] = False
+                current_payload["_transfer_failure"] = (
+                    "compact output did not acknowledge every tool result in "
+                    "the extraction batch"
+                )
+    retained_units = [
+        unit for index, unit in enumerate(units)
+        if piece_counts.get(index, 0) == 0
+        or succeeded.get(index, 0) < piece_counts[index]
+    ]
+    if retained_units:
+        payload = dict(payload)
+        payload["_transfer_complete"] = False
+        payload["_transfer_failure"] = (
+            f"{len(retained_units)} complete history unit(s) could not be "
+            "semantically transferred within the compact call budget"
         )
-    else:
-        raw_payload = _deterministic_history_summary(selected, runtime)
-    payload = _coerce_compact_payload(raw_payload, selected, runtime)
-    _merge_semantic_payload(payload, selected, runtime)
-    return payload, retained
+    return (
+        payload,
+        [message for unit in retained_units for message in unit],
+    )
 
 
 def _history_and_recent_tail(messages: list, keep_tail: int):
@@ -838,9 +991,91 @@ def _history_and_recent_tail(messages: list, keep_tail: int):
     return history, tail
 
 
+def _compact_with_postcondition(
+    messages: list,
+    *,
+    allow_model_summary: bool,
+    runtime: AgentRuntime | None,
+    reactive: bool,
+    target_context_budget: int | None,
+    request_size_fn,
+    system: str,
+    tools: list | None,
+) -> list:
+    target = (
+        max(1000, int(target_context_budget))
+        if target_context_budget is not None
+        else max(1000, CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS)
+    )
+    sizer = request_size_fn or (
+        lambda candidate: estimate_context_size(
+            candidate, system=system, tools=tools,
+        )
+    )
+    current = list(messages)
+    previous_size = sizer(current)
+    last_failure = ""
+    for iteration in range(3):
+        keep_tail = COMPACT_KEEP_TAIL_MESSAGES if iteration == 0 else 0
+        history, tail = _history_and_recent_tail(current, keep_tail)
+        payload, retained = _compact_outgoing_history(
+            history,
+            allow_model_summary=allow_model_summary,
+            runtime=runtime,
+        )
+        candidate = [
+            *retained,
+            _checkpoint_message(payload, reactive=reactive),
+            *tail,
+        ]
+        request_size = sizer(candidate)
+        record_event(
+            "compact_postcondition",
+            kind="reactive" if reactive else "automatic",
+            iteration=iteration + 1,
+            target_context_budget=target,
+            assembled_request_size=request_size,
+            retained_messages=len(retained),
+            transfer_complete=payload.get("_transfer_complete") is True,
+        )
+        current = candidate
+        if request_size <= target:
+            return candidate
+        if retained:
+            last_failure = str(payload.get(
+                "_transfer_failure",
+                "semantic extraction did not cover retained history",
+            ))
+            break
+        if request_size >= previous_size and iteration > 0:
+            last_failure = (
+                "compaction made no progress; fixed system/tool/dynamic "
+                "context or the bounded checkpoint exceeds the target"
+            )
+            break
+        previous_size = request_size
+    if not last_failure:
+        last_failure = "maximum compact iterations reached"
+    record_event(
+        "compact_postcondition_failed",
+        kind="reactive" if reactive else "automatic",
+        target_context_budget=target,
+        assembled_request_size=sizer(current),
+        reason=last_failure,
+    )
+    raise ContextCompactionError(
+        "Context compact could not satisfy target budget "
+        f"{target}: {last_failure}"
+    )
+
+
 def compact_history(
     messages: list, *, allow_model_summary: bool | None = None,
     reason: str = "", runtime: AgentRuntime | None = None,
+    target_context_budget: int | None = None,
+    request_size_fn=None,
+    system: str = "",
+    tools: list | None = None,
 ) -> list:
     transcript = write_transcript(messages, runtime)
     model_client = (
@@ -856,13 +1091,6 @@ def compact_history(
     _record_compact_event(
         "automatic", transcript, messages, summary_mode=summary_mode)
     print(f"  \033[36m[compact] transcript saved: {transcript}\033[0m")
-    history, tail = _history_and_recent_tail(
-        messages, COMPACT_KEEP_TAIL_MESSAGES)
-    payload, retained = _compact_outgoing_history(
-        history,
-        allow_model_summary=bool(allow_model_summary),
-        runtime=runtime,
-    )
     if not allow_model_summary:
         record_event(
             "model_budget_guard", decision="deterministic_compact",
@@ -870,16 +1098,26 @@ def compact_history(
             **{key: value for key, value in budget.items()
                if key != "available"},
         )
-    return [
-        *retained,
-        _checkpoint_message(payload),
-        *tail,
-    ]
+    return _compact_with_postcondition(
+        messages,
+        allow_model_summary=bool(allow_model_summary),
+        runtime=runtime,
+        reactive=False,
+        target_context_budget=target_context_budget,
+        request_size_fn=request_size_fn,
+        system=system,
+        tools=tools,
+    )
 
 
 def reactive_compact(
     messages: list,
     runtime: AgentRuntime | None = None,
+    *,
+    target_context_budget: int | None = None,
+    request_size_fn=None,
+    system: str = "",
+    tools: list | None = None,
 ) -> list:
     transcript = write_transcript(messages, runtime)
     model_client = (
@@ -890,40 +1128,23 @@ def reactive_compact(
     _record_compact_event(
         "reactive", transcript, messages, summary_mode=summary_mode)
     print(f"  \033[31m[reactive compact] transcript saved: {transcript}\033[0m")
-    history, tail = _history_and_recent_tail(
-        messages, COMPACT_KEEP_TAIL_MESSAGES)
-    if allow_model_summary:
-        try:
-            payload, retained = _compact_outgoing_history(
-                history,
-                allow_model_summary=True,
-                runtime=runtime,
-            )
-        except Exception:
-            payload = _fallback_semantic_payload(history, runtime)
-            payload["conversation_checkpoint"]["summary"] = (
-                "Earlier conversation was compacted after a prompt-too-long "
-                "error using deterministic fallback."
-            )
-            _merge_semantic_payload(payload, history, runtime)
-            retained = []
-    else:
-        payload, retained = _compact_outgoing_history(
-            history,
-            allow_model_summary=False,
-            runtime=runtime,
-        )
+    if not allow_model_summary:
         record_event(
             "model_budget_guard", decision="deterministic_reactive_compact",
             reason="finalization_reserve",
             **{key: value for key, value in budget.items()
                if key != "available"},
         )
-    return [
-        *retained,
-        _checkpoint_message(payload, reactive=True),
-        *tail,
-    ]
+    return _compact_with_postcondition(
+        messages,
+        allow_model_summary=bool(allow_model_summary),
+        runtime=runtime,
+        reactive=True,
+        target_context_budget=target_context_budget,
+        request_size_fn=request_size_fn,
+        system=system,
+        tools=tools,
+    )
 
 
 

@@ -158,14 +158,11 @@ def _acceptance_review_message(
         f"{read_budget} read_file calls. Rely on prior context and existing test "
         "notifications. Compare every task-relevant explicit requirement with "
         "the changed code and tests. Treat the current checklist as potentially "
-        "incomplete: look for omitted error paths, words such as any/different/"
-        "unchanged, and every field named in normalized data. For a derived "
-        "value such as a fingerprint, normalized key, hash, or serialized "
-        "payload, inspect its producer function and enumerate every contract "
-        "field; checking only the caller or comparison site is not evidence. "
-        "For any/all requirements, inspect every named exception or state "
-        "branch. Public tests alone do not prove requirements they do not "
-        "cover. Add any missing "
+        "incomplete. Systematically inspect explicit requirements, the producer "
+        "chain for derived values, relevant state branches, exceptional paths, "
+        "and required-field completeness. Checking only a caller or comparison "
+        "site is not evidence for behavior produced elsewhere. Public tests "
+        "alone do not prove requirements they do not cover. Add any missing "
         "kind=acceptance items, fix uncovered gaps, and call todo_write again "
         "after this audit with concise evidence before producing final.\n"
         "Changed files to review:\n"
@@ -406,6 +403,28 @@ def _run_context_stage(stage: str, messages: list, func) -> list:
     return next_messages
 
 
+def _request_sizer(
+    base_context: dict,
+    tools: list,
+    runtime: AgentRuntime | None,
+):
+    def size(candidate: list) -> int:
+        refreshed = (
+            update_context(base_context, candidate, runtime)
+            if runtime is not None else update_context(base_context, candidate)
+        )
+        assembled = (
+            assemble_system_prompt(refreshed, runtime)
+            if runtime is not None else assemble_system_prompt(refreshed)
+        )
+        return estimate_context_size(
+            candidate,
+            system=assembled,
+            tools=tools,
+        )
+    return size
+
+
 def prepare_context(
     messages: list,
     runtime: AgentRuntime | None = None,
@@ -451,9 +470,23 @@ def prepare_context(
         tool_schema_size=estimate_size(budget_tools),
     )
     if before["estimated_size"] > CONTEXT_LIMIT:
+        sizer = _request_sizer(budget_context, budget_tools, runtime)
         messages[:] = (
-            compact_history(messages, runtime=runtime)
-            if runtime is not None else compact_history(messages)
+            compact_history(
+                messages,
+                runtime=runtime,
+                target_context_budget=(
+                    CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
+                ),
+                request_size_fn=sizer,
+            )
+            if runtime is not None else compact_history(
+                messages,
+                target_context_budget=(
+                    CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
+                ),
+                request_size_fn=sizer,
+            )
         )
         refreshed_context = (
             update_context(budget_context, messages, runtime)
@@ -778,6 +811,7 @@ def agent_loop(
     if runtime is not None:
         runtime.state.knowledge.clear()
         runtime.state.semantic_memory.clear(runtime.state.root_task)
+        runtime.state.read_observations.clear()
     acceptance_required = requires_acceptance_todos(messages)
     todo_required = requires_initial_todo(messages) or acceptance_required
     todo_started = False
@@ -946,9 +980,23 @@ def agent_loop(
                 raise
             record_error(e)
             if is_prompt_too_long_error(e) and not state.has_attempted_reactive_compact:
+                reactive_sizer = _request_sizer(context, tools, runtime)
                 messages[:] = (
-                    reactive_compact(messages, runtime)
-                    if runtime is not None else reactive_compact(messages)
+                    reactive_compact(
+                        messages,
+                        runtime,
+                        target_context_budget=(
+                            CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
+                        ),
+                        request_size_fn=reactive_sizer,
+                    )
+                    if runtime is not None else reactive_compact(
+                        messages,
+                        target_context_budget=(
+                            CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
+                        ),
+                        request_size_fn=reactive_sizer,
+                    )
                 )
                 state.has_attempted_reactive_compact = True
                 continue
@@ -1311,9 +1359,23 @@ def agent_loop(
                     continue
 
             if block.name == "compact":
+                compact_sizer = _request_sizer(context, tools, runtime)
                 messages[:] = (
-                    compact_history(messages, runtime=runtime)
-                    if runtime is not None else compact_history(messages)
+                    compact_history(
+                        messages,
+                        runtime=runtime,
+                        target_context_budget=(
+                            CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
+                        ),
+                        request_size_fn=compact_sizer,
+                    )
+                    if runtime is not None else compact_history(
+                        messages,
+                        target_context_budget=(
+                            CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
+                        ),
+                        request_size_fn=compact_sizer,
+                    )
                 )
                 output = "[Compacted. Continue with summarized context.]"
                 compact_tool_use_preserved = any(
@@ -1386,7 +1448,12 @@ def agent_loop(
                 [dict(todo) for todo in current_todos]
                 if block.name == "todo_write" and acceptance_locked else None
             )
-            output = call_tool_handler(handler, block.input, block.name)
+            output = call_tool_handler(
+                handler,
+                block.input,
+                block.name,
+                tool_use_id=block.id,
+            )
             if (block.name == "todo_write" and todo_snapshot is not None
                     and not str(output).startswith("Error:")):
                 notices, reconciliation_error = _reconcile_locked_acceptance(

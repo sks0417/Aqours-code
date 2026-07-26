@@ -197,7 +197,12 @@ def start_background_task(block, handlers: dict) -> str:
         status = "completed"
         try:
             handler = handlers.get(block.name)
-            result = call_tool_handler(handler, block.input, block.name)
+            result = call_tool_handler(
+                handler,
+                block.input,
+                block.name,
+                tool_use_id=block.id,
+            )
             trigger_hooks("PostToolUse", block, result)
         except BaseException as exc:
             status = "failed"
