@@ -74,17 +74,17 @@ Host prepares a disposable case copy
 -> trusted tests produce the final summary
 ```
 
-The Agent container runs the normal `run_agent_task()` with all 30 built-in
+The Agent container runs the normal `run_agent_task()` with all 31 built-in
 tools, dynamic MCP tools, Skill, Memory, Task, Cron, Background, Subagent,
 Teammate, Protocol, and Worktree support. It receives only `/workspace`,
 per-case `/state`, `/runtime`, and the model forwarding directories. The host
 project, API keys, Docker socket, trusted grader, and grading workspace are not
 mounted. The container is network-disabled, non-root, and resource limited.
 
-The 30 built-ins and every role-specific projection come from one `ToolSpec`
+The 31 built-ins and every role-specific projection come from one `ToolSpec`
 registry. API schemas are the authoritative tool descriptions, so the system
 prompt no longer duplicates them. A regression budget keeps the fixed prompt
-plus 30-tool schema below 12,000 characters without hiding any Lead tool.
+plus 31-tool schema below 12,000 characters without hiding any Lead tool.
 
 Each run also owns deterministic `RunKnowledge`: file digests/versions,
 confirmed Python symbols and contracts, modified paths, recent test results,
@@ -103,8 +103,12 @@ an atomic unit, then summarizes the older prefix. A later Compact folds the old
 checkpoint into one replacement checkpoint rather than stacking summaries.
 There is no JSON semantic state machine or per-file semantic card injection.
 Summary failure or empty output leaves raw history unchanged. Exceptional
-single Tool Results are persisted with a locatable head/tail preview; normal
-results are not trimmed on ordinary turns. Automatic and reactive Compact
+single Tool Results are not globally truncated. Every result that enters the
+outgoing prefix is archived under the current Trace run; the full result reaches
+the summarizer unless the measured summary request requires masking an archived
+copy. Checkpoints receive a programmatic archive locator, and the Lead can
+recover exact output by Tool-use ID through `read_archived_tool_result`.
+Each Compact budgets and makes at most one summary call. Automatic and reactive Compact
 verify the complete assembled request against the target and trace their
 before/after budget. This feature is `Implemented`, not `Validated`, until the
 paid paired Eval criteria below pass.

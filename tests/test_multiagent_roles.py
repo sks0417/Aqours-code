@@ -392,7 +392,7 @@ def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
     lead_tools = [
         {tool["name"] for tool in call["tools"]}
         for call in client.calls
-        if len(call["tools"]) == 30
+        if len(call["tools"]) == 31
     ]
     assert lead_tools and all("delegate_agent" in tools for tools in lead_tools)
     reviewer_calls = [
@@ -594,7 +594,7 @@ def test_pre_final_reviewer_is_skipped_before_consuming_tail_reserve(tmp_path):
 
     assert result["final_answer"] == "ready for final"
     assert len(client.calls) == 2
-    assert all(len(call["tools"]) == 30 for call in client.calls)
+    assert all(len(call["tools"]) == 31 for call in client.calls)
 
 
 def test_last_budget_call_is_forced_to_be_a_tool_free_final(tmp_path):

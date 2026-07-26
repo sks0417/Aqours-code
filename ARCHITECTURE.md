@@ -60,7 +60,8 @@ policy, role access, and runtime-binding metadata.
   `delegated_tool_policy` with both `allowed_tools` and
   `allow_parent_permission_expansion=true`; the environment policy remains an
   absolute upper bound.
-- The Lead projection remains the same 30 built-in tools.
+- The Lead projection has 31 built-in tools, including the narrow
+  `read_archived_tool_result` recovery surface.
 - General, Explorer, Reviewer, Worker, and Teammate projections use the same
   effective-permission function. Synchronous roles and asynchronous Teammates
   therefore cannot obtain Bash or write tools merely because their profile
@@ -81,7 +82,7 @@ handled by `SAFETY_POLICY_VALIDATORS` in the pre-tool Hook, including
 are handled by `BACKGROUND_POLICY_ROUTERS`; an unknown policy cannot be
 registered as if it were active.
 
-The fixed empty-context system prompt plus 30-tool JSON payload is guarded
+The fixed empty-context system prompt plus 31-tool JSON payload is guarded
 below 12,000 characters. Capability-group lazy exposure is deferred; this phase
 does not remove any Lead tool.
 
@@ -93,10 +94,12 @@ history untouched. At 85% of the configured context budget, the lifecycle is:
 
 ```text
 assemble the complete current request
--> persist and preview only individually oversized Tool Results
--> choose a recent raw suffix by token estimate, at complete Tool boundaries
+-> choose prefix + recent raw suffix from the untouched history
+-> archive every Tool Result in the outgoing prefix into the current Trace run
+-> fit one summary request; mask only archived copies when strictly necessary
 -> summarize the older prefix into one Markdown continuation checkpoint
--> assemble checkpoint + unchanged recent tail
+-> append a programmatic archive locator
+-> assemble checkpoint + unchanged complete recent tail
 -> verify the complete next request fits the target
 ```
 
@@ -114,21 +117,35 @@ retained verbatim even when a long tool run pushes it outside the suffix.
 Checkpoint-boundary user messages are safely merged so provider role ordering
 remains valid.
 
-If a summary call fails or returns empty text, the original history is kept. If
-the summary request itself overflows, at most two retries drop one complete
-oldest history unit at a time; the full pre-compact transcript remains on disk.
-If a successful summary still cannot fit, the tail budget is reduced once and
-the expanded older prefix is summarized again. A remaining overflow raises a
-diagnostic `ContextCompactionError`.
+Checkpoint and real user instructions are pinned. Compact never drops old
+units to recover from a summary overflow. Before the model call, the complete
+summary prompt is measured against a conservative input budget. Tool Results
+are normally shown to the summarizer in full. Only if the prompt does not fit
+are the largest Tool Results replaced in the summary-request copy by bounded
+descriptors containing Tool ID/name/input, archive ID/path, size, digest, and
+head/tail preview. The original messages and recent tail are never modified.
+If even that request cannot fit, the original history remains unchanged.
 
-An individual exceptional Tool Result is written to the runtime tool-results
-directory. Live history retains its source Tool ID, full path, character/line
-counts, and bounded head/tail preview. Normal Tool Results are never silently
-trimmed at the beginning of an Agent round.
+One compact attempt reserves and issues at most one summary model call. Model
+failure, empty output, or an over-budget assembled candidate retains the
+original history; there is no retry or second summary call.
+
+Every Tool Result entering the outgoing prefix is archived exactly once under
+the current Trace run's `artifacts/compacted-tool-results` directory, regardless
+of size. `manifest.jsonl` maps Tool-use ID/name/input to the exact UTF-8 file,
+character count, and SHA-256 digest. Checkpoints mechanically include an
+`archive://<run-id>/manifest.jsonl` locator. The Lead-only
+`read_archived_tool_result` tool resolves a Tool-use ID inside that directory
+and cannot accept arbitrary paths. Recent-tail results are archived only when
+a later Compact moves them into the prefix.
+
+Archives inherit Trace retention as one run artifact: the active run and
+pinned runs are protected, while completed unpinned runs are subject to the
+existing age/count/disk cleanup. Cleanup failure remains non-fatal.
 
 Compact trace records reason, before/after messages and token estimates,
 summarized prefix size, raw-tail size, summary length, outcome, and oversized
-result handling. Successful compaction increments a small runtime generation
+archive/masking counts and the exact summary-call count. Successful compaction increments a small runtime generation
 counter used only by the post-compact redundant-read metric.
 
 **Status: Implemented, not Validated.** Local tests cover the lightweight

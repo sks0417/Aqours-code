@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,6 +77,11 @@ def checkpoint_count(messages: list) -> int:
     return render(messages).count(compact.CONTEXT_CHECKPOINT_MARKER)
 
 
+def archive_records(runtime):
+    _, root = compact._archive_location(runtime, create=False)
+    return compact._read_manifest(root / "manifest.jsonl")
+
+
 def assert_tool_pairs(messages: list) -> None:
     for index, message in enumerate(messages):
         if not compact.is_tool_result_message(message):
@@ -101,7 +107,7 @@ def force_compact(messages, **kwargs):
     return compact.compact_history(
         messages,
         reason="manual",
-        target_context_budget=kwargs.pop("target_context_budget", 5_000),
+        target_context_budget=kwargs.pop("target_context_budget", 12_000),
         request_size_fn=kwargs.pop("request_size_fn", compact.estimate_size),
         **kwargs,
     )
@@ -171,20 +177,20 @@ def test_prior_checkpoint_is_folded_into_next_without_stacking(monkeypatch):
             or "second cumulative checkpoint"
         ),
     )
-    second = force_compact(first, target_context_budget=2_200)
+    second = force_compact(first, target_context_budget=10_000)
 
     assert compact.CONTEXT_CHECKPOINT_MARKER in render(calls[0])
     assert checkpoint_count(second) == 1
     assert "second cumulative checkpoint" in render(second)
 
 
-def test_recent_tail_is_preserved_verbatim(monkeypatch):
+def test_recent_tail_tool_result_remains_verbatim(monkeypatch):
     install_summary(monkeypatch)
     messages = long_history(9, width=400)
     recent = exchange(50, "precise recent output")
     messages.extend(recent)
 
-    result = force_compact(messages, target_context_budget=5_000)
+    result = force_compact(messages, target_context_budget=12_000)
 
     assert result[-2:] == recent
     assert_tool_pairs(result)
@@ -196,7 +202,7 @@ def test_latest_user_request_is_preserved_even_outside_suffix(monkeypatch):
     for index in range(12):
         messages.extend(exchange(index, "z" * 500))
 
-    result = force_compact(messages, target_context_budget=4_000)
+    result = force_compact(messages, target_context_budget=10_000)
 
     assert "LATEST USER REQUIREMENT" in render(result)
     assert checkpoint_count(result) == 1
@@ -205,7 +211,7 @@ def test_latest_user_request_is_preserved_even_outside_suffix(monkeypatch):
 def test_cut_point_never_splits_tool_exchange(monkeypatch):
     install_summary(monkeypatch)
 
-    result = force_compact(long_history(14, width=300), target_context_budget=3_500)
+    result = force_compact(long_history(14, width=300), target_context_budget=10_000)
 
     assert_tool_pairs(result)
 
@@ -231,7 +237,7 @@ def test_multiple_tool_calls_near_cut_remain_paired(monkeypatch):
     messages = long_history(8, width=300)
     messages.extend((multi_use, multi_result))
 
-    result = force_compact(messages, target_context_budget=4_000)
+    result = force_compact(messages, target_context_budget=10_000)
 
     assert_tool_pairs(result)
     if multi_result in result:
@@ -264,57 +270,282 @@ def test_empty_summary_keeps_original_history(monkeypatch):
     assert checkpoint_count(result) == 0
 
 
-def test_summary_overflow_drops_only_one_complete_old_unit(monkeypatch):
+def test_second_compaction_overflow_never_drops_prior_checkpoint(monkeypatch):
     attempts = []
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                f"{compact.CONTEXT_CHECKPOINT_MARKER}\n"
+                "CRITICAL PRIOR CHECKPOINT"
+            ),
+        },
+        *long_history(12, width=400),
+    ]
+    original = json.loads(json.dumps(messages))
 
     def summarize(messages, runtime=None):
         attempts.append(json.loads(json.dumps(messages)))
-        if len(attempts) == 1:
-            raise RuntimeError("context_length_exceeded")
-        return "overflow recovery succeeded"
+        raise RuntimeError("context_length_exceeded")
 
     monkeypatch.setattr(compact, "summarize_history", summarize)
 
-    result = force_compact(long_history(12), target_context_budget=4_000)
+    result = force_compact(messages, target_context_budget=12_000)
 
-    assert len(attempts) == 2
-    assert len(compact._history_units(attempts[0])) == (
-        len(compact._history_units(attempts[1])) + 1
+    assert len(attempts) == 1
+    assert "CRITICAL PRIOR CHECKPOINT" in render(attempts[0])
+    assert result is messages
+    assert messages == original
+
+
+def test_compaction_uses_at_most_one_summary_model_call(monkeypatch):
+    budget_requests = []
+    monkeypatch.setattr(
+        compact,
+        "can_spend_optional_calls",
+        lambda _client, calls: (
+            budget_requests.append(calls) or (True, {"available": True})
+        ),
     )
-    assert_tool_pairs(attempts[1])
-    assert "overflow recovery succeeded" in render(result)
+    scenarios = (
+        lambda _messages, runtime=None: (_ for _ in ()).throw(
+            RuntimeError("context_length_exceeded")
+        ),
+        lambda _messages, runtime=None: "s" * 30_000,
+    )
+    for summarize in scenarios:
+        calls = 0
+
+        def counted(messages, runtime=None):
+            nonlocal calls
+            calls += 1
+            return summarize(messages, runtime)
+
+        monkeypatch.setattr(compact, "summarize_history", counted)
+        messages = long_history(15, width=400)
+        original = json.loads(json.dumps(messages))
+        force_compact(messages, target_context_budget=12_000)
+        assert calls <= 1
+        assert messages == original
+
+    # An oversized pinned user instruction fails before the model call.
+    calls = 0
+    monkeypatch.setattr(
+        compact,
+        "summarize_history",
+        lambda *_args, **_kwargs: pytest.fail("unsafe request must not be sent"),
+    )
+    impossible = [
+        {"role": "user", "content": "PINNED-" + "p" * 60_000},
+        *long_history(4),
+    ]
+    force_compact(impossible, target_context_budget=12_000)
+    assert calls == 0
+    assert budget_requests and set(budget_requests) == {1}
 
 
-def test_oversized_tool_result_is_persisted_with_locatable_preview(
+def test_small_prefix_tool_result_is_archived_before_removal(
     tmp_path,
     monkeypatch,
 ):
     runtime = make_runtime(tmp_path)
     install_summary(monkeypatch)
-    monkeypatch.setattr(compact, "PERSIST_THRESHOLD", 100)
-    monkeypatch.setattr(compact, "PERSIST_PREVIEW_CHARS", 40)
-    huge = "HEAD-" + ("q" * 500) + "-TAIL"
-    messages = long_history(5, width=150)
-    messages.extend(exchange(80, huge))
+    exact = "small exact output"
+    messages = [
+        {"role": "user", "content": "archive old results"},
+        *exchange(1, exact),
+        *long_history(12, width=300)[1:],
+    ]
 
-    result = force_compact(
-        messages,
-        runtime=runtime,
-        target_context_budget=4_000,
+    force_compact(messages, runtime=runtime, target_context_budget=12_000)
+
+    record = next(
+        item for item in archive_records(runtime)
+        if item["tool_use_id"] == "tool-1"
+    )
+    assert Path(record["output_path"]).read_text(encoding="utf-8") == exact
+    assert record["character_count"] == len(exact)
+    assert record["sha256"] == hashlib.sha256(
+        exact.encode("utf-8")
+    ).hexdigest()
+
+
+def test_rearchiving_same_tool_result_reuses_manifest_record(tmp_path):
+    runtime = make_runtime(tmp_path)
+    prefix = exchange(7, "same exact output")
+
+    first, _ = compact._archive_prefix_tool_results(prefix, runtime)
+    second, _ = compact._archive_prefix_tool_results(prefix, runtime)
+
+    assert first[0]["output_path"] == second[0]["output_path"]
+    assert len(archive_records(runtime)) == 1
+
+
+def test_large_result_middle_content_is_recoverable(tmp_path, monkeypatch):
+    runtime = make_runtime(tmp_path)
+    install_summary(monkeypatch)
+    marker = "UNIQUE-MIDDLE-RECOVERY-MARKER"
+    huge = "H" * 35_000 + marker + "T" * 35_000
+    messages = [
+        {"role": "user", "content": "preserve exact old output"},
+        *exchange(18, huge),
+        *long_history(12, width=300)[1:],
+    ]
+
+    result = force_compact(messages, runtime=runtime)
+
+    record = next(
+        item for item in archive_records(runtime)
+        if item["tool_use_id"] == "tool-18"
+    )
+    assert marker in Path(record["output_path"]).read_text(encoding="utf-8")
+    assert record["archive_id"] in render(result) or "archive://" in render(result)
+
+
+def test_full_result_reaches_summary_when_request_fits(tmp_path, monkeypatch):
+    runtime = make_runtime(tmp_path)
+    marker = "FULL-RESULT-MIDDLE-MARKER"
+    output = "a" * 16_000 + marker + "b" * 16_000
+    seen = []
+    monkeypatch.setattr(
+        compact,
+        "summarize_history",
+        lambda messages, runtime=None: (
+            seen.append(render(messages)) or "summary"
+        ),
+    )
+    messages = [
+        {"role": "user", "content": "summarize full result"},
+        *exchange(20, output),
+        *long_history(10, width=250)[1:],
+    ]
+
+    force_compact(messages, runtime=runtime, target_context_budget=12_000)
+
+    assert len(seen) == 1
+    assert marker in seen[0]
+    assert "<archived-tool-result>" not in seen[0]
+
+
+def test_only_summary_input_is_masked_when_budget_requires_it(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = make_runtime(tmp_path)
+    marker = "MASKED-MIDDLE-IS-STILL-ON-DISK"
+    huge = "a" * 35_000 + marker + "b" * 35_000
+    messages = [
+        {"role": "user", "content": "compact safely"},
+        *exchange(30, huge),
+        *long_history(10, width=250)[1:],
+        *exchange(99, "RECENT VERBATIM RESULT"),
+    ]
+    original = json.loads(json.dumps(messages))
+    seen = []
+    monkeypatch.setattr(
+        compact,
+        "summarize_history",
+        lambda summary_input, runtime=None: (
+            seen.append(render(summary_input)) or "masked summary"
+        ),
     )
 
-    output_path = runtime.paths.tool_results_dir / "tool-80.txt"
-    assert output_path.read_text(encoding="utf-8") == huge
+    result = force_compact(messages, runtime=runtime)
+
+    assert "<archived-tool-result>" in seen[0]
+    assert "tool_name: read_file" in seen[0]
+    assert "tool_input:" in seen[0]
+    assert "src/30.py" in seen[0]
+    assert "sha256:" in seen[0]
+    assert marker not in seen[0]
+    assert messages == original
+    assert "RECENT VERBATIM RESULT" in render(result[-2:])
+    record = next(
+        item for item in archive_records(runtime)
+        if item["tool_use_id"] == "tool-30"
+    )
+    assert marker in Path(record["output_path"]).read_text(encoding="utf-8")
+
+
+def test_checkpoint_contains_programmatic_archive_locator(tmp_path, monkeypatch):
+    runtime = make_runtime(tmp_path)
+    install_summary(monkeypatch, "summary without any path")
+    messages = long_history(12, width=300)
+
+    result = force_compact(messages, runtime=runtime)
+
     text = render(result)
-    retained_result = next(
-        str(block["content"])
-        for _, _, block in compact.collect_tool_results(result)
-        if block["tool_use_id"] == "tool-80"
+    assert "## Archived tool results" in text
+    assert "archive://" in text
+    assert "read_archived_tool_result" in text
+
+
+def test_archived_result_is_readable_by_agent_and_cannot_escape(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = make_runtime(tmp_path)
+    install_summary(monkeypatch)
+    exact = "line one\nline two\nline three\n"
+    messages = [
+        {"role": "user", "content": "archive"},
+        *exchange(44, exact),
+        *long_history(10, width=300)[1:],
+    ]
+    force_compact(messages, runtime=runtime)
+
+    from codepilot_s20.tool_defs import builtin_handlers
+    archive_reader = builtin_handlers(runtime)["read_archived_tool_result"]
+
+    assert archive_reader(tool_use_id="tool-44") == exact
+    assert compact.read_archived_tool_result(
+        "tool-44", offset=1, limit=1, runtime=runtime
+    ) == "line two"
+
+    _, root = compact._archive_location(runtime, create=False)
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("SECRET", encoding="utf-8")
+    with (root / "manifest.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({
+            "tool_use_id": "escape",
+            "output_path": str(outside),
+        }) + "\n")
+    escaped = compact.read_archived_tool_result("escape", runtime=runtime)
+    assert escaped == "Error: invalid archived tool result path"
+    assert "SECRET" not in escaped
+
+
+def test_active_run_archives_are_not_cleaned(tmp_path, monkeypatch):
+    from codepilot_s20 import trace
+
+    run = trace.start_run(
+        "active archive",
+        workdir=tmp_path,
+        model_provider="test",
+        model="test",
     )
-    assert str(output_path) in retained_result
-    assert "Character count: 510" in text
-    assert "Source tool result: tool-80" in text
-    assert huge not in text
+    runtime = make_runtime(tmp_path)
+    runtime.services.trace_recorder = run
+    install_summary(monkeypatch)
+    force_compact(
+        [
+            {"role": "user", "content": "archive during active run"},
+            *exchange(55, "ACTIVE RUN EXACT RESULT"),
+            *long_history(10, width=300)[1:],
+        ],
+        runtime=runtime,
+    )
+    _, archive_root = compact._archive_location(runtime, create=False)
+    assert archive_root.exists()
+
+    monkeypatch.setattr(trace, "TRACE_CLEANUP_ENABLED", True)
+    monkeypatch.setattr(trace, "TRACE_RETENTION_MAX_DAYS", 0)
+    monkeypatch.setattr(trace, "TRACE_RETENTION_MAX_RUNS", 0)
+    monkeypatch.setattr(trace, "TRACE_RETENTION_MAX_MB", 0)
+    trace.cleanup_old_runs(workdir=tmp_path, current_run_id=run.run_id)
+
+    assert archive_root.exists()
+    assert (archive_root / "manifest.jsonl").exists()
 
 
 def test_normal_tool_results_are_not_silently_removed_on_ordinary_turn(
@@ -342,22 +573,22 @@ def test_compacted_request_satisfies_assembled_target(monkeypatch):
 
     result = force_compact(
         long_history(15, width=300),
-        target_context_budget=4_500,
+        target_context_budget=12_000,
         request_size_fn=assembled_size,
     )
 
-    assert assembled_size(result) <= 4_500
+    assert assembled_size(result) <= 12_000
 
 
 def test_reactive_compact_forces_compaction_below_automatic_trigger(
     monkeypatch,
 ):
     calls = install_summary(monkeypatch, "reactive checkpoint")
-    messages = long_history(4, width=100)
+    messages = long_history(8, width=200)
 
     result = compact.reactive_compact(
         messages,
-        target_context_budget=2_000,
+        target_context_budget=10_000,
         request_size_fn=compact.estimate_size,
     )
 
@@ -420,10 +651,10 @@ def test_two_consecutive_compactions_keep_one_checkpoint(monkeypatch):
         "type": "text",
         "text": "Keep the latest list-form request exact.",
     }]
-    first = force_compact(messages, target_context_budget=4_000)
+    first = force_compact(messages, target_context_budget=10_000)
     first.extend(long_history(5, width=250)[1:])
 
-    second = force_compact(first, target_context_budget=3_500)
+    second = force_compact(first, target_context_budget=9_000)
 
     assert checkpoint_count(second) == 1
     assert "checkpoint two" in render(second)

@@ -155,7 +155,8 @@ TRUSTED_DIRS = {"workspace", "grader_tests", "agent_state"}
 DOCKER_EVAL_TOOL_POLICY = {
     "name": "docker_eval_full_harness",
     "allowed_tools": [
-        "bash", "read_file", "write_file", "edit_file", "glob", "todo_write",
+        "bash", "read_file", "read_archived_tool_result",
+        "write_file", "edit_file", "glob", "todo_write",
         "task", "delegate_agent", "load_skill", "compact", "create_task", "list_tasks",
         "get_task", "claim_task", "complete_task", "schedule_cron",
         "schedule_once", "list_crons", "cancel_cron", "spawn_teammate",

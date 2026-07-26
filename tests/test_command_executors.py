@@ -553,7 +553,7 @@ def test_docker_eval_integration_smoke(tmp_path):
         event for event in run_eval.read_trace_events(Path(tests_result["trace"]))
         if event.get("type") == "tool_policy"
     ]
-    assert len(policy_events[-1]["allowed_tools"]) == 30
+    assert len(policy_events[-1]["allowed_tools"]) == 31
     assert policy_events[-1]["disabled_tools"] == []
 
     smoke_case = tmp_path / "_docker_bash_write_smoke"

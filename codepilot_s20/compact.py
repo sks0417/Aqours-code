@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import threading
 import time
+import uuid
 from copy import deepcopy
 from pathlib import Path
 
@@ -20,8 +23,11 @@ RECENT_TAIL_MAX_TOKENS = 8_000
 RECENT_TAIL_RATIO = 0.15
 COMPACT_OUTPUT_RESERVE_CHARS = 6_000
 SUMMARY_MAX_TOKENS = 2_000
-SUMMARY_OVERFLOW_RETRIES = 2
-POST_COMPACT_REASSEMBLY_LIMIT = 1
+SUMMARY_OUTPUT_RESERVE_CHARS = SUMMARY_MAX_TOKENS * 3
+ARCHIVE_PREVIEW_CHARS = 2_000
+ARCHIVE_URI_PREFIX = "archive://"
+_ARCHIVE_LOCK = threading.RLock()
+_LEGACY_ARCHIVE_RUN_ID = "standalone-" + uuid.uuid4().hex[:12]
 
 COMPACTION_PROMPT = """\
 You are creating a context checkpoint for another coding-agent model
@@ -44,6 +50,10 @@ Preserve:
 
 For tool results, preserve what was learned from them. Do not merely state
 that a command was executed or that a file was read.
+If a tool result is represented by an archived-result descriptor, its exact
+content remains recoverable through that descriptor. Preserve the tool_use_id
+when an exact detail may matter later. Do not copy an archive manifest into
+the checkpoint.
 
 Use exact file paths, symbol names, commands, errors, URLs and identifiers
 when they matter. Give more detail to recent and currently relevant work.
@@ -287,72 +297,229 @@ def _safe_result_filename(tool_use_id: str) -> str:
     return (safe[:120] or "unknown") + ".txt"
 
 
-def persist_large_output(
-    tool_use_id: str,
-    output: str,
+def _collect_tool_uses(messages: list) -> dict[str, dict]:
+    uses = {}
+    for message in messages:
+        if not message_has_tool_use(message):
+            continue
+        for block in message["content"]:
+            if block_type(block) != "tool_use":
+                continue
+            tool_use_id = str(_block_field(block, "id", ""))
+            if not tool_use_id:
+                continue
+            tool_input = _block_field(block, "input", {})
+            uses[tool_use_id] = {
+                "tool_name": str(_block_field(block, "name", "")),
+                "tool_input": (
+                    deepcopy(tool_input)
+                    if isinstance(tool_input, dict)
+                    else {}
+                ),
+            }
+    return uses
+
+
+def _archive_location(
+    runtime: AgentRuntime | None,
     *,
-    force: bool = False,
-    preview_chars: int | None = None,
-    runtime: AgentRuntime | None = None,
-) -> str:
-    """Persist one exceptional result and return a locatable head/tail preview."""
-    if not force and len(output) <= PERSIST_THRESHOLD:
-        return output
-    results_dir = (
-        runtime.paths.tool_results_dir
+    create: bool,
+) -> tuple[str, Path]:
+    recorder = (
+        runtime.services.trace_recorder
         if runtime is not None
-        else TOOL_RESULTS_DIR
+        else None
     )
-    results_dir.mkdir(parents=True, exist_ok=True)
-    path = results_dir / _safe_result_filename(tool_use_id)
-    path.write_text(output, encoding="utf-8")
-    lines = output.splitlines()
-    preview_chars = (
-        PERSIST_PREVIEW_CHARS
-        if preview_chars is None
-        else max(0, int(preview_chars))
-    )
+    if recorder is None:
+        getter = globals().get("get_current_run")
+        recorder = getter() if callable(getter) else None
+    if recorder is not None and getattr(recorder, "run_dir", None):
+        run_id = str(recorder.run_id)
+        root = Path(recorder.run_dir) / "artifacts" / "compacted-tool-results"
+    elif runtime is not None:
+        run_id = str(runtime.state.metadata.setdefault(
+            "archive_run_id",
+            "runtime-" + uuid.uuid4().hex[:12],
+        ))
+        root = (
+            runtime.paths.state_root
+            / ".codepilot"
+            / "runs"
+            / run_id
+            / "artifacts"
+            / "compacted-tool-results"
+        )
+    else:
+        run_id = _LEGACY_ARCHIVE_RUN_ID
+        root = (
+            Path(WORKDIR)
+            / ".codepilot"
+            / "runs"
+            / run_id
+            / "artifacts"
+            / "compacted-tool-results"
+        )
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+    return run_id, root
+
+
+def _read_manifest(manifest_path: Path) -> list[dict]:
+    records = []
+    try:
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            value = json.loads(line)
+            if isinstance(value, dict):
+                records.append(value)
+    except (OSError, json.JSONDecodeError):
+        return records
+    return records
+
+
+def _archive_prefix_tool_results(
+    prefix: list,
+    runtime: AgentRuntime | None,
+) -> tuple[list[dict], str]:
+    """Archive every exact Tool Result that is about to leave live context."""
+    results = collect_tool_results(prefix)
+    if not results:
+        return [], ""
+    run_id, archive_root = _archive_location(runtime, create=True)
+    manifest_path = archive_root / "manifest.jsonl"
+    tool_uses = _collect_tool_uses(prefix)
+    archived = []
+    with _ARCHIVE_LOCK:
+        existing = _read_manifest(manifest_path)
+        by_key = {
+            (str(item.get("tool_use_id", "")), str(item.get("sha256", ""))): item
+            for item in existing
+        }
+        appended = []
+        for _, _, block in results:
+            tool_use_id = str(_block_field(block, "tool_use_id", "unknown"))
+            output = str(_block_field(block, "content", ""))
+            digest = hashlib.sha256(output.encode("utf-8")).hexdigest()
+            existing_record = by_key.get((tool_use_id, digest))
+            if existing_record is not None:
+                output_path = Path(str(existing_record.get("output_path", "")))
+                try:
+                    reusable = (
+                        output_path.resolve().parent == archive_root.resolve()
+                        and output_path.is_file()
+                        and not output_path.is_symlink()
+                        and hashlib.sha256(output_path.read_bytes()).hexdigest()
+                        == digest
+                    )
+                except OSError:
+                    reusable = False
+                if reusable:
+                    archived.append(existing_record)
+                    continue
+
+            filename = _safe_result_filename(tool_use_id)
+            output_path = archive_root / filename
+            if output_path.exists():
+                output_path = archive_root / (
+                    output_path.stem + "-" + digest[:12] + ".txt"
+                )
+            output_path.write_text(output, encoding="utf-8")
+            use = tool_uses.get(tool_use_id, {})
+            record = {
+                "tool_use_id": tool_use_id,
+                "tool_name": str(use.get("tool_name", "")),
+                "tool_input": dict(use.get("tool_input", {})),
+                "output_path": str(output_path),
+                "archive_id": f"{run_id}/{output_path.name}",
+                "character_count": len(output),
+                "sha256": digest,
+            }
+            by_key[(tool_use_id, digest)] = record
+            appended.append(record)
+            archived.append(record)
+        if appended:
+            with manifest_path.open("a", encoding="utf-8") as stream:
+                for record in appended:
+                    stream.write(json.dumps(
+                        record,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ) + "\n")
+    return archived, f"{ARCHIVE_URI_PREFIX}{run_id}/manifest.jsonl"
+
+
+def _archived_descriptor(record: dict, output: str) -> str:
+    preview_chars = min(ARCHIVE_PREVIEW_CHARS, max(0, len(output)))
     head_chars = preview_chars // 2
     tail_chars = preview_chars - head_chars
     head = output[:head_chars]
-    tail = output[-tail_chars:] if tail_chars and len(output) > preview_chars else ""
-    parts = [
-        "<persisted-output>",
-        f"Source tool result: {tool_use_id}",
-        f"Full output: {path}",
-        f"Character count: {len(output)}",
-        f"Line count: {len(lines)}",
-    ]
-    if head:
-        parts.extend(("First output:", head))
-    if tail:
-        parts.extend(("Last output:", tail))
-    parts.append("</persisted-output>")
-    return "\n".join(parts)
+    tail = output[-tail_chars:] if len(output) > preview_chars else ""
+    return "\n".join([
+        "<archived-tool-result>",
+        f"tool_use_id: {record.get('tool_use_id', '')}",
+        f"tool_name: {record.get('tool_name', '')}",
+        "tool_input: " + json.dumps(
+            record.get("tool_input", {}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        f"archive_id: {record.get('archive_id', '')}",
+        f"output_path: {record.get('output_path', '')}",
+        f"character_count: {record.get('character_count', len(output))}",
+        f"sha256: {record.get('sha256', '')}",
+        "First output:",
+        head,
+        "Last output:",
+        tail,
+        "</archived-tool-result>",
+    ])
 
 
-def _bound_oversized_tool_results(
-    messages: list,
-    runtime: AgentRuntime | None,
-) -> tuple[list, int]:
-    bounded = deepcopy(messages)
-    changed = 0
-    for _, _, block in collect_tool_results(bounded):
-        content = str(_block_field(block, "content", ""))
-        if len(content) <= PERSIST_THRESHOLD:
-            continue
-        tool_use_id = str(_block_field(block, "tool_use_id", "unknown"))
-        replacement = persist_large_output(
-            tool_use_id,
-            content,
-            runtime=runtime,
+def read_archived_tool_result(
+    tool_use_id: str,
+    offset: int | None = None,
+    limit: int | None = None,
+    runtime: AgentRuntime | None = None,
+) -> str:
+    """Read one exact result from the current run archive by Tool-use ID."""
+    try:
+        _, archive_root = _archive_location(runtime, create=False)
+        records = _read_manifest(archive_root / "manifest.jsonl")
+        record = next(
+            (
+                item
+                for item in reversed(records)
+                if str(item.get("tool_use_id", "")) == str(tool_use_id)
+            ),
+            None,
         )
-        if isinstance(block, dict):
-            block["content"] = replacement
-        else:
-            setattr(block, "content", replacement)
-        changed += 1
-    return bounded, changed
+        if record is None:
+            return f"Error: archived tool result not found: {tool_use_id}"
+        output_path = Path(str(record.get("output_path", "")))
+        resolved = output_path.resolve()
+        if (
+            resolved.parent != archive_root.resolve()
+            or not resolved.is_file()
+            or resolved.is_symlink()
+        ):
+            return "Error: invalid archived tool result path"
+        output = resolved.read_text(encoding="utf-8")
+        expected_digest = str(record.get("sha256", ""))
+        if (
+            expected_digest
+            and hashlib.sha256(output.encode("utf-8")).hexdigest()
+            != expected_digest
+        ):
+            return "Error: archived tool result digest mismatch"
+        if offset is None and limit is None:
+            return output
+        lines = output.splitlines()
+        start = max(0, int(offset or 0))
+        selected = lines[start:]
+        if limit is not None:
+            selected = selected[:max(0, int(limit))]
+        return "\n".join(selected)
+    except Exception as exc:
+        return f"Error: {type(exc).__name__}: {exc}"
 
 
 def write_transcript(
@@ -428,51 +595,77 @@ def summarize_history(
     ).strip()
 
 
-def _is_context_overflow(exc: BaseException) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return (
-        ("prompt" in text and "long" in text)
-        or "context_length_exceeded" in text
-        or "max_context_window" in text
-        or ("context" in text and "overflow" in text)
-    )
-
-
-def _summarize_with_overflow_retry(
+def _prepare_summary_input(
     prefix: list,
+    archived: list[dict],
+    *,
+    max_prompt_chars: int,
+) -> tuple[list | None, int]:
+    """Fit one summary request by masking archived result copies only."""
+    summary_input = deepcopy(prefix)
+    if len(_compact_prompt(summary_input)) <= max_prompt_chars:
+        return summary_input, 0
+    records = {
+        (str(record.get("tool_use_id", "")), str(record.get("sha256", ""))):
+        record
+        for record in archived
+    }
+    candidates = []
+    for _, _, block in collect_tool_results(summary_input):
+        output = str(_block_field(block, "content", ""))
+        tool_use_id = str(_block_field(block, "tool_use_id", ""))
+        digest = hashlib.sha256(output.encode("utf-8")).hexdigest()
+        record = records.get((tool_use_id, digest))
+        if record is not None:
+            candidates.append((len(output), block, output, record))
+    masked = 0
+    for _, block, output, record in sorted(candidates, reverse=True, key=lambda x: x[0]):
+        descriptor = _archived_descriptor(record, output)
+        if isinstance(block, dict):
+            block["content"] = descriptor
+        else:
+            setattr(block, "content", descriptor)
+        masked += 1
+        if len(_compact_prompt(summary_input)) <= max_prompt_chars:
+            return summary_input, masked
+    return None, masked
+
+
+def _summarize_once(
+    summary_input: list,
     runtime: AgentRuntime | None,
-) -> tuple[str | None, int, str]:
-    units = _history_units(prefix)
-    dropped = 0
-    for attempt in range(SUMMARY_OVERFLOW_RETRIES + 1):
-        current = _flatten(units)
-        if not current:
-            return None, dropped, "summary prefix became empty"
-        try:
-            summary = (
-                summarize_history(current, runtime)
-                if runtime is not None
-                else summarize_history(current)
-            )
-        except Exception as exc:
-            record_event(
-                "compact_summary_error",
-                attempt=attempt + 1,
-                error_type=type(exc).__name__,
-                error=str(exc)[:1000],
-                context_overflow=_is_context_overflow(exc),
-            )
-            if not _is_context_overflow(exc):
-                return None, dropped, f"{type(exc).__name__}: {exc}"
-            if attempt >= SUMMARY_OVERFLOW_RETRIES or len(units) <= 1:
-                return None, dropped, "summary request context overflow"
-            units.pop(0)
-            dropped += 1
-            continue
-        if not str(summary or "").strip():
-            return None, dropped, "summary model returned empty text"
-        return str(summary).strip(), dropped, ""
-    return None, dropped, "summary retry limit reached"
+) -> tuple[str | None, str]:
+    try:
+        summary = (
+            summarize_history(summary_input, runtime)
+            if runtime is not None
+            else summarize_history(summary_input)
+        )
+    except Exception as exc:
+        record_event(
+            "compact_summary_error",
+            attempt=1,
+            error_type=type(exc).__name__,
+            error=str(exc)[:1000],
+        )
+        return None, f"{type(exc).__name__}: {exc}"
+    if not str(summary or "").strip():
+        return None, "summary model returned empty text"
+    return str(summary).strip(), ""
+
+
+def _append_archive_locator(summary: str, manifest_uri: str) -> str:
+    if not manifest_uri:
+        return summary.strip()
+    return (
+        summary.strip()
+        + "\n\n## Archived tool results\n\n"
+        + f"Manifest: `{manifest_uri}`\n\n"
+        + "Exact outputs removed from the live context can be recovered from "
+        + "this manifest by tool_use_id, tool name, or original tool input. "
+        + "Use `read_archived_tool_result` and reuse archived results instead "
+        + "of rerunning unchanged tools."
+    )
 
 
 def _checkpoint_message(summary: str) -> dict:
@@ -541,8 +734,9 @@ def _record_compact(
     summary: str,
     success: bool,
     failure_reason: str = "",
-    oversized_results: int = 0,
-    dropped_prefix_units: int = 0,
+    archived_results: int = 0,
+    masked_summary_results: int = 0,
+    summary_model_calls: int = 0,
 ) -> None:
     try:
         record_event(
@@ -562,9 +756,10 @@ def _record_compact(
             summary_length=len(summary),
             success=success,
             failure_reason=failure_reason,
-            oversized_result_handled=oversized_results > 0,
-            oversized_result_count=oversized_results,
-            dropped_prefix_units=dropped_prefix_units,
+            oversized_result_handled=masked_summary_results > 0,
+            archived_result_count=archived_results,
+            masked_summary_result_count=masked_summary_results,
+            summary_model_calls=summary_model_calls,
         )
     except Exception:
         pass
@@ -611,18 +806,14 @@ def _compact(
         )
         return messages
 
-    model_client = (
-        runtime.services.model_client if runtime is not None else client
-    )
-    if allow_model_summary is None:
-        allow_model_summary, budget = can_spend_optional_calls(model_client, 1)
-    else:
-        budget = {}
-    if not allow_model_summary:
+    model_client = runtime.services.model_client if runtime is not None else client
+    budget_allowed, budget = can_spend_optional_calls(model_client, 1)
+    if allow_model_summary is False or not budget_allowed:
         record_event(
             "model_budget_guard",
             decision="compact_skipped",
             reason="finalization_reserve",
+            estimated_calls=1,
             **{
                 key: value
                 for key, value in budget.items()
@@ -644,130 +835,179 @@ def _compact(
         )
         return messages
 
-    bounded, oversized_count = _bound_oversized_tool_results(messages, runtime)
     fixed_request_size = sizer([])
-    usable_message_chars = max(1_000, target - fixed_request_size)
-    initial_tail_budget = min(
+    usable_message_chars = target - fixed_request_size
+    locator_reserve = 800
+    tail_capacity = (
+        usable_message_chars
+        - SUMMARY_OUTPUT_RESERVE_CHARS
+        - locator_reserve
+    )
+    if tail_capacity < 256:
+        failure = (
+            "fixed request plus summary output reserve leaves no safe recent "
+            "tail budget"
+        )
+        _record_compact(
+            reason=reason,
+            transcript=transcript,
+            before_messages=len(messages),
+            before_size=before_size,
+            after_messages=len(messages),
+            after_size=before_size,
+            summarized_prefix=0,
+            tail=messages,
+            summary="",
+            success=False,
+            failure_reason=failure,
+        )
+        return messages
+    tail_budget = min(
         _recent_tail_budget_chars(target),
-        max(1_000, usable_message_chars - COMPACT_OUTPUT_RESERVE_CHARS),
+        tail_capacity,
     )
-    tail_budget = initial_tail_budget
-    last_candidate: list | None = None
-    last_size = before_size
-
-    for reassembly in range(POST_COMPACT_REASSEMBLY_LIMIT + 1):
-        prefix, tail = _select_prefix_and_recent_tail(
-            bounded,
-            tail_budget_chars=tail_budget,
-        )
-        if not prefix:
-            processed_size = sizer(bounded)
-            if oversized_count and processed_size <= target:
-                _record_compact(
-                    reason=reason,
-                    transcript=transcript,
-                    before_messages=len(messages),
-                    before_size=before_size,
-                    after_messages=len(bounded),
-                    after_size=processed_size,
-                    summarized_prefix=0,
-                    tail=bounded,
-                    summary="",
-                    success=True,
-                    oversized_results=oversized_count,
-                )
-                if runtime is not None:
-                    runtime.state.metadata["compact_generation"] = (
-                        int(runtime.state.metadata.get("compact_generation", 0))
-                        + 1
-                    )
-                return bounded
-            _record_compact(
-                reason=reason,
-                transcript=transcript,
-                before_messages=len(messages),
-                before_size=before_size,
-                after_messages=len(messages),
-                after_size=before_size,
-                summarized_prefix=0,
-                tail=bounded,
-                summary="",
-                success=False,
-                failure_reason="no safe older prefix to summarize",
-                oversized_results=oversized_count,
-            )
-            return messages
-
-        summary, dropped, failure = _summarize_with_overflow_retry(
-            prefix,
-            runtime,
-        )
-        if not summary:
-            _record_compact(
-                reason=reason,
-                transcript=transcript,
-                before_messages=len(messages),
-                before_size=before_size,
-                after_messages=len(messages),
-                after_size=before_size,
-                summarized_prefix=len(prefix),
-                tail=tail,
-                summary="",
-                success=False,
-                failure_reason=failure,
-                oversized_results=oversized_count,
-                dropped_prefix_units=dropped,
-            )
-            return messages
-
-        candidate = _assemble_compacted_history(summary, tail)
-        candidate_size = sizer(candidate)
-        last_candidate = candidate
-        last_size = candidate_size
-        if candidate_size <= target:
-            _record_compact(
-                reason=reason,
-                transcript=transcript,
-                before_messages=len(messages),
-                before_size=before_size,
-                after_messages=len(candidate),
-                after_size=candidate_size,
-                summarized_prefix=len(prefix),
-                tail=tail,
-                summary=summary,
-                success=True,
-                oversized_results=oversized_count,
-                dropped_prefix_units=dropped,
-            )
-            if runtime is not None:
-                runtime.state.metadata["compact_generation"] = (
-                    int(runtime.state.metadata.get("compact_generation", 0)) + 1
-                )
-            return candidate
-
-        # Re-select a smaller suffix and summarize the now-larger prefix once.
-        # This is a bounded postcondition retry, not incremental semantic merge.
-        tail_budget = max(1_000, tail_budget // 2)
-
-    failure = (
-        f"assembled request remains {last_size} chars, above target {target}, "
-        f"after oversized-result handling and one tail reduction"
+    prefix, tail = _select_prefix_and_recent_tail(
+        messages,
+        tail_budget_chars=tail_budget,
     )
+    if not prefix:
+        _record_compact(
+            reason=reason,
+            transcript=transcript,
+            before_messages=len(messages),
+            before_size=before_size,
+            after_messages=len(messages),
+            after_size=before_size,
+            summarized_prefix=0,
+            tail=messages,
+            summary="",
+            success=False,
+            failure_reason="no safe older prefix to summarize",
+        )
+        return messages
+
+    reserved_candidate = _assemble_compacted_history(
+        "x" * (SUMMARY_OUTPUT_RESERVE_CHARS + locator_reserve),
+        tail,
+    )
+    if sizer(reserved_candidate) > target:
+        failure = (
+            "complete recent tail cannot fit with the reserved checkpoint; "
+            "tail Tool Results remain verbatim"
+        )
+        _record_compact(
+            reason=reason,
+            transcript=transcript,
+            before_messages=len(messages),
+            before_size=before_size,
+            after_messages=len(messages),
+            after_size=before_size,
+            summarized_prefix=len(prefix),
+            tail=tail,
+            summary="",
+            success=False,
+            failure_reason=failure,
+        )
+        return messages
+
+    archived, manifest_uri = _archive_prefix_tool_results(prefix, runtime)
+    summary_prompt_budget = max(
+        1_000,
+        CONTEXT_LIMIT - SUMMARY_OUTPUT_RESERVE_CHARS,
+    )
+    summary_input, masked_count = _prepare_summary_input(
+        prefix,
+        archived,
+        max_prompt_chars=summary_prompt_budget,
+    )
+    if summary_input is None:
+        failure = (
+            "safe summary request cannot fit without deleting pinned "
+            "checkpoint or user instructions"
+        )
+        _record_compact(
+            reason=reason,
+            transcript=transcript,
+            before_messages=len(messages),
+            before_size=before_size,
+            after_messages=len(messages),
+            after_size=before_size,
+            summarized_prefix=len(prefix),
+            tail=tail,
+            summary="",
+            success=False,
+            failure_reason=failure,
+            archived_results=len(archived),
+            masked_summary_results=masked_count,
+        )
+        return messages
+
+    summary, failure = _summarize_once(summary_input, runtime)
+    if not summary:
+        _record_compact(
+            reason=reason,
+            transcript=transcript,
+            before_messages=len(messages),
+            before_size=before_size,
+            after_messages=len(messages),
+            after_size=before_size,
+            summarized_prefix=len(prefix),
+            tail=tail,
+            summary="",
+            success=False,
+            failure_reason=failure,
+            archived_results=len(archived),
+            masked_summary_results=masked_count,
+            summary_model_calls=1,
+        )
+        return messages
+
+    checkpoint = _append_archive_locator(summary, manifest_uri)
+    candidate = _assemble_compacted_history(checkpoint, tail)
+    candidate_size = sizer(candidate)
+    if candidate_size > target:
+        failure = (
+            f"assembled request remains {candidate_size} chars above target "
+            f"{target}; a second summary call is forbidden"
+        )
+        _record_compact(
+            reason=reason,
+            transcript=transcript,
+            before_messages=len(messages),
+            before_size=before_size,
+            after_messages=len(messages),
+            after_size=before_size,
+            summarized_prefix=len(prefix),
+            tail=tail,
+            summary=checkpoint,
+            success=False,
+            failure_reason=failure,
+            archived_results=len(archived),
+            masked_summary_results=masked_count,
+            summary_model_calls=1,
+        )
+        return messages
+
     _record_compact(
         reason=reason,
         transcript=transcript,
         before_messages=len(messages),
         before_size=before_size,
-        after_messages=len(last_candidate or messages),
-        after_size=last_size,
-        summarized_prefix=0,
-        tail=[],
-        summary="",
-        success=False,
-        failure_reason=failure,
-        oversized_results=oversized_count,
+        after_messages=len(candidate),
+        after_size=candidate_size,
+        summarized_prefix=len(prefix),
+        tail=tail,
+        summary=checkpoint,
+        success=True,
+        archived_results=len(archived),
+        masked_summary_results=masked_count,
+        summary_model_calls=1,
     )
-    raise ContextCompactionError(failure)
+    if runtime is not None:
+        runtime.state.metadata["compact_generation"] = (
+            int(runtime.state.metadata.get("compact_generation", 0)) + 1
+        )
+    return candidate
 
 
 def compact_history(
