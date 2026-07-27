@@ -26,6 +26,8 @@ class RuntimePaths:
 
     workdir: Path
     state_root: Path
+    context_archive_root: Path
+    context_archive_dir: Path
     skills_dir: Path
     transcript_dir: Path
     tool_results_dir: Path
@@ -42,12 +44,21 @@ class RuntimePaths:
         cls,
         workdir: str | Path,
         state_root: str | Path | None = None,
+        context_archive_root: str | Path | None = None,
     ) -> "RuntimePaths":
         workspace = Path(workdir).resolve()
         root = Path(state_root).resolve() if state_root else workspace
+        archive_root = (
+            Path(context_archive_root).resolve()
+            if context_archive_root else root
+        )
         return cls(
             workdir=workspace,
             state_root=root,
+            context_archive_root=archive_root,
+            context_archive_dir=(
+                archive_root / ".codepilot" / "context-archives"
+            ),
             skills_dir=root / "skills",
             transcript_dir=root / ".transcripts",
             tool_results_dir=root / ".task_outputs" / "tool-results",
@@ -115,6 +126,7 @@ class AgentRuntime:
         root_task: str = "",
         deadline: float | None = None,
         state_root: str | Path | None = None,
+        context_archive_root: str | Path | None = None,
     ) -> "AgentRuntime":
         return cls(
             config=RuntimeConfig(
@@ -126,12 +138,17 @@ class AgentRuntime:
                 approval_mode=approval_mode,
                 background_tasks_enabled=background_tasks_enabled,
             ),
-            paths=RuntimePaths.create(workdir, state_root),
+            paths=RuntimePaths.create(
+                workdir,
+                state_root,
+                context_archive_root,
+            ),
             state=RunState(
                 root_task=root_task,
                 deadline=deadline,
                 metadata={
                     "context_session_id": "session-" + uuid.uuid4().hex,
+                    "context_archive_active": True,
                 },
             ),
             services=RuntimeServices(
@@ -157,6 +174,7 @@ class AgentRuntime:
         return AgentRuntime.create(
             workdir=child_workdir,
             state_root=self.paths.state_root,
+            context_archive_root=self.paths.context_archive_root,
             model_client=self.services.model_client,
             command_executor=self.services.command_executor,
             model_provider=self.config.model_provider,

@@ -28,6 +28,8 @@ SUMMARY_MAX_TOKENS = 2_000
 SUMMARY_OUTPUT_RESERVE_CHARS = SUMMARY_MAX_TOKENS * 3
 ARCHIVE_PREVIEW_CHARS = 2_000
 ARCHIVE_URI_PREFIX = "archive://"
+CONTEXT_ARCHIVE_ACTIVE_TTL_SECONDS = 24 * 60 * 60
+CONTEXT_ARCHIVE_ACTIVE_MARKER = ".active"
 _ARCHIVE_LOCK = threading.RLock()
 _LEGACY_CONTEXT_SESSION_ID = "session-legacy-" + uuid.uuid4().hex
 
@@ -333,17 +335,21 @@ def _archive_location(
     create: bool,
 ) -> tuple[str, Path]:
     session_id = _context_session_id(runtime)
-    state_root = (
-        runtime.paths.state_root
+    archive_base = (
+        runtime.paths.context_archive_root
         if runtime is not None
         else Path(WORKDIR)
     )
-    archive_parent = state_root / ".codepilot" / "context-archives"
+    archive_parent = (
+        runtime.paths.context_archive_dir
+        if runtime is not None
+        else archive_base / ".codepilot" / "context-archives"
+    )
     root = archive_parent / session_id
     if (
         archive_parent.is_symlink()
         or not archive_parent.resolve().is_relative_to(
-            Path(state_root).resolve()
+            Path(archive_base).resolve()
         )
     ):
         raise OSError("context archive root cannot be a symlink")
@@ -352,6 +358,7 @@ def _archive_location(
         if root.exists() and (root.is_symlink() or not root.is_dir()):
             raise OSError("context session archive is not a safe directory")
         root.mkdir(exist_ok=True)
+        _mark_context_archive_active(root, session_id)
         results_dir = root / "results"
         if results_dir.exists() and (
             results_dir.is_symlink() or not results_dir.is_dir()
@@ -362,6 +369,15 @@ def _archive_location(
         if metadata_path.is_symlink():
             raise OSError("context archive metadata cannot be a symlink")
         _touch_archive_metadata(root, session_id)
+    elif (
+        root.is_dir()
+        and runtime is not None
+        and runtime.state.metadata.get("context_archive_active", True)
+    ):
+        try:
+            _mark_context_archive_active(root, session_id)
+        except OSError:
+            pass
     return session_id, root
 
 
@@ -378,6 +394,46 @@ def _atomic_write_bytes(path: Path, raw: bytes) -> None:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _mark_context_archive_active(
+    archive_root: Path,
+    session_id: str,
+) -> None:
+    marker = archive_root / CONTEXT_ARCHIVE_ACTIVE_MARKER
+    if marker.is_symlink() or (marker.exists() and not marker.is_file()):
+        raise OSError("context archive active marker is not a safe file")
+    if marker.exists():
+        os.utime(marker, None)
+        return
+    raw = json.dumps({
+        "context_session_id": session_id,
+        "pid": os.getpid(),
+        "activated_at": time.time(),
+    }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    _atomic_write_bytes(marker, raw)
+
+
+def refresh_context_archive_session(runtime: AgentRuntime) -> None:
+    """Best-effort heartbeat for an active Runtime's existing archive."""
+    if not runtime.state.metadata.get("context_archive_active", True):
+        return
+    try:
+        _archive_location(runtime, create=False)
+    except OSError:
+        return
+
+
+def release_context_archive_session(runtime: AgentRuntime) -> None:
+    """Release one Runtime's active marker without deleting its archive."""
+    runtime.state.metadata["context_archive_active"] = False
+    try:
+        _, root = _archive_location(runtime, create=False)
+        marker = root / CONTEXT_ARCHIVE_ACTIVE_MARKER
+        if marker.is_symlink() or marker.is_file():
+            marker.unlink(missing_ok=True)
+    except OSError:
+        return
 
 
 def _touch_archive_metadata(
@@ -757,21 +813,24 @@ def _archive_updated_at(path: Path) -> float:
 def cleanup_context_archives(
     current_session_id: str,
     *,
-    state_root: str | Path,
+    context_archive_dir: str | Path,
     max_age_days: float | None = None,
     max_sessions: int | None = None,
     max_total_mb: float | None = None,
+    active_ttl_seconds: float | None = None,
 ) -> dict:
     """Best-effort whole-session retention for Context archives."""
     stats = {"deleted": 0, "session_count": 0, "total_bytes": 0}
     try:
-        state_root_path = Path(state_root).resolve()
-        archive_parent = state_root_path / ".codepilot" / "context-archives"
+        archive_parent = Path(context_archive_dir)
         if not archive_parent.is_dir():
             return stats
+        archive_base = archive_parent.parent.parent
         if (
             archive_parent.is_symlink()
-            or not archive_parent.resolve().is_relative_to(state_root_path)
+            or not archive_parent.resolve().is_relative_to(
+                archive_base.resolve()
+            )
         ):
             return stats
         age_days = (
@@ -787,6 +846,24 @@ def cleanup_context_archives(
             TRACE_RETENTION_MAX_MB
             if max_total_mb is None else float(max_total_mb),
         ) * 1024 * 1024)
+        active_ttl = max(
+            0.0,
+            CONTEXT_ARCHIVE_ACTIVE_TTL_SECONDS
+            if active_ttl_seconds is None else float(active_ttl_seconds),
+        )
+        now = time.time()
+
+        def active_marker_is_fresh(path: Path) -> bool:
+            marker = path / CONTEXT_ARCHIVE_ACTIVE_MARKER
+            try:
+                if marker.is_symlink() or not marker.is_file():
+                    return False
+                if now - marker.stat().st_mtime <= active_ttl:
+                    return True
+                marker.unlink(missing_ok=True)
+            except OSError:
+                return False
+            return False
 
         def scan():
             sessions = []
@@ -798,14 +875,17 @@ def cleanup_context_archives(
                         or path.parent.resolve() != archive_parent.resolve()
                     ):
                         continue
+                    active = active_marker_is_fresh(path)
                     sessions.append({
                         "id": path.name,
                         "path": path,
                         "updated_at": _archive_updated_at(path),
                         "size": _archive_dir_size(path),
+                        "active": active,
                         "protected": (
                             path.name == current_session_id
                             or (path / ".keep").exists()
+                            or active
                         ),
                     })
                 except OSError:
@@ -858,7 +938,7 @@ def initialize_context_archive(runtime: AgentRuntime) -> None:
         session_id = _context_session_id(runtime)
         cleanup_context_archives(
             session_id,
-            state_root=runtime.paths.state_root,
+            context_archive_dir=runtime.paths.context_archive_dir,
         )
     except Exception:
         return

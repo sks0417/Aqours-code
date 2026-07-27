@@ -14,7 +14,12 @@ from codepilot_s20.command_executor import LocalCommandExecutor
 from codepilot_s20.runtime import AgentRuntime
 
 
-def make_runtime(tmp_path: Path, responses=()) -> AgentRuntime:
+def make_runtime(
+    tmp_path: Path,
+    responses=(),
+    *,
+    context_archive_root: Path | None = None,
+) -> AgentRuntime:
     class Messages:
         def __init__(self, values):
             self.values = list(values)
@@ -33,6 +38,7 @@ def make_runtime(tmp_path: Path, responses=()) -> AgentRuntime:
     return AgentRuntime.create(
         workdir=tmp_path,
         state_root=tmp_path / "state",
+        context_archive_root=context_archive_root,
         model_client=SimpleNamespace(messages=Messages(responses)),
         command_executor=LocalCommandExecutor(),
         model_provider="test",
@@ -949,6 +955,7 @@ def _make_archive_session(
     updated_at: float,
     size: int = 0,
     keep: bool = False,
+    active_age_seconds: float | None = None,
 ) -> Path:
     root = (
         state_root / ".codepilot" / "context-archives" / session_id
@@ -963,6 +970,11 @@ def _make_archive_session(
         (root / "results" / "payload.txt").write_bytes(b"x" * size)
     if keep:
         (root / ".keep").write_text("", encoding="utf-8")
+    if active_age_seconds is not None:
+        marker = root / compact.CONTEXT_ARCHIVE_ACTIVE_MARKER
+        marker.write_text("active", encoding="utf-8")
+        active_at = time.time() - active_age_seconds
+        os.utime(marker, (active_at, active_at))
     return root
 
 
@@ -987,7 +999,9 @@ def test_context_archive_retention_protects_current_and_keep(tmp_path):
 
     compact.cleanup_context_archives(
         "session-current",
-        state_root=state_root,
+        context_archive_dir=(
+            state_root / ".codepilot" / "context-archives"
+        ),
         max_age_days=1,
         max_sessions=10,
         max_total_mb=10,
@@ -1017,7 +1031,9 @@ def test_context_archive_retention_count_quota_and_failure_are_safe(
 
     compact.cleanup_context_archives(
         "session-current",
-        state_root=state_root,
+        context_archive_dir=(
+            state_root / ".codepilot" / "context-archives"
+        ),
         max_age_days=365,
         max_sessions=2,
         max_total_mb=10,
@@ -1028,7 +1044,9 @@ def test_context_archive_retention_count_quota_and_failure_are_safe(
 
     compact.cleanup_context_archives(
         "session-current",
-        state_root=state_root,
+        context_archive_dir=(
+            state_root / ".codepilot" / "context-archives"
+        ),
         max_age_days=365,
         max_sessions=10,
         max_total_mb=0.0007,
@@ -1046,13 +1064,120 @@ def test_context_archive_retention_count_quota_and_failure_are_safe(
     )
     compact.cleanup_context_archives(
         "session-current",
-        state_root=state_root,
+        context_archive_dir=(
+            state_root / ".codepilot" / "context-archives"
+        ),
         max_age_days=0,
         max_sessions=0,
         max_total_mb=0,
     )
     assert current.exists()
     assert doomed.exists()
+
+
+def test_retention_protects_all_fresh_active_sessions_and_keep(tmp_path):
+    archive_base = tmp_path / "shared"
+    archive_dir = (
+        archive_base / ".codepilot" / "context-archives"
+    )
+    now = time.time()
+    active_a = _make_archive_session(
+        archive_base,
+        "session-active-a",
+        updated_at=now - 10_000,
+        size=700,
+        active_age_seconds=1,
+    )
+    active_b = _make_archive_session(
+        archive_base,
+        "session-active-b",
+        updated_at=now - 10_000,
+        size=700,
+        active_age_seconds=1,
+    )
+    pinned = _make_archive_session(
+        archive_base,
+        "session-pinned",
+        updated_at=now - 10_000,
+        size=700,
+        keep=True,
+    )
+    inactive = _make_archive_session(
+        archive_base,
+        "session-inactive",
+        updated_at=now - 10_000,
+        size=700,
+    )
+
+    compact.cleanup_context_archives(
+        "session-active-b",
+        context_archive_dir=archive_dir,
+        max_age_days=0,
+        max_sessions=0,
+        max_total_mb=0,
+        active_ttl_seconds=60,
+    )
+
+    assert active_a.exists()
+    assert active_b.exists()
+    assert pinned.exists()
+    assert not inactive.exists()
+
+
+def test_released_and_expired_active_sessions_become_collectable(tmp_path):
+    archive_base = tmp_path / "shared"
+    archive_dir = (
+        archive_base / ".codepilot" / "context-archives"
+    )
+    now = time.time()
+    runtime_a = make_runtime(
+        tmp_path,
+        context_archive_root=archive_base,
+    )
+    runtime_a.state.metadata["context_session_id"] = "session-active-a"
+    released = _make_archive_session(
+        archive_base,
+        "session-active-a",
+        updated_at=now,
+        active_age_seconds=1,
+    )
+    current_b = _make_archive_session(
+        archive_base,
+        "session-active-b",
+        updated_at=now,
+        active_age_seconds=1,
+    )
+    expired = _make_archive_session(
+        archive_base,
+        "session-expired-active",
+        updated_at=now - 10_000,
+        active_age_seconds=120,
+    )
+    pinned = _make_archive_session(
+        archive_base,
+        "session-pinned",
+        updated_at=now - 10_000,
+        keep=True,
+        active_age_seconds=120,
+    )
+
+    compact.release_context_archive_session(runtime_a)
+    assert not (
+        released / compact.CONTEXT_ARCHIVE_ACTIVE_MARKER
+    ).exists()
+    compact.cleanup_context_archives(
+        "session-active-b",
+        context_archive_dir=archive_dir,
+        max_age_days=365,
+        max_sessions=0,
+        max_total_mb=0,
+        active_ttl_seconds=60,
+    )
+
+    assert not released.exists()
+    assert current_b.exists()
+    assert not expired.exists()
+    assert pinned.exists()
 
 
 def test_normal_tool_results_are_not_silently_removed_on_ordinary_turn(

@@ -25,7 +25,11 @@ def main():
         client,
     )
     from .context import update_context
-    from .compact import initialize_context_archive
+    from .compact import (
+        initialize_context_archive,
+        refresh_context_archive_session,
+        release_context_archive_session,
+    )
     from .cron import start_scheduler
     from .hooks import trigger_hooks
     from .protocol import consume_lead_inbox
@@ -55,43 +59,48 @@ def main():
     context = update_context({}, [], runtime)
     threading.Thread(target=cron_autorun_loop,
                      args=(history, context, runtime), daemon=True).start()
-    while True:
-        try:
-            query = input(PROMPT)
-        except (EOFError, KeyboardInterrupt):
-            break
-        if query.strip().lower() in ("q", "exit", ""):
-            break
-        start_run(query, workdir=WORKDIR, model_provider=MODEL_PROVIDER, model=MODEL)
-        record_hook("UserPromptSubmit", input=query)
-        trigger_hooks("UserPromptSubmit", query)
-        turn_start = len(history)
-        history.append({"role": "user", "content": query})
-        runtime.state.root_task = query
-        with agent_lock:
-            agent_loop(history, context, runtime)
-            context = update_context(context, history, runtime)
-            print_turn_assistants(history, turn_start)
-            final_text = ""
-            for msg in reversed(history[turn_start:]):
-                if msg.get("role") == "assistant":
-                    final_text = extract_text(msg.get("content", ""))
-                    break
-            finish_run(final_text)
+    try:
+        while True:
+            try:
+                query = input(PROMPT)
+            except (EOFError, KeyboardInterrupt):
+                break
+            if query.strip().lower() in ("q", "exit", ""):
+                break
+            refresh_context_archive_session(runtime)
+            start_run(query, workdir=WORKDIR,
+                      model_provider=MODEL_PROVIDER, model=MODEL)
+            record_hook("UserPromptSubmit", input=query)
+            trigger_hooks("UserPromptSubmit", query)
+            turn_start = len(history)
+            history.append({"role": "user", "content": query})
+            runtime.state.root_task = query
+            with agent_lock:
+                agent_loop(history, context, runtime)
+                context = update_context(context, history, runtime)
+                print_turn_assistants(history, turn_start)
+                final_text = ""
+                for msg in reversed(history[turn_start:]):
+                    if msg.get("role") == "assistant":
+                        final_text = extract_text(msg.get("content", ""))
+                        break
+                finish_run(final_text)
 
-        inbox = consume_lead_inbox(route_protocol=True)
-        if inbox:
-            def inbox_label(msg):
-                req_id = msg.get("metadata", {}).get("request_id", "")
-                suffix = f" req:{req_id}" if req_id else ""
-                return f"{msg.get('type', 'message')}{suffix}"
+            inbox = consume_lead_inbox(route_protocol=True)
+            if inbox:
+                def inbox_label(msg):
+                    req_id = msg.get("metadata", {}).get("request_id", "")
+                    suffix = f" req:{req_id}" if req_id else ""
+                    return f"{msg.get('type', 'message')}{suffix}"
 
-            inbox_text = "\n".join(
-                f"From {m['from']} [{inbox_label(m)}]: "
-                f"{m['content'][:200]}" for m in inbox)
-            history.append({"role": "user",
-                            "content": f"[Inbox]\n{inbox_text}"})
-        print()
+                inbox_text = "\n".join(
+                    f"From {m['from']} [{inbox_label(m)}]: "
+                    f"{m['content'][:200]}" for m in inbox)
+                history.append({"role": "user",
+                                "content": f"[Inbox]\n{inbox_text}"})
+            print()
+    finally:
+        release_context_archive_session(runtime)
 
 
 if __name__ == "__main__":

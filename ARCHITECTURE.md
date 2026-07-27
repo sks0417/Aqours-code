@@ -36,14 +36,20 @@ not add another module-global per-run value.
 ## Runtime invariants
 
 1. A workspace path comes from `runtime.paths.workdir` when a runtime exists.
-2. A state artifact comes from `runtime.paths.state_root`, never from a host
-   workspace inferred later.
-3. Todo, changed-file, and Lead read state belongs to `runtime.state`.
-4. Main and child roles share bounded services but receive separate mutable
+2. General Agent state comes from `runtime.paths.state_root`.
+   `trace_storage_root` only selects trusted Trace/Eval output and never
+   redirects Skills, Memory, Tasks, Worktrees, mailboxes, transcripts,
+   scheduled tasks, or persisted tool results.
+3. Context archives use the independent
+   `runtime.paths.context_archive_root/context_archive_dir`. It defaults to
+   `<state_root>/.codepilot/context-archives`; Eval may explicitly base it on
+   `trace_storage_root` without changing any other Runtime path.
+4. Todo, changed-file, and Lead read state belongs to `runtime.state`.
+5. Main and child roles share bounded services but receive separate mutable
    `RunState` objects.
-5. Runtime-aware functions retain their old no-runtime entry point only for
+6. Runtime-aware functions retain their old no-runtime entry point only for
    compatibility and tests.
-6. A migration step must preserve the existing full test suite and Docker Eval
+7. A migration step must preserve the existing full test suite and Docker Eval
    smoke before another subsystem is moved.
 
 ## Tool registry
@@ -132,8 +138,11 @@ original history; there is no retry or second summary call.
 
 Every Tool Result entering the outgoing prefix is archived exactly once per
 `tool_use_id + SHA-256` under
-`<state_root>/.codepilot/context-archives/<context_session_id>`, regardless of
-size. The Context Session ID is created with the Runtime and remains stable
+`<context_archive_dir>/<context_session_id>`, regardless of size. By default
+`context_archive_dir` is
+`<state_root>/.codepilot/context-archives`; Eval can place only this directory
+under its trusted Trace storage root. The Context Session ID is created with
+the Runtime and remains stable
 across interactive CLI inputs and Trace run switches. `manifest.jsonl` maps a
 randomized `archive_id` plus Tool-use ID/name/input to a relative result
 filename, exact UTF-8 byte digest, character count, and timestamp. Result files
@@ -150,9 +159,13 @@ Neither tool accepts an arbitrary filesystem path. Recent-tail results are
 archived only when a later Compact moves them into the prefix.
 
 Archive retention deletes whole inactive Context Session directories by last
-update time, maximum session count, and total bytes. The current session and
-`.keep` sessions are protected. Initialization runs cleanup once; cleanup
-failure remains non-fatal and no per-result TTL is used.
+update time, maximum session count, and total bytes. Every live session has a
+small `.active` heartbeat, so concurrent sessions sharing one archive root are
+protected alongside the cleanup caller and `.keep` sessions. Normal CLI and
+`run_agent_task()` termination removes the marker. A marker left by a process
+crash expires after 24 hours and then no longer blocks whole-session cleanup.
+Initialization runs cleanup once; cleanup failure remains non-fatal and no
+per-result TTL is used.
 
 Compact trace records reason, before/after messages and token estimates,
 summarized prefix size, raw-tail size, summary length, outcome, and oversized

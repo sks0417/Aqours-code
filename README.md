@@ -110,6 +110,11 @@ unless the measured summary request requires masking an archived copy.
 Checkpoints receive one programmatic session locator. The Lead can locate
 metadata with `search_archived_tool_results` and recover an exact version with
 `read_archived_tool_result(archive_id=...)`.
+Archive storage has its own Runtime path: it normally lives below `state_root`,
+while Eval may place only the archive below `trace_storage_root` without
+redirecting Skills, Memory, Tasks, Worktrees, or other Agent state. Fresh
+`.active` markers protect concurrent Context Sessions; normal exit releases
+them and crash leftovers expire after 24 hours.
 Each Compact budgets and makes at most one summary call. Automatic and reactive Compact
 verify the complete assembled request against the target and trace their
 before/after budget. This feature is `Implemented`, not `Validated`, until the

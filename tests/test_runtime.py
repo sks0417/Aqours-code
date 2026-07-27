@@ -1,7 +1,14 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from codepilot_s20 import agent_loop, basic_tools, context, mcp, prompts
+from codepilot_s20 import (
+    agent_loop,
+    basic_tools,
+    compact,
+    context,
+    mcp,
+    prompts,
+)
 from codepilot_s20.command_executor import LocalCommandExecutor
 from codepilot_s20.runtime import AgentRuntime
 
@@ -44,6 +51,14 @@ def test_runtime_paths_and_mutable_state_are_isolated(tmp_path):
     assert (
         runtime_a.state.metadata["context_session_id"]
         != runtime_b.state.metadata["context_session_id"]
+    )
+    child = runtime_a.child()
+    assert child.paths.context_archive_root == (
+        runtime_a.paths.context_archive_root
+    )
+    assert child.paths.context_archive_dir == runtime_a.paths.context_archive_dir
+    assert child.state.metadata["context_session_id"] != (
+        runtime_a.state.metadata["context_session_id"]
     )
 
 
@@ -141,3 +156,145 @@ def test_run_agent_task_constructs_and_passes_explicit_runtime(
     assert runtime.services.trace_recorder is not None
     assert runtime.state.metadata["context_archive_initialized"] is True
     assert result["final_answer"] == "done"
+
+
+def test_trace_storage_root_only_redirects_context_archive(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    trusted_trace_root = tmp_path / "trusted-trace"
+    observed = {}
+
+    def inspect(messages, _live_context, runtime):
+        observed["runtime"] = runtime
+        records, _ = compact._archive_prefix_tool_results([
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "tool-paths",
+                    "name": "read_file",
+                    "input": {"path": "service.py"},
+                }],
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-paths",
+                    "content": "exact archived output",
+                }],
+            },
+        ], runtime)
+        observed["archive_id"] = records[0]["archive_id"]
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+        })
+
+    monkeypatch.setattr(agent_loop, "agent_loop", inspect)
+    agent_loop.run_agent_task(
+        "path ownership",
+        str(workspace),
+        model_client=SimpleNamespace(messages=object()),
+        model_provider="test",
+        model="test-model",
+        command_executor=LocalCommandExecutor(),
+        trace_storage_root=str(trusted_trace_root),
+    )
+
+    runtime = observed["runtime"]
+    assert runtime.paths.workdir == workspace.resolve()
+    assert runtime.paths.state_root == workspace.resolve()
+    assert runtime.paths.skills_dir == workspace.resolve() / "skills"
+    assert runtime.paths.memory_dir == workspace.resolve() / ".memory"
+    assert runtime.paths.tasks_dir == workspace.resolve() / ".tasks"
+    assert runtime.paths.worktrees_dir == workspace.resolve() / ".worktrees"
+    assert runtime.paths.context_archive_root == trusted_trace_root.resolve()
+    assert runtime.paths.context_archive_dir == (
+        trusted_trace_root.resolve()
+        / ".codepilot"
+        / "context-archives"
+    )
+    assert compact.read_archived_tool_result(
+        archive_id=observed["archive_id"],
+        runtime=runtime,
+    ) == "exact archived output"
+    _, session_dir = compact._archive_location(runtime, create=False)
+    assert session_dir.is_dir()
+    assert not (
+        session_dir / compact.CONTEXT_ARCHIVE_ACTIVE_MARKER
+    ).exists()
+
+
+def test_explicit_runtime_root_still_owns_general_state(
+    tmp_path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    runtime_root = tmp_path / "runtime-state"
+    trusted_trace_root = tmp_path / "trusted-trace"
+    observed = {}
+
+    def inspect(messages, _live_context, runtime):
+        observed["runtime"] = runtime
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+        })
+
+    monkeypatch.setattr(agent_loop, "agent_loop", inspect)
+    agent_loop.run_agent_task(
+        "explicit roots",
+        str(workspace),
+        model_client=SimpleNamespace(messages=object()),
+        model_provider="test",
+        model="test-model",
+        command_executor=LocalCommandExecutor(),
+        runtime_root=str(runtime_root),
+        trace_storage_root=str(trusted_trace_root),
+    )
+
+    runtime = observed["runtime"]
+    assert runtime.paths.state_root == runtime_root.resolve()
+    assert runtime.paths.skills_dir.parent == runtime_root.resolve()
+    assert runtime.paths.memory_dir.parent == runtime_root.resolve()
+    assert runtime.paths.tasks_dir.parent == runtime_root.resolve()
+    assert runtime.paths.worktrees_dir.parent == runtime_root.resolve()
+    assert runtime.paths.context_archive_root == trusted_trace_root.resolve()
+
+
+def test_default_context_archive_uses_state_root_and_remains_readable(
+    tmp_path,
+):
+    state_root = tmp_path / "state"
+    runtime = make_runtime(tmp_path / "workspace", state_root=state_root)
+    records, _ = compact._archive_prefix_tool_results([
+        {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "tool-default",
+                "name": "read_file",
+                "input": {"path": "default.py"},
+            }],
+        },
+        {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-default",
+                "content": "default archive",
+            }],
+        },
+    ], runtime)
+
+    assert runtime.paths.context_archive_root == state_root.resolve()
+    assert runtime.paths.context_archive_dir == (
+        state_root.resolve() / ".codepilot" / "context-archives"
+    )
+    assert compact.read_archived_tool_result(
+        archive_id=records[0]["archive_id"],
+        runtime=runtime,
+    ) == "default archive"
