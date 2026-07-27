@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
-from copy import deepcopy
+from copy import copy as shallow_copy
 from pathlib import Path
 
 from .model_budget import can_spend_optional_calls
@@ -14,12 +15,13 @@ from .runtime_state import *
 # Markdown checkpoint plus a recent verbatim suffix. Token counts are estimates
 # because supported providers do not share a tokenizer.
 CONTEXT_CHECKPOINT_MARKER = "[Context checkpoint]"
+LATEST_USER_INSTRUCTION_MARKER = "[Latest user instruction — verbatim]"
+LATEST_USER_INSTRUCTION_END_MARKER = "[/Latest user instruction]"
 COMPACT_TRIGGER_RATIO = 0.85
-# The configured 50,000-character provider budget is roughly 16,667 tokens
-# under this module's conservative estimator. A 12k-token chunk leaves room for
-# the summary instructions and the 2k-token output reserve in one model call.
-COMPACT_CHUNK_TOKENS = 12_000
 RECENT_TOOL_RESULT_COUNT = 4
+# A 6k-token raw suffix plus the reserved 2k-token checkpoint leaves roughly
+# 6k estimated tokens for system/tool schemas in the 50,000-character window.
+RECENT_TAIL_MAX_TOKENS = 6_000
 MAX_TOOL_RESULT_TOKENS = 6_000
 SUMMARY_MAX_TOKENS = 2_000
 ESTIMATED_CHARS_PER_TOKEN = 3
@@ -115,6 +117,35 @@ def _block_field(block, name: str, default=None):
         if isinstance(block, dict)
         else getattr(block, name, default)
     )
+
+
+def _copy_content(content):
+    if isinstance(content, list):
+        copied = []
+        for block in content:
+            if isinstance(block, dict):
+                copied.append(dict(block))
+            else:
+                try:
+                    copied.append(shallow_copy(block))
+                except Exception:
+                    copied.append(block)
+        return copied
+    # Runtime notification strings may be subclasses with required __new__
+    # arguments. They are immutable, so retaining them is safe.
+    return content
+
+
+def _copy_messages(messages: list) -> list:
+    copied = []
+    for message in messages:
+        if not isinstance(message, dict):
+            copied.append(message)
+            continue
+        item = dict(message)
+        item["content"] = _copy_content(message.get("content"))
+        copied.append(item)
+    return copied
 
 
 def message_has_tool_use(message: dict) -> bool:
@@ -222,14 +253,67 @@ def _is_user_instruction(message: dict) -> bool:
         return False
     content = message.get("content")
     if isinstance(content, str):
-        return bool(content.strip())
+        text = content.strip()
+        return bool(text) and not text.startswith("<task_notification>")
     if not isinstance(content, list):
         return bool(str(content).strip())
     return any(
         block_type(block) == "text"
         and str(_block_field(block, "text", "")).strip()
+        and not str(_block_field(block, "text", "")).strip().startswith(
+            "<task_notification>"
+        )
         for block in content
     )
+
+
+def _extract_pinned_user_instruction(message: dict):
+    """Extract only the mechanically delimited verbatim checkpoint section."""
+    if not _is_checkpoint_message(message):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        start = "\n" + LATEST_USER_INSTRUCTION_MARKER + "\n"
+        end = "\n" + LATEST_USER_INSTRUCTION_END_MARKER
+        start_at = content.rfind(start)
+        if start_at < 0 or not content.endswith(end):
+            return None
+        return content[start_at + len(start):-len(end)]
+    if not isinstance(content, list):
+        return None
+    start_at = -1
+    for index, block in enumerate(content):
+        if (
+            block_type(block) == "text"
+            and str(_block_field(block, "text", ""))
+            == LATEST_USER_INSTRUCTION_MARKER
+        ):
+            start_at = index
+    if start_at < 0:
+        return None
+    for index in range(start_at + 1, len(content)):
+        block = content[index]
+        if (
+            block_type(block) == "text"
+            and str(_block_field(block, "text", ""))
+            == LATEST_USER_INSTRUCTION_END_MARKER
+        ):
+            if index == start_at + 1:
+                return None
+            return _copy_content(content[start_at + 1:index])
+    return None
+
+
+def _latest_user_instruction(messages: list) -> tuple[object | None, int | None]:
+    """Return the newest real instruction, or the prior pinned instruction."""
+    for message in reversed(messages):
+        if _is_user_instruction(message):
+            return _copy_content(message.get("content")), id(message)
+    for message in reversed(messages):
+        pinned = _extract_pinned_user_instruction(message)
+        if pinned is not None:
+            return pinned, None
+    return None, None
 
 
 def _flatten(units: list[list[dict]]) -> list[dict]:
@@ -238,78 +322,79 @@ def _flatten(units: list[list[dict]]) -> list[dict]:
 
 def _select_prefix_and_recent_tail(
     messages: list,
-    *,
-    chunk_tokens: int = COMPACT_CHUNK_TOKENS,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], object | None]:
     """Select an old contiguous prefix and keep recent tool exchanges atomic.
 
-    The closest safe boundary to ``chunk_tokens`` is used. The last four tool
-    exchange units and at least the final message unit are never summarized.
-    If the latest human instruction falls in the prefix, a verbatim copy is
-    retained at the front of the recent tail.
+    The boundary preserves as much recent raw context as fits under both the
+    four-exchange cap and the total tail budget. The remaining contiguous old
+    prefix is summarized. The latest human instruction is returned separately
+    for deterministic checkpoint pinning.
     """
     units = _history_units(messages)
     if len(units) < 2:
-        return [], deepcopy(messages)
+        pinned, _ = _latest_user_instruction(messages)
+        return [], _copy_messages(messages), pinned
 
-    tool_indexes = [
-        index
-        for index, unit in enumerate(units)
-        if _is_tool_exchange_unit(unit)
-    ]
-    protected_tool_indexes = tool_indexes[-RECENT_TOOL_RESULT_COUNT:]
-    upper_boundary = (
-        protected_tool_indexes[0]
-        if protected_tool_indexes
-        else len(units) - 1
+    pinned, pinned_message_id = _latest_user_instruction(messages)
+    pinned_size = (
+        estimate_size([{"role": "user", "content": pinned}])
+        if pinned is not None else 0
     )
-    if upper_boundary <= 0:
-        return [], deepcopy(messages)
+    tail_limit_chars = (
+        RECENT_TAIL_MAX_TOKENS * ESTIMATED_CHARS_PER_TOKEN
+    )
 
-    target_chars = max(1, int(chunk_tokens)) * ESTIMATED_CHARS_PER_TOKEN
-    cumulative = 0
-    boundary = 0
-    previous_size = 0
-    for index in range(upper_boundary):
-        previous_size = cumulative
-        cumulative += estimate_size(units[index])
-        boundary = index + 1
-        if cumulative >= target_chars:
-            if (
-                boundary > 1
-                and abs(previous_size - target_chars)
-                <= abs(cumulative - target_chars)
-            ):
-                boundary -= 1
+    # Find the earliest unit allowed in the raw suffix. The selected latest
+    # user message is counted once as the pinned checkpoint section.
+    tail_start = len(units) - 1
+    tail_size = pinned_size
+    tool_count = 0
+    for index in range(len(units) - 1, -1, -1):
+        unit = units[index]
+        is_tool = _is_tool_exchange_unit(unit)
+        unit_size = sum(
+            0 if id(message) == pinned_message_id
+            else estimate_size([message])
+            for message in unit
+        )
+        if (
+            index < len(units) - 1
+            and (
+                tail_size + unit_size > tail_limit_chars
+                or (
+                    is_tool
+                    and tool_count >= RECENT_TOOL_RESULT_COUNT
+                )
+            )
+        ):
             break
+        if index == len(units) - 1 and tail_size + unit_size > tail_limit_chars:
+            return [], _copy_messages(messages), pinned
+        tail_start = index
+        tail_size += unit_size
+        if is_tool:
+            tool_count += 1
 
+    boundary = tail_start
     if boundary <= 0:
-        return [], deepcopy(messages)
+        return [], _copy_messages(messages), pinned
 
     prefix_units = units[:boundary]
     tail_units = units[boundary:]
-    tail = deepcopy(_flatten(tail_units))
-
-    latest_user = next(
-        (
-            message
-            for message in reversed(messages)
-            if _is_user_instruction(message)
-        ),
-        None,
-    )
-    tail_message_ids = {id(message) for unit in tail_units for message in unit}
-    if latest_user is not None and id(latest_user) not in tail_message_ids:
-        tail.insert(0, deepcopy(latest_user))
-
-    return deepcopy(_flatten(prefix_units)), tail
+    tail = [
+        _copy_messages([message])[0]
+        for unit in tail_units
+        for message in unit
+        if id(message) != pinned_message_id
+    ]
+    return _copy_messages(_flatten(prefix_units)), tail, pinned
 
 
-def _replace_oversized_tool_results(
+def sanitize_context_tool_results(
     messages: list,
 ) -> tuple[list, int]:
     """Replace oversized result bodies in a copy while preserving protocol IDs."""
-    copied = deepcopy(messages)
+    copied = _copy_messages(messages)
     replaced = 0
     for _, _, block in collect_tool_results(copied):
         output = str(_block_field(block, "content", ""))
@@ -333,7 +418,7 @@ def write_transcript(
     messages: list,
     runtime: AgentRuntime | None = None,
 ) -> Path:
-    safe_messages, _ = _replace_oversized_tool_results(messages)
+    safe_messages, _ = sanitize_context_tool_results(messages)
     transcript_dir = (
         runtime.paths.transcript_dir
         if runtime is not None
@@ -426,10 +511,24 @@ def _summarize_once(
     return str(summary).strip(), ""
 
 
-def _checkpoint_message(summary: str) -> dict:
+def _instruction_blocks(content) -> list:
+    if isinstance(content, list):
+        return _copy_content(content)
+    return [{"type": "text", "text": str(content)}]
+
+
+def _checkpoint_message(summary: str, pinned_instruction=None) -> dict:
+    checkpoint_text = f"{CONTEXT_CHECKPOINT_MARKER}\n{summary.strip()}"
+    if pinned_instruction is None:
+        return {"role": "user", "content": checkpoint_text}
     return {
         "role": "user",
-        "content": f"{CONTEXT_CHECKPOINT_MARKER}\n{summary.strip()}",
+        "content": [
+            {"type": "text", "text": checkpoint_text},
+            {"type": "text", "text": LATEST_USER_INSTRUCTION_MARKER},
+            *_instruction_blocks(pinned_instruction),
+            {"type": "text", "text": LATEST_USER_INSTRUCTION_END_MARKER},
+        ],
     }
 
 
@@ -439,20 +538,27 @@ def _merge_user_content(left, right):
     left_blocks = (
         [{"type": "text", "text": left}]
         if isinstance(left, str)
-        else deepcopy(left) if isinstance(left, list)
+        else _copy_content(left) if isinstance(left, list)
         else [{"type": "text", "text": str(left)}]
     )
     right_blocks = (
         [{"type": "text", "text": right}]
         if isinstance(right, str)
-        else deepcopy(right) if isinstance(right, list)
+        else _copy_content(right) if isinstance(right, list)
         else [{"type": "text", "text": str(right)}]
     )
     return left_blocks + right_blocks
 
 
-def _assemble_compacted_history(summary: str, tail: list) -> list:
-    candidate = [_checkpoint_message(summary), *deepcopy(tail)]
+def _assemble_compacted_history(
+    summary: str,
+    tail: list,
+    pinned_instruction=None,
+) -> list:
+    candidate = [
+        _checkpoint_message(summary, pinned_instruction),
+        *_copy_messages(tail),
+    ]
     # Merge only the synthetic checkpoint boundary when a provider would
     # otherwise receive adjacent user roles.
     if len(candidate) >= 2 and candidate[1].get("role") == "user":
@@ -477,6 +583,40 @@ def _request_sizer(
             tools=tools,
         )
     )
+
+
+def _compact_signature(messages: list, *, target: int, fixed_size: int) -> str:
+    payload = json.dumps(
+        {
+            "messages": messages,
+            "target": target,
+            "fixed_size": fixed_size,
+        },
+        default=str,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _remember_failed_compact(
+    runtime: AgentRuntime | None,
+    *,
+    reason: str,
+    signature: str,
+    failure: str,
+) -> None:
+    if runtime is None or reason != "automatic":
+        return
+    runtime.state.metadata["last_failed_compact_signature"] = signature
+    runtime.state.metadata["last_failed_compact_reason"] = failure[:500]
+
+
+def _clear_failed_compact(runtime: AgentRuntime | None) -> None:
+    if runtime is None:
+        return
+    runtime.state.metadata.pop("last_failed_compact_signature", None)
+    runtime.state.metadata.pop("last_failed_compact_reason", None)
 
 
 def _record_compact(
@@ -533,9 +673,12 @@ def _compact(
     force: bool,
     allow_model_summary: bool | None,
 ) -> list:
-    transcript = write_transcript(messages, runtime)
     sizer = _request_sizer(request_size_fn, system=system, tools=tools)
-    before_size = sizer(messages)
+    original_size = sizer(messages)
+    sanitized, omitted_count = sanitize_context_tool_results(messages)
+    active_messages = sanitized if omitted_count else messages
+    active_size = sizer(active_messages)
+    transcript = write_transcript(active_messages, runtime)
     target = max(
         1_000,
         int(
@@ -545,22 +688,146 @@ def _compact(
         ),
     )
     trigger = int(CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO)
+    signature = _compact_signature(
+        active_messages,
+        target=target,
+        fixed_size=sizer([]),
+    )
 
-    if not force and before_size <= trigger:
+    if not force and active_size <= trigger:
+        if omitted_count:
+            _clear_failed_compact(runtime)
         _record_compact(
             reason=reason,
             transcript=transcript,
             before_messages=len(messages),
-            before_size=before_size,
-            after_messages=len(messages),
-            after_size=before_size,
+            before_size=original_size,
+            after_messages=len(active_messages),
+            after_size=active_size,
             summarized_prefix=0,
-            tail=messages,
+            tail=active_messages,
             summary="",
             success=False,
             failure_reason="below compact trigger",
+            omitted_tool_results=omitted_count,
         )
-        return messages
+        return active_messages
+
+    if (
+        not force
+        and reason == "automatic"
+        and runtime is not None
+        and runtime.state.metadata.get("last_failed_compact_signature")
+        == signature
+    ):
+        failure = "unchanged history matches the last failed compact"
+        _record_compact(
+            reason=reason,
+            transcript=transcript,
+            before_messages=len(messages),
+            before_size=original_size,
+            after_messages=len(active_messages),
+            after_size=active_size,
+            summarized_prefix=0,
+            tail=active_messages,
+            summary="",
+            success=False,
+            failure_reason=failure,
+            omitted_tool_results=omitted_count,
+        )
+        return active_messages
+
+    prefix, tail, pinned_instruction = (
+        _select_prefix_and_recent_tail(active_messages)
+    )
+    if not prefix:
+        failure = "no safe bounded older prefix to summarize"
+        _remember_failed_compact(
+            runtime,
+            reason=reason,
+            signature=signature,
+            failure=failure,
+        )
+        _record_compact(
+            reason=reason,
+            transcript=transcript,
+            before_messages=len(messages),
+            before_size=original_size,
+            after_messages=len(active_messages),
+            after_size=active_size,
+            summarized_prefix=0,
+            tail=active_messages,
+            summary="",
+            success=False,
+            failure_reason=failure,
+            omitted_tool_results=omitted_count,
+        )
+        return active_messages
+
+    # Reserve the maximum checkpoint output before paying for its generation.
+    # If the fixed recent suffix is still too large, move whole oldest units
+    # into the prefix until the candidate fits or only the final unit remains.
+    while sizer(_assemble_compacted_history(
+        "x" * SUMMARY_OUTPUT_RESERVE_CHARS,
+        tail,
+        pinned_instruction,
+    )) > target:
+        tail_units = _history_units(tail)
+        if len(tail_units) <= 1:
+            failure = (
+                "minimum recent tail cannot fit with the reserved checkpoint"
+            )
+            _remember_failed_compact(
+                runtime,
+                reason=reason,
+                signature=signature,
+                failure=failure,
+            )
+            _record_compact(
+                reason=reason,
+                transcript=transcript,
+                before_messages=len(messages),
+                before_size=original_size,
+                after_messages=len(active_messages),
+                after_size=active_size,
+                summarized_prefix=len(prefix),
+                tail=tail,
+                summary="",
+                success=False,
+                failure_reason=failure,
+                omitted_tool_results=omitted_count,
+            )
+            return active_messages
+        prefix.extend(_copy_messages(tail_units[0]))
+        tail = _copy_messages(_flatten(tail_units[1:]))
+
+    summary_prompt_budget = max(
+        1_000,
+        CONTEXT_LIMIT - SUMMARY_OUTPUT_RESERVE_CHARS,
+    )
+    if len(_compact_prompt(prefix)) > summary_prompt_budget:
+        failure = "selected prefix cannot fit one safe summary request"
+        _remember_failed_compact(
+            runtime,
+            reason=reason,
+            signature=signature,
+            failure=failure,
+        )
+        _record_compact(
+            reason=reason,
+            transcript=transcript,
+            before_messages=len(messages),
+            before_size=original_size,
+            after_messages=len(active_messages),
+            after_size=active_size,
+            summarized_prefix=len(prefix),
+            tail=tail,
+            summary="",
+            success=False,
+            failure_reason=failure,
+            omitted_tool_results=omitted_count,
+        )
+        return active_messages
 
     model_client = runtime.services.model_client if runtime is not None else client
     budget_allowed, budget = can_spend_optional_calls(model_client, 1)
@@ -580,71 +847,33 @@ def _compact(
             reason=reason,
             transcript=transcript,
             before_messages=len(messages),
-            before_size=before_size,
-            after_messages=len(messages),
-            after_size=before_size,
+            before_size=original_size,
+            after_messages=len(active_messages),
+            after_size=active_size,
             summarized_prefix=0,
-            tail=messages,
+            tail=active_messages,
             summary="",
             success=False,
             failure_reason="model summary call unavailable",
-        )
-        return messages
-
-    prefix, tail = _select_prefix_and_recent_tail(messages)
-    if not prefix:
-        _record_compact(
-            reason=reason,
-            transcript=transcript,
-            before_messages=len(messages),
-            before_size=before_size,
-            after_messages=len(messages),
-            after_size=before_size,
-            summarized_prefix=0,
-            tail=messages,
-            summary="",
-            success=False,
-            failure_reason="no safe older prefix to summarize",
-        )
-        return messages
-
-    summary_input, prefix_omitted = _replace_oversized_tool_results(prefix)
-    safe_tail, tail_omitted = _replace_oversized_tool_results(tail)
-    omitted_count = prefix_omitted + tail_omitted
-
-    # The summary call must itself fit the provider context. There is no
-    # recursive or multi-stage fallback: failure leaves the original history.
-    summary_prompt_budget = max(
-        1_000,
-        CONTEXT_LIMIT - SUMMARY_OUTPUT_RESERVE_CHARS,
-    )
-    if len(_compact_prompt(summary_input)) > summary_prompt_budget:
-        failure = "selected prefix cannot fit one safe summary request"
-        _record_compact(
-            reason=reason,
-            transcript=transcript,
-            before_messages=len(messages),
-            before_size=before_size,
-            after_messages=len(messages),
-            after_size=before_size,
-            summarized_prefix=len(prefix),
-            tail=tail,
-            summary="",
-            success=False,
-            failure_reason=failure,
             omitted_tool_results=omitted_count,
         )
-        return messages
+        return active_messages
 
-    summary, failure = _summarize_once(summary_input, runtime)
+    summary, failure = _summarize_once(prefix, runtime)
     if not summary:
+        _remember_failed_compact(
+            runtime,
+            reason=reason,
+            signature=signature,
+            failure=failure,
+        )
         _record_compact(
             reason=reason,
             transcript=transcript,
             before_messages=len(messages),
-            before_size=before_size,
-            after_messages=len(messages),
-            after_size=before_size,
+            before_size=original_size,
+            after_messages=len(active_messages),
+            after_size=active_size,
             summarized_prefix=len(prefix),
             tail=tail,
             summary="",
@@ -653,9 +882,13 @@ def _compact(
             omitted_tool_results=omitted_count,
             summary_model_calls=1,
         )
-        return messages
+        return active_messages
 
-    candidate = _assemble_compacted_history(summary, safe_tail)
+    candidate = _assemble_compacted_history(
+        summary,
+        tail,
+        pinned_instruction,
+    )
     candidate_size = sizer(candidate)
     if candidate_size > target:
         failure = (
@@ -666,9 +899,9 @@ def _compact(
             reason=reason,
             transcript=transcript,
             before_messages=len(messages),
-            before_size=before_size,
-            after_messages=len(messages),
-            after_size=before_size,
+            before_size=original_size,
+            after_messages=len(active_messages),
+            after_size=active_size,
             summarized_prefix=len(prefix),
             tail=tail,
             summary=summary,
@@ -677,22 +910,29 @@ def _compact(
             omitted_tool_results=omitted_count,
             summary_model_calls=1,
         )
-        return messages
+        _remember_failed_compact(
+            runtime,
+            reason=reason,
+            signature=signature,
+            failure=failure,
+        )
+        return active_messages
 
     _record_compact(
         reason=reason,
         transcript=transcript,
         before_messages=len(messages),
-        before_size=before_size,
+        before_size=original_size,
         after_messages=len(candidate),
         after_size=candidate_size,
         summarized_prefix=len(prefix),
-        tail=safe_tail,
+        tail=tail,
         summary=summary,
         success=True,
         omitted_tool_results=omitted_count,
         summary_model_calls=1,
     )
+    _clear_failed_compact(runtime)
     if runtime is not None:
         runtime.state.metadata["compact_generation"] = (
             int(runtime.state.metadata.get("compact_generation", 0)) + 1

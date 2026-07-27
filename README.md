@@ -96,21 +96,25 @@ Evidence is `verified`, `stale`, or `unbound`; text without explicit file,
 test, or Reviewer provenance is never verified. Test workspace snapshots are
 not presented as source coverage.
 
-Context continuation uses one cumulative Markdown checkpoint plus a small
-verbatim recent tail. At 85% of the complete assembled request budget, Compact
-selects a contiguous old prefix near 12,000 estimated tokens and summarizes it
-once. Tool-use/result exchanges are atomic, the latest user instruction remains
-verbatim, and the most recent four tool exchanges remain raw. A later Compact
-folds the old checkpoint into one replacement checkpoint rather than stacking
-summaries.
+Context continuation uses one cumulative Markdown checkpoint plus a bounded
+verbatim recent tail. Before every provider request, Tool Results are first
+limited deterministically; the complete sanitized request then triggers Compact
+at 85% of its budget. Tool-use/result exchanges are atomic. Up to four recent
+exchanges remain raw only while the complete tail stays below 6,000 estimated
+tokens. A later Compact folds the old checkpoint into one replacement
+checkpoint rather than stacking summaries.
 
 A single Tool Result above 6,000 estimated tokens is replaced with a short
-placeholder only in the copied context sent to the summarizer or next model
-request; its message and `tool_use_id` remain valid and the original in-memory
-history is not mutated. There is no Context Tool Result archive, manifest,
+placeholder in the active history before request sizing; its message,
+corresponding Tool-use, and `tool_use_id` remain valid. There is no Context Tool
+Result archive, manifest,
 recovery tool, JSON semantic state machine, or per-file semantic-card injection.
 Summary failure, empty output, an unsafe split, or an over-budget result leaves
-raw history unchanged. Each Compact makes at most one summary call. Automatic
+ordinary history unchanged while retaining deterministic placeholders. The
+latest real user instruction is pinned verbatim inside a delimited checkpoint
+section and survives later compactions without relying on the summary model.
+Each Compact makes at most one summary call. Repeated automatic attempts on the
+same failed history are suppressed by one runtime-only digest. Automatic
 and reactive Compact verify the complete assembled request against the target
 and trace their before/after budget. This feature is `Implemented`, not
 `Validated`, until the paid paired Eval criteria below pass.

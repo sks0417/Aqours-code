@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from codepilot_s20 import compact, context
+from codepilot_s20 import agent_loop, compact, context
 from codepilot_s20.command_executor import LocalCommandExecutor
 from codepilot_s20.runtime import AgentRuntime
 
@@ -129,7 +129,7 @@ def test_automatic_trigger_uses_complete_request_size(monkeypatch):
         messages,
         allow_model_summary=True,
         target_context_budget=49_000,
-        request_size_fn=lambda candidate: compact.estimate_size(candidate) + 43_000,
+        request_size_fn=lambda candidate: compact.estimate_size(candidate) + 39_000,
     )
 
     assert calls
@@ -313,6 +313,162 @@ def test_oversized_prefix_result_is_masked_only_in_summary_copy(monkeypatch):
     assert messages == original
 
 
+def test_prepare_context_limits_oversized_result_below_compact_trigger(
+    monkeypatch,
+):
+    huge = "H" * (
+        compact.MAX_TOOL_RESULT_TOKENS
+        * compact.ESTIMATED_CHARS_PER_TOKEN
+        + 3
+    )
+    messages = exchange(1, huge)
+    summary_calls = []
+    events = []
+    monkeypatch.setattr(agent_loop, "assemble_tool_pool", lambda *args: ([], {}))
+    monkeypatch.setattr(
+        agent_loop, "assemble_system_prompt", lambda *args: "system"
+    )
+    monkeypatch.setattr(agent_loop, "update_context", lambda *args: {})
+    monkeypatch.setattr(
+        agent_loop,
+        "compact_history",
+        lambda *args, **kwargs: summary_calls.append(True),
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "record_event",
+        lambda event_type, **payload: events.append({
+            "type": event_type,
+            **payload,
+        }),
+    )
+
+    agent_loop.prepare_context(messages)
+
+    assert summary_calls == []
+    assert messages[1]["content"][0]["tool_use_id"] == "tool-1"
+    assert messages[1]["content"][0]["content"].startswith(
+        "[Large tool result omitted]"
+    )
+    assert_tool_pairs(messages)
+    changed = [
+        event for event in events
+        if event["type"] == "context_compact"
+    ]
+    assert len(changed) == 1
+    assert changed[0]["stage"] == "tool_result_limit"
+    assert changed[0]["changed"] is True
+
+
+@pytest.mark.parametrize("changes_history", [False, True])
+def test_prepare_context_trace_changed_matches_compact_result(
+    monkeypatch,
+    changes_history,
+):
+    messages = [{"role": "user", "content": "trace truth"}]
+    events = []
+    monkeypatch.setattr(agent_loop, "assemble_tool_pool", lambda *args: ([], {}))
+    monkeypatch.setattr(
+        agent_loop,
+        "assemble_system_prompt",
+        lambda *args: "s" * 43_000,
+    )
+    monkeypatch.setattr(agent_loop, "update_context", lambda *args: {})
+    monkeypatch.setattr(
+        agent_loop,
+        "compact_history",
+        (
+            lambda current, **kwargs: [
+                {"role": "user", "content": "[Context checkpoint]\nnew"}
+            ]
+            if changes_history else current
+        ),
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "record_event",
+        lambda event_type, **payload: events.append({
+            "type": event_type,
+            **payload,
+        }),
+    )
+
+    agent_loop.prepare_context(messages)
+
+    event = next(
+        item for item in events
+        if item["type"] == "context_compact"
+        and item["stage"] == "compact_history"
+    )
+    assert event["changed"] is changes_history
+
+
+def test_prepare_context_below_trigger_does_not_report_compact(monkeypatch):
+    messages = [{"role": "user", "content": "small"}]
+    events = []
+    monkeypatch.setattr(agent_loop, "assemble_tool_pool", lambda *args: ([], {}))
+    monkeypatch.setattr(
+        agent_loop, "assemble_system_prompt", lambda *args: "system"
+    )
+    monkeypatch.setattr(agent_loop, "update_context", lambda *args: {})
+    monkeypatch.setattr(
+        agent_loop,
+        "compact_history",
+        lambda *args, **kwargs: pytest.fail("must remain below trigger"),
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "record_event",
+        lambda event_type, **payload: events.append({
+            "type": event_type,
+            **payload,
+        }),
+    )
+
+    agent_loop.prepare_context(messages)
+
+    assert not any(
+        event["type"] == "context_compact" for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    "summary_behavior",
+    [
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("offline")
+        ),
+        lambda *_args, **_kwargs: " ",
+    ],
+)
+def test_summary_failure_keeps_placeholder_but_not_full_large_result(
+    tmp_path,
+    monkeypatch,
+    summary_behavior,
+):
+    runtime = make_runtime(tmp_path)
+    huge = "Q" * (
+        compact.MAX_TOOL_RESULT_TOKENS
+        * compact.ESTIMATED_CHARS_PER_TOKEN
+        + 3
+    )
+    messages = [
+        {"role": "user", "content": "Keep ordinary history."},
+        *exchange(0, huge),
+    ]
+    for index in range(1, 7):
+        messages.extend(exchange(index, "normal"))
+    monkeypatch.setattr(compact, "summarize_history", summary_behavior)
+
+    result = force_compact(messages, runtime=runtime)
+
+    assert "Keep ordinary history." in render(result)
+    assert huge not in render(result)
+    assert "[Large tool result omitted]" in render(result)
+    assert_tool_pairs(result)
+    assert runtime.state.metadata.get("compact_generation", 0) == 0
+
+
 def test_normal_recent_tool_result_is_not_modified(monkeypatch):
     install_summary(monkeypatch)
     messages = long_history(8, width=100)
@@ -322,6 +478,48 @@ def test_normal_recent_tool_result_is_not_modified(monkeypatch):
     result = force_compact(messages)
 
     assert result[-2:] == recent
+
+
+def test_recent_tool_exchanges_obey_total_tail_budget(monkeypatch):
+    calls = install_summary(monkeypatch, "bounded")
+    messages = [{"role": "user", "content": "Keep budget bounded."}]
+    for index in range(6):
+        messages.extend(exchange(index, str(index) * 7_000))
+
+    result = force_compact(
+        messages,
+        target_context_budget=25_000,
+    )
+
+    retained_results = [
+        block
+        for _, _, block in compact.collect_tool_results(result)
+    ]
+    assert len(calls) == 1
+    assert 1 <= len(retained_results) < compact.RECENT_TOOL_RESULT_COUNT
+    assert compact.estimate_size(result) <= 25_000
+    assert_tool_pairs(result)
+
+
+def test_candidate_budget_expands_prefix_before_summary(monkeypatch):
+    calls = install_summary(monkeypatch, "bounded")
+    messages = [{"role": "user", "content": "Keep candidate bounded."}]
+    for index in range(6):
+        messages.extend(exchange(index, str(index) * 7_000))
+
+    def assembled_size(candidate):
+        return compact.estimate_size(candidate) + 25_000
+
+    result = force_compact(
+        messages,
+        target_context_budget=42_500,
+        request_size_fn=assembled_size,
+    )
+
+    assert len(calls) == 1
+    assert assembled_size(result) <= 42_500
+    assert len(compact.collect_tool_results(result)) == 1
+    assert_tool_pairs(result)
 
 
 @pytest.mark.parametrize(
@@ -389,6 +587,50 @@ def test_each_compact_uses_at_most_one_summary_model_call(monkeypatch):
 
     assert len(calls) == 1
     assert budget_requests == [1]
+
+
+def test_unchanged_failed_automatic_compact_is_not_retried(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = make_runtime(tmp_path)
+    calls = []
+
+    def fail(messages, runtime=None):
+        calls.append(render(messages))
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(compact, "summarize_history", fail)
+    messages = long_history(10)
+    sizer = lambda candidate: compact.estimate_size(candidate) + 39_000
+
+    first = compact.compact_history(
+        messages,
+        runtime=runtime,
+        allow_model_summary=True,
+        target_context_budget=49_000,
+        request_size_fn=sizer,
+    )
+    second = compact.compact_history(
+        first,
+        runtime=runtime,
+        allow_model_summary=True,
+        target_context_budget=49_000,
+        request_size_fn=sizer,
+    )
+    changed = [*second, {"role": "assistant", "content": "new history"}]
+    compact.compact_history(
+        changed,
+        runtime=runtime,
+        allow_model_summary=True,
+        target_context_budget=49_000,
+        request_size_fn=sizer,
+    )
+
+    assert len(calls) == 2
+    assert runtime.state.metadata["last_failed_compact_signature"]
+    assert len(runtime.state.metadata["last_failed_compact_signature"]) == 64
+    assert first == second == messages
 
 
 def test_compacted_request_satisfies_complete_assembled_target(monkeypatch):
@@ -501,3 +743,135 @@ def test_three_compactions_keep_exactly_one_checkpoint(monkeypatch):
     assert compact.CONTEXT_CHECKPOINT_MARKER in render(seen[2])
     assert "checkpoint three" in render(messages)
     assert_tool_pairs(messages)
+
+
+def test_latest_user_instruction_survives_three_compacts_verbatim(
+    monkeypatch,
+):
+    exact = "DO NOT CHANGE THIS EXACT USER REQUIREMENT: αβγ"
+    monkeypatch.setattr(
+        compact,
+        "summarize_history",
+        lambda *_args, **_kwargs: "summary deliberately omits the requirement",
+    )
+    messages = [{"role": "user", "content": exact}]
+    for generation in range(3):
+        for index in range(generation * 6, generation * 6 + 6):
+            messages.extend(exchange(index, "work-" + "x" * 300))
+        messages = force_compact(messages)
+        assert exact in render(messages)
+        assert checkpoint_count(messages) == 1
+        assert render(messages).count(
+            compact.LATEST_USER_INSTRUCTION_MARKER
+        ) == 1
+
+
+def test_new_real_user_instruction_replaces_old_pinned_instruction(
+    monkeypatch,
+):
+    old = "OLD PINNED REQUIREMENT"
+    new = "NEW PINNED REQUIREMENT"
+    monkeypatch.setattr(
+        compact,
+        "summarize_history",
+        lambda *_args, **_kwargs: "summary omits both requirements",
+    )
+    messages = [{"role": "user", "content": old}, *long_history(6)[1:]]
+    messages = force_compact(messages)
+    messages.append({"role": "user", "content": new})
+    for index in range(10, 16):
+        messages.extend(exchange(index, "new work-" + "y" * 300))
+
+    messages = force_compact(messages)
+
+    assert new in render(messages)
+    assert old not in render(messages)
+    assert render(messages).count(
+        compact.LATEST_USER_INSTRUCTION_MARKER
+    ) == 1
+
+
+def test_background_notification_does_not_replace_latest_user_instruction(
+    monkeypatch,
+):
+    exact = "REAL USER REQUIREMENT"
+    monkeypatch.setattr(
+        compact,
+        "summarize_history",
+        lambda *_args, **_kwargs: "summary",
+    )
+    messages = [
+        {"role": "user", "content": exact},
+        {
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": (
+                    "<task_notification><status>completed</status>"
+                    "</task_notification>"
+                ),
+            }],
+        },
+    ]
+    for index in range(6):
+        messages.extend(exchange(index, "work"))
+
+    result = force_compact(messages)
+
+    assert exact in render(result)
+    assert compact._extract_pinned_user_instruction(result[0]) is not None
+
+
+def test_list_form_instruction_and_multiple_result_blocks_are_supported(
+    monkeypatch,
+):
+    exact = "LIST BLOCK REQUIREMENT"
+    huge = "Z" * (
+        compact.MAX_TOOL_RESULT_TOKENS
+        * compact.ESTIMATED_CHARS_PER_TOKEN
+        + 3
+    )
+    multi_use = {
+        "role": "assistant",
+        "content": [
+            {"type": "tool_use", "id": "large", "name": "read_file",
+             "input": {"path": "large.py"}},
+            {"type": "tool_use", "id": "small", "name": "read_file",
+             "input": {"path": "small.py"}},
+        ],
+    }
+    multi_result = {
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": "large",
+             "content": huge},
+            {"type": "tool_result", "tool_use_id": "small",
+             "content": "small exact"},
+        ],
+    }
+    monkeypatch.setattr(
+        compact,
+        "summarize_history",
+        lambda *_args, **_kwargs: "summary",
+    )
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": exact}]},
+        multi_use,
+        multi_result,
+    ]
+    for index in range(6):
+        messages.extend(exchange(index, "work"))
+
+    sanitized, count = compact.sanitize_context_tool_results(messages)
+    result = force_compact(messages)
+
+    assert count == 1
+    sanitized_results = compact.collect_tool_results(sanitized)
+    assert sanitized_results[0][2]["tool_use_id"] == "large"
+    assert sanitized_results[0][2]["content"].startswith(
+        "[Large tool result omitted]"
+    )
+    assert sanitized_results[1][2]["content"] == "small exact"
+    assert exact in render(result)
+    assert huge not in render(result)
+    assert_tool_pairs(result)

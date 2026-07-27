@@ -431,9 +431,16 @@ def prepare_context(
     context: dict | None = None,
     tools: list | None = None,
 ) -> list:
-    # History remains lossless on ordinary turns. Compaction happens only after
-    # the complete request (system, tools, dynamic context, messages) crosses
-    # the trigger.
+    # A per-result hard limit applies before both complete-request sizing and
+    # the next provider call. This deterministic replacement is independent of
+    # whether semantic compaction reaches its trigger.
+    raw_messages = list(messages)
+    sanitized_messages, sanitized_count = sanitize_context_tool_results(
+        messages
+    )
+    if sanitized_count:
+        messages[:] = sanitized_messages
+
     budget_context = (
         context
         if context is not None
@@ -452,6 +459,30 @@ def prepare_context(
         assemble_system_prompt(budget_context, runtime)
         if runtime is not None else assemble_system_prompt(budget_context)
     )
+    if sanitized_count:
+        raw_stats = _context_stats(
+            raw_messages,
+            system=system,
+            tools=budget_tools,
+        )
+        sanitized_stats = _context_stats(
+            messages,
+            system=system,
+            tools=budget_tools,
+        )
+        record_event(
+            "context_compact",
+            stage="tool_result_limit",
+            changed=True,
+            summary_attempted=False,
+            omitted_tool_result_count=sanitized_count,
+            before_messages=raw_stats["message_count"],
+            after_messages=sanitized_stats["message_count"],
+            before_size=raw_stats["estimated_size"],
+            after_size=sanitized_stats["estimated_size"],
+            before_tokens=raw_stats["estimated_tokens"],
+            after_tokens=sanitized_stats["estimated_tokens"],
+        )
     before = _context_stats(messages, system=system, tools=budget_tools)
     record_event(
         "context_budget",
@@ -464,7 +495,7 @@ def prepare_context(
     compact_trigger = int(CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO)
     if before["estimated_size"] > compact_trigger:
         sizer = _request_sizer(budget_context, budget_tools, runtime)
-        messages[:] = (
+        compacted = (
             compact_history(
                 messages,
                 runtime=runtime,
@@ -479,6 +510,8 @@ def prepare_context(
                 request_size_fn=sizer,
             )
         )
+        changed = compacted != messages
+        messages[:] = compacted
         refreshed_context = (
             update_context(budget_context, messages, runtime)
             if runtime is not None else update_context(budget_context, messages)
@@ -495,7 +528,7 @@ def prepare_context(
         record_event(
             "context_compact",
             stage="compact_history",
-            changed=True,
+            changed=changed,
             before_messages=before["message_count"],
             after_messages=after["message_count"],
             before_size=before["estimated_size"],

@@ -95,9 +95,11 @@ history untouched. At 85% of the configured context budget, the lifecycle is:
 
 ```text
 assemble the complete current request
--> choose prefix + recent raw suffix from the untouched history
--> keep the latest user instruction and four latest Tool exchanges raw
--> replace copied Tool Results above 6,000 estimated tokens with placeholders
+-> replace Tool Results above 6,000 estimated tokens with placeholders
+-> measure the complete sanitized request and decide whether to compact
+-> choose a bounded recent raw suffix of at most four Tool exchanges
+-> pin the latest real user instruction verbatim
+-> reserve checkpoint + tail + system/tool budget before calling the summarizer
 -> summarize the older prefix into one Markdown continuation checkpoint
 -> assemble checkpoint + recent complete tail
 -> verify the complete next request fits the target
@@ -110,26 +112,34 @@ not stack. The summary is free-form Markdown. There is no JSON schema, semantic
 merge, file-card state, Tool-result acknowledgement protocol, or deterministic
 semantic fallback.
 
-The old prefix is selected near `COMPACT_CHUNK_TOKENS` using the nearest safe
-history-unit boundary. Assistant Tool-use and matching user Tool-result
-messages are one atomic unit and cannot be cut apart; a parallel Tool batch is
-one unit as well. The latest human instruction is retained verbatim even if it
-also appears in the summarized prefix. The most recent
-`RECENT_TOOL_RESULT_COUNT` (currently four) complete exchanges remain in the
-raw tail. Checkpoint-boundary user messages are safely merged so provider role
-ordering remains valid.
+Assistant Tool-use and matching user Tool-result messages are one atomic unit
+and cannot be cut apart; a parallel Tool batch is one unit as well. The recent
+suffix retains at most `RECENT_TOOL_RESULT_COUNT` (currently four) complete
+exchanges and at most `RECENT_TAIL_MAX_TOKENS` (currently 6,000 estimated
+tokens) in total. If the reserved candidate still exceeds the complete target,
+whole oldest suffix units move into the summary prefix before the single model
+call. If the minimum safe suffix cannot fit, no summary call is made.
 
-Before either copied context is used, a Tool Result above
+The latest real user instruction is stored between explicit marker blocks in
+the checkpoint. Later compactions extract only that delimited section. A newer
+real user message replaces it, while Tool Results and coincidental marker-like
+summary text are not treated as instructions. Checkpoint-boundary user messages
+can still be merged without losing the pinned section.
+
+Before request sizing or any provider call, a Tool Result above
 `MAX_TOOL_RESULT_TOKENS` (currently 6,000 estimated tokens) has only its content
-replaced by a short size/reason placeholder. The Tool-result message and
-`tool_use_id` remain intact. Normal results are unchanged, the caller's
-original history is never mutated, and no result is written to disk or made
+replaced by a short size/reason placeholder. The Tool-result message,
+corresponding Tool-use, and `tool_use_id` remain intact. Normal results are
+unchanged, and no complete oversized result is written to disk or made
 recoverable later.
 
 One compact attempt issues at most one summary model call. The complete summary
 prompt is measured before that call. Model failure, empty output, an unsafe
-boundary, or an over-budget assembled candidate returns the original history;
-there is no recursive summary, retry, disk fallback, or second call.
+boundary, or an over-budget assembled candidate preserves ordinary history and
+any deterministic placeholder replacements. One runtime-only SHA-256 signature
+suppresses a repeated automatic summary attempt for the same failed history;
+manual Compact may retry and any history change produces a new signature.
+There is no recursive summary, disk fallback, or second call.
 
 Compact trace records reason, before/after messages and token estimates,
 summarized prefix size, raw-tail size, summary length, outcome,
