@@ -10,10 +10,6 @@ from .basic_tools import (
     run_todo_write,
     run_write,
 )
-from .compact import (
-    read_archived_tool_result,
-    search_archived_tool_results,
-)
 from .cron import (
     run_cancel_cron,
     run_list_crons,
@@ -60,23 +56,6 @@ _TOOL_SCHEMAS = [
                                      "limit": {"type": "integer"},
                                      "offset": {"type": "integer"}},
                       "required": ["path"]}},
-    {"name": "read_archived_tool_result",
-     "description": "Read archive by archive_id or latest tool_use_id.",
-     "input_schema": {"type": "object",
-                      "properties": {
-                          "archive_id": {"type": "string"},
-                          "tool_use_id": {"type": "string"},
-                          "offset": {"type": "integer"},
-                          "limit": {"type": "integer"}},
-                      "required": []}},
-    {"name": "search_archived_tool_results",
-     "description": "Search archives.",
-     "input_schema": {"type": "object",
-                      "properties": {
-                          "query": {"type": "string"},
-                          "tool_name": {"type": "string"},
-                          "limit": {"type": "integer"}},
-                      "required": []}},
     {"name": "write_file", "description": "Write content to a file.",
      "input_schema": {"type": "object",
                       "properties": {"path": {"type": "string"},
@@ -301,8 +280,6 @@ _TOOL_SCHEMAS = [
 
 _TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "read_archived_tool_result": read_archived_tool_result,
-    "search_archived_tool_results": search_archived_tool_results,
     "edit_file": run_edit, "glob": run_glob,
     "todo_write": run_todo_write, "task": spawn_subagent,
     "delegate_agent": run_delegate_agent,
@@ -341,9 +318,7 @@ _ROLE_ACCESS = {
     "submit_plan": frozenset({"teammate"}),
 }
 _RUNTIME_AWARE = frozenset({
-    "bash", "read_file", "read_archived_tool_result",
-    "search_archived_tool_results",
-    "write_file", "edit_file", "glob", "todo_write",
+    "bash", "read_file", "write_file", "edit_file", "glob", "todo_write",
     "load_skill", "task", "delegate_agent", "spawn_teammate",
     "integrate_worktree",
 })

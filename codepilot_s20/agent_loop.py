@@ -16,11 +16,6 @@ from .model_budget import (
     can_spend_optional_calls,
     finalization_reserve_active,
 )
-from .compact import (
-    initialize_context_archive,
-    refresh_context_archive_session,
-    release_context_archive_session,
-)
 from .runtime import AgentRuntime
 
 # ── Agent Loop ──
@@ -854,8 +849,6 @@ def agent_loop(
             "multiagent_policy", decision="advisory", **complexity)
 
     while True:
-        if runtime is not None:
-            refresh_context_archive_session(runtime)
         _check_case_deadline(runtime)
         # One cycle: inject scheduled/background work, prepare context, call
         # the model, execute tool_use blocks, append tool_results, repeat.
@@ -1785,7 +1778,6 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         runtime = AgentRuntime.create(
             workdir=workdir_path,
             state_root=runtime_root,
-            context_archive_root=trace_storage_root,
             model_client=_runtime_value("client"),
             command_executor=_runtime_value("COMMAND_EXECUTOR"),
             model_provider=provider_name,
@@ -1799,7 +1791,6 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
             root_task=task,
             deadline=case_deadline,
         )
-        initialize_context_archive(runtime)
         run = start_run(task, workdir=workdir_path,
                         model_provider=provider_name, model=model_name,
                         storage_root=(_Path(trace_storage_root).resolve()
@@ -1878,8 +1869,6 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
             lambda: wait_for_background_tasks(cleanup_remaining()),
             "background worker threads did not stop",
         )
-        if runtime is not None:
-            cleanup_step(lambda: release_context_archive_session(runtime))
         if run is not None:
             cleanup_step(lambda: _copy_trace_file(run.trace_path, trace_path))
         # Restoring these dicts while an owned worker still references them is

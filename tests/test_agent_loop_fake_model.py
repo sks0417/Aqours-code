@@ -173,6 +173,30 @@ def test_compact_tool_preserves_tool_result_pair_when_recent_tail_is_kept(
     assert paired_result["content"][0]["tool_use_id"] == "compact_1"
 
 
+def test_context_error_runs_reactive_compact_and_retries_only_once(
+        monkeypatch):
+    install_common_agent_mocks(monkeypatch)
+    fake_client = FakeClient([
+        RuntimeError("context_length_exceeded"),
+        RuntimeError("context_length_exceeded"),
+    ])
+    monkeypatch.setattr(agent_loop, "client", fake_client)
+    compact_calls = []
+
+    def fake_reactive(messages, **kwargs):
+        compact_calls.append(list(messages))
+        return messages
+
+    monkeypatch.setattr(agent_loop, "reactive_compact", fake_reactive)
+    messages = [{"role": "user", "content": "retry compact once"}]
+
+    agent_loop.agent_loop(messages, {})
+
+    assert len(fake_client.messages.calls) == 2
+    assert len(compact_calls) == 1
+    assert "context_length_exceeded" in str(messages[-1]["content"])
+
+
 def test_tool_use_then_text_completes_full_round(monkeypatch):
     install_common_agent_mocks(monkeypatch)
     fake_client = FakeClient([

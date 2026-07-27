@@ -32,10 +32,8 @@ def test_registry_is_the_authoritative_lead_surface():
     assert set(lead_names) <= {
         spec.name for spec in TOOL_REGISTRY.specs()
     }
-    assert {
-        "read_archived_tool_result",
-        "search_archived_tool_results",
-    } <= set(lead_names)
+    assert "read_archived_tool_result" not in lead_names
+    assert "search_archived_tool_results" not in lead_names
     assert [tool["name"] for tool in BUILTIN_TOOLS] == list(lead_names)
     assert set(BUILTIN_HANDLERS) == set(lead_names) - {"compact"}
     assert builtin_handlers() == BUILTIN_HANDLERS
@@ -69,13 +67,6 @@ def test_registry_policy_metadata_drives_existing_policy_categories():
     assert TOOL_REGISTRY.get("bash").safety_policy == "command_guard"
     assert TOOL_REGISTRY.get("bash").background_policy == "slow_or_explicit"
     assert TOOL_REGISTRY.get("read_file").background_policy == "foreground"
-    archive_reader = TOOL_REGISTRY.get("read_archived_tool_result")
-    archive_search = TOOL_REGISTRY.get("search_archived_tool_results")
-    assert archive_reader.allowed_roles == frozenset({"lead"})
-    assert archive_reader.runtime_aware is True
-    assert archive_search.allowed_roles == frozenset({"lead"})
-    assert archive_search.runtime_aware is True
-    assert "path" not in archive_reader.api_schema()["input_schema"]["properties"]
     assert TOOL_REGISTRY.get("write_file").safety_policy == "workspace_write"
     assert TOOL_REGISTRY.get("edit_file").safety_policy == "workspace_write"
 

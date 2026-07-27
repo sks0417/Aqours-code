@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from codepilot_s20 import (
     agent_loop,
     basic_tools,
-    compact,
     context,
     mcp,
     prompts,
@@ -45,21 +44,9 @@ def test_runtime_paths_and_mutable_state_are_isolated(tmp_path):
     assert runtime_b.state.lead_read_counts == {}
     assert runtime_a.paths.memory_index == tmp_path / "state-a" / ".memory" / "MEMORY.md"
     assert runtime_b.paths.workdir == (tmp_path / "workspace-b").resolve()
-    assert runtime_a.state.metadata["context_session_id"].startswith(
-        "session-"
-    )
-    assert (
-        runtime_a.state.metadata["context_session_id"]
-        != runtime_b.state.metadata["context_session_id"]
-    )
     child = runtime_a.child()
-    assert child.paths.context_archive_root == (
-        runtime_a.paths.context_archive_root
-    )
-    assert child.paths.context_archive_dir == runtime_a.paths.context_archive_dir
-    assert child.state.metadata["context_session_id"] != (
-        runtime_a.state.metadata["context_session_id"]
-    )
+    assert child.paths.state_root == runtime_a.paths.state_root
+    assert child.state is not runtime_a.state
 
 
 def test_explicit_runtime_controls_file_tools_and_todos(tmp_path, monkeypatch):
@@ -154,11 +141,10 @@ def test_run_agent_task_constructs_and_passes_explicit_runtime(
     assert runtime.paths.workdir == (tmp_path / "workspace").resolve()
     assert runtime.paths.state_root == (tmp_path / "state").resolve()
     assert runtime.services.trace_recorder is not None
-    assert runtime.state.metadata["context_archive_initialized"] is True
     assert result["final_answer"] == "done"
 
 
-def test_trace_storage_root_only_redirects_context_archive(
+def test_trace_storage_root_never_changes_runtime_state_paths(
     tmp_path,
     monkeypatch,
 ):
@@ -168,26 +154,6 @@ def test_trace_storage_root_only_redirects_context_archive(
 
     def inspect(messages, _live_context, runtime):
         observed["runtime"] = runtime
-        records, _ = compact._archive_prefix_tool_results([
-            {
-                "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": "tool-paths",
-                    "name": "read_file",
-                    "input": {"path": "service.py"},
-                }],
-            },
-            {
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": "tool-paths",
-                    "content": "exact archived output",
-                }],
-            },
-        ], runtime)
-        observed["archive_id"] = records[0]["archive_id"]
         messages.append({
             "role": "assistant",
             "content": [{"type": "text", "text": "done"}],
@@ -211,20 +177,10 @@ def test_trace_storage_root_only_redirects_context_archive(
     assert runtime.paths.memory_dir == workspace.resolve() / ".memory"
     assert runtime.paths.tasks_dir == workspace.resolve() / ".tasks"
     assert runtime.paths.worktrees_dir == workspace.resolve() / ".worktrees"
-    assert runtime.paths.context_archive_root == trusted_trace_root.resolve()
-    assert runtime.paths.context_archive_dir == (
-        trusted_trace_root.resolve()
-        / ".codepilot"
-        / "context-archives"
-    )
-    assert compact.read_archived_tool_result(
-        archive_id=observed["archive_id"],
-        runtime=runtime,
-    ) == "exact archived output"
-    _, session_dir = compact._archive_location(runtime, create=False)
-    assert session_dir.is_dir()
+    assert not hasattr(runtime.paths, "context_archive_root")
+    assert not hasattr(runtime.paths, "context_archive_dir")
     assert not (
-        session_dir / compact.CONTEXT_ARCHIVE_ACTIVE_MARKER
+        trusted_trace_root / ".codepilot" / "context-archives"
     ).exists()
 
 
@@ -262,39 +218,7 @@ def test_explicit_runtime_root_still_owns_general_state(
     assert runtime.paths.memory_dir.parent == runtime_root.resolve()
     assert runtime.paths.tasks_dir.parent == runtime_root.resolve()
     assert runtime.paths.worktrees_dir.parent == runtime_root.resolve()
-    assert runtime.paths.context_archive_root == trusted_trace_root.resolve()
-
-
-def test_default_context_archive_uses_state_root_and_remains_readable(
-    tmp_path,
-):
-    state_root = tmp_path / "state"
-    runtime = make_runtime(tmp_path / "workspace", state_root=state_root)
-    records, _ = compact._archive_prefix_tool_results([
-        {
-            "role": "assistant",
-            "content": [{
-                "type": "tool_use",
-                "id": "tool-default",
-                "name": "read_file",
-                "input": {"path": "default.py"},
-            }],
-        },
-        {
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": "tool-default",
-                "content": "default archive",
-            }],
-        },
-    ], runtime)
-
-    assert runtime.paths.context_archive_root == state_root.resolve()
-    assert runtime.paths.context_archive_dir == (
-        state_root.resolve() / ".codepilot" / "context-archives"
-    )
-    assert compact.read_archived_tool_result(
-        archive_id=records[0]["archive_id"],
-        runtime=runtime,
-    ) == "default archive"
+    assert not hasattr(runtime.paths, "context_archive_root")
+    assert not (
+        trusted_trace_root / ".codepilot" / "context-archives"
+    ).exists()

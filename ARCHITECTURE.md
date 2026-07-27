@@ -40,10 +40,7 @@ not add another module-global per-run value.
    `trace_storage_root` only selects trusted Trace/Eval output and never
    redirects Skills, Memory, Tasks, Worktrees, mailboxes, transcripts,
    scheduled tasks, or persisted tool results.
-3. Context archives use the independent
-   `runtime.paths.context_archive_root/context_archive_dir`. It defaults to
-   `<state_root>/.codepilot/context-archives`; Eval may explicitly base it on
-   `trace_storage_root` without changing any other Runtime path.
+3. Context compaction does not own a filesystem root or persist Tool Results.
 4. Todo, changed-file, and Lead read state belongs to `runtime.state`.
 5. Main and child roles share bounded services but receive separate mutable
    `RunState` objects.
@@ -66,8 +63,6 @@ policy, role access, and runtime-binding metadata.
   `delegated_tool_policy` with both `allowed_tools` and
   `allow_parent_permission_expansion=true`; the environment policy remains an
   absolute upper bound.
-- The Lead projection includes narrow `search_archived_tool_results` and
-  `read_archived_tool_result` recovery surfaces.
 - General, Explorer, Reviewer, Worker, and Teammate projections use the same
   effective-permission function. Synchronous roles and asynchronous Teammates
   therefore cannot obtain Bash or write tools merely because their profile
@@ -101,11 +96,10 @@ history untouched. At 85% of the configured context budget, the lifecycle is:
 ```text
 assemble the complete current request
 -> choose prefix + recent raw suffix from the untouched history
--> archive every Tool Result in the outgoing prefix into the Context Session
--> fit one summary request; mask only archived copies when strictly necessary
+-> keep the latest user instruction and four latest Tool exchanges raw
+-> replace copied Tool Results above 6,000 estimated tokens with placeholders
 -> summarize the older prefix into one Markdown continuation checkpoint
--> append a programmatic archive locator
--> assemble checkpoint + unchanged complete recent tail
+-> assemble checkpoint + recent complete tail
 -> verify the complete next request fits the target
 ```
 
@@ -116,60 +110,30 @@ not stack. The summary is free-form Markdown. There is no JSON schema, semantic
 merge, file-card state, Tool-result acknowledgement protocol, or deterministic
 semantic fallback.
 
-The recent tail is selected by an estimated token budget, not by a fixed number
-of results. Assistant Tool-use and matching user Tool-result messages are one
-atomic history unit and cannot be cut apart. The latest human instruction is
-retained verbatim even when a long tool run pushes it outside the suffix.
-Checkpoint-boundary user messages are safely merged so provider role ordering
-remains valid.
+The old prefix is selected near `COMPACT_CHUNK_TOKENS` using the nearest safe
+history-unit boundary. Assistant Tool-use and matching user Tool-result
+messages are one atomic unit and cannot be cut apart; a parallel Tool batch is
+one unit as well. The latest human instruction is retained verbatim even if it
+also appears in the summarized prefix. The most recent
+`RECENT_TOOL_RESULT_COUNT` (currently four) complete exchanges remain in the
+raw tail. Checkpoint-boundary user messages are safely merged so provider role
+ordering remains valid.
 
-Checkpoint and real user instructions are pinned. Compact never drops old
-units to recover from a summary overflow. Before the model call, the complete
-summary prompt is measured against a conservative input budget. Tool Results
-are normally shown to the summarizer in full. Only if the prompt does not fit
-are the largest Tool Results replaced in the summary-request copy by bounded
-descriptors containing Tool ID/name/input, archive ID/relative filename, size, digest, and
-head/tail preview. The original messages and recent tail are never modified.
-If even that request cannot fit, the original history remains unchanged.
+Before either copied context is used, a Tool Result above
+`MAX_TOOL_RESULT_TOKENS` (currently 6,000 estimated tokens) has only its content
+replaced by a short size/reason placeholder. The Tool-result message and
+`tool_use_id` remain intact. Normal results are unchanged, the caller's
+original history is never mutated, and no result is written to disk or made
+recoverable later.
 
-One compact attempt reserves and issues at most one summary model call. Model
-failure, empty output, or an over-budget assembled candidate retains the
-original history; there is no retry or second summary call.
-
-Every Tool Result entering the outgoing prefix is archived exactly once per
-`tool_use_id + SHA-256` under
-`<context_archive_dir>/<context_session_id>`, regardless of size. By default
-`context_archive_dir` is
-`<state_root>/.codepilot/context-archives`; Eval can place only this directory
-under its trusted Trace storage root. The Context Session ID is created with
-the Runtime and remains stable
-across interactive CLI inputs and Trace run switches. `manifest.jsonl` maps a
-randomized `archive_id` plus Tool-use ID/name/input to a relative result
-filename, exact UTF-8 byte digest, character count, and timestamp. Result files
-and manifest replacements are atomic. A failed archive prevents the summary
-call and returns the original history unchanged.
-
-Checkpoints mechanically include exactly one
-`archive://context/<context_session_id>/manifest.jsonl` locator.
-`search_archived_tool_results` searches bounded metadata in only the current
-session; `read_archived_tool_result(archive_id=...)` verifies the controlled
-relative path, symlink boundary, and digest before decoding exact UTF-8 bytes.
-The compatibility Tool-use ID lookup explicitly selects the latest version.
-Neither tool accepts an arbitrary filesystem path. Recent-tail results are
-archived only when a later Compact moves them into the prefix.
-
-Archive retention deletes whole inactive Context Session directories by last
-update time, maximum session count, and total bytes. Every live session has a
-small `.active` heartbeat, so concurrent sessions sharing one archive root are
-protected alongside the cleanup caller and `.keep` sessions. Normal CLI and
-`run_agent_task()` termination removes the marker. A marker left by a process
-crash expires after 24 hours and then no longer blocks whole-session cleanup.
-Initialization runs cleanup once; cleanup failure remains non-fatal and no
-per-result TTL is used.
+One compact attempt issues at most one summary model call. The complete summary
+prompt is measured before that call. Model failure, empty output, an unsafe
+boundary, or an over-budget assembled candidate returns the original history;
+there is no recursive summary, retry, disk fallback, or second call.
 
 Compact trace records reason, before/after messages and token estimates,
-summarized prefix size, raw-tail size, summary length, outcome, and oversized
-archive/masking counts, archive failure type, and the exact summary-call count.
+summarized prefix size, raw-tail size, summary length, outcome,
+oversized-result placeholder count, and the exact summary-call count.
 Successful compaction increments a small runtime generation
 counter used only by the post-compact redundant-read metric.
 

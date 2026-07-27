@@ -97,28 +97,23 @@ test, or Reviewer provenance is never verified. Test workspace snapshots are
 not presented as source coverage.
 
 Context continuation uses one cumulative Markdown checkpoint plus a small
-verbatim recent tail. At 85% of the assembled request budget, Compact selects
-the tail by estimated tokens while treating each Tool-use/result exchange as
-an atomic unit, then summarizes the older prefix. A later Compact folds the old
-checkpoint into one replacement checkpoint rather than stacking summaries.
-There is no JSON semantic state machine or per-file semantic card injection.
-Summary failure or empty output leaves raw history unchanged. Exceptional
-single Tool Results are not globally truncated. Every result that enters the
-outgoing prefix is archived under the Runtime's stable Context Session; changing
-Trace runs does not change that archive. The full result reaches the summarizer
-unless the measured summary request requires masking an archived copy.
-Checkpoints receive one programmatic session locator. The Lead can locate
-metadata with `search_archived_tool_results` and recover an exact version with
-`read_archived_tool_result(archive_id=...)`.
-Archive storage has its own Runtime path: it normally lives below `state_root`,
-while Eval may place only the archive below `trace_storage_root` without
-redirecting Skills, Memory, Tasks, Worktrees, or other Agent state. Fresh
-`.active` markers protect concurrent Context Sessions; normal exit releases
-them and crash leftovers expire after 24 hours.
-Each Compact budgets and makes at most one summary call. Automatic and reactive Compact
-verify the complete assembled request against the target and trace their
-before/after budget. This feature is `Implemented`, not `Validated`, until the
-paid paired Eval criteria below pass.
+verbatim recent tail. At 85% of the complete assembled request budget, Compact
+selects a contiguous old prefix near 12,000 estimated tokens and summarizes it
+once. Tool-use/result exchanges are atomic, the latest user instruction remains
+verbatim, and the most recent four tool exchanges remain raw. A later Compact
+folds the old checkpoint into one replacement checkpoint rather than stacking
+summaries.
+
+A single Tool Result above 6,000 estimated tokens is replaced with a short
+placeholder only in the copied context sent to the summarizer or next model
+request; its message and `tool_use_id` remain valid and the original in-memory
+history is not mutated. There is no Context Tool Result archive, manifest,
+recovery tool, JSON semantic state machine, or per-file semantic-card injection.
+Summary failure, empty output, an unsafe split, or an over-budget result leaves
+raw history unchanged. Each Compact makes at most one summary call. Automatic
+and reactive Compact verify the complete assembled request against the target
+and trace their before/after budget. This feature is `Implemented`, not
+`Validated`, until the paid paired Eval criteria below pass.
 
 For complex code changes, `todo_write` distinguishes execution steps
 (`kind=plan`) from external requirements (`kind=acceptance`). Completed
