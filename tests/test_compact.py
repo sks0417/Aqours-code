@@ -101,7 +101,7 @@ def force_compact(messages, **kwargs):
     return compact.compact_history(
         messages,
         reason="manual",
-        target_context_budget=kwargs.pop("target_context_budget", 12_000),
+        target_context_budget=kwargs.pop("target_context_budget", 120_000),
         request_size_fn=kwargs.pop("request_size_fn", compact.estimate_size),
         **kwargs,
     )
@@ -128,8 +128,10 @@ def test_automatic_trigger_uses_complete_request_size(monkeypatch):
     result = compact.compact_history(
         messages,
         allow_model_summary=True,
-        target_context_budget=49_000,
-        request_size_fn=lambda candidate: compact.estimate_size(candidate) + 39_000,
+        target_context_budget=190_000,
+        request_size_fn=lambda candidate: (
+            compact.estimate_size(candidate) + 160_000
+        ),
     )
 
     assert calls
@@ -148,6 +150,22 @@ def test_successful_compact_has_checkpoint_and_recent_raw_tail(monkeypatch):
 
     assert len(calls) == 1
     assert checkpoint_count(result) == 1
+    assert result[0] == {
+        "role": "user",
+        "content": (
+            compact.CONTEXT_CHECKPOINT_MARKER
+            + "\n## Handoff\n- changed `src/a.py`\n- tests pass"
+        ),
+    }
+    assert result[:2] == [
+        result[0],
+        messages[0],
+    ]
+    assert result[1] is not messages[0]
+    assert (
+        compact.MAX_TOOL_RESULT_TOKENS
+        < compact.RECENT_TAIL_MAX_TOKENS
+    )
     assert "## Handoff" in render(result)
     assert result[-len(expected_tail):] == expected_tail
     assert_tool_pairs(result)
@@ -204,14 +222,120 @@ def test_prior_checkpoint_is_folded_into_replacement_without_stacking(
 
 def test_latest_user_instruction_is_retained_verbatim(monkeypatch):
     install_summary(monkeypatch)
-    messages = [{"role": "user", "content": "LATEST USER REQUIREMENT"}]
+    latest = {"role": "user", "content": "LATEST USER REQUIREMENT"}
+    messages = [latest]
     for index in range(12):
         messages.extend(exchange(index, "z" * 300))
 
     result = force_compact(messages)
 
-    assert "LATEST USER REQUIREMENT" in render(result)
+    assert result[1] == latest
+    assert sum(message == latest for message in result) == 1
     assert checkpoint_count(result) == 1
+
+
+def test_latest_user_message_already_in_recent_tail_is_not_duplicated(
+    monkeypatch,
+):
+    install_summary(monkeypatch)
+    messages = long_history(7, width=100)
+    latest = {
+        "role": "user",
+        "content": "Use the new API contract exactly.",
+    }
+    messages.append(latest)
+    messages.extend(exchange(20, "after-latest-20"))
+    messages.extend(exchange(21, "after-latest-21"))
+
+    result = force_compact(messages)
+
+    assert result[1] == latest
+    assert sum(message == latest for message in result) == 1
+    assert result[-4:] == messages[-4:]
+
+
+def test_latest_user_message_outside_raw_tail_budget_stays_original(
+    monkeypatch,
+):
+    install_summary(monkeypatch)
+    latest = {
+        "role": "user",
+        "content": "Keep this old-position instruction byte-for-byte.",
+    }
+    messages = [latest]
+    result_chars = 7_000 * compact.ESTIMATED_CHARS_PER_TOKEN
+    for index in range(6):
+        messages.extend(exchange(index, str(index) * result_chars))
+
+    result = force_compact(messages)
+
+    assert result[1] == latest
+    assert sum(message == latest for message in result) == 1
+    assert compact.estimate_context_tokens(
+        compact.estimate_size(result[2:])
+    ) <= compact.RECENT_TAIL_MAX_TOKENS
+    assert_tool_pairs(result)
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "[Latest user instruction — verbatim]",
+        "[/Latest user instruction]",
+    ],
+)
+def test_old_marker_literals_are_ordinary_user_text(
+    monkeypatch,
+    literal,
+):
+    monkeypatch.setattr(
+        compact,
+        "summarize_history",
+        lambda *_args, **_kwargs: "summary without literal recovery",
+    )
+    messages = [{"role": "user", "content": literal}]
+    for generation in range(2):
+        for index in range(generation * 6, generation * 6 + 6):
+            messages.extend(exchange(index, "work-" + "x" * 100))
+        messages = force_compact(messages)
+
+    assert messages[1] == {"role": "user", "content": literal}
+    assert sum(
+        message == {"role": "user", "content": literal}
+        for message in messages
+    ) == 1
+
+
+def test_latest_user_block_list_is_preserved_without_stringification(
+    monkeypatch,
+):
+    install_summary(monkeypatch)
+    latest = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Inspect this image exactly."},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "aW1hZ2U=",
+                },
+            },
+            {"type": "text", "text": "Keep block order."},
+        ],
+    }
+    messages = [latest, *long_history(8, width=100)[1:]]
+
+    result = force_compact(messages)
+
+    assert result[1] == latest
+    assert isinstance(result[1]["content"], list)
+    assert [block["type"] for block in result[1]["content"]] == [
+        "text",
+        "image",
+        "text",
+    ]
 
 
 def test_recent_four_tool_exchanges_remain_verbatim(monkeypatch):
@@ -371,7 +495,7 @@ def test_prepare_context_trace_changed_matches_compact_result(
     monkeypatch.setattr(
         agent_loop,
         "assemble_system_prompt",
-        lambda *args: "s" * 43_000,
+        lambda *args: "s" * 170_000,
     )
     monkeypatch.setattr(agent_loop, "update_context", lambda *args: {})
     monkeypatch.setattr(
@@ -484,11 +608,16 @@ def test_recent_tool_exchanges_obey_total_tail_budget(monkeypatch):
     calls = install_summary(monkeypatch, "bounded")
     messages = [{"role": "user", "content": "Keep budget bounded."}]
     for index in range(6):
-        messages.extend(exchange(index, str(index) * 7_000))
+        messages.extend(exchange(
+            index,
+            str(index) * (
+                7_000 * compact.ESTIMATED_CHARS_PER_TOKEN
+            ),
+        ))
 
     result = force_compact(
         messages,
-        target_context_budget=25_000,
+        target_context_budget=120_000,
     )
 
     retained_results = [
@@ -496,8 +625,44 @@ def test_recent_tool_exchanges_obey_total_tail_budget(monkeypatch):
         for _, _, block in compact.collect_tool_results(result)
     ]
     assert len(calls) == 1
-    assert 1 <= len(retained_results) < compact.RECENT_TOOL_RESULT_COUNT
-    assert compact.estimate_size(result) <= 25_000
+    assert len(retained_results) == 2
+    assert [block["tool_use_id"] for block in retained_results] == [
+        "tool-4",
+        "tool-5",
+    ]
+    assert "tool-3" in render(calls[0])
+    assert (
+        compact.estimate_context_tokens(compact.estimate_size(result[2:]))
+        <= compact.RECENT_TAIL_MAX_TOKENS
+    )
+    assert_tool_pairs(result)
+
+
+def test_near_limit_tool_result_allows_compact_to_progress(monkeypatch):
+    calls = install_summary(monkeypatch, "bounded")
+    latest = {
+        "role": "user",
+        "content": "Preserve this instruction with the large result.",
+    }
+    messages = [latest]
+    for index in range(5):
+        messages.extend(exchange(index, f"small-{index}"))
+    near_limit = "N" * (
+        (compact.MAX_TOOL_RESULT_TOKENS - 100)
+        * compact.ESTIMATED_CHARS_PER_TOKEN
+    )
+    messages.extend(exchange(99, near_limit))
+
+    result = force_compact(
+        messages,
+        target_context_budget=50_000,
+    )
+
+    assert len(calls) == 1
+    assert result[1] == latest
+    assert near_limit in render(result)
+    assert "[Large tool result omitted]" not in render(result)
+    assert compact.estimate_size(result) <= 50_000
     assert_tool_pairs(result)
 
 
@@ -529,7 +694,7 @@ def test_candidate_budget_expands_prefix_before_summary(monkeypatch):
             RuntimeError("offline")
         ),
         lambda _messages, runtime=None: "   ",
-        lambda _messages, runtime=None: "s" * 30_000,
+        lambda _messages, runtime=None: "s" * 130_000,
     ],
 )
 def test_compaction_failure_keeps_original_history(
@@ -561,7 +726,7 @@ def test_unsafe_summary_input_fails_before_model_call(monkeypatch):
         lambda *_args, **_kwargs: pytest.fail("unsafe request must not be sent"),
     )
     messages = [
-        {"role": "user", "content": "PINNED-" + "p" * 60_000},
+        {"role": "user", "content": "LATEST-" + "p" * 120_000},
         *long_history(6)[1:],
     ]
     original = json.loads(json.dumps(messages))
@@ -602,20 +767,20 @@ def test_unchanged_failed_automatic_compact_is_not_retried(
 
     monkeypatch.setattr(compact, "summarize_history", fail)
     messages = long_history(10)
-    sizer = lambda candidate: compact.estimate_size(candidate) + 39_000
+    sizer = lambda candidate: compact.estimate_size(candidate) + 160_000
 
     first = compact.compact_history(
         messages,
         runtime=runtime,
         allow_model_summary=True,
-        target_context_budget=49_000,
+        target_context_budget=190_000,
         request_size_fn=sizer,
     )
     second = compact.compact_history(
         first,
         runtime=runtime,
         allow_model_summary=True,
-        target_context_budget=49_000,
+        target_context_budget=190_000,
         request_size_fn=sizer,
     )
     changed = [*second, {"role": "assistant", "content": "new history"}]
@@ -623,7 +788,7 @@ def test_unchanged_failed_automatic_compact_is_not_retried(
         changed,
         runtime=runtime,
         allow_model_summary=True,
-        target_context_budget=49_000,
+        target_context_budget=190_000,
         request_size_fn=sizer,
     )
 
@@ -759,18 +924,21 @@ def test_latest_user_instruction_survives_three_compacts_verbatim(
         for index in range(generation * 6, generation * 6 + 6):
             messages.extend(exchange(index, "work-" + "x" * 300))
         messages = force_compact(messages)
-        assert exact in render(messages)
-        assert checkpoint_count(messages) == 1
-        assert render(messages).count(
-            compact.LATEST_USER_INSTRUCTION_MARKER
+        assert messages[1] == {"role": "user", "content": exact}
+        assert sum(
+            message == {"role": "user", "content": exact}
+            for message in messages
         ) == 1
+        assert checkpoint_count(messages) == 1
+        assert not hasattr(compact, "LATEST_USER_INSTRUCTION_MARKER")
+        assert not hasattr(compact, "LATEST_USER_INSTRUCTION_END_MARKER")
 
 
-def test_new_real_user_instruction_replaces_old_pinned_instruction(
+def test_new_real_user_instruction_replaces_prior_latest_instruction(
     monkeypatch,
 ):
-    old = "OLD PINNED REQUIREMENT"
-    new = "NEW PINNED REQUIREMENT"
+    old = "OLD REQUIREMENT"
+    new = "NEW REQUIREMENT"
     monkeypatch.setattr(
         compact,
         "summarize_history",
@@ -784,10 +952,11 @@ def test_new_real_user_instruction_replaces_old_pinned_instruction(
 
     messages = force_compact(messages)
 
-    assert new in render(messages)
+    assert messages[1] == {"role": "user", "content": new}
     assert old not in render(messages)
-    assert render(messages).count(
-        compact.LATEST_USER_INSTRUCTION_MARKER
+    assert sum(
+        message == {"role": "user", "content": new}
+        for message in messages
     ) == 1
 
 
@@ -818,8 +987,11 @@ def test_background_notification_does_not_replace_latest_user_instruction(
 
     result = force_compact(messages)
 
-    assert exact in render(result)
-    assert compact._extract_pinned_user_instruction(result[0]) is not None
+    assert result[1] == {"role": "user", "content": exact}
+    assert sum(
+        message == {"role": "user", "content": exact}
+        for message in result
+    ) == 1
 
 
 def test_list_form_instruction_and_multiple_result_blocks_are_supported(

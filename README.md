@@ -99,20 +99,21 @@ not presented as source coverage.
 Context continuation uses one cumulative Markdown checkpoint plus a bounded
 verbatim recent tail. Before every provider request, Tool Results are first
 limited deterministically; the complete sanitized request then triggers Compact
-at 85% of its budget. Tool-use/result exchanges are atomic. Up to four recent
-exchanges remain raw only while the complete tail stays below 6,000 estimated
-tokens. A later Compact folds the old checkpoint into one replacement
-checkpoint rather than stacking summaries.
+at 85% of the 192,000-character budget (about 64,000 tokens at the existing
+three-characters-per-token estimate). Tool-use/result exchanges are atomic. Up
+to four recent exchanges remain raw only while the complete tail stays below
+20,000 estimated tokens. A later Compact folds the old checkpoint into one
+replacement checkpoint rather than stacking summaries.
 
-A single Tool Result above 6,000 estimated tokens is replaced with a short
+A single Tool Result above 8,000 estimated tokens is replaced with a short
 placeholder in the active history before request sizing; its message,
 corresponding Tool-use, and `tool_use_id` remain valid. There is no Context Tool
 Result archive, manifest,
 recovery tool, JSON semantic state machine, or per-file semantic-card injection.
 Summary failure, empty output, an unsafe split, or an over-budget result leaves
 ordinary history unchanged while retaining deterministic placeholders. The
-latest real user instruction is pinned verbatim inside a delimited checkpoint
-section and survives later compactions without relying on the summary model.
+latest real user instruction survives as its original standalone user message
+immediately after the checkpoint, without relying on the summary model.
 Each Compact makes at most one summary call. Repeated automatic attempts on the
 same failed history are suppressed by one runtime-only digest. Automatic
 and reactive Compact verify the complete assembled request against the target

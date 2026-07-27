@@ -12,23 +12,19 @@ from .runtime_state import *
 
 
 # Compaction is intentionally a small sliding-window mechanism: one cumulative
-# Markdown checkpoint plus a recent verbatim suffix. Token counts are estimates
-# because supported providers do not share a tokenizer.
+# Markdown checkpoint, the latest genuine user message, and a recent verbatim
+# suffix. Token counts are estimates because providers do not share a tokenizer.
 CONTEXT_CHECKPOINT_MARKER = "[Context checkpoint]"
-LATEST_USER_INSTRUCTION_MARKER = "[Latest user instruction — verbatim]"
-LATEST_USER_INSTRUCTION_END_MARKER = "[/Latest user instruction]"
 COMPACT_TRIGGER_RATIO = 0.85
 RECENT_TOOL_RESULT_COUNT = 4
-# A 6k-token raw suffix plus the reserved 2k-token checkpoint leaves roughly
-# 6k estimated tokens for system/tool schemas in the 50,000-character window.
-RECENT_TAIL_MAX_TOKENS = 6_000
-MAX_TOOL_RESULT_TOKENS = 6_000
-SUMMARY_MAX_TOKENS = 2_000
+RECENT_TAIL_MAX_TOKENS = 20_000
+MAX_TOOL_RESULT_TOKENS = 8_000
+SUMMARY_MAX_TOKENS = 3_000
 ESTIMATED_CHARS_PER_TOKEN = 3
-COMPACT_OUTPUT_RESERVE_CHARS = 6_000
 SUMMARY_OUTPUT_RESERVE_CHARS = (
     SUMMARY_MAX_TOKENS * ESTIMATED_CHARS_PER_TOKEN
 )
+COMPACT_OUTPUT_RESERVE_CHARS = SUMMARY_OUTPUT_RESERVE_CHARS
 
 COMPACTION_PROMPT = """\
 You are creating a context checkpoint for another coding-agent model
@@ -254,65 +250,48 @@ def _is_user_instruction(message: dict) -> bool:
     content = message.get("content")
     if isinstance(content, str):
         text = content.strip()
-        return bool(text) and not text.startswith("<task_notification>")
+        return bool(text) and not _is_harness_control_text(text)
     if not isinstance(content, list):
         return bool(str(content).strip())
-    return any(
-        block_type(block) == "text"
-        and str(_block_field(block, "text", "")).strip()
-        and not str(_block_field(block, "text", "")).strip().startswith(
-            "<task_notification>"
-        )
-        for block in content
+    for block in content:
+        kind = block_type(block)
+        if kind == "tool_result":
+            continue
+        if kind == "text":
+            text = str(_block_field(block, "text", "")).strip()
+            if text and not _is_harness_control_text(text):
+                return True
+            continue
+        # Images and other legal user content blocks are real input and must
+        # retain their original block representation.
+        return True
+    return False
+
+
+_HARNESS_CONTROL_PREFIXES = (
+    "<task_notification>",
+    "<multiagent_policy",
+    "<reminder>",
+    "<finalization_budget>",
+    "<finalization_deadline>",
+    "<acceptance_review>",
+    "<pre_final_review",
+)
+
+
+def _is_harness_control_text(text: str) -> bool:
+    stripped = str(text).strip()
+    return (
+        stripped == CONTINUATION_PROMPT
+        or stripped.startswith(_HARNESS_CONTROL_PREFIXES)
     )
 
 
-def _extract_pinned_user_instruction(message: dict):
-    """Extract only the mechanically delimited verbatim checkpoint section."""
-    if not _is_checkpoint_message(message):
-        return None
-    content = message.get("content")
-    if isinstance(content, str):
-        start = "\n" + LATEST_USER_INSTRUCTION_MARKER + "\n"
-        end = "\n" + LATEST_USER_INSTRUCTION_END_MARKER
-        start_at = content.rfind(start)
-        if start_at < 0 or not content.endswith(end):
-            return None
-        return content[start_at + len(start):-len(end)]
-    if not isinstance(content, list):
-        return None
-    start_at = -1
-    for index, block in enumerate(content):
-        if (
-            block_type(block) == "text"
-            and str(_block_field(block, "text", ""))
-            == LATEST_USER_INSTRUCTION_MARKER
-        ):
-            start_at = index
-    if start_at < 0:
-        return None
-    for index in range(start_at + 1, len(content)):
-        block = content[index]
-        if (
-            block_type(block) == "text"
-            and str(_block_field(block, "text", ""))
-            == LATEST_USER_INSTRUCTION_END_MARKER
-        ):
-            if index == start_at + 1:
-                return None
-            return _copy_content(content[start_at + 1:index])
-    return None
-
-
-def _latest_user_instruction(messages: list) -> tuple[object | None, int | None]:
-    """Return the newest real instruction, or the prior pinned instruction."""
+def _latest_user_message(messages: list) -> tuple[dict | None, int | None]:
+    """Return a safe copy of the newest genuine user message."""
     for message in reversed(messages):
         if _is_user_instruction(message):
-            return _copy_content(message.get("content")), id(message)
-    for message in reversed(messages):
-        pinned = _extract_pinned_user_instruction(message)
-        if pinned is not None:
-            return pinned, None
+            return _copy_messages([message])[0], id(message)
     return None, None
 
 
@@ -322,62 +301,64 @@ def _flatten(units: list[list[dict]]) -> list[dict]:
 
 def _select_prefix_and_recent_tail(
     messages: list,
-) -> tuple[list[dict], list[dict], object | None]:
+) -> tuple[list[dict], list[dict], dict | None]:
     """Select an old contiguous prefix and keep recent tool exchanges atomic.
 
     The boundary preserves as much recent raw context as fits under both the
     four-exchange cap and the total tail budget. The remaining contiguous old
-    prefix is summarized. The latest human instruction is returned separately
-    for deterministic checkpoint pinning.
+    prefix is summarized. The newest genuine user message is returned
+    separately and remains an ordinary, unmodified message.
     """
     units = _history_units(messages)
     if len(units) < 2:
-        pinned, _ = _latest_user_instruction(messages)
-        return [], _copy_messages(messages), pinned
+        latest, _ = _latest_user_message(messages)
+        return [], _copy_messages(messages), latest
 
-    pinned, pinned_message_id = _latest_user_instruction(messages)
-    pinned_size = (
-        estimate_size([{"role": "user", "content": pinned}])
-        if pinned is not None else 0
-    )
+    latest, latest_message_id = _latest_user_message(messages)
     tail_limit_chars = (
         RECENT_TAIL_MAX_TOKENS * ESTIMATED_CHARS_PER_TOKEN
     )
 
-    # Find the earliest unit allowed in the raw suffix. The selected latest
-    # user message is counted once as the pinned checkpoint section.
-    tail_start = len(units) - 1
-    tail_size = pinned_size
+    # Find the earliest unit allowed in the raw suffix. The latest user message
+    # is a separate required message, so it does not consume the raw-tail cap.
+    tail_start = len(units)
+    tail_size = 0
     tool_count = 0
     for index in range(len(units) - 1, -1, -1):
         unit = units[index]
         is_tool = _is_tool_exchange_unit(unit)
         unit_size = sum(
-            0 if id(message) == pinned_message_id
+            0 if id(message) == latest_message_id
             else estimate_size([message])
             for message in unit
         )
         if (
-            index < len(units) - 1
-            and (
-                tail_size + unit_size > tail_limit_chars
-                or (
-                    is_tool
-                    and tool_count >= RECENT_TOOL_RESULT_COUNT
-                )
+            tail_size + unit_size > tail_limit_chars
+            or (
+                is_tool
+                and tool_count >= RECENT_TOOL_RESULT_COUNT
             )
         ):
             break
-        if index == len(units) - 1 and tail_size + unit_size > tail_limit_chars:
-            return [], _copy_messages(messages), pinned
         tail_start = index
         tail_size += unit_size
         if is_tool:
             tool_count += 1
 
+    latest_unit_index = next(
+        (
+            index
+            for index, unit in enumerate(units)
+            if any(id(message) == latest_message_id for message in unit)
+        ),
+        -1,
+    )
+    if latest_unit_index >= 0:
+        tail_start = max(tail_start, latest_unit_index)
+
     boundary = tail_start
     if boundary <= 0:
-        return [], _copy_messages(messages), pinned
+        return [], _copy_messages(messages), latest
 
     prefix_units = units[:boundary]
     tail_units = units[boundary:]
@@ -385,9 +366,9 @@ def _select_prefix_and_recent_tail(
         _copy_messages([message])[0]
         for unit in tail_units
         for message in unit
-        if id(message) != pinned_message_id
+        if id(message) != latest_message_id
     ]
-    return _copy_messages(_flatten(prefix_units)), tail, pinned
+    return _copy_messages(_flatten(prefix_units)), tail, latest
 
 
 def sanitize_context_tool_results(
@@ -511,63 +492,26 @@ def _summarize_once(
     return str(summary).strip(), ""
 
 
-def _instruction_blocks(content) -> list:
-    if isinstance(content, list):
-        return _copy_content(content)
-    return [{"type": "text", "text": str(content)}]
-
-
-def _checkpoint_message(summary: str, pinned_instruction=None) -> dict:
-    checkpoint_text = f"{CONTEXT_CHECKPOINT_MARKER}\n{summary.strip()}"
-    if pinned_instruction is None:
-        return {"role": "user", "content": checkpoint_text}
+def _checkpoint_message(summary: str) -> dict:
     return {
         "role": "user",
-        "content": [
-            {"type": "text", "text": checkpoint_text},
-            {"type": "text", "text": LATEST_USER_INSTRUCTION_MARKER},
-            *_instruction_blocks(pinned_instruction),
-            {"type": "text", "text": LATEST_USER_INSTRUCTION_END_MARKER},
-        ],
+        "content": f"{CONTEXT_CHECKPOINT_MARKER}\n{summary.strip()}",
     }
-
-
-def _merge_user_content(left, right):
-    if isinstance(left, str) and isinstance(right, str):
-        return left + "\n\n" + right
-    left_blocks = (
-        [{"type": "text", "text": left}]
-        if isinstance(left, str)
-        else _copy_content(left) if isinstance(left, list)
-        else [{"type": "text", "text": str(left)}]
-    )
-    right_blocks = (
-        [{"type": "text", "text": right}]
-        if isinstance(right, str)
-        else _copy_content(right) if isinstance(right, list)
-        else [{"type": "text", "text": str(right)}]
-    )
-    return left_blocks + right_blocks
 
 
 def _assemble_compacted_history(
     summary: str,
     tail: list,
-    pinned_instruction=None,
+    latest_user_message: dict | None = None,
 ) -> list:
-    candidate = [
-        _checkpoint_message(summary, pinned_instruction),
+    return [
+        _checkpoint_message(summary),
+        *(
+            _copy_messages([latest_user_message])
+            if latest_user_message is not None else []
+        ),
         *_copy_messages(tail),
     ]
-    # Merge only the synthetic checkpoint boundary when a provider would
-    # otherwise receive adjacent user roles.
-    if len(candidate) >= 2 and candidate[1].get("role") == "user":
-        candidate[0]["content"] = _merge_user_content(
-            candidate[0]["content"],
-            candidate[1].get("content", ""),
-        )
-        del candidate[1]
-    return candidate
 
 
 def _request_sizer(
@@ -737,7 +681,7 @@ def _compact(
         )
         return active_messages
 
-    prefix, tail, pinned_instruction = (
+    prefix, tail, latest_user_message = (
         _select_prefix_and_recent_tail(active_messages)
     )
     if not prefix:
@@ -766,16 +710,17 @@ def _compact(
 
     # Reserve the maximum checkpoint output before paying for its generation.
     # If the fixed recent suffix is still too large, move whole oldest units
-    # into the prefix until the candidate fits or only the final unit remains.
+    # into the prefix until the candidate fits or no raw unit remains. The
+    # standalone latest user message is never removed.
     while sizer(_assemble_compacted_history(
         "x" * SUMMARY_OUTPUT_RESERVE_CHARS,
         tail,
-        pinned_instruction,
+        latest_user_message,
     )) > target:
         tail_units = _history_units(tail)
-        if len(tail_units) <= 1:
+        if not tail_units:
             failure = (
-                "minimum recent tail cannot fit with the reserved checkpoint"
+                "checkpoint and latest user message cannot fit within target"
             )
             _remember_failed_compact(
                 runtime,
@@ -887,7 +832,7 @@ def _compact(
     candidate = _assemble_compacted_history(
         summary,
         tail,
-        pinned_instruction,
+        latest_user_message,
     )
     candidate_size = sizer(candidate)
     if candidate_size > target:

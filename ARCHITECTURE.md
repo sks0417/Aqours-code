@@ -95,13 +95,13 @@ history untouched. At 85% of the configured context budget, the lifecycle is:
 
 ```text
 assemble the complete current request
--> replace Tool Results above 6,000 estimated tokens with placeholders
+-> replace Tool Results above 8,000 estimated tokens with placeholders
 -> measure the complete sanitized request and decide whether to compact
 -> choose a bounded recent raw suffix of at most four Tool exchanges
--> pin the latest real user instruction verbatim
+-> copy the latest real user message verbatim as a standalone message
 -> reserve checkpoint + tail + system/tool budget before calling the summarizer
 -> summarize the older prefix into one Markdown continuation checkpoint
--> assemble checkpoint + recent complete tail
+-> assemble checkpoint + latest user message + recent complete tail
 -> verify the complete next request fits the target
 ```
 
@@ -110,24 +110,27 @@ The checkpoint is an ordinary internal user message marked
 older prefix and replaces it with one new cumulative checkpoint; summaries do
 not stack. The summary is free-form Markdown. There is no JSON schema, semantic
 merge, file-card state, Tool-result acknowledgement protocol, or deterministic
-semantic fallback.
+semantic fallback. The context limit is 192,000 characters, approximately
+64,000 tokens using the existing three-characters-per-token estimate. Compact
+triggers at 85%, and reserves up to 3,000 estimated tokens for the summary.
 
 Assistant Tool-use and matching user Tool-result messages are one atomic unit
 and cannot be cut apart; a parallel Tool batch is one unit as well. The recent
 suffix retains at most `RECENT_TOOL_RESULT_COUNT` (currently four) complete
-exchanges and at most `RECENT_TAIL_MAX_TOKENS` (currently 6,000 estimated
+exchanges and at most `RECENT_TAIL_MAX_TOKENS` (currently 20,000 estimated
 tokens) in total. If the reserved candidate still exceeds the complete target,
 whole oldest suffix units move into the summary prefix before the single model
-call. If the minimum safe suffix cannot fit, no summary call is made.
+call. If the checkpoint plus latest user message cannot fit after the raw
+suffix is exhausted, no summary call is made.
 
-The latest real user instruction is stored between explicit marker blocks in
-the checkpoint. Later compactions extract only that delimited section. A newer
-real user message replaces it, while Tool Results and coincidental marker-like
-summary text are not treated as instructions. Checkpoint-boundary user messages
-can still be merged without losing the pinned section.
+The latest real user instruction remains a safe copy of its original message,
+immediately after the checkpoint. Its string or content-block representation is
+not rewritten, merged into the checkpoint, or recovered from summary text.
+Tool Results and harness control messages are not treated as instructions. If
+the same user message falls inside the raw-tail selection, it appears only once.
 
 Before request sizing or any provider call, a Tool Result above
-`MAX_TOOL_RESULT_TOKENS` (currently 6,000 estimated tokens) has only its content
+`MAX_TOOL_RESULT_TOKENS` (currently 8,000 estimated tokens) has only its content
 replaced by a short size/reason placeholder. The Tool-result message,
 corresponding Tool-use, and `tool_use_id` remain intact. Normal results are
 unchanged, and no complete oversized result is written to disk or made
