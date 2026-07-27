@@ -16,6 +16,7 @@ from .model_budget import (
     can_spend_optional_calls,
     finalization_reserve_active,
 )
+from .compact import initialize_context_archive
 from .runtime import AgentRuntime
 
 # ── Agent Loop ──
@@ -1777,7 +1778,7 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         _set_runtime_value("PRIMARY_MODEL", model_name)
         runtime = AgentRuntime.create(
             workdir=workdir_path,
-            state_root=runtime_root,
+            state_root=runtime_root or trace_storage_root,
             model_client=_runtime_value("client"),
             command_executor=_runtime_value("COMMAND_EXECUTOR"),
             model_provider=provider_name,
@@ -1791,6 +1792,7 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
             root_task=task,
             deadline=case_deadline,
         )
+        initialize_context_archive(runtime)
         run = start_run(task, workdir=workdir_path,
                         model_provider=provider_name, model=model_name,
                         storage_root=(_Path(trace_storage_root).resolve()

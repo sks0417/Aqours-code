@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -27,7 +29,7 @@ SUMMARY_OUTPUT_RESERVE_CHARS = SUMMARY_MAX_TOKENS * 3
 ARCHIVE_PREVIEW_CHARS = 2_000
 ARCHIVE_URI_PREFIX = "archive://"
 _ARCHIVE_LOCK = threading.RLock()
-_LEGACY_ARCHIVE_RUN_ID = "standalone-" + uuid.uuid4().hex[:12]
+_LEGACY_CONTEXT_SESSION_ID = "session-legacy-" + uuid.uuid4().hex
 
 COMPACTION_PROMPT = """\
 You are creating a context checkpoint for another coding-agent model
@@ -292,11 +294,6 @@ def _select_prefix_and_recent_tail(
     return deepcopy(_flatten(prefix_units)), tail
 
 
-def _safe_result_filename(tool_use_id: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(tool_use_id or "unknown"))
-    return (safe[:120] or "unknown") + ".txt"
-
-
 def _collect_tool_uses(messages: list) -> dict[str, dict]:
     uses = {}
     for message in messages:
@@ -320,60 +317,193 @@ def _collect_tool_uses(messages: list) -> dict[str, dict]:
     return uses
 
 
+def _context_session_id(runtime: AgentRuntime | None) -> str:
+    if runtime is None:
+        return _LEGACY_CONTEXT_SESSION_ID
+    value = str(runtime.state.metadata.get("context_session_id", ""))
+    if not re.fullmatch(r"session-[A-Za-z0-9_-]{8,100}", value):
+        value = "session-" + uuid.uuid4().hex
+        runtime.state.metadata["context_session_id"] = value
+    return value
+
+
 def _archive_location(
     runtime: AgentRuntime | None,
     *,
     create: bool,
 ) -> tuple[str, Path]:
-    recorder = (
-        runtime.services.trace_recorder
+    session_id = _context_session_id(runtime)
+    state_root = (
+        runtime.paths.state_root
         if runtime is not None
-        else None
+        else Path(WORKDIR)
     )
-    if recorder is None:
-        getter = globals().get("get_current_run")
-        recorder = getter() if callable(getter) else None
-    if recorder is not None and getattr(recorder, "run_dir", None):
-        run_id = str(recorder.run_id)
-        root = Path(recorder.run_dir) / "artifacts" / "compacted-tool-results"
-    elif runtime is not None:
-        run_id = str(runtime.state.metadata.setdefault(
-            "archive_run_id",
-            "runtime-" + uuid.uuid4().hex[:12],
-        ))
-        root = (
-            runtime.paths.state_root
-            / ".codepilot"
-            / "runs"
-            / run_id
-            / "artifacts"
-            / "compacted-tool-results"
+    archive_parent = state_root / ".codepilot" / "context-archives"
+    root = archive_parent / session_id
+    if (
+        archive_parent.is_symlink()
+        or not archive_parent.resolve().is_relative_to(
+            Path(state_root).resolve()
         )
-    else:
-        run_id = _LEGACY_ARCHIVE_RUN_ID
-        root = (
-            Path(WORKDIR)
-            / ".codepilot"
-            / "runs"
-            / run_id
-            / "artifacts"
-            / "compacted-tool-results"
-        )
+    ):
+        raise OSError("context archive root cannot be a symlink")
     if create:
-        root.mkdir(parents=True, exist_ok=True)
-    return run_id, root
+        archive_parent.mkdir(parents=True, exist_ok=True)
+        if root.exists() and (root.is_symlink() or not root.is_dir()):
+            raise OSError("context session archive is not a safe directory")
+        root.mkdir(exist_ok=True)
+        results_dir = root / "results"
+        if results_dir.exists() and (
+            results_dir.is_symlink() or not results_dir.is_dir()
+        ):
+            raise OSError("context archive results is not a safe directory")
+        results_dir.mkdir(exist_ok=True)
+        metadata_path = root / "metadata.json"
+        if metadata_path.is_symlink():
+            raise OSError("context archive metadata cannot be a symlink")
+        _touch_archive_metadata(root, session_id)
+    return session_id, root
+
+
+def _atomic_write_bytes(path: Path, raw: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _touch_archive_metadata(
+    archive_root: Path,
+    session_id: str,
+    *,
+    timestamp: float | None = None,
+) -> None:
+    metadata_path = archive_root / "metadata.json"
+    now = time.time() if timestamp is None else float(timestamp)
+    created_at = now
+    try:
+        current = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if isinstance(current, dict):
+            created_at = float(current.get("created_at", now))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    raw = json.dumps({
+        "context_session_id": session_id,
+        "created_at": created_at,
+        "updated_at": now,
+    }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    _atomic_write_bytes(metadata_path, raw)
 
 
 def _read_manifest(manifest_path: Path) -> list[dict]:
     records = []
-    try:
-        for line in manifest_path.read_text(encoding="utf-8").splitlines():
-            value = json.loads(line)
-            if isinstance(value, dict):
-                records.append(value)
-    except (OSError, json.JSONDecodeError):
+    if manifest_path.is_symlink():
         return records
+    try:
+        lines = manifest_path.read_bytes().splitlines()
+    except OSError:
+        return records
+    invalid = 0
+    for raw_line in lines:
+        if not raw_line.strip():
+            continue
+        try:
+            line = raw_line.decode("utf-8", errors="strict")
+            value = json.loads(line)
+        except (UnicodeError, json.JSONDecodeError, TypeError):
+            invalid += 1
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+        else:
+            invalid += 1
+    if invalid:
+        try:
+            record_event(
+                "archive_warning",
+                reason="invalid_manifest_records",
+                invalid_record_count=invalid,
+                manifest=str(manifest_path),
+            )
+        except Exception:
+            pass
     return records
+
+
+def _record_path(archive_root: Path, record: dict) -> Path | None:
+    filename = str(record.get("filename", ""))
+    relative = Path(filename)
+    if (
+        not filename
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or len(relative.parts) != 2
+        or relative.parts[0] != "results"
+    ):
+        return None
+    try:
+        results_dir = archive_root / "results"
+        candidate = archive_root / relative
+        if (
+            archive_root.is_symlink()
+            or results_dir.is_symlink()
+            or candidate.is_symlink()
+        ):
+            return None
+        resolved = candidate.resolve()
+        results_root = results_dir.resolve()
+        if resolved.parent != results_root:
+            return None
+        return resolved
+    except OSError:
+        return None
+
+
+def _record_is_reusable(
+    archive_root: Path,
+    record: dict,
+    digest: str,
+) -> bool:
+    output_path = _record_path(archive_root, record)
+    if output_path is None:
+        return False
+    try:
+        return (
+            output_path.is_file()
+            and not output_path.is_symlink()
+            and hashlib.sha256(output_path.read_bytes()).hexdigest() == digest
+        )
+    except OSError:
+        return False
+
+
+def _archive_uri(session_id: str) -> str:
+    return (
+        f"{ARCHIVE_URI_PREFIX}context/{session_id}/manifest.jsonl"
+    )
+
+
+def _write_manifest_atomic(
+    manifest_path: Path,
+    records: list[dict],
+) -> None:
+    raw = "".join(
+        json.dumps(
+            record,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ) + "\n"
+        for record in records
+    ).encode("utf-8")
+    _atomic_write_bytes(manifest_path, raw)
 
 
 def _archive_prefix_tool_results(
@@ -381,70 +511,357 @@ def _archive_prefix_tool_results(
     runtime: AgentRuntime | None,
 ) -> tuple[list[dict], str]:
     """Archive every exact Tool Result that is about to leave live context."""
+    session_id, archive_root = _archive_location(runtime, create=True)
+    manifest_path = archive_root / "manifest.jsonl"
     results = collect_tool_results(prefix)
     if not results:
-        return [], ""
-    run_id, archive_root = _archive_location(runtime, create=True)
-    manifest_path = archive_root / "manifest.jsonl"
+        return [], _archive_uri(session_id) if manifest_path.exists() else ""
     tool_uses = _collect_tool_uses(prefix)
     archived = []
+    created_paths: list[Path] = []
     with _ARCHIVE_LOCK:
         existing = _read_manifest(manifest_path)
         by_key = {
-            (str(item.get("tool_use_id", "")), str(item.get("sha256", ""))): item
+            (str(item.get("tool_use_id", "")), str(item.get("sha256", ""))):
+            item
             for item in existing
+            if str(item.get("context_session_id", "")) == session_id
         }
         appended = []
-        for _, _, block in results:
-            tool_use_id = str(_block_field(block, "tool_use_id", "unknown"))
-            output = str(_block_field(block, "content", ""))
-            digest = hashlib.sha256(output.encode("utf-8")).hexdigest()
-            existing_record = by_key.get((tool_use_id, digest))
-            if existing_record is not None:
-                output_path = Path(str(existing_record.get("output_path", "")))
-                try:
-                    reusable = (
-                        output_path.resolve().parent == archive_root.resolve()
-                        and output_path.is_file()
-                        and not output_path.is_symlink()
-                        and hashlib.sha256(output_path.read_bytes()).hexdigest()
-                        == digest
+        try:
+            for _, _, block in results:
+                tool_use_id = str(_block_field(
+                    block, "tool_use_id", "unknown",
+                ))
+                output = str(_block_field(block, "content", ""))
+                raw = output.encode("utf-8")
+                digest = hashlib.sha256(raw).hexdigest()
+                existing_record = by_key.get((tool_use_id, digest))
+                if (
+                    existing_record is not None
+                    and _record_is_reusable(
+                        archive_root, existing_record, digest,
                     )
-                except OSError:
-                    reusable = False
-                if reusable:
+                ):
                     archived.append(existing_record)
                     continue
 
-            filename = _safe_result_filename(tool_use_id)
-            output_path = archive_root / filename
-            if output_path.exists():
-                output_path = archive_root / (
-                    output_path.stem + "-" + digest[:12] + ".txt"
+                archive_id = (
+                    f"ar_{digest[:12]}_{uuid.uuid4().hex[:10]}"
                 )
-            output_path.write_text(output, encoding="utf-8")
-            use = tool_uses.get(tool_use_id, {})
-            record = {
-                "tool_use_id": tool_use_id,
-                "tool_name": str(use.get("tool_name", "")),
-                "tool_input": dict(use.get("tool_input", {})),
-                "output_path": str(output_path),
-                "archive_id": f"{run_id}/{output_path.name}",
-                "character_count": len(output),
-                "sha256": digest,
-            }
-            by_key[(tool_use_id, digest)] = record
-            appended.append(record)
-            archived.append(record)
-        if appended:
-            with manifest_path.open("a", encoding="utf-8") as stream:
-                for record in appended:
-                    stream.write(json.dumps(
-                        record,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ) + "\n")
-    return archived, f"{ARCHIVE_URI_PREFIX}{run_id}/manifest.jsonl"
+                relative_filename = f"results/{archive_id}.txt"
+                output_path = archive_root / Path(relative_filename)
+                _atomic_write_bytes(output_path, raw)
+                created_paths.append(output_path)
+                use = tool_uses.get(tool_use_id, {})
+                record = {
+                    "archive_id": archive_id,
+                    "context_session_id": session_id,
+                    "tool_use_id": tool_use_id,
+                    "tool_name": str(use.get("tool_name", "")),
+                    "tool_input": dict(use.get("tool_input", {})),
+                    "character_count": len(output),
+                    "sha256": digest,
+                    "filename": relative_filename,
+                    "archived_at": time.time(),
+                }
+                by_key[(tool_use_id, digest)] = record
+                appended.append(record)
+                archived.append(record)
+            if appended:
+                _touch_archive_metadata(archive_root, session_id)
+                _write_manifest_atomic(
+                    manifest_path,
+                    [*existing, *appended],
+                )
+        except Exception:
+            for created_path in created_paths:
+                try:
+                    created_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+    return archived, _archive_uri(session_id)
+
+
+def _tool_input_preview(value, limit: int = 500):
+    try:
+        rendered = json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        rendered = str(value)
+    if len(rendered) <= limit:
+        return value if isinstance(value, dict) else {"value": rendered}
+    return {"preview": rendered[:limit], "truncated": True}
+
+
+def search_archived_tool_results(
+    query: str = "",
+    tool_name: str = "",
+    limit: int = 20,
+    runtime: AgentRuntime | None = None,
+) -> str:
+    """Search bounded metadata from the current Context Session manifest."""
+    try:
+        session_id, archive_root = _archive_location(runtime, create=False)
+        records = [
+            record
+            for record in _read_manifest(archive_root / "manifest.jsonl")
+            if str(record.get("context_session_id", "")) == session_id
+        ]
+        needle = str(query or "").casefold()
+        tool_filter = str(tool_name or "").casefold()
+        matches = []
+        for record in reversed(records):
+            if (
+                tool_filter
+                and str(record.get("tool_name", "")).casefold()
+                != tool_filter
+            ):
+                continue
+            haystack = "\n".join((
+                str(record.get("archive_id", "")),
+                str(record.get("tool_use_id", "")),
+                str(record.get("tool_name", "")),
+                json.dumps(
+                    record.get("tool_input", {}),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ),
+            )).casefold()
+            if needle and needle not in haystack:
+                continue
+            matches.append({
+                "archive_id": str(record.get("archive_id", "")),
+                "tool_use_id": str(record.get("tool_use_id", "")),
+                "tool_name": str(record.get("tool_name", "")),
+                "tool_input": _tool_input_preview(
+                    record.get("tool_input", {}),
+                ),
+                "character_count": int(
+                    record.get("character_count", 0) or 0,
+                ),
+                "sha256": str(record.get("sha256", "")),
+                "archived_at": record.get("archived_at"),
+            })
+            if len(matches) >= min(20, max(1, int(limit or 20))):
+                break
+        return json.dumps(
+            matches,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except Exception as exc:
+        return json.dumps({
+            "error": f"{type(exc).__name__}: {exc}",
+            "results": [],
+        }, ensure_ascii=False, separators=(",", ":"))
+
+
+def read_archived_tool_result(
+    archive_id: str = "",
+    tool_use_id: str = "",
+    offset: int | None = None,
+    limit: int | None = None,
+    runtime: AgentRuntime | None = None,
+) -> str:
+    """Read one exact result from the current Context Session archive."""
+    if not str(archive_id or tool_use_id).strip():
+        return "Error: archive_id or tool_use_id is required"
+    try:
+        session_id, archive_root = _archive_location(runtime, create=False)
+        records = [
+            record
+            for record in _read_manifest(archive_root / "manifest.jsonl")
+            if str(record.get("context_session_id", "")) == session_id
+        ]
+        selected_by_tool = False
+        if archive_id:
+            record = next(
+                (
+                    item for item in records
+                    if str(item.get("archive_id", "")) == str(archive_id)
+                ),
+                None,
+            )
+        else:
+            record = next(
+                (
+                    item for item in reversed(records)
+                    if str(item.get("tool_use_id", "")) == str(tool_use_id)
+                ),
+                None,
+            )
+            selected_by_tool = record is not None
+        requested = archive_id or tool_use_id
+        if record is None:
+            return f"Error: archived tool result not found: {requested}"
+        output_path = _record_path(archive_root, record)
+        if (
+            output_path is None
+            or not output_path.is_file()
+            or output_path.is_symlink()
+        ):
+            return "Error: invalid archived tool result path"
+        raw = output_path.read_bytes()
+        expected_digest = str(record.get("sha256", ""))
+        if hashlib.sha256(raw).hexdigest() != expected_digest:
+            return "Error: archived tool result digest mismatch"
+        output = raw.decode("utf-8")
+        if offset is None and limit is None:
+            selected = output
+        else:
+            lines = output.splitlines()
+            start = max(0, int(offset or 0))
+            selected_lines = lines[start:]
+            if limit is not None:
+                selected_lines = selected_lines[:max(0, int(limit))]
+            selected = "\n".join(selected_lines)
+        if selected_by_tool:
+            return (
+                f"[Resolved latest archive_id="
+                f"{record.get('archive_id', '')} for tool_use_id="
+                f"{tool_use_id}]\n{selected}"
+            )
+        return selected
+    except Exception as exc:
+        return f"Error: {type(exc).__name__}: {exc}"
+
+
+def _archive_dir_size(path: Path) -> int:
+    total = 0
+    try:
+        for candidate in path.rglob("*"):
+            if candidate.is_file() and not candidate.is_symlink():
+                total += candidate.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
+def _archive_updated_at(path: Path) -> float:
+    try:
+        metadata = json.loads(
+            (path / "metadata.json").read_text(encoding="utf-8"),
+        )
+        return float(metadata.get("updated_at", path.stat().st_mtime))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+
+def cleanup_context_archives(
+    current_session_id: str,
+    *,
+    state_root: str | Path,
+    max_age_days: float | None = None,
+    max_sessions: int | None = None,
+    max_total_mb: float | None = None,
+) -> dict:
+    """Best-effort whole-session retention for Context archives."""
+    stats = {"deleted": 0, "session_count": 0, "total_bytes": 0}
+    try:
+        state_root_path = Path(state_root).resolve()
+        archive_parent = state_root_path / ".codepilot" / "context-archives"
+        if not archive_parent.is_dir():
+            return stats
+        if (
+            archive_parent.is_symlink()
+            or not archive_parent.resolve().is_relative_to(state_root_path)
+        ):
+            return stats
+        age_days = (
+            TRACE_RETENTION_MAX_DAYS
+            if max_age_days is None else float(max_age_days)
+        )
+        session_limit = (
+            TRACE_RETENTION_MAX_RUNS
+            if max_sessions is None else int(max_sessions)
+        )
+        quota_bytes = int(max(
+            0.0,
+            TRACE_RETENTION_MAX_MB
+            if max_total_mb is None else float(max_total_mb),
+        ) * 1024 * 1024)
+
+        def scan():
+            sessions = []
+            for path in archive_parent.iterdir():
+                try:
+                    if (
+                        not path.is_dir()
+                        or path.is_symlink()
+                        or path.parent.resolve() != archive_parent.resolve()
+                    ):
+                        continue
+                    sessions.append({
+                        "id": path.name,
+                        "path": path,
+                        "updated_at": _archive_updated_at(path),
+                        "size": _archive_dir_size(path),
+                        "protected": (
+                            path.name == current_session_id
+                            or (path / ".keep").exists()
+                        ),
+                    })
+                except OSError:
+                    continue
+            return sessions
+
+        def remove(info):
+            if info["protected"]:
+                return False
+            try:
+                shutil.rmtree(info["path"])
+                stats["deleted"] += 1
+                return True
+            except OSError:
+                return False
+
+        cutoff = time.time() - max(0.0, age_days) * 86400
+        for info in scan():
+            if info["updated_at"] < cutoff:
+                remove(info)
+
+        sessions = sorted(
+            scan(), key=lambda item: item["updated_at"], reverse=True,
+        )
+        for index, info in enumerate(sessions):
+            if index >= max(0, session_limit):
+                remove(info)
+
+        sessions = sorted(scan(), key=lambda item: item["updated_at"])
+        total = sum(info["size"] for info in sessions)
+        for info in sessions:
+            if total <= quota_bytes:
+                break
+            if remove(info):
+                total -= info["size"]
+        sessions = scan()
+        stats["session_count"] = len(sessions)
+        stats["total_bytes"] = sum(info["size"] for info in sessions)
+    except Exception:
+        return stats
+    return stats
+
+
+def initialize_context_archive(runtime: AgentRuntime) -> None:
+    """Run archive retention once for an already-created Context Session."""
+    if runtime.state.metadata.get("context_archive_initialized"):
+        return
+    runtime.state.metadata["context_archive_initialized"] = True
+    try:
+        session_id = _context_session_id(runtime)
+        cleanup_context_archives(
+            session_id,
+            state_root=runtime.paths.state_root,
+        )
+    except Exception:
+        return
 
 
 def _archived_descriptor(record: dict, output: str) -> str:
@@ -463,7 +880,7 @@ def _archived_descriptor(record: dict, output: str) -> str:
             separators=(",", ":"),
         ),
         f"archive_id: {record.get('archive_id', '')}",
-        f"output_path: {record.get('output_path', '')}",
+        f"filename: {record.get('filename', '')}",
         f"character_count: {record.get('character_count', len(output))}",
         f"sha256: {record.get('sha256', '')}",
         "First output:",
@@ -472,54 +889,6 @@ def _archived_descriptor(record: dict, output: str) -> str:
         tail,
         "</archived-tool-result>",
     ])
-
-
-def read_archived_tool_result(
-    tool_use_id: str,
-    offset: int | None = None,
-    limit: int | None = None,
-    runtime: AgentRuntime | None = None,
-) -> str:
-    """Read one exact result from the current run archive by Tool-use ID."""
-    try:
-        _, archive_root = _archive_location(runtime, create=False)
-        records = _read_manifest(archive_root / "manifest.jsonl")
-        record = next(
-            (
-                item
-                for item in reversed(records)
-                if str(item.get("tool_use_id", "")) == str(tool_use_id)
-            ),
-            None,
-        )
-        if record is None:
-            return f"Error: archived tool result not found: {tool_use_id}"
-        output_path = Path(str(record.get("output_path", "")))
-        resolved = output_path.resolve()
-        if (
-            resolved.parent != archive_root.resolve()
-            or not resolved.is_file()
-            or resolved.is_symlink()
-        ):
-            return "Error: invalid archived tool result path"
-        output = resolved.read_text(encoding="utf-8")
-        expected_digest = str(record.get("sha256", ""))
-        if (
-            expected_digest
-            and hashlib.sha256(output.encode("utf-8")).hexdigest()
-            != expected_digest
-        ):
-            return "Error: archived tool result digest mismatch"
-        if offset is None and limit is None:
-            return output
-        lines = output.splitlines()
-        start = max(0, int(offset or 0))
-        selected = lines[start:]
-        if limit is not None:
-            selected = selected[:max(0, int(limit))]
-        return "\n".join(selected)
-    except Exception as exc:
-        return f"Error: {type(exc).__name__}: {exc}"
 
 
 def write_transcript(
@@ -654,17 +1023,26 @@ def _summarize_once(
     return str(summary).strip(), ""
 
 
+def _strip_archive_locator(summary: str) -> str:
+    return re.sub(
+        r"(?ms)\n*^## Archived tool results\s*$.*?(?=^##\s|\Z)",
+        "",
+        summary,
+    ).strip()
+
+
 def _append_archive_locator(summary: str, manifest_uri: str) -> str:
+    summary = _strip_archive_locator(summary)
     if not manifest_uri:
-        return summary.strip()
+        return summary
     return (
-        summary.strip()
+        summary
         + "\n\n## Archived tool results\n\n"
-        + f"Manifest: `{manifest_uri}`\n\n"
-        + "Exact outputs removed from the live context can be recovered from "
-        + "this manifest by tool_use_id, tool name, or original tool input. "
-        + "Use `read_archived_tool_result` and reuse archived results instead "
-        + "of rerunning unchanged tools."
+        + f"Archive session: `{manifest_uri}`\n\n"
+        + "When an exact old tool result is needed, first use "
+        + "`search_archived_tool_results`, then call "
+        + "`read_archived_tool_result(archive_id=...)`. Do not rerun an "
+        + "unchanged tool only to recover output that is already archived."
     )
 
 
@@ -737,6 +1115,8 @@ def _record_compact(
     archived_results: int = 0,
     masked_summary_results: int = 0,
     summary_model_calls: int = 0,
+    archive_failed: bool = False,
+    archive_error_type: str = "",
 ) -> None:
     try:
         record_event(
@@ -760,6 +1140,8 @@ def _record_compact(
             archived_result_count=archived_results,
             masked_summary_result_count=masked_summary_results,
             summary_model_calls=summary_model_calls,
+            archive_failed=archive_failed,
+            archive_error_type=archive_error_type,
         )
     except Exception:
         pass
@@ -910,7 +1292,27 @@ def _compact(
         )
         return messages
 
-    archived, manifest_uri = _archive_prefix_tool_results(prefix, runtime)
+    try:
+        archived, manifest_uri = _archive_prefix_tool_results(prefix, runtime)
+    except Exception as exc:
+        failure = f"archive failed: {type(exc).__name__}: {exc}"
+        _record_compact(
+            reason=reason,
+            transcript=transcript,
+            before_messages=len(messages),
+            before_size=before_size,
+            after_messages=len(messages),
+            after_size=before_size,
+            summarized_prefix=len(prefix),
+            tail=tail,
+            summary="",
+            success=False,
+            failure_reason=failure,
+            summary_model_calls=0,
+            archive_failed=True,
+            archive_error_type=type(exc).__name__,
+        )
+        return messages
     summary_prompt_budget = max(
         1_000,
         CONTEXT_LIMIT - SUMMARY_OUTPUT_RESERVE_CHARS,

@@ -60,8 +60,8 @@ policy, role access, and runtime-binding metadata.
   `delegated_tool_policy` with both `allowed_tools` and
   `allow_parent_permission_expansion=true`; the environment policy remains an
   absolute upper bound.
-- The Lead projection has 31 built-in tools, including the narrow
-  `read_archived_tool_result` recovery surface.
+- The Lead projection includes narrow `search_archived_tool_results` and
+  `read_archived_tool_result` recovery surfaces.
 - General, Explorer, Reviewer, Worker, and Teammate projections use the same
   effective-permission function. Synchronous roles and asynchronous Teammates
   therefore cannot obtain Bash or write tools merely because their profile
@@ -82,7 +82,7 @@ handled by `SAFETY_POLICY_VALIDATORS` in the pre-tool Hook, including
 are handled by `BACKGROUND_POLICY_ROUTERS`; an unknown policy cannot be
 registered as if it were active.
 
-The fixed empty-context system prompt plus 31-tool JSON payload is guarded
+The fixed empty-context system prompt plus complete Lead-tool JSON payload is guarded
 below 12,000 characters. Capability-group lazy exposure is deferred; this phase
 does not remove any Lead tool.
 
@@ -95,7 +95,7 @@ history untouched. At 85% of the configured context budget, the lifecycle is:
 ```text
 assemble the complete current request
 -> choose prefix + recent raw suffix from the untouched history
--> archive every Tool Result in the outgoing prefix into the current Trace run
+-> archive every Tool Result in the outgoing prefix into the Context Session
 -> fit one summary request; mask only archived copies when strictly necessary
 -> summarize the older prefix into one Markdown continuation checkpoint
 -> append a programmatic archive locator
@@ -122,7 +122,7 @@ units to recover from a summary overflow. Before the model call, the complete
 summary prompt is measured against a conservative input budget. Tool Results
 are normally shown to the summarizer in full. Only if the prompt does not fit
 are the largest Tool Results replaced in the summary-request copy by bounded
-descriptors containing Tool ID/name/input, archive ID/path, size, digest, and
+descriptors containing Tool ID/name/input, archive ID/relative filename, size, digest, and
 head/tail preview. The original messages and recent tail are never modified.
 If even that request cannot fit, the original history remains unchanged.
 
@@ -130,22 +130,34 @@ One compact attempt reserves and issues at most one summary model call. Model
 failure, empty output, or an over-budget assembled candidate retains the
 original history; there is no retry or second summary call.
 
-Every Tool Result entering the outgoing prefix is archived exactly once under
-the current Trace run's `artifacts/compacted-tool-results` directory, regardless
-of size. `manifest.jsonl` maps Tool-use ID/name/input to the exact UTF-8 file,
-character count, and SHA-256 digest. Checkpoints mechanically include an
-`archive://<run-id>/manifest.jsonl` locator. The Lead-only
-`read_archived_tool_result` tool resolves a Tool-use ID inside that directory
-and cannot accept arbitrary paths. Recent-tail results are archived only when
-a later Compact moves them into the prefix.
+Every Tool Result entering the outgoing prefix is archived exactly once per
+`tool_use_id + SHA-256` under
+`<state_root>/.codepilot/context-archives/<context_session_id>`, regardless of
+size. The Context Session ID is created with the Runtime and remains stable
+across interactive CLI inputs and Trace run switches. `manifest.jsonl` maps a
+randomized `archive_id` plus Tool-use ID/name/input to a relative result
+filename, exact UTF-8 byte digest, character count, and timestamp. Result files
+and manifest replacements are atomic. A failed archive prevents the summary
+call and returns the original history unchanged.
 
-Archives inherit Trace retention as one run artifact: the active run and
-pinned runs are protected, while completed unpinned runs are subject to the
-existing age/count/disk cleanup. Cleanup failure remains non-fatal.
+Checkpoints mechanically include exactly one
+`archive://context/<context_session_id>/manifest.jsonl` locator.
+`search_archived_tool_results` searches bounded metadata in only the current
+session; `read_archived_tool_result(archive_id=...)` verifies the controlled
+relative path, symlink boundary, and digest before decoding exact UTF-8 bytes.
+The compatibility Tool-use ID lookup explicitly selects the latest version.
+Neither tool accepts an arbitrary filesystem path. Recent-tail results are
+archived only when a later Compact moves them into the prefix.
+
+Archive retention deletes whole inactive Context Session directories by last
+update time, maximum session count, and total bytes. The current session and
+`.keep` sessions are protected. Initialization runs cleanup once; cleanup
+failure remains non-fatal and no per-result TTL is used.
 
 Compact trace records reason, before/after messages and token estimates,
 summarized prefix size, raw-tail size, summary length, outcome, and oversized
-archive/masking counts and the exact summary-call count. Successful compaction increments a small runtime generation
+archive/masking counts, archive failure type, and the exact summary-call count.
+Successful compaction increments a small runtime generation
 counter used only by the post-compact redundant-read metric.
 
 **Status: Implemented, not Validated.** Local tests cover the lightweight

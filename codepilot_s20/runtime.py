@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import uuid
 from .knowledge import RunKnowledge
 
 
@@ -126,7 +127,13 @@ class AgentRuntime:
                 background_tasks_enabled=background_tasks_enabled,
             ),
             paths=RuntimePaths.create(workdir, state_root),
-            state=RunState(root_task=root_task, deadline=deadline),
+            state=RunState(
+                root_task=root_task,
+                deadline=deadline,
+                metadata={
+                    "context_session_id": "session-" + uuid.uuid4().hex,
+                },
+            ),
             services=RuntimeServices(
                 model_client=model_client,
                 command_executor=command_executor,

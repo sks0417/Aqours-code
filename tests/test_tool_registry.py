@@ -25,12 +25,17 @@ from codepilot_s20.tool_registry import (
 )
 
 
-def test_registry_is_the_authoritative_31_tool_lead_surface():
+def test_registry_is_the_authoritative_lead_surface():
     lead_names = TOOL_REGISTRY.names_for_role("lead")
 
-    assert len(TOOL_REGISTRY) == 32  # 31 lead tools + teammate-only submit_plan
-    assert len(lead_names) == 31
-    assert "read_archived_tool_result" in lead_names
+    assert len(set(lead_names)) == len(lead_names)
+    assert set(lead_names) <= {
+        spec.name for spec in TOOL_REGISTRY.specs()
+    }
+    assert {
+        "read_archived_tool_result",
+        "search_archived_tool_results",
+    } <= set(lead_names)
     assert [tool["name"] for tool in BUILTIN_TOOLS] == list(lead_names)
     assert set(BUILTIN_HANDLERS) == set(lead_names) - {"compact"}
     assert builtin_handlers() == BUILTIN_HANDLERS
@@ -65,8 +70,11 @@ def test_registry_policy_metadata_drives_existing_policy_categories():
     assert TOOL_REGISTRY.get("bash").background_policy == "slow_or_explicit"
     assert TOOL_REGISTRY.get("read_file").background_policy == "foreground"
     archive_reader = TOOL_REGISTRY.get("read_archived_tool_result")
+    archive_search = TOOL_REGISTRY.get("search_archived_tool_results")
     assert archive_reader.allowed_roles == frozenset({"lead"})
     assert archive_reader.runtime_aware is True
+    assert archive_search.allowed_roles == frozenset({"lead"})
+    assert archive_search.runtime_aware is True
     assert "path" not in archive_reader.api_schema()["input_schema"]["properties"]
     assert TOOL_REGISTRY.get("write_file").safety_policy == "workspace_write"
     assert TOOL_REGISTRY.get("edit_file").safety_policy == "workspace_write"
@@ -205,8 +213,14 @@ def test_every_declared_policy_has_an_execution_dispatcher(monkeypatch):
     ) == "explicit"
 
 
-def test_fixed_prompt_and_31_tool_schema_stay_below_phase_two_budget():
+def test_fixed_prompt_and_lead_tool_schema_stay_below_phase_two_budget(
+    monkeypatch,
+):
     mcp.mcp_clients.clear()
+    monkeypatch.setattr(prompts, "list_skills", lambda _runtime=None: "(none)")
+    monkeypatch.setattr(prompts, "WORKDIR", "/workspace")
+    monkeypatch.setattr(prompts, "TOOL_POLICY", {})
+    monkeypatch.setattr(mcp, "TOOL_POLICY", {})
     tools, _ = mcp.assemble_tool_pool()
     system = prompts.assemble_system_prompt({})
     fixed_payload = json.dumps(
@@ -215,7 +229,9 @@ def test_fixed_prompt_and_31_tool_schema_stay_below_phase_two_budget():
         separators=(",", ":"),
     )
 
-    assert len(tools) == 31
+    assert {tool["name"] for tool in tools} == set(
+        TOOL_REGISTRY.names_for_role("lead")
+    )
     assert len(fixed_payload) < 12_000
     assert "API tool definitions and input schemas" in system
     assert "Available tools (full descriptions):" not in system

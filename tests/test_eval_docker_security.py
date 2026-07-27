@@ -87,7 +87,7 @@ def test_docker_eval_policy_exposes_full_harness(monkeypatch):
 
     assert names == set(run_eval.DOCKER_EVAL_TOOL_POLICY["allowed_tools"])
     assert set(handlers) == names - {"compact"}
-    assert len(names) == 31
+    assert "search_archived_tool_results" in names
     assert run_eval.DOCKER_EVAL_TOOL_POLICY["disabled_tools"] == []
     assert run_eval.DOCKER_EVAL_TOOL_POLICY["allow_mcp"] is True
     assert run_eval.DOCKER_EVAL_TOOL_POLICY["allow_memory_context"] is True

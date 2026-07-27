@@ -553,7 +553,10 @@ def test_docker_eval_integration_smoke(tmp_path):
         event for event in run_eval.read_trace_events(Path(tests_result["trace"]))
         if event.get("type") == "tool_policy"
     ]
-    assert len(policy_events[-1]["allowed_tools"]) == 31
+    from codepilot_s20.tool_defs import TOOL_REGISTRY
+    assert set(policy_events[-1]["allowed_tools"]) == set(
+        TOOL_REGISTRY.names_for_role("lead")
+    )
     assert policy_events[-1]["disabled_tools"] == []
 
     smoke_case = tmp_path / "_docker_bash_write_smoke"

@@ -38,6 +38,13 @@ def test_runtime_paths_and_mutable_state_are_isolated(tmp_path):
     assert runtime_b.state.lead_read_counts == {}
     assert runtime_a.paths.memory_index == tmp_path / "state-a" / ".memory" / "MEMORY.md"
     assert runtime_b.paths.workdir == (tmp_path / "workspace-b").resolve()
+    assert runtime_a.state.metadata["context_session_id"].startswith(
+        "session-"
+    )
+    assert (
+        runtime_a.state.metadata["context_session_id"]
+        != runtime_b.state.metadata["context_session_id"]
+    )
 
 
 def test_explicit_runtime_controls_file_tools_and_todos(tmp_path, monkeypatch):
@@ -132,4 +139,5 @@ def test_run_agent_task_constructs_and_passes_explicit_runtime(
     assert runtime.paths.workdir == (tmp_path / "workspace").resolve()
     assert runtime.paths.state_root == (tmp_path / "state").resolve()
     assert runtime.services.trace_recorder is not None
+    assert runtime.state.metadata["context_archive_initialized"] is True
     assert result["final_answer"] == "done"

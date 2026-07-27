@@ -74,17 +74,17 @@ Host prepares a disposable case copy
 -> trusted tests produce the final summary
 ```
 
-The Agent container runs the normal `run_agent_task()` with all 31 built-in
+The Agent container runs the normal `run_agent_task()` with the full built-in
 tools, dynamic MCP tools, Skill, Memory, Task, Cron, Background, Subagent,
 Teammate, Protocol, and Worktree support. It receives only `/workspace`,
 per-case `/state`, `/runtime`, and the model forwarding directories. The host
 project, API keys, Docker socket, trusted grader, and grading workspace are not
 mounted. The container is network-disabled, non-root, and resource limited.
 
-The 31 built-ins and every role-specific projection come from one `ToolSpec`
+The built-ins and every role-specific projection come from one `ToolSpec`
 registry. API schemas are the authoritative tool descriptions, so the system
 prompt no longer duplicates them. A regression budget keeps the fixed prompt
-plus 31-tool schema below 12,000 characters without hiding any Lead tool.
+plus complete Lead tool schema below 12,000 characters without hiding tools.
 
 Each run also owns deterministic `RunKnowledge`: file digests/versions,
 confirmed Python symbols and contracts, modified paths, recent test results,
@@ -104,10 +104,12 @@ checkpoint into one replacement checkpoint rather than stacking summaries.
 There is no JSON semantic state machine or per-file semantic card injection.
 Summary failure or empty output leaves raw history unchanged. Exceptional
 single Tool Results are not globally truncated. Every result that enters the
-outgoing prefix is archived under the current Trace run; the full result reaches
-the summarizer unless the measured summary request requires masking an archived
-copy. Checkpoints receive a programmatic archive locator, and the Lead can
-recover exact output by Tool-use ID through `read_archived_tool_result`.
+outgoing prefix is archived under the Runtime's stable Context Session; changing
+Trace runs does not change that archive. The full result reaches the summarizer
+unless the measured summary request requires masking an archived copy.
+Checkpoints receive one programmatic session locator. The Lead can locate
+metadata with `search_archived_tool_results` and recover an exact version with
+`read_archived_tool_result(archive_id=...)`.
 Each Compact budgets and makes at most one summary call. Automatic and reactive Compact
 verify the complete assembled request against the target and trace their
 before/after budget. This feature is `Implemented`, not `Validated`, until the

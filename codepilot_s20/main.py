@@ -25,6 +25,7 @@ def main():
         client,
     )
     from .context import update_context
+    from .compact import initialize_context_archive
     from .cron import start_scheduler
     from .hooks import trigger_hooks
     from .protocol import consume_lead_inbox
@@ -49,6 +50,7 @@ def main():
         approval_mode=APPROVAL_MODE,
         background_tasks_enabled=BACKGROUND_TASKS_ENABLED,
     )
+    initialize_context_archive(runtime)
     history = []
     context = update_context({}, [], runtime)
     threading.Thread(target=cron_autorun_loop,
