@@ -91,7 +91,7 @@ does not remove any Lead tool.
 
 Every model turn is budgeted as one assembled request: rebuilt system prompt,
 API tool schemas, dynamic runtime state, and messages. Ordinary turns leave
-history untouched. At 85% of the configured context budget, the lifecycle is:
+history untouched. At 80% of the configured context budget, the lifecycle is:
 
 ```text
 assemble the complete current request
@@ -110,9 +110,9 @@ The checkpoint is an ordinary internal user message marked
 older prefix and replaces it with one new cumulative checkpoint; summaries do
 not stack. The summary is free-form Markdown. There is no JSON schema, semantic
 merge, file-card state, Tool-result acknowledgement protocol, or deterministic
-semantic fallback. The context limit is 192,000 characters, approximately
-64,000 tokens using the existing three-characters-per-token estimate. Compact
-triggers at 85%, and reserves up to 3,000 estimated tokens for the summary.
+semantic fallback. The context limit is 128,000 characters, approximately
+42,000 tokens using the existing three-characters-per-token estimate. Compact
+triggers at 80%, and reserves up to 3,000 estimated tokens for the summary.
 
 Assistant Tool-use and matching user Tool-result messages are one atomic unit
 and cannot be cut apart; a parallel Tool batch is one unit as well. The recent

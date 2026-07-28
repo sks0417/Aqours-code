@@ -15,7 +15,7 @@ from .runtime_state import *
 # Markdown checkpoint, the latest genuine user message, and a recent verbatim
 # suffix. Token counts are estimates because providers do not share a tokenizer.
 CONTEXT_CHECKPOINT_MARKER = "[Context checkpoint]"
-COMPACT_TRIGGER_RATIO = 0.85
+COMPACT_TRIGGER_RATIO = 0.80
 RECENT_TOOL_RESULT_COUNT = 4
 RECENT_TAIL_MAX_TOKENS = 20_000
 MAX_TOOL_RESULT_TOKENS = 8_000

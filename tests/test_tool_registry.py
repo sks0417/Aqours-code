@@ -227,3 +227,18 @@ def test_fixed_prompt_and_lead_tool_schema_stay_below_phase_two_budget(
     assert "API tool definitions and input schemas" in system
     assert "Available tools (full descriptions):" not in system
     assert TOOL_REGISTRY.get("delegate_agent").description not in system
+
+
+def test_tool_strategy_batches_only_safe_independent_operations():
+    strategy = prompts.PROMPT_SECTIONS["tool_strategy"]
+
+    assert "Batch independent reads" in strategy
+    assert "at most 8" in strategy
+    assert "each targets a different file" in strategy
+    assert "at most one mutation per file" in strategy
+    assert "none depends on another result" in strategy
+    assert "read-to-dependent-edit" in strategy
+    assert "mutations with tests, background commands, or worktree" in strategy
+    assert "Tools execute in response order" in strategy
+    assert "partial failure does not roll back" in strategy
+    assert "Complete one coherent phase" in strategy

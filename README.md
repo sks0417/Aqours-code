@@ -99,11 +99,11 @@ not presented as source coverage.
 Context continuation uses one cumulative Markdown checkpoint plus a bounded
 verbatim recent tail. Before every provider request, Tool Results are first
 limited deterministically; the complete sanitized request then triggers Compact
-at 85% of the 192,000-character budget (about 64,000 tokens at the existing
-three-characters-per-token estimate). Tool-use/result exchanges are atomic. Up
-to four recent exchanges remain raw only while the complete tail stays below
-20,000 estimated tokens. A later Compact folds the old checkpoint into one
-replacement checkpoint rather than stacking summaries.
+at 80% of the 128,000-character budget (about 42,000 tokens at the existing
+three-characters-per-token estimate). Tool-use/result exchanges are atomic.
+Up to four recent exchanges remain raw only while the complete tail stays
+below 20,000 estimated tokens. A later Compact folds the old checkpoint into
+one replacement checkpoint rather than stacking summaries.
 
 A single Tool Result above 8,000 estimated tokens is replaced with a short
 placeholder in the active history before request sizing; its message,
