@@ -47,7 +47,7 @@ def test_registry_is_the_authoritative_lead_surface():
 
 
 def test_role_agents_and_teammates_project_the_same_specs():
-    for role in ("general", "explorer", "reviewer", "worker"):
+    for role in ("general-purpose", "explore", "plan", "review"):
         profile = get_agent_profile(role)
         projected = tool_schemas_for_names(profile.tool_names, role=role)
         assert {tool["name"] for tool in projected} == set(profile.tool_names)
@@ -61,6 +61,34 @@ def test_role_agents_and_teammates_project_the_same_specs():
         "complete_task",
     }
     assert "lead" not in TOOL_REGISTRY.get("submit_plan").allowed_roles
+    delegate = TOOL_REGISTRY.get("delegate_agent").api_schema()
+    assert delegate["input_schema"]["properties"]["role"]["enum"] == [
+        "explore", "plan", "review", "general-purpose",
+    ]
+    assert "task_id" not in delegate["input_schema"]["properties"]
+
+
+def test_teammate_focus_never_removes_team_protocol(tmp_path, monkeypatch):
+    runtime = AgentRuntime.create(
+        workdir=tmp_path,
+        model_client=SimpleNamespace(messages=object()),
+        command_executor=LocalCommandExecutor(),
+        model_provider="test",
+        model="test",
+        tool_policy=None,
+    )
+    monkeypatch.setattr(teammate, "TOOL_POLICY", {})
+    expected = set(TOOL_REGISTRY.names_for_role("teammate"))
+
+    assert expected == {
+        "bash", "read_file", "write_file", "edit_file", "glob",
+        "send_message", "submit_plan", "list_tasks", "claim_task",
+        "complete_task",
+    }
+    for focus in ("recovery", "tests", "researcher", "review"):
+        assert set(teammate.effective_teammate_tool_names(
+            focus, runtime,
+        )) == expected
 
 
 def test_registry_policy_metadata_drives_existing_policy_categories():
@@ -71,7 +99,7 @@ def test_registry_policy_metadata_drives_existing_policy_categories():
     assert TOOL_REGISTRY.get("edit_file").safety_policy == "workspace_write"
 
 
-def test_parent_runtime_policy_caps_worker_and_teammate_tools(
+def test_parent_runtime_policy_caps_subagent_and_teammate_tools(
     tmp_path, monkeypatch,
 ):
     policy = {
@@ -90,26 +118,26 @@ def test_parent_runtime_policy_caps_worker_and_teammate_tools(
         tool_policy=policy,
     )
     monkeypatch.setattr(teammate, "TOOL_POLICY", {})
-    worker = get_agent_profile("worker")
+    helper = get_agent_profile("general-purpose")
 
-    worker_tools = effective_tool_names(
+    helper_tools = effective_tool_names(
         TOOL_REGISTRY,
-        worker.tool_names,
-        role="worker",
+        helper.tool_names,
+        role="general-purpose",
         parent_policy=policy,
         environment_policy={},
     )
     environment_capped = effective_tool_names(
         TOOL_REGISTRY,
-        worker.tool_names,
-        role="worker",
-        parent_policy={"allowed_tools": list(worker.tool_names)},
+        helper.tool_names,
+        role="general-purpose",
+        parent_policy={"allowed_tools": list(helper.tool_names)},
         environment_policy={"allowed_tools": ["read_file"]},
     )
     explicit_expansion = effective_tool_names(
         TOOL_REGISTRY,
-        worker.tool_names,
-        role="worker",
+        helper.tool_names,
+        role="general-purpose",
         parent_policy={"allowed_tools": ["read_file"]},
         environment_policy={"allowed_tools": ["read_file", "bash"]},
         delegated_policy={
@@ -121,11 +149,11 @@ def test_parent_runtime_policy_caps_worker_and_teammate_tools(
         "worker", runtime,
     )
 
-    assert set(worker_tools) == {"read_file"}
+    assert set(helper_tools) == {"read_file"}
     assert set(environment_capped) == {"read_file"}
     assert set(explicit_expansion) == {"bash"}
     assert set(teammate_tools) == {"read_file"}
-    assert {"bash", "write_file", "edit_file"}.isdisjoint(worker_tools)
+    assert {"bash", "write_file", "edit_file"}.isdisjoint(helper_tools)
     assert {"bash", "write_file", "edit_file"}.isdisjoint(teammate_tools)
 
     captured = {}
@@ -145,7 +173,7 @@ def test_parent_runtime_policy_caps_worker_and_teammate_tools(
 
     runtime.services.model_client = CapturingClient()
     monkeypatch.setattr(subagent, "TOOL_POLICY", {})
-    subagent.run_role_agent("worker", "inspect", tmp_path, runtime)
+    subagent.run_role_agent("general-purpose", "inspect", tmp_path, runtime)
 
     assert {
         tool["name"] for tool in captured["tools"]
@@ -159,8 +187,9 @@ def test_api_schema_and_role_projections_cannot_pollute_registry():
     first = canonical.api_schema()
     first["input_schema"]["properties"]["command"]["type"] = "number"
     first["input_schema"]["properties"]["new_field"] = {"type": "string"}
-    worker_projection = tool_schemas_for_names(["bash"], role="worker")
-    worker_projection[0]["input_schema"]["required"].append("new_field")
+    helper_projection = tool_schemas_for_names(
+        ["bash"], role="general-purpose")
+    helper_projection[0]["input_schema"]["required"].append("new_field")
 
     fresh = canonical.api_schema()
     lead_projection = TOOL_REGISTRY.schemas_for_role("lead")

@@ -1,5 +1,6 @@
 from .runtime_state import *
-from .agent_profiles import classify_delegation_intent, get_agent_profile
+from .agent_profiles import get_agent_profile, normalize_agent_role
+from .knowledge import snapshot_workspace
 from .model_budget import can_spend_optional_calls
 from .runtime import AgentRuntime
 from .tool_registry import (
@@ -94,6 +95,7 @@ def _role_handlers(
 
 
 def _parse_role_result(text: str, role: str) -> dict:
+    role = normalize_agent_role(role)
     raw = str(text or "").strip()
     candidates = [raw]
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S | re.I)
@@ -111,9 +113,9 @@ def _parse_role_result(text: str, role: str) -> dict:
             value.setdefault("verdict", "blocked")
             value.setdefault("summary", "")
             return (_normalize_reviewer_result(value)
-                    if role == "reviewer" else value)
-    fallback = "blocked" if role == "worker" else "inconclusive"
-    if role == "reviewer":
+                    if role == "review" else value)
+    fallback = "blocked"
+    if role == "review":
         return _fallback_reviewer_result(raw)
     return {"verdict": fallback, "summary": raw[:4000], "invalid_json": True}
 
@@ -161,12 +163,21 @@ def _normalize_reviewer_result(value: dict) -> dict:
     missing = value.get("missing_evidence", [])
     if not isinstance(missing, list):
         missing = [missing] if missing else []
+    raw_verified_ids = value.get("verified_acceptance_ids", [])
+    if not isinstance(raw_verified_ids, list):
+        raw_verified_ids = [raw_verified_ids] if raw_verified_ids else []
+    verified_acceptance_ids = []
+    for raw_id in raw_verified_ids[:16]:
+        item_id = _short_text(raw_id, 100)
+        if item_id and item_id not in verified_acceptance_ids:
+            verified_acceptance_ids.append(item_id)
     return {
         "verdict": verdict,
         "summary": _short_text(value.get("summary", ""), 500),
         "findings": findings,
         "files_checked": [_short_text(item, 240) for item in files_checked[:16]],
         "missing_evidence": [_short_text(item, 300) for item in missing[:8]],
+        "verified_acceptance_ids": verified_acceptance_ids,
     }
 
 
@@ -194,15 +205,9 @@ def _fallback_reviewer_result(raw: str) -> dict:
         "findings": findings,
         "files_checked": [],
         "missing_evidence": ["Valid structured reviewer result"],
+        "verified_acceptance_ids": [],
         "invalid_json": True,
     }
-
-
-def _safe_delegation_name(value: str, role: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip()).strip(".-_")
-    if not slug:
-        slug = f"{role}-{int(_time.time())}-{random.randint(0, 9999):04d}"
-    return slug[:64]
 
 
 def _bounded_repository_manifest(cwd: Path, max_entries: int = 200) -> str:
@@ -227,12 +232,12 @@ def _successful_tool_output(output: str) -> bool:
 def _finalize_role_result(
     result: dict, profile, successful_read_paths: set[str],
 ) -> dict:
-    if profile.name not in {"explorer", "reviewer"}:
+    if profile.name not in {"explore", "plan", "review"}:
         return result
     normalized = dict(result)
     normalized["files_checked"] = sorted(successful_read_paths)[
         :profile.max_read_paths]
-    if profile.name == "explorer":
+    if profile.name == "explore":
         source_paths = [
             path for path in successful_read_paths
             if Path(path).suffix.lower() in {
@@ -295,7 +300,7 @@ def run_role_agent(
         else CURRENT_ROOT_TASK or ""
     ).strip() or "(not available)"
     manifest_section = ""
-    if profile.name == "explorer":
+    if profile.name == "explore":
         manifest = _bounded_repository_manifest(cwd)
         manifest_section = (
             "\nHarness-provided repository manifest (do not run glob to "
@@ -331,7 +336,7 @@ def run_role_agent(
     for _ in range(profile.max_tool_rounds):
         response = _request_with_deadline(
             system=system, messages=messages, tools=tools,
-            purpose="delegate_agent", role=profile.name,
+            purpose="subagent", role=profile.name,
             max_tokens=profile.max_response_tokens,
             runtime=role_runtime,
         )
@@ -420,7 +425,7 @@ def run_role_agent(
                 executed_tool_calls += 1
                 trigger_hooks("PostToolUse", block, output)
             output_text = str(output)
-            if profile.name in {"explorer", "reviewer"} \
+            if profile.name in {"explore", "plan", "review"} \
                     and block_name == "read_file" \
                     and _successful_tool_output(output_text):
                 evidence_path = str(block_input.get("path", ""))
@@ -450,20 +455,25 @@ def run_role_agent(
         needs_synthesis = True
 
     if needs_synthesis:
-        if profile.name == "reviewer":
+        if profile.name == "review":
             synthesis_instruction = (
                 '<synthesis>Tool use is over. Return one compact JSON object and '
                 'nothing else: {"verdict":"pass|gaps|blocked","summary":"max '
                 '240 chars","findings":[{"severity":"critical|major|minor",'
                 '"requirement":"max 220 chars","file":"path","symbol":"name",'
-                '"evidence":"max 500 chars"}],"files_checked":[],'
-                '"missing_evidence":[]}. Include at most 5 findings. Put every '
-                'actionable concern in findings; do not narrate reasoning, use '
-                'Markdown, or request more tools. A pass requires zero findings.'
+                '"evidence":"max 240 chars"}],"files_checked":[],'
+                '"missing_evidence":[],"verified_acceptance_ids":[]}. Include at '
+                'most 3 highest-severity findings. Reason silently. Do not put '
+                'withdrawn, retracted, satisfied, safe, or "no defect" items in '
+                'findings. Put only actionable concerns in findings; do not '
+                'narrate reasoning, use Markdown, or request more tools. A pass '
+                'requires zero findings. '
+                'Copy only concretely verified lead acceptance IDs into '
+                'verified_acceptance_ids; omit IDs with findings or missing evidence.'
                 '</synthesis>'
             )
-            synthesis_max_tokens = 1600
-        elif profile.name == "explorer":
+            synthesis_max_tokens = 2200
+        elif profile.name == "explore":
             synthesis_instruction = (
                 '<synthesis>Tool use is over. Return one compact JSON object and '
                 'nothing else: {"verdict":"complete|blocked","summary":"max '
@@ -496,7 +506,7 @@ def run_role_agent(
             tool_rounds=tool_rounds,
         )
         synthesis_messages = messages
-        if profile.name in {"explorer", "reviewer"}:
+        if profile.name in {"explore", "plan", "review"}:
             # A fresh turn prevents the synthesis model from continuing the
             # role's last unfinished intent (for example, "now run tests")
             # instead of analyzing evidence and returning the required JSON.
@@ -511,7 +521,7 @@ def run_role_agent(
             }]
         response = _request_with_deadline(
             system=system, messages=synthesis_messages, tools=[],
-            purpose="delegate_agent", role=profile.name,
+            purpose="subagent", role=profile.name,
             max_tokens=synthesis_max_tokens,
             runtime=role_runtime,
         )
@@ -524,16 +534,26 @@ def run_role_agent(
     )
 
 
-def delegate_agent(role: str, prompt: str, name: str = "",
-                   task_id: str = "",
-                   runtime: AgentRuntime | None = None) -> str:
-    """Run a bounded role with fresh context; workers are isolated by default."""
-    normalized_role = str(role or "").strip().lower()
+def delegate_agent(
+    role: str,
+    prompt: str,
+    name: str = "",
+    runtime: AgentRuntime | None = None,
+) -> str:
+    """Run one bounded temporary subagent with fresh context.
+
+    Temporary subagents never create or claim shared Tasks, join the teammate
+    mailbox, or own Worktrees. Persistent collaboration belongs exclusively to
+    ``spawn_teammate`` and the shared Task system.
+    """
+    normalized_role = normalize_agent_role(role)
     profile = get_agent_profile(normalized_role)
     if profile is None:
         return json.dumps({
             "status": "error",
-            "error": "role must be general, explorer, reviewer, or worker",
+            "error": (
+                "role must be explore, plan, review, or general-purpose"
+            ),
         })
     if not str(prompt or "").strip():
         return json.dumps({"status": "error", "error": "prompt cannot be empty"})
@@ -564,101 +584,46 @@ def delegate_agent(role: str, prompt: str, name: str = "",
                        if key != "available"},
         })
 
-    record_event("delegation_start", agent_role=normalized_role, name=name)
-    if not profile.uses_worktree:
-        try:
-            role_workdir = (
-                runtime.paths.workdir if runtime is not None else WORKDIR
-            )
-            result = run_role_agent(
-                normalized_role, prompt, role_workdir, runtime)
-        except Exception as exc:
-            record_event(
-                "delegation_finish", agent_role=normalized_role,
-                verdict="blocked", status="error",
-                error_type=type(exc).__name__, error=str(exc)[:1000],
-            )
-            return json.dumps({
-                "status": "error", "role": normalized_role,
-                "verdict": "blocked",
-                "error": f"{type(exc).__name__}: {exc}"[:2000],
-            })
-        envelope = {
-            "status": "completed", "role": normalized_role,
-            "verdict": result.get("verdict", "inconclusive"),
-            "result": result,
-        }
-        record_event(
-            "delegation_finish", agent_role=normalized_role,
-            verdict=envelope["verdict"], status=envelope["status"],
-        )
-        return json.dumps(envelope)
-
-    worktree_name = _safe_delegation_name(name, normalized_role)
-    if (WORKTREES_DIR / worktree_name).exists():
-        return json.dumps({
-            "status": "error", "role": normalized_role,
-            "error": f"worktree already exists: {worktree_name}",
-        })
-    task = None
-    if task_id:
-        try:
-            task = load_task(task_id)
-        except FileNotFoundError:
-            return json.dumps({"status": "error", "error": f"task not found: {task_id}"})
-    else:
-        task = create_task(
-            f"Worker: {str(prompt).strip()[:80]}", str(prompt).strip())
-    created = create_worktree(worktree_name, task.id)
-    if not (WORKTREES_DIR / worktree_name).exists():
-        return json.dumps({
-            "status": "error", "role": normalized_role,
-            "task_id": task.id, "error": created,
-        })
-    claimed = claim_task(task.id, owner=f"worker:{worktree_name}")
-    if not claimed.startswith("Claimed"):
-        return json.dumps({
-            "status": "error", "role": normalized_role,
-            "task_id": task.id, "worktree": worktree_name,
-            "error": claimed,
-        })
-
+    record_event(
+        "subagent_start", agent_role=normalized_role, name=name,
+    )
+    role_workdir = (
+        runtime.paths.workdir if runtime is not None else WORKDIR
+    )
+    before = (
+        snapshot_workspace(role_workdir) if not profile.read_only else {}
+    )
     try:
         result = run_role_agent(
-            normalized_role, prompt, WORKTREES_DIR / worktree_name, runtime)
+            normalized_role, prompt, role_workdir, runtime)
     except Exception as exc:
         record_event(
-            "delegation_finish", agent_role=normalized_role,
-            verdict="blocked", status="error", worktree=worktree_name,
+            "subagent_finish", agent_role=normalized_role,
+            verdict="blocked", status="error",
             error_type=type(exc).__name__, error=str(exc)[:1000],
         )
         return json.dumps({
             "status": "error", "role": normalized_role,
-            "verdict": "blocked", "task_id": task.id,
-            "worktree": worktree_name,
+            "verdict": "blocked",
             "error": f"{type(exc).__name__}: {exc}"[:2000],
-            "recovery": "worktree retained with task in progress",
         })
-    finalized = json.loads(finalize_worktree(
-        worktree_name, f"worker({worktree_name}): {str(prompt).strip()[:120]}",
-    ))
-    if finalized.get("status") in {"changes_ready", "no_changes"}:
-        complete_task(task.id)
+    after = snapshot_workspace(role_workdir) if not profile.read_only else {}
+    changed_files = sorted({
+        path for path in set(before) | set(after)
+        if before.get(path) != after.get(path)
+    })
     envelope = {
-        "status": finalized.get("status", "error"),
-        "role": normalized_role, "verdict": result.get("verdict", "blocked"),
-        "task_id": task.id, "worktree": worktree_name,
-        "commit": finalized.get("commit", ""),
-        "changed_files": finalized.get("changed_files", []),
-        "diff_stat": finalized.get("diff_stat", []),
+        "status": "completed",
+        "role": normalized_role,
+        "verdict": result.get("verdict", "inconclusive"),
         "result": result,
     }
-    if finalized.get("error"):
-        envelope["error"] = finalized["error"]
+    if not profile.read_only:
+        envelope["changed_files"] = changed_files
     record_event(
-        "delegation_finish", agent_role=normalized_role,
+        "subagent_finish", agent_role=normalized_role,
         verdict=envelope["verdict"], status=envelope["status"],
-        worktree=worktree_name, commit=envelope["commit"],
+        changed_files=changed_files,
     )
     return json.dumps(envelope)
 
@@ -667,13 +632,11 @@ def spawn_subagent(
     description: str,
     runtime: AgentRuntime | None = None,
 ) -> str:
-    """Compatibility entry point routed into the bounded role runtime."""
-    routing = classify_delegation_intent(description)
-    role = routing["role"]
+    """Run the legacy ``task`` tool as a general-purpose temporary subagent."""
+    role = "general-purpose"
     record_event(
-        "delegation_routed", source_tool="task", agent_role=role,
-        reason=routing["reason"],
-        matched_markers=routing["matched_markers"],
+        "subagent_routed", source_tool="task", agent_role=role,
+        reason="legacy_task_general_purpose",
     )
     raw = delegate_agent(role, description, runtime=runtime)
     try:
@@ -685,7 +648,7 @@ def spawn_subagent(
             "result": {"summary": str(raw)[:2000]},
         }
     envelope["routed_from"] = "task"
-    envelope["routing_reason"] = routing["reason"]
+    envelope["routing_reason"] = "legacy_task_general_purpose"
     return json.dumps(envelope)
 
 

@@ -78,7 +78,9 @@ _TOOL_SCHEMAS = [
                      "description": ("Create and manage implementation plan steps and contract "
                      "acceptance criteria. Use kind=plan for work still to do and "
                      "kind=acceptance for every externally required outcome, "
-                     "including error paths omitted by public tests. Completed "
+                     "including error paths omitted by public tests. For README or "
+                     "contract tasks, cover each relevant section, not only failing "
+                     "tests. Completed "
                      "acceptance items require concise evidence plus explicit "
                      "evidence_sources bound to files, tests, or Reviewer "
                      "findings. Existing "
@@ -114,30 +116,31 @@ _TOOL_SCHEMAS = [
                                     "required": ["status"]}}},
                       "required": ["todos"]}},
     {"name": "task",
-     "description": ("Compatibility entry for one focused delegation. The harness "
-                     "routes inspection to explorer, implementation to an isolated "
-                     "worker worktree, final audit to reviewer, and a small unmatched "
-                     "question to a read-only general helper. Returns a structured "
-                     "envelope; worker changes require integrate_worktree. Do not use "
-                     "it merely to wait for a background task_notification."),
+     "description": ("Run one bounded general-purpose temporary subagent in a "
+                     "fresh context and return its result synchronously. It may "
+                     "inspect or edit the current workspace when asked, but it does "
+                     "not join the shared Task pool, own a Worktree, use teammate "
+                     "mailboxes, or remain alive."),
      "input_schema": {"type": "object",
                       "properties": {"description": {"type": "string"}},
                       "required": ["description"]}},
     {"name": "delegate_agent",
-     "description": ("Delegate a bounded task to a fresh role context. general "
-                     "answers one small read-only question; explorer "
-                     "maps contracts/code read-only; reviewer independently audits "
-                     "final correctness read-only; worker edits only an isolated "
-                     "worktree and returns a commit that must be integrated. For "
-                     "worker, this tool automatically creates and owns the Task and "
-                     "Worktree; do not create them first."),
+     "description": ("Run one bounded temporary subagent in a fresh context. "
+                     "explore maps code read-only; plan produces a read-only "
+                     "implementation plan; review independently audits correctness "
+                     "read-only; general-purpose handles one focused task and may "
+                     "edit the current workspace. Temporary subagents never create "
+                     "or claim shared Tasks, own Worktrees, use teammate mailboxes, "
+                     "or remain alive."),
      "input_schema": {"type": "object",
                       "properties": {
                           "role": {"type": "string",
-                                   "enum": ["general", "explorer", "reviewer", "worker"]},
+                                   "enum": [
+                                       "explore", "plan", "review",
+                                       "general-purpose",
+                                   ]},
                           "prompt": {"type": "string"},
-                          "name": {"type": "string"},
-                          "task_id": {"type": "string"}},
+                          "name": {"type": "string"}},
                       "required": ["role", "prompt"]}},
     {"name": "load_skill",
      "description": "Load the full content of a skill by name.",
@@ -150,8 +153,8 @@ _TOOL_SCHEMAS = [
                       "properties": {"focus": {"type": "string"}},
                       "required": []}},
     {"name": "create_task",
-     "description": ("Low-level manual task API. Do not call this before "
-                     "delegate_agent(role=worker), which creates its own task."),
+     "description": ("Create a shared persistent-team Task. Teammates can claim "
+                     "unassigned, unblocked Tasks and mark them completed."),
      "input_schema": {"type": "object",
                       "properties": {"subject": {"type": "string"},
                                      "description": {"type": "string"},
@@ -208,7 +211,11 @@ _TOOL_SCHEMAS = [
      "input_schema": {"type": "object",
                       "properties": {"job_id": {"type": "string"}},
                       "required": ["job_id"]}},
-    {"name": "spawn_teammate", "description": "Spawn an autonomous teammate.",
+    {"name": "spawn_teammate",
+     "description": ("Spawn a persistent teammate with a fresh context and a "
+                     "current focus label. It participates in shared Tasks and "
+                     "mailboxes, remains available across Tasks, and stops only "
+                     "when the Lead or owning runtime requests shutdown."),
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"},
                                      "role": {"type": "string"},
@@ -241,8 +248,8 @@ _TOOL_SCHEMAS = [
                                      "feedback": {"type": "string"}},
                       "required": ["request_id", "approve"]}},
     {"name": "create_worktree",
-     "description": ("Low-level manual worktree API. Do not call this before "
-                     "delegate_agent(role=worker), which creates its own worktree."),
+     "description": ("Create an isolated Worktree, optionally bound to a shared "
+                     "persistent-team Task."),
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"},
                                      "task_id": {"type": "string"}},
@@ -259,8 +266,8 @@ _TOOL_SCHEMAS = [
                       "properties": {"name": {"type": "string"}},
                       "required": ["name"]}},
     {"name": "integrate_worktree",
-     "description": ("Integrate a finalized worker worktree into the lead workspace. "
-                     "Refuses overlapping lead/worker file changes and preserves "
+     "description": ("Integrate a finalized teammate Worktree into the Lead workspace. "
+                     "Refuses overlapping Lead/teammate file changes and preserves "
                      "the worktree when integration cannot complete."),
      "input_schema": {"type": "object",
                       "properties": {"name": {"type": "string"},
@@ -304,13 +311,13 @@ _TOOL_HANDLERS = {
 
 _LEAD = frozenset({"lead"})
 _ROLE_ACCESS = {
-    "bash": frozenset({"lead", "worker", "teammate"}),
+    "bash": frozenset({"lead", "general-purpose", "teammate"}),
     "read_file": frozenset({
-        "lead", "general", "explorer", "reviewer", "worker", "teammate",
+        "lead", "general-purpose", "explore", "plan", "review", "teammate",
     }),
-    "write_file": frozenset({"lead", "worker", "teammate"}),
-    "edit_file": frozenset({"lead", "worker", "teammate"}),
-    "glob": frozenset({"lead", "general", "worker", "teammate"}),
+    "write_file": frozenset({"lead", "general-purpose", "teammate"}),
+    "edit_file": frozenset({"lead", "general-purpose", "teammate"}),
+    "glob": frozenset({"lead", "general-purpose", "plan", "teammate"}),
     "send_message": frozenset({"lead", "teammate"}),
     "list_tasks": frozenset({"lead", "teammate"}),
     "claim_task": frozenset({"lead", "teammate"}),

@@ -274,8 +274,7 @@ _HARNESS_CONTROL_PREFIXES = (
     "<reminder>",
     "<finalization_budget>",
     "<finalization_deadline>",
-    "<acceptance_review>",
-    "<pre_final_review",
+    "<todo_completion_gate>",
 )
 
 

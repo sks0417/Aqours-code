@@ -28,21 +28,19 @@ PROMPT_SECTIONS = {
         "waiting for short commands. "
         "Record every observable contract clause, including negative paths, as a "
         "kind=acceptance item; preserve discovered items and complete them only "
-        "after final review with concise evidence. Public tests do not prove "
+        "with concise implementation or test evidence. Public tests do not prove "
         "uncovered clauses. Treat 'Tool not run' as recoverable guidance. Stop on "
         "'Permission denied'. For background bash, never rerun, poll check_inbox, "
         "or delegate merely to wait; continue independent work or finish and use "
         "the task_notification result."
     ),
     "multiagent": (
-        "Multiagent: the lead owns decomposition, integration, tests, and final "
-        "claims. Use at most one explorer for fresh read-only mapping and one "
-        "bounded worker slice. delegate_agent(worker) creates its Task and "
-        "Worktree; integrate_worktree is required for its commit. The harness may "
-        "attach one pre-final reviewer: do not duplicate it, and resolve each "
-        "finding with code evidence. Avoid repeating role reads or delegating "
-        "trivial/whole tasks. After a finalization-budget notice, start no new "
-        "role. The task compatibility tool uses the same bounded role runtime."
+        "task and delegate_agent run bounded temporary explore, plan, review, or "
+        "general-purpose agents; they do not join shared Tasks, own Worktrees, or "
+        "persist. spawn_teammate creates a persistent collaborator with shared "
+        "Tasks and mailboxes that lives until Lead shutdown. Lead owns lifecycle, "
+        "integration, tests, and final claims. Delegation is optional; use it only "
+        "when useful and never after a finalization-budget notice."
     ),
 }
 
@@ -81,7 +79,9 @@ def assemble_system_prompt(
                 PROMPT_SECTIONS["tool_strategy"],
                 PROMPT_SECTIONS["permissions"],
     ])
-    if "delegate_agent" in allowed_tools:
+    if any(name in allowed_tools for name in (
+        "task", "delegate_agent", "spawn_teammate",
+    )):
         sections.insert(-1, PROMPT_SECTIONS["multiagent"])
     if any(name in allowed_tools for name in ("schedule_cron", "schedule_once")):
         sections.insert(2, PROMPT_SECTIONS["scheduling"])

@@ -23,7 +23,9 @@ def idle_poll(agent_name: str, messages: list,
               stop_event=None) -> str:
     # Autonomous teammates wake up for inbox messages first, then look for
     # unclaimed tasks. This keeps direct protocol messages higher priority.
-    for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
+    # A teammate is persistent: being idle never ends its lifecycle. It waits
+    # until work arrives or the Lead/runtime explicitly requests shutdown.
+    while True:
         if stop_event is not None:
             if stop_event.wait(IDLE_POLL_INTERVAL):
                 return "shutdown"
@@ -56,7 +58,6 @@ def idle_poll(agent_name: str, messages: list,
                     "content": f"<auto-claimed>Task {task_data['id']}: "
                                f"{task_data['subject']}{wt_info}</auto-claimed>"})
                 return "work"
-    return "timeout"
 
 
 

@@ -157,7 +157,7 @@ def test_subagent_and_teammate_have_bounded_full_runtime_lifecycle(monkeypatch):
     monkeypatch.setattr(subagent, "client", client)
     monkeypatch.setattr(subagent, "MODEL", "scripted")
     delegation = json.loads(subagent.spawn_subagent("finish"))
-    assert delegation["role"] == "general"
+    assert delegation["role"] == "general-purpose"
     assert delegation["result"]["summary"] == "sub-runtime-done"
     assert delegation["routed_from"] == "task"
 

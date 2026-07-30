@@ -278,7 +278,7 @@ def test_docker_full_prompt_uses_only_case_memory_skills_and_state(
     tool_names = {tool["name"] for tool in captured["tools"]}
     assert {"create_worktree", "spawn_teammate", "load_skill"} <= tool_names
     assert "create_worktree" not in prompt
-    assert "spawn_teammate" not in prompt
+    assert "spawn_teammate creates a persistent collaborator" in prompt
     assert "Memory context:" in prompt
     assert "MCP state:" in prompt
     assert "Active teammate state:" in prompt
@@ -344,7 +344,7 @@ def test_docker_policy_subagent_prompt_uses_container_runtime(tmp_path, monkeypa
     monkeypatch.setattr(subagent, "MODEL", "scripted")
 
     delegation = json.loads(subagent.spawn_subagent("inspect"))
-    assert delegation["role"] == "explorer"
+    assert delegation["role"] == "general-purpose"
     assert delegation["result"]["summary"].startswith("done")
     assert delegation["result"]["verdict"] == "blocked"
     assert delegation["routed_from"] == "task"

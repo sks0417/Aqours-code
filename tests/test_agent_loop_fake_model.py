@@ -271,14 +271,7 @@ def test_complex_code_task_allows_contract_read_before_todo(tmp_path, monkeypatc
             {"path": "service.py", "old_text": "broken", "new_text": "fixed"},
             "edit_after_contract",
         )]),
-        response([text_block("done before final audit")]),
-        response([tool_block("read_file", {"path": "README.md"}, "audit_read")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Fix service", "status": "completed", "kind": "plan"},
-            {"content": "Preserve the public API", "status": "completed",
-             "kind": "acceptance", "evidence": "README and final diff audited"},
-        ]}, "todo_after_audit")]),
-        response([text_block("done after final audit")]),
+        response([text_block("done without forced review")]),
     ])
     monkeypatch.setattr(agent_loop, "client", fake_client)
 
@@ -295,13 +288,14 @@ def test_complex_code_task_allows_contract_read_before_todo(tmp_path, monkeypatc
     assert read_result == "Contract: preserve the public API."
     assert "Tool not run" not in read_result
     assert (tmp_path / "service.py").read_text(encoding="utf-8") == "fixed = True\n"
-    audit_messages = fake_client.messages.calls[4]["messages"]
-    assert any(
+    assert len(fake_client.messages.calls) == 4
+    assert not any(
         "<acceptance_review>" in str(message.get("content"))
-        and "potentially incomplete" in str(message.get("content"))
-        for message in audit_messages
+        or "<pre_final_review" in str(message.get("content"))
+        for call in fake_client.messages.calls
+        for message in call["messages"]
     )
-    assert messages[-1]["content"][0].text == "done after final audit"
+    assert messages[-1]["content"][0].text == "done without forced review"
 
 
 def test_completed_acceptance_todo_requires_evidence():
@@ -338,7 +332,7 @@ def test_completed_acceptance_todo_requires_evidence():
         basic_tools.CURRENT_TODOS.clear()
 
 
-def test_complex_code_task_requires_acceptance_before_edit_and_reviews_it(
+def test_complex_code_task_requires_acceptance_before_edit_without_forced_review(
     tmp_path, monkeypatch,
 ):
     from codepilot_s20 import basic_tools
@@ -377,13 +371,6 @@ def test_complex_code_task_requires_acceptance_before_edit_and_reviews_it(
             {"content": contract, "status": "completed", "kind": "acceptance",
              "evidence": "service.py diff reviewed and rollback test passes"},
         ]}, "todo_verified")]),
-        response([text_block("verified before contract audit")]),
-        response([tool_block("read_file", {"path": "README.md"}, "audit_read")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Fix service", "status": "completed", "kind": "plan"},
-            {"content": contract, "status": "completed", "kind": "acceptance",
-             "evidence": "README, final diff, and rollback test audited"},
-        ]}, "todo_audited")]),
         response([text_block("verified and complete")]),
     ])
     monkeypatch.setattr(agent_loop, "client", fake_client)
@@ -409,13 +396,16 @@ def test_complex_code_task_requires_acceptance_before_edit_and_reviews_it(
     assert "Acceptance checklist required" in tool_results[0]
     assert tool_results[1].startswith("Tool not run: before changing files")
     assert (tmp_path / "service.py").read_text(encoding="utf-8") == "fixed = True\n"
-    review_messages = fake_client.messages.calls[7]["messages"]
-    assert any(
-        "<acceptance_review>" in str(message.get("content"))
-        and contract in str(message.get("content"))
-        for message in review_messages
+    assert len(fake_client.messages.calls) == 7
+    assert not any(
+        "You are the review role" in call["system"]
+        or any(
+            "<acceptance_review>" in str(message.get("content"))
+            for message in call["messages"]
+        )
+        for call in fake_client.messages.calls
     )
-    assert final_todos[-1]["evidence"].startswith("README, final diff")
+    assert final_todos[-1]["evidence"].startswith("service.py diff")
     assert messages[-1]["content"][0].text == "verified and complete"
 
 
@@ -452,13 +442,6 @@ def test_acceptance_items_cannot_be_silently_removed_or_rewritten(
             {"content": contract, "status": "completed", "kind": "acceptance",
              "evidence": "fingerprint regression passes"},
         ]}, "todo_restored_contract")]),
-        response([text_block("done before audit")]),
-        response([tool_block("read_file", {"path": "README.md"}, "audit_read")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Fix fingerprint", "status": "completed", "kind": "plan"},
-            {"content": contract, "status": "completed", "kind": "acceptance",
-             "evidence": "README, diff, and regression test audited"},
-        ]}, "todo_after_audit")]),
         response([text_block("done")]),
     ])
     monkeypatch.setattr(agent_loop, "client", fake_client)
@@ -494,7 +477,7 @@ def test_acceptance_items_cannot_be_silently_removed_or_rewritten(
     assert messages[-1]["content"][0].text == "done"
 
 
-def test_final_contract_audit_can_add_requirement_omitted_from_completed_list(
+def test_completed_acceptance_does_not_force_fresh_contract_audit(
     tmp_path, monkeypatch,
 ):
     from codepilot_s20 import basic_tools
@@ -562,20 +545,21 @@ def test_final_contract_audit_can_add_requirement_omitted_from_completed_list(
     finally:
         basic_tools.CURRENT_TODOS.clear()
 
-    review_messages = fake_client.messages.calls[5]["messages"]
-    assert any(
+    assert len(fake_client.messages.calls) == 5
+    assert not any(
         "<acceptance_review>" in str(message.get("content"))
-        and "potentially incomplete" in str(message.get("content"))
-        for message in review_messages
+        or "<pre_final_review" in str(message.get("content"))
+        for call in fake_client.messages.calls
+        for message in call["messages"]
     )
-    assert any(todo["content"] == contract_b for todo in final_todos)
+    assert not any(todo["content"] == contract_b for todo in final_todos)
     assert all(todo["status"] == "completed" for todo in final_todos)
-    assert "conflict_fixed = True" in (
+    assert "conflict_fixed = False" in (
         tmp_path / "service.py").read_text(encoding="utf-8")
-    assert messages[-1]["content"][0].text == "complete after fresh audit"
+    assert messages[-1]["content"][0].text == "complete before fresh audit"
 
 
-def test_final_contract_audit_scopes_and_deduplicates_reads(
+def test_completed_acceptance_has_no_forced_audit_read_budget(
     tmp_path, monkeypatch,
 ):
     from codepilot_s20 import basic_tools
@@ -627,34 +611,17 @@ def test_final_contract_audit_scopes_and_deduplicates_reads(
     finally:
         basic_tools.CURRENT_TODOS.clear()
 
-    audit_prompt = next(
-        str(message["content"])
-        for message in messages
-        if message.get("role") == "user"
-        and "<acceptance_review>" in str(message.get("content"))
+    assert len(fake_client.messages.calls) == 4
+    assert not any(
+        "<acceptance_review>" in str(message.get("content"))
+        or "read budget" in str(message.get("content")).lower()
+        for call in fake_client.messages.calls
+        for message in call["messages"]
     )
-    assert "service.py" in audit_prompt
-    assert "at most 4 read_file calls" in audit_prompt
-    assert "producer chain for derived values" in audit_prompt
-    assert "Checking only a caller or comparison site is not evidence" in audit_prompt
-    by_id = {
-        block["tool_use_id"]: block["content"]
-        for message in messages
-        if message.get("role") == "user" and isinstance(message.get("content"), list)
-        for block in message["content"]
-        if isinstance(block, dict) and block.get("type") == "tool_result"
-    }
-    assert by_id["audit_readme"].startswith("content for README.md")
-    assert "already read" in by_id["audit_duplicate"]
-    assert "glob scans are disabled" in by_id["audit_glob"]
-    assert by_id["audit_changed"].startswith("fixed service")
-    assert by_id["audit_third"].startswith("content for extra_a.py")
-    assert by_id["audit_fourth"].startswith("content for extra_b.py")
-    assert "read budget reached" in by_id["audit_over_budget"]
-    assert messages[-1]["content"][0].text == "done after scoped audit"
+    assert messages[-1]["content"][0].text == "ready for final"
 
 
-def test_ignored_acceptance_review_marks_final_incomplete(monkeypatch):
+def test_unfinished_acceptance_gets_one_generic_todo_followup(monkeypatch):
     from codepilot_s20 import basic_tools
 
     install_common_agent_mocks(monkeypatch)
@@ -664,9 +631,8 @@ def test_ignored_acceptance_review_marks_final_incomplete(monkeypatch):
             {"content": "Apply fix", "status": "completed", "kind": "plan"},
             {"content": contract, "status": "pending", "kind": "acceptance"},
         ]}, "todo_unverified")]),
-        response([text_block("everything is complete before audit")]),
-        response([text_block("still complete without recording audit")]),
-        response([text_block("everything is complete")]),
+        response([text_block("everything is complete too early")]),
+        response([text_block("still incomplete")]),
     ])
     monkeypatch.setattr(agent_loop, "client", fake_client)
     messages = [{
@@ -678,11 +644,15 @@ def test_ignored_acceptance_review_marks_final_incomplete(monkeypatch):
     finally:
         basic_tools.CURRENT_TODOS.clear()
 
-    assert len(fake_client.messages.calls) == 4
+    assert len(fake_client.messages.calls) == 3
+    assert any(
+        "<todo_completion_gate>" in str(message.get("content"))
+        and contract in str(message.get("content"))
+        for message in fake_client.messages.calls[-1]["messages"]
+    )
     final_text = agent_loop.extract_text(messages[-1]["content"])
-    assert "everything is complete" in final_text
+    assert "still incomplete" in final_text
     assert "Acceptance review incomplete" in final_text
-    assert "final contract audit was not recorded" in final_text
     assert contract in final_text
 
 

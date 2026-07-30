@@ -1,5 +1,4 @@
 from .runtime_state import *
-from .agent_profiles import get_agent_profile
 from .runtime import AgentRuntime
 from .tool_registry import (
     delegated_policy_for_role,
@@ -12,15 +11,10 @@ def effective_teammate_tool_names(
     role: str,
     runtime: AgentRuntime | None = None,
 ) -> tuple[str, ...]:
-    role_profile = get_agent_profile(role)
-    requested = set()
-    if role_profile:
-        coordination = {"send_message"}
-        if role_profile.uses_worktree:
-            coordination.update({
-                "submit_plan", "list_tasks", "claim_task", "complete_task",
-            })
-        requested = set(role_profile.tool_names) | coordination
+    # A persistent teammate always speaks the complete team protocol. ``role``
+    # describes its current focus; it must never remove Task, mailbox, planning,
+    # or completion capabilities.
+    requested = set(TOOL_REGISTRY.names_for_role("teammate"))
     parent_policy = runtime.config.tool_policy if runtime is not None else None
     return effective_tool_names(
         TOOL_REGISTRY,
@@ -59,14 +53,14 @@ def spawn_teammate_thread(
         if runtime is not None else None
     )
     stop_event = threading.Event()
-    role_profile = get_agent_profile(role)
-    profile_instructions = (
-        role_profile.instructions if role_profile else
-        "Use tools to complete the assigned task and report concrete results."
+    system = (
+        f"You are persistent teammate '{name}'. Current focus: {role}. "
+        "Use the shared Task list and mailbox to coordinate with the Lead and "
+        "other teammates. You may inspect, edit, test, claim and complete Tasks "
+        "within the assigned workspace. After completing one Task, remain "
+        "available for another until the Lead requests shutdown. If a claimed "
+        "Task has a Worktree, work only in that directory."
     )
-    system = (f"You are '{name}', role: {role}. "
-              f"{profile_instructions} "
-              f"If a task has a worktree, work in that directory.")
 
     def handle_inbox_message(name: str, msg: dict, messages: list):
         msg_type = msg.get("type", "message")
@@ -251,7 +245,7 @@ def spawn_teammate_thread(
                 continue
             idle_result = idle_poll(
                 name, messages, name, role, wt_ctx, stop_event=stop_event)
-            if idle_result in ("shutdown", "timeout"):
+            if idle_result == "shutdown":
                 break
 
         summary = "Done."

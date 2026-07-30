@@ -11,6 +11,7 @@ from .agent_profiles import (
     assess_task_complexity,
     classify_delegation_intent,
     complex_delegation_briefing,
+    normalize_agent_role,
 )
 from .model_budget import (
     can_spend_optional_calls,
@@ -119,66 +120,20 @@ def _acceptance_gate_items(
     return [todo for todo in items if todo.get("status") != "completed"]
 
 
-def _acceptance_review_message(
-    items: list[dict], changed_files: set[str], read_budget: int,
-    reviewer_output: str = "", reviewer_note: str = "",
-) -> str:
+def _todo_completion_message(items: list[dict]) -> str:
     lines = "\n".join(
         f"- [{item.get('id', 'acceptance')} "
         f"{item.get('status', 'pending')}] {item.get('content', '')}"
-        for item in items[:12]
-    ) or "- (no acceptance criteria were recorded)"
-    changed = "\n".join(
-        f"- {path}" for path in sorted(changed_files)
-    ) or "- (no file changes were recorded)"
-    reviewer_section = ""
-    if reviewer_output:
-        reviewer_section = (
-            "\nIndependent reviewer result (fresh context):\n"
-            f"<reviewer_result>{reviewer_output}</reviewer_result>\n"
-            "Resolve every finding or reject it with concrete code evidence. "
-            "Associate unresolved findings with the acceptance checklist. Reuse "
-            "the reviewer's files_checked evidence instead of repeating those "
-            "reads in the lead context.\n"
-        )
-    elif reviewer_note:
-        reviewer_section = (
-            "\nIndependent reviewer status: "
-            f"{reviewer_note}. Continue with the bounded Lead audit below; "
-            "no reviewer findings were attached.\n"
-        )
-    return (
-        "<acceptance_review>Your final answer is paused for one fresh contract "
-        "audit. If no independent reviewer result is attached, re-read the "
-        "original task and relevant README/contract with read_file once, then "
-        "review only the changed files listed below once. "
-        "Do not glob, re-read tests, scan the whole repository, or re-read an "
-        "unchanged dependency unless a specific uncovered requirement requires "
-        "it. The audit has a strict budget of at most "
-        f"{read_budget} read_file calls. Rely on prior context and existing test "
-        "notifications. Compare every task-relevant explicit requirement with "
-        "the changed code and tests. Treat the current checklist as potentially "
-        "incomplete. Systematically inspect explicit requirements, the producer "
-        "chain for derived values, relevant state branches, exceptional paths, "
-        "and required-field completeness. Checking only a caller or comparison "
-        "site is not evidence for behavior produced elsewhere. Public tests "
-        "alone do not prove requirements they do not cover. Add any missing "
-        "kind=acceptance items, fix uncovered gaps, and call todo_write again "
-        "after this audit with concise evidence before producing final.\n"
-        "Changed files to review:\n"
-        f"{changed}\n"
-        "Current checklist:\n"
-        f"{lines}\n"
-        f"{reviewer_section}</acceptance_review>"
+        for item in items[:8]
     )
-
-
-def _acceptance_review_followup_message() -> str:
     return (
-        "<acceptance_review>The final contract audit has not been recorded. "
-        "Before final, use todo_write to record the audited acceptance checklist "
-        "and evidence, including any requirements omitted from the earlier list."
-        "</acceptance_review>"
+        "<todo_completion_gate>Your final answer is paused once because the "
+        "following acceptance Todo items remain incomplete:\n"
+        f"{lines}\n"
+        "Complete and verify them with the normal tools, or leave them pending "
+        "and report the task as incomplete if they cannot be resolved. A Review "
+        "Subagent is optional and should be called only if it is useful."
+        "</todo_completion_gate>"
     )
 
 
@@ -196,17 +151,6 @@ def _append_acceptance_warning(content: list, items: list[dict]):
     })
 
 
-def _append_contract_audit_warning(content: list):
-    content.append({
-        "type": "text",
-        "text": (
-            "\n\n[Acceptance review incomplete]\n"
-            "The required final contract audit was not recorded with todo_write; "
-            "the completion claim may omit task/README requirements."
-        ),
-    })
-
-
 def _tool_json(output) -> dict:
     if isinstance(output, dict):
         return output
@@ -215,27 +159,6 @@ def _tool_json(output) -> dict:
     except (TypeError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
-
-
-def _reviewer_task_prompt(
-    changed_files: set[str], revision: int, checklist: list[dict],
-) -> str:
-    changed = "\n".join(
-        f"- {path}" for path in sorted(changed_files)
-    ) or "- (no changed-file path was recorded)"
-    requirements = "\n".join(
-        f"- {item.get('content', '')}" for item in checklist[:12]
-    ) or "- Extract requirements independently from the root task and README."
-    return (
-        f"Perform the independent pre-final audit for revision {revision}. The "
-        "root task and repository README/contract are authoritative; do not limit "
-        "the audit to fixes the lead believes it made. Inspect the complete current "
-        "changed-file set below and only direct producers/dependencies "
-        "needed to verify every contract field and state/error branch. Public tests "
-        "alone are insufficient. Return at most five concise structured findings.\n"
-        f"Changed files:\n{changed}\n"
-        f"Lead checklist (potentially incomplete):\n{requirements}"
-    )
 
 
 def _reviewer_findings(output: str) -> list[dict]:
@@ -248,12 +171,369 @@ def _reviewer_findings(output: str) -> list[dict]:
         if isinstance(findings, list) else []
 
 
+_REVIEW_FINDING_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "both", "by", "does",
+    "for", "from", "in", "is", "it", "must", "not", "of", "on", "or",
+    "that", "the", "this", "to", "when", "with",
+}
+_REVIEW_FINDING_ROOT_WORDS = {
+    "allocation", "atomic", "balance", "batch", "checkpoint", "currency",
+    "digest", "duplicate", "event", "exactly", "fingerprint", "idempotency",
+    "ingestion", "partition", "receipt", "recovery", "replay", "restore",
+    "rollback", "sequence", "serialization", "snapshot", "state",
+    "transaction", "validation",
+}
+_REVIEW_SEVERITY_RANK = {
+    "warning": 0,
+    "minor": 1,
+    "major": 2,
+    "critical": 3,
+}
+
+
+def _reviewer_path_key(value: object) -> str:
+    path = str(value or "").strip().replace("\\", "/")
+    path = re.sub(r":\d+(?:-\d+)?$", "", path)
+    while path.startswith("./"):
+        path = path[2:]
+    if path.lower().startswith("/workspace/"):
+        path = path[len("/workspace/"):]
+    return path.strip("/").lower()
+
+
+def _reviewer_text_tokens(value: object) -> set[str]:
+    return {
+        token for token in re.findall(
+            r"[a-z0-9_]+", str(value or "").lower()
+        )
+        if len(token) >= 3 and token not in _REVIEW_FINDING_STOP_WORDS
+    }
+
+
+def _reviewer_token_overlap(left: object, right: object) -> tuple[int, float]:
+    left_tokens = _reviewer_text_tokens(left)
+    right_tokens = _reviewer_text_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0, 0.0
+    shared = len(left_tokens & right_tokens)
+    return shared, shared / min(len(left_tokens), len(right_tokens))
+
+
+def _reviewer_checked_path(path: str, checked_paths: set[str]) -> bool:
+    key = _reviewer_path_key(path)
+    return bool(key and any(
+        key == checked
+        or key.endswith(f"/{checked}")
+        or checked.endswith(f"/{key}")
+        for checked in checked_paths if checked
+    ))
+
+
+def _reviewer_finding_file(
+    path: str,
+    runtime: AgentRuntime | None,
+) -> _Path | None:
+    if runtime is None:
+        return None
+    cleaned = re.sub(
+        r":\d+(?:-\d+)?$", "", str(path or "").strip().replace("\\", "/")
+    )
+    if cleaned.lower().startswith("/workspace/"):
+        cleaned = cleaned[len("/workspace/"):]
+    candidate = _Path(cleaned)
+    if not candidate.is_absolute():
+        candidate = runtime.paths.workdir / cleaned
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError):
+        return None
+    if (
+        not resolved.is_relative_to(runtime.paths.workdir)
+        or not resolved.is_file()
+    ):
+        return None
+    return resolved
+
+
+def _reviewer_self_negating_evidence(evidence: object) -> bool:
+    text = " ".join(str(evidence or "").lower().split())
+    patterns = (
+        r"\b(?:this|that|the)\s+(?:code|implementation|behavior|logic)\s+"
+        r"(?:is|appears)\s+(?:already\s+)?(?:correct|acceptable|handled)\b",
+        r"\b(?:is|was)\s+already\s+(?:handled|implemented|validated|verified)\b",
+        r"\bverified\s+(?:as\s+)?(?:correct|acceptable)\b",
+        r"\bno\s+(?:hidden\s+)?defect\s+(?:exists|was found|is present)\b",
+        r"\bno\s+(?:actual\s+)?defect\b",
+        r"\bfinding\s+(?:is\s+)?withdrawn\b",
+        r"\bwithdraw(?:n)?\b",
+        r"\bno\s+finding\b",
+        r"\b(?:contract|requirement)\s+(?:is|appears\s+)?satisfied\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _reviewer_unsupported_absence_evidence(evidence: object) -> bool:
+    """Reject repository-wide absence claims that provide no inspected proof."""
+    text = " ".join(str(evidence or "").lower().split())
+    return bool(
+        re.search(r"\b(?:there\s+is\s+)?no\s+evidence\b", text)
+        or re.search(r"\bnot\s+implemented\s+anywhere\b", text)
+    )
+
+
+def _reviewer_findings_duplicate(
+    left: dict,
+    right: dict,
+) -> bool:
+    if _reviewer_path_key(left.get("file")) != _reviewer_path_key(
+        right.get("file")
+    ):
+        return False
+    left_symbol = str(left.get("symbol", "")).strip().lower()
+    right_symbol = str(right.get("symbol", "")).strip().lower()
+    if left_symbol != right_symbol:
+        return False
+    left_requirement = " ".join(
+        str(left.get("requirement", "")).lower().split()
+    )
+    right_requirement = " ".join(
+        str(right.get("requirement", "")).lower().split()
+    )
+    if left_requirement and (
+        left_requirement == right_requirement
+        or (
+            min(len(left_requirement), len(right_requirement)) >= 30
+            and (
+                left_requirement in right_requirement
+                or right_requirement in left_requirement
+            )
+        )
+    ):
+        return True
+    combined_left = (
+        f"{left.get('requirement', '')} {left.get('evidence', '')}"
+    )
+    combined_right = (
+        f"{right.get('requirement', '')} {right.get('evidence', '')}"
+    )
+    shared, overlap = _reviewer_token_overlap(combined_left, combined_right)
+    root_overlap = (
+        _reviewer_text_tokens(combined_left)
+        & _reviewer_text_tokens(combined_right)
+        & _REVIEW_FINDING_ROOT_WORDS
+    )
+    return bool(
+        shared >= 4
+        and (overlap >= 0.55 or (len(root_overlap) >= 3 and overlap >= 0.35))
+    )
+
+
+def _reviewer_existing_acceptance_id(
+    finding: dict,
+    runtime: AgentRuntime | None,
+) -> str:
+    finding_text = (
+        f"{finding.get('requirement', '')} {finding.get('evidence', '')}"
+    )
+    finding_path = _reviewer_path_key(finding.get("file"))
+    for todo in _acceptance_items(runtime):
+        todo_id = str(todo.get("id", "")).strip()
+        if not todo_id:
+            continue
+        sources = todo.get("evidence_sources", {})
+        source_files = sources.get("files", []) if isinstance(sources, dict) else []
+        source_match = any(
+            _reviewer_checked_path(finding_path, {_reviewer_path_key(path)})
+            for path in source_files
+        )
+        if finding_path and not source_match:
+            evidence_text = str(todo.get("evidence", "")).lower()
+            source_match = (
+                finding_path in evidence_text
+                or _Path(finding_path).name in evidence_text
+            )
+        todo_text = f"{todo.get('content', '')} {todo.get('evidence', '')}"
+        shared, overlap = _reviewer_token_overlap(finding_text, todo_text)
+        if (
+            (shared >= 4 and overlap >= 0.78)
+            or (source_match and shared >= 4 and overlap >= 0.55)
+        ):
+            return todo_id
+    return ""
+
+
+def _reviewer_trace_finding(finding: dict) -> dict:
+    return {
+        "severity": str(finding.get("severity", "warning"))[:30],
+        "requirement": str(finding.get("requirement", ""))[:500],
+        "file": str(finding.get("file", ""))[:260],
+        "symbol": str(finding.get("symbol", ""))[:160],
+        "evidence": str(finding.get("evidence", ""))[:500],
+    }
+
+
+def _screen_reviewer_findings(
+    delegation: dict,
+    runtime: AgentRuntime | None = None,
+) -> dict:
+    """Validate and deduplicate Reviewer findings before they lock the Todo list."""
+    result = delegation.get("result", {})
+    if not isinstance(result, dict):
+        result = {}
+    raw_findings = result.get("findings", [])
+    if not isinstance(raw_findings, list):
+        raw_findings = [raw_findings] if raw_findings else []
+    checked = result.get("files_checked", [])
+    if not isinstance(checked, list):
+        checked = [checked] if checked else []
+    checked_paths = {
+        _reviewer_path_key(path) for path in checked[:20]
+        if _reviewer_path_key(path)
+    }
+
+    accepted: list[dict] = []
+    suppressed: list[dict] = []
+    for raw_index, raw_finding in enumerate(raw_findings[:5], 1):
+        if not isinstance(raw_finding, dict):
+            continue
+        finding = dict(raw_finding)
+        evidence = str(finding.get("evidence", "")).strip()
+        path = str(finding.get("file", "")).strip()
+        reason = ""
+        if not evidence:
+            reason = "missing_evidence"
+        elif not path:
+            reason = "missing_file"
+        elif not _reviewer_checked_path(path, checked_paths):
+            reason = "file_not_checked"
+        elif _reviewer_self_negating_evidence(evidence):
+            reason = "self_negating_evidence"
+        elif _reviewer_unsupported_absence_evidence(evidence):
+            reason = "unsupported_absence_claim"
+
+        candidate = None
+        if not reason and runtime is not None:
+            candidate = _reviewer_finding_file(path, runtime)
+            if candidate is None:
+                reason = "file_not_found"
+        symbol = str(finding.get("symbol", "")).strip()
+        if not reason and candidate is not None and symbol:
+            symbol_parts = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", symbol)
+            symbol_name = symbol_parts[-1] if symbol_parts else ""
+            if symbol_name and symbol_name.lower() not in {"module", "file"}:
+                try:
+                    source = candidate.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    reason = "file_not_readable"
+                else:
+                    if re.search(
+                        rf"\b{re.escape(symbol_name)}\b", source
+                    ) is None:
+                        reason = "symbol_not_found"
+
+        duplicate_of = 0
+        if not reason:
+            for accepted_index, existing in enumerate(accepted, 1):
+                if _reviewer_findings_duplicate(existing, finding):
+                    duplicate_of = accepted_index
+                    reason = "semantic_duplicate"
+                    current_severity = str(
+                        existing.get("severity", "warning")
+                    ).lower()
+                    incoming_severity = str(
+                        finding.get("severity", "warning")
+                    ).lower()
+                    if _REVIEW_SEVERITY_RANK.get(
+                        incoming_severity, 0
+                    ) > _REVIEW_SEVERITY_RANK.get(current_severity, 0):
+                        existing["severity"] = incoming_severity
+                    incoming_evidence = str(
+                        finding.get("evidence", "")
+                    ).strip()
+                    existing_evidence = str(
+                        existing.get("evidence", "")
+                    ).strip()
+                    if (
+                        incoming_evidence
+                        and incoming_evidence not in existing_evidence
+                    ):
+                        existing["evidence"] = (
+                            f"{existing_evidence}; {incoming_evidence}"
+                        ).strip("; ")[:500]
+                    break
+
+        if reason:
+            trace_item = {
+                "raw_index": raw_index,
+                "reason": reason,
+                "finding": _reviewer_trace_finding(finding),
+            }
+            if duplicate_of:
+                trace_item["duplicate_of_accepted_index"] = duplicate_of
+            suppressed.append(trace_item)
+            continue
+
+        existing_todo_id = _reviewer_existing_acceptance_id(finding, runtime)
+        if existing_todo_id:
+            finding["_existing_todo_id"] = existing_todo_id
+        accepted.append(finding)
+
+    record_event(
+        "acceptance_gate",
+        decision="reviewer_findings_screened",
+        raw_count=len(raw_findings[:5]),
+        accepted_count=len(accepted),
+        suppressed_count=len(suppressed),
+        suppressed_findings=suppressed,
+    )
+    return {
+        "findings": accepted,
+        "suppressed": suppressed,
+        "raw_count": len(raw_findings[:5]),
+    }
+
+
+def _screened_reviewer_output(
+    delegation: dict,
+    screening: dict,
+) -> str:
+    """Give the Lead only actionable findings while preserving raw output in trace."""
+    payload = dict(delegation)
+    raw_result = delegation.get("result", {})
+    result = dict(raw_result) if isinstance(raw_result, dict) else {}
+    actionable = []
+    for finding in screening.get("findings", [])[:5]:
+        if not isinstance(finding, dict):
+            continue
+        actionable.append({
+            key: value for key, value in finding.items()
+            if not str(key).startswith("_")
+        })
+    result["findings"] = actionable
+    payload["result"] = result
+    payload["screening"] = {
+        "raw_finding_count": int(screening.get("raw_count", 0)),
+        "actionable_finding_count": len(actionable),
+        "suppressed_finding_count": len(screening.get("suppressed", [])),
+        "note": (
+            "Only actionable findings are included in result.findings. "
+            "Suppressed findings are retained in the execution trace and must "
+            "not be re-audited by the Lead."
+        ),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _ingest_delegation_knowledge(
     delegation: dict,
     role: str,
     runtime: AgentRuntime | None,
 ) -> None:
-    if runtime is None or role not in {"explorer", "reviewer", "general"}:
+    if runtime is None or role not in {
+        "explore", "plan", "review", "general-purpose",
+    }:
         return
     result = delegation.get("result", {})
     if not isinstance(result, dict):
@@ -271,13 +551,13 @@ def _ingest_delegation_knowledge(
         runtime.state.knowledge.observe_file(path, candidate.read_bytes())
         observed_paths.append(path)
     requirements = result.get("requirements", [])
-    if role == "explorer" and isinstance(requirements, list):
+    if role == "explore" and isinstance(requirements, list):
         for index, requirement in enumerate(requirements[:12], 1):
             runtime.state.knowledge.record_contract(
                 f"explorer:{index}",
                 str(requirement),
                 observed_paths,
-                role="explorer",
+                role="explore",
             )
 
 
@@ -292,8 +572,40 @@ def _register_reviewer_findings(
     current_todos = _runtime_todos(runtime)
     registered = []
     registered_ids = []
+    reused_ids = []
     for index, finding in enumerate(findings[:5], 1):
         finding_id = f"review:r{revision_number}:f{index}"
+        matched_todo_id = str(
+            finding.get("_existing_todo_id", "")
+        ).strip()
+        if matched_todo_id:
+            matched_todo = next(
+                (
+                    todo for todo in current_todos
+                    if str(todo.get("id", "")).strip() == matched_todo_id
+                    and todo.get("kind") == "acceptance"
+                ),
+                None,
+            )
+            if matched_todo is not None:
+                matched_todo["status"] = "pending"
+                matched_todo.pop("evidence", None)
+                sources = matched_todo.get("evidence_sources", {})
+                if not isinstance(sources, dict):
+                    sources = {}
+                reviewer_sources = [
+                    str(value).strip()
+                    for value in sources.get("reviewer_findings", [])
+                    if str(value).strip()
+                ]
+                if finding_id not in reviewer_sources:
+                    reviewer_sources.append(finding_id)
+                sources["reviewer_findings"] = reviewer_sources[:20]
+                matched_todo["evidence_sources"] = sources
+                registered.append(str(matched_todo.get("content", "")))
+                registered_ids.append(matched_todo_id)
+                reused_ids.append(matched_todo_id)
+                continue
         existing = next(
             (todo for todo in current_todos if todo.get("id") == finding_id),
             None,
@@ -310,7 +622,7 @@ def _register_reviewer_findings(
             finding.get("requirement", "Reviewer concern")).strip()
         detail = f"{location} {requirement}".strip()
         content = (
-            f"Resolve pre-final reviewer finding for revision "
+            f"Resolve Reviewer finding for revision "
             f"{revision_number}: {detail or 'Reviewer concern'}"
         )[:500]
         acceptance_count = len(_acceptance_items(runtime))
@@ -332,7 +644,7 @@ def _register_reviewer_findings(
     record_event(
         "acceptance_gate", decision="reviewer_findings_registered",
         finding_count=len(findings), registered_count=len(registered),
-        updateable_ids=registered_ids,
+        updateable_ids=registered_ids, reused_ids=reused_ids,
     )
     if runtime is not None:
         runtime.state.knowledge.record_reviewer_findings(
@@ -342,15 +654,131 @@ def _register_reviewer_findings(
     return "; ".join(registered)
 
 
-def _reviewer_only_message(output: str, revision: int) -> str:
-    return (
-        f"<pre_final_review revision=\"{revision}\">An independent reviewer "
-        "has audited the current revision from fresh context. Resolve every "
-        "finding or reject it with concrete code evidence before final. Do not "
-        "repeat the reviewer's repository reads by default.\n"
-        f"<reviewer_result>{output}</reviewer_result>"
-        "</pre_final_review>"
+def _apply_reviewer_acceptance_verifications(
+    delegation: dict,
+    revision: int | None = None,
+    runtime: AgentRuntime | None = None,
+) -> dict:
+    """Bind a clean Reviewer pass to the exact acceptance IDs it verified."""
+    result = delegation.get("result", {})
+    if not isinstance(result, dict):
+        result = {}
+    verdict = str(
+        delegation.get("verdict") or result.get("verdict") or ""
+    ).strip().lower()
+    findings = result.get("findings", [])
+    if not isinstance(findings, list):
+        findings = [findings] if findings else []
+    missing = result.get("missing_evidence", [])
+    if not isinstance(missing, list):
+        missing = [missing] if missing else []
+    raw_ids = result.get("verified_acceptance_ids", [])
+    if not isinstance(raw_ids, list):
+        raw_ids = [raw_ids] if raw_ids else []
+    requested_ids = []
+    for raw_id in raw_ids[:16]:
+        item_id = str(raw_id or "").strip()
+        if item_id and item_id not in requested_ids:
+            requested_ids.append(item_id)
+
+    current_todos = _runtime_todos(runtime)
+    acceptance = [
+        todo for todo in current_todos
+        if todo.get("kind") == "acceptance"
+    ]
+    acceptance_by_id = {
+        str(todo.get("id")): todo
+        for todo in acceptance if todo.get("id")
+    }
+    checked = result.get("files_checked", [])
+    if not isinstance(checked, list):
+        checked = [checked] if checked else []
+    checked_files = []
+    for raw_path in checked[:16]:
+        path = str(raw_path or "").strip()
+        if path and path not in checked_files:
+            checked_files.append(path)
+
+    eligible = bool(
+        delegation.get("status") == "completed"
+        and verdict == "pass"
+        and not findings
+        and not missing
+        and requested_ids
+        and checked_files
     )
+    matched_ids = [
+        item_id for item_id in requested_ids
+        if item_id in acceptance_by_id
+    ]
+    ignored_ids = [
+        item_id for item_id in requested_ids
+        if item_id not in acceptance_by_id
+    ]
+    completed_ids = []
+    if eligible:
+        summary = " ".join(str(result.get("summary", "")).split())
+        revision_number = revision if revision is not None else 0
+        evidence = (
+            f"Independent Reviewer pass for revision {revision_number}"
+            + (f": {summary}" if summary else ".")
+        )[:500]
+        for item_id in matched_ids:
+            todo = acceptance_by_id[item_id]
+            if todo.get("status") == "completed" and todo.get("evidence"):
+                continue
+            todo["status"] = "completed"
+            todo["evidence"] = evidence
+            sources = todo.get("evidence_sources", {})
+            if not isinstance(sources, dict):
+                sources = {}
+            merged_files = []
+            for path in [*sources.get("files", []), *checked_files]:
+                normalized = str(path or "").strip()
+                if normalized and normalized not in merged_files:
+                    merged_files.append(normalized)
+            sources["files"] = merged_files[:20]
+            todo["evidence_sources"] = sources
+            completed_ids.append(item_id)
+        if runtime is not None:
+            runtime.state.knowledge.sync_acceptance(current_todos)
+
+    acceptance_ids = set(acceptance_by_id)
+    coverage_complete = bool(
+        eligible
+        and acceptance_ids
+        and acceptance_ids.issubset(set(matched_ids))
+    )
+    all_acceptance_completed = bool(
+        acceptance
+        and all(todo.get("status") == "completed" for todo in acceptance)
+    )
+    decision = (
+        "reviewer_acceptance_verified"
+        if eligible else "reviewer_acceptance_not_applied"
+    )
+    record_event(
+        "acceptance_gate",
+        decision=decision,
+        revision=revision if revision is not None else 0,
+        verdict=verdict or "unknown",
+        requested_ids=requested_ids,
+        matched_ids=matched_ids,
+        completed_ids=completed_ids,
+        ignored_ids=ignored_ids,
+        finding_count=len(findings),
+        missing_evidence_count=len(missing),
+        coverage_complete=coverage_complete,
+        all_acceptance_completed=all_acceptance_completed,
+    )
+    return {
+        "eligible": eligible,
+        "matched_ids": matched_ids,
+        "completed_ids": completed_ids,
+        "ignored_ids": ignored_ids,
+        "coverage_complete": coverage_complete,
+        "all_acceptance_completed": all_acceptance_completed,
+    }
 
 
 def _finalization_budget_message(snapshot: dict) -> str:
@@ -358,7 +786,8 @@ def _finalization_budget_message(snapshot: dict) -> str:
         "<finalization_budget>This task has entered its reserved finalization "
         f"budget ({snapshot.get('remaining_calls')} model calls remain; "
         f"{snapshot.get('reserve_calls')} are reserved). Do not start a new "
-        "Explorer, Reviewer, Worker, broad repository scan, or model-generated "
+        "Explore, Plan, Review, persistent Teammate, broad repository scan, or "
+        "model-generated "
         "compact summary. Continue directly from retained evidence. Use the "
         "remaining calls only for unresolved fixes, targeted verification, and "
         "one final answer.</finalization_budget>"
@@ -839,9 +1268,7 @@ def agent_loop(
     todo_required = requires_initial_todo(messages) or acceptance_required
     todo_started = False
     acceptance_locked = False
-    acceptance_review_prompted = False
-    acceptance_review_todo_updated = False
-    acceptance_review_followup_prompted = False
+    todo_completion_followup_revision = -1
     changed_file_paths = (
         runtime.state.changed_files if runtime is not None else set()
     )
@@ -851,8 +1278,6 @@ def agent_loop(
         runtime.state.lead_read_counts if runtime is not None else {}
     )
     lead_read_counts.clear()
-    audit_read_paths: set[str] = set()
-    audit_read_budget = 0
     root_task = str(
         runtime.state.root_task if runtime is not None
         else CURRENT_ROOT_TASK or _latest_user_instruction(messages)
@@ -1084,160 +1509,24 @@ def agent_loop(
             notification_wait = 2.0 if remaining is None else max(0, min(2.0, remaining))
             if wait_for_imminent_once(notification_wait):
                 continue
-            needs_acceptance_review = (
-                acceptance_required and not acceptance_review_prompted
-            )
-            needs_independent_reviewer = (
-                multiagent_required and mutation_revision > 0
-                and reviewer_attempted_revision != mutation_revision
-            )
-            if needs_acceptance_review or needs_independent_reviewer:
-                checklist = _acceptance_items(runtime)
-                if needs_acceptance_review:
-                    audit_read_paths.clear()
-                    audit_read_budget = max(
-                        4, min(8, len(changed_file_paths) + 3))
-                    acceptance_review_prompted = True
-                    acceptance_review_todo_updated = False
-                    acceptance_review_followup_prompted = False
-
-                reviewer_output = (
-                    reviewer_cached_result
-                    if reviewer_attempted_revision == mutation_revision else ""
-                )
-                reviewer_attached = bool(reviewer_output)
-                reviewer_note = ""
-                if needs_independent_reviewer:
-                    reviewer_allowed, reviewer_budget = can_spend_optional_calls(
-                        model_client, 3)
-                    if reviewer_allowed:
-                        record_event(
-                            "multiagent_policy", decision="reviewer_auto_started",
-                            mutation_revision=mutation_revision,
-                            **{key: value for key, value in reviewer_budget.items()
-                               if key != "available"},
-                        )
-                        reviewer_output = call_tool_handler(
-                            handlers.get("delegate_agent"),
-                            {
-                                "role": "reviewer",
-                                "prompt": _reviewer_task_prompt(
-                                    changed_file_paths,
-                                    mutation_revision,
-                                    checklist,
-                                ),
-                                "name": f"pre-final-review-{mutation_revision}",
-                            },
-                            "delegate_agent",
-                        )
-                        reviewer_attached = True
-                    else:
-                        reviewer_cached_result = json.dumps({
-                            "status": "budget_reserved",
-                            "role": "reviewer",
-                            "verdict": "blocked",
-                            "error": (
-                                "Independent reviewer skipped to preserve calls "
-                                "for direct fixes, verification, and final."
-                            ),
-                            "budget": {
-                                key: value for key, value in reviewer_budget.items()
-                                if key != "available"
-                            },
-                        })
-                        reviewer_output = ""
-                        reviewer_attached = False
-                        reviewer_note = (
-                            "skipped to preserve the finalization call reserve")
-                        record_event(
-                            "model_budget_guard",
-                            decision="automatic_reviewer_skipped",
-                            mutation_revision=mutation_revision,
-                            **{key: value for key, value in reviewer_budget.items()
-                               if key != "available"},
-                        )
-                    reviewer_attempted_revision = mutation_revision
-                    if reviewer_attached:
-                        reviewer_cached_result = str(reviewer_output)
-                    delegation = _tool_json(reviewer_output)
-                    _ingest_delegation_knowledge(
-                        delegation, "reviewer", runtime,
-                    )
-                    verdict = str(delegation.get("verdict", "")).lower()
-                    findings = _reviewer_findings(reviewer_output)
-                    if findings:
-                        if not acceptance_required:
-                            acceptance_required = True
-                            todo_required = True
-                        if not acceptance_review_prompted:
-                            audit_read_paths.clear()
-                            audit_read_budget = max(
-                                4, min(8, len(changed_file_paths) + 3))
-                            acceptance_review_prompted = True
-                            acceptance_review_todo_updated = False
-                            acceptance_review_followup_prompted = False
-                            needs_acceptance_review = True
-                        _register_reviewer_findings(
-                            findings, mutation_revision, runtime)
-                        checklist = _acceptance_items(runtime)
-                    if reviewer_attached:
-                        record_event(
-                            "multiagent_policy", decision="reviewer_auto_observed",
-                            verdict=verdict or "unknown",
-                            finding_count=len(findings),
-                            mutation_revision=mutation_revision,
-                        )
-
-                if needs_acceptance_review:
-                    prompt = _acceptance_review_message(
-                        checklist, changed_file_paths, audit_read_budget,
-                        reviewer_output=str(reviewer_output),
-                        reviewer_note=reviewer_note,
-                    )
-                elif reviewer_attached:
-                    prompt = _reviewer_only_message(
-                        str(reviewer_output), mutation_revision)
-                else:
-                    prompt = ""
-                if prompt:
-                    messages.append({
-                        "role": "user",
-                        "content": prompt,
-                    })
-                if needs_acceptance_review:
-                    record_event(
-                        "acceptance_gate", decision="pre_final_review",
-                        checklist_count=len(checklist),
-                        changed_file_count=len(changed_file_paths),
-                        read_budget=audit_read_budget,
-                        reviewer_attached=reviewer_attached,
-                        reviewer_status=(
-                            "attached" if reviewer_attached else "skipped_budget"),
-                        unresolved_count=sum(
-                            1 for item in checklist
-                            if item.get("status") != "completed"),
-                    )
-                if prompt:
-                    continue
-            if (acceptance_required and acceptance_review_prompted
-                    and not acceptance_review_todo_updated):
-                if not acceptance_review_followup_prompted:
-                    messages.append({
-                        "role": "user",
-                        "content": _acceptance_review_followup_message(),
-                    })
-                    acceptance_review_followup_prompted = True
-                    record_event(
-                        "acceptance_gate", decision="review_followup",
-                    )
-                    continue
-                _append_contract_audit_warning(response.content)
-                record_event(
-                    "acceptance_gate", decision="audit_incomplete_final",
-                )
             unresolved_acceptance = _acceptance_gate_items(
                 acceptance_required, runtime)
             if unresolved_acceptance:
+                if todo_completion_followup_revision != mutation_revision:
+                    messages.append({
+                        "role": "user",
+                        "content": _todo_completion_message(
+                            unresolved_acceptance,
+                        ),
+                    })
+                    todo_completion_followup_revision = mutation_revision
+                    record_event(
+                        "acceptance_gate",
+                        decision="todo_completion_followup",
+                        mutation_revision=mutation_revision,
+                        unresolved_count=len(unresolved_acceptance),
+                    )
+                    continue
                 _append_acceptance_warning(
                     response.content, unresolved_acceptance)
                 record_event(
@@ -1260,14 +1549,28 @@ def agent_loop(
 
             mutation_requested = block.name in _MAIN_MUTATION_TOOLS
             delegated_role = ""
+            delegated_mutation_requested = False
             if block.name == "delegate_agent":
-                delegated_role = str(
-                    block.input.get("role", "")).strip().lower()
+                delegated_role = normalize_agent_role(
+                    block.input.get("role", ""))
+                if delegated_role == "general-purpose":
+                    routing = classify_delegation_intent(
+                        block.input.get("prompt", ""))
+                    delegated_mutation_requested = bool(
+                        routing["role"] == "general-purpose"
+                        and routing["matched_markers"]
+                    )
             elif block.name == "task":
-                delegated_role = classify_delegation_intent(
-                    block.input.get("description", ""))["role"]
-            worker_requested = delegated_role == "worker"
-            implementation_requested = mutation_requested or worker_requested
+                delegated_role = "general-purpose"
+                routing = classify_delegation_intent(
+                    block.input.get("description", ""))
+                delegated_mutation_requested = bool(
+                    routing["role"] == "general-purpose"
+                    and routing["matched_markers"]
+                )
+            implementation_requested = (
+                mutation_requested or delegated_mutation_requested
+            )
             if implementation_requested and todo_required and not todo_started:
                 output = todo_required_message(acceptance_required)
                 record_event("todo_gate", tool=block.name,
@@ -1280,13 +1583,13 @@ def agent_loop(
                 continue
 
             if block.name in {"delegate_agent", "task"} \
-                    and delegated_role == "explorer" \
+                    and delegated_role == "explore" \
                     and explorer_attempted:
                 cached = _tool_json(explorer_cached_result)
                 cached["reused"] = True
                 output = json.dumps(cached)
                 record_event(
-                    "delegation_reused", agent_role="explorer",
+                    "delegation_reused", agent_role="explore",
                     tool_use_id=block.id,
                 )
                 results.append({"type": "tool_result",
@@ -1295,13 +1598,13 @@ def agent_loop(
                 record_tool_result(block.id, block.name, output)
                 continue
             if (block.name in {"delegate_agent", "task"}
-                    and delegated_role == "reviewer"
+                    and delegated_role == "review"
                     and reviewer_attempted_revision == mutation_revision):
                 cached = _tool_json(reviewer_cached_result)
                 cached["reused"] = True
                 output = json.dumps(cached)
                 record_event(
-                    "delegation_reused", agent_role="reviewer",
+                    "delegation_reused", agent_role="review",
                     tool_use_id=block.id, mutation_revision=mutation_revision,
                 )
                 results.append({"type": "tool_result",
@@ -1320,66 +1623,6 @@ def agent_loop(
                                 "content": output})
                 record_tool_result(block.id, block.name, output)
                 continue
-
-            audit_active = (
-                acceptance_review_prompted
-                and not acceptance_review_todo_updated
-            )
-            if audit_active and block.name == "glob":
-                known_paths = ["README.md", *sorted(changed_file_paths)]
-                output = (
-                    "Tool not run: final contract audit is scoped to the "
-                    "original task/README and recorded changed files; repository "
-                    "glob scans are disabled. Call read_file directly only if a "
-                    "listed path still needs its one allowed audit read. Known "
-                    "paths: " + ", ".join(known_paths[:10]) + ". Use prior "
-                    "context, then update the acceptance checklist with todo_write."
-                )
-                record_event(
-                    "acceptance_gate", decision="audit_glob_blocked",
-                    tool=block.name, tool_use_id=block.id, input=block.input,
-                    reason=output,
-                )
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": output})
-                record_tool_result(block.id, block.name, output)
-                continue
-            if audit_active and block.name == "read_file":
-                audit_path = _os.path.normpath(
-                    str(block.input.get("path", "")).strip()
-                ).replace("\\", "/").lower()
-                if audit_path in audit_read_paths:
-                    output = (
-                        "Tool not run: this path was already read during the "
-                        "final contract audit. Use the retained result instead "
-                        "of re-reading it."
-                    )
-                    decision = "audit_read_deduplicated"
-                elif len(audit_read_paths) >= audit_read_budget:
-                    output = (
-                        "Tool not run: final contract audit read budget reached. "
-                        "Use the retained context and update the acceptance "
-                        "checklist with todo_write."
-                    )
-                    decision = "audit_read_budget_reached"
-                else:
-                    audit_read_paths.add(audit_path)
-                    output = ""
-                    decision = ""
-                if decision:
-                    record_event(
-                        "acceptance_gate", decision=decision,
-                        tool=block.name, tool_use_id=block.id,
-                        input=block.input, reason=output,
-                        read_count=len(audit_read_paths),
-                        read_budget=audit_read_budget,
-                    )
-                    results.append({"type": "tool_result",
-                                    "tool_use_id": block.id,
-                                    "content": output})
-                    record_tool_result(block.id, block.name, output)
-                    continue
 
             if block.name == "compact":
                 compact_sizer = _request_sizer(context, tools, runtime)
@@ -1493,38 +1736,56 @@ def agent_loop(
             record_hook("PostToolUse", tool=block.name)
             print(str(output)[:300])
 
+            delegated_changed_files: list[str] = []
             if (block.name in {"delegate_agent", "task"}
                     and not str(output).startswith("Error:")):
                 delegation = _tool_json(output)
+                raw_changed_files = delegation.get("changed_files", [])
+                if isinstance(raw_changed_files, list):
+                    delegated_changed_files = [
+                        str(path).strip() for path in raw_changed_files
+                        if str(path).strip()
+                    ]
                 verdict = str(delegation.get("verdict", "")).lower()
                 _ingest_delegation_knowledge(
                     delegation, delegated_role, runtime,
                 )
-                if delegated_role == "explorer":
+                if delegated_role == "explore":
                     explorer_attempted = True
                     explorer_cached_result = str(output)
                     record_event(
-                        "multiagent_policy", decision="explorer_observed",
+                        "subagent_policy", decision="explore_observed",
                         verdict=verdict or "unknown",
                     )
-                elif delegated_role == "reviewer":
+                elif delegated_role == "review":
                     reviewer_attempted_revision = mutation_revision
                     reviewer_cached_result = str(output)
-                    findings = _reviewer_findings(str(output))
+                    screening = _screen_reviewer_findings(
+                        delegation, runtime,
+                    )
+                    findings = screening["findings"]
+                    output = _screened_reviewer_output(
+                        delegation, screening,
+                    )
+                    reviewer_cached_result = str(output)
                     if findings:
                         if not acceptance_required:
                             acceptance_required = True
                             todo_required = True
                         _register_reviewer_findings(
                             findings, mutation_revision, runtime)
+                    _apply_reviewer_acceptance_verifications(
+                        delegation, mutation_revision, runtime)
                     record_event(
-                        "multiagent_policy",
+                        "subagent_policy",
                         decision=("reviewer_pass" if (
                             delegation.get("status") == "completed"
                             and verdict == "pass" and not findings
                         ) else "reviewer_observed"),
                         verdict=verdict or "unknown",
                         finding_count=len(findings),
+                        raw_finding_count=screening["raw_count"],
+                        suppressed_finding_count=len(screening["suppressed"]),
                         mutation_revision=mutation_revision,
                     )
 
@@ -1532,8 +1793,6 @@ def agent_loop(
                 rounds_since_todo = 0
                 if not str(output).startswith("Error:"):
                     todo_started = True
-                    if acceptance_review_prompted:
-                        acceptance_review_todo_updated = True
                 if (not str(output).startswith("Error:")
                         and acceptance_required
                         and not _acceptance_items(runtime)):
@@ -1544,7 +1803,7 @@ def agent_loop(
             else:
                 rounds_since_todo += 1
                 mutation_succeeded = (
-                    mutation_requested
+                    (mutation_requested or bool(delegated_changed_files))
                     and not str(output).lower().startswith((
                         "error:", "permission denied", "tool not run"))
                 )
@@ -1554,16 +1813,14 @@ def agent_loop(
                 if mutation_succeeded:
                     acceptance_locked = True
                     mutation_revision += 1
-                    if multiagent_required and acceptance_review_prompted:
-                        acceptance_review_prompted = False
-                        acceptance_review_todo_updated = False
-                        acceptance_review_followup_prompted = False
                     changed_path = str(block.input.get("path", "")).strip()
                     if changed_path:
                         changed_file_paths.add(changed_path)
                     for changed_path in integration.get("changed_files", []):
                         if changed_path:
                             changed_file_paths.add(str(changed_path))
+                    for changed_path in delegated_changed_files:
+                        changed_file_paths.add(changed_path)
 
             if (block.name == "read_file"
                     and not str(output).lower().startswith("error:")):

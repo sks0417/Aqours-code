@@ -24,10 +24,13 @@ def run_integrate_worktree(
         output = integrate_worktree(name, cleanup)
     return output
 
-def run_delegate_agent(role: str, prompt: str, name: str = "",
-                       task_id: str = "",
-                       runtime: AgentRuntime | None = None) -> str:
-    return delegate_agent(role, prompt, name, task_id, runtime)
+def run_delegate_agent(
+    role: str,
+    prompt: str,
+    name: str = "",
+    runtime: AgentRuntime | None = None,
+) -> str:
+    return delegate_agent(role, prompt, name, runtime)
 
 
 # ── Basic tool handlers ──
