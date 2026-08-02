@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -734,6 +735,7 @@ class TraceRun:
     def __init__(self, workdir: Path, model_provider: str, model: str,
                  user_prompt: str = "", storage_root: Path | None = None):
         self.run_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
+        self._event_lock = threading.RLock()
         self.workdir = Path(workdir)
         # Eval runs can keep trusted trace data outside the workspace mounted
         # into the Agent container.  Local/interactive runs retain the existing
@@ -845,14 +847,15 @@ class TraceRun:
             self.blocked_count += 1
 
     def event(self, event_type: str, **payload):
-        event = {"type": event_type, "ts": time.time(), **_redact(payload)}
-        self.event_count += 1
-        self._update_counts(event)
-        self._safe(lambda: self._append_jsonl(self.trace_path, event))
-        timeline_event = _timeline_from_trace_event(event)
-        if timeline_event:
-            self.timeline_event(timeline_event)
-        self.sync_metadata_and_index()
+        with self._event_lock:
+            event = {"type": event_type, "ts": time.time(), **_redact(payload)}
+            self.event_count += 1
+            self._update_counts(event)
+            self._safe(lambda: self._append_jsonl(self.trace_path, event))
+            timeline_event = _timeline_from_trace_event(event)
+            if timeline_event:
+                self.timeline_event(timeline_event)
+            self.sync_metadata_and_index()
 
     def _append_jsonl(self, path: Path, event: dict):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -860,13 +863,14 @@ class TraceRun:
             handle.write(json.dumps(event, ensure_ascii=False, default=_json_default) + "\n")
 
     def timeline_event(self, event: dict):
-        event = _redact(event)
-        self.timeline_events.append(event)
-        self.timeline_event_count += 1
-        self._safe(lambda: self._append_jsonl(self.timeline_path, event))
-        self._safe(lambda: self.timeline_md_path.write_text(
-            _render_timeline_markdown(self.run_id, self.timeline_events),
-            encoding="utf-8"))
+        with self._event_lock:
+            event = _redact(event)
+            self.timeline_events.append(event)
+            self.timeline_event_count += 1
+            self._safe(lambda: self._append_jsonl(self.timeline_path, event))
+            self._safe(lambda: self.timeline_md_path.write_text(
+                _render_timeline_markdown(self.run_id, self.timeline_events),
+                encoding="utf-8"))
 
     def infer_final_status(self, final_answer: str = "") -> str:
         text = str(final_answer or "").strip().lower()
@@ -881,13 +885,14 @@ class TraceRun:
         return "success"
 
     def finish(self, final_answer: str = "", status: str | None = None):
-        if self.finished:
-            return
-        self.finished = True
-        self.status = status if status in RUN_STATUSES else self.infer_final_status(final_answer)
-        self.end_time = time.time()
-        self._safe(lambda: self.final_path.write_text(_redact_text(final_answer or ""), encoding="utf-8"))
-        self.sync_metadata_and_index()
+        with self._event_lock:
+            if self.finished:
+                return
+            self.finished = True
+            self.status = status if status in RUN_STATUSES else self.infer_final_status(final_answer)
+            self.end_time = time.time()
+            self._safe(lambda: self.final_path.write_text(_redact_text(final_answer or ""), encoding="utf-8"))
+            self.sync_metadata_and_index()
 
 
 def start_run(user_prompt: str, *, workdir: Path, model_provider: str, model: str,

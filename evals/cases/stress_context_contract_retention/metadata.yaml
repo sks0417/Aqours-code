@@ -1,0 +1,20 @@
+id: stress_context_contract_retention
+suite: stress
+difficulty: 4
+category: context_compaction_contract_retention
+max_model_calls: 40
+max_model_tokens: 900000
+context_limit_chars: 52000
+compact_trigger_ratio: 0.65
+score_runtime_target_sec: 180
+score_runtime_hard_limit_sec: 600
+score_llm_call_target: 14
+score_llm_call_hard_limit: 40
+score_tool_call_target: 35
+score_tool_call_hard_limit: 120
+score_token_target: 300000
+score_token_hard_limit: 1000000
+forbidden_paths: [README.md, docs/**, pyproject.toml, tests/**]
+expected_artifacts: [src/notification_dispatcher/__init__.py, src/notification_dispatcher/api.py, src/notification_dispatcher/bootstrap.py, src/notification_dispatcher/dedupe.py, src/notification_dispatcher/errors.py, src/notification_dispatcher/models.py, src/notification_dispatcher/policy.py, src/notification_dispatcher/providers.py, src/notification_dispatcher/rate_limit.py, src/notification_dispatcher/serialization.py, src/notification_dispatcher/service.py, src/notification_dispatcher/validation.py]
+allowed_changes: [src/notification_dispatcher/*.py]
+scripted_supported: false

@@ -1,5 +1,6 @@
 from .runtime_state import *
 from .runtime import AgentRuntime
+from .model_api import assistant_message_from_response
 from .tool_registry import (
     delegated_policy_for_role,
     effective_tool_names,
@@ -38,6 +39,7 @@ def spawn_teammate_thread(
 ) -> str:
     if name in active_teammates:
         return f"Teammate '{name}' already exists"
+    record_event("teammate_spawned", teammate=name, role=role)
 
     # Plan approval is a real gate: after submit_plan, the teammate stops
     # taking model/tool steps until lead sends plan_approval_response.
@@ -81,6 +83,7 @@ def spawn_teammate_thread(
         return False
 
     def run():
+        record_event("teammate_started", teammate=name, role=role)
         wt_ctx = {"path": None}
         registered_handlers = {
             tool_name: get_tool_spec(tool_name).handler
@@ -204,17 +207,38 @@ def spawn_teammate_thread(
                         messages.append({"role": "user",
                             "content": "<inbox>" + json.dumps(non_protocol) + "</inbox>"})
                 try:
+                    record_llm_request(
+                        model=MODEL, max_tokens=8000,
+                        message_count=len(messages[-20:]),
+                        tool_count=len(sub_tools), purpose="teammate",
+                        agent_role=name,
+                    )
                     response = client.messages.create(
                         model=MODEL, system=system, messages=messages[-20:],
                         tools=sub_tools, max_tokens=8000)
-                except Exception:
+                    record_llm_response(response, purpose="teammate",
+                                        agent_role=name)
+                    record_event(
+                        "teammate_turn", teammate=name,
+                        tool_use_count=sum(
+                            1 for item in response.content
+                            if getattr(item, "type", None) == "tool_use"),
+                    )
+                except Exception as exc:
+                    record_event("teammate_model_error", teammate=name,
+                                 error_type=type(exc).__name__, message=str(exc))
                     break
-                messages.append({"role": "assistant", "content": response.content})
+                messages.append(assistant_message_from_response(response))
                 if not has_tool_use(response.content):
                     break
                 results = []
                 for block in response.content:
                     if block.type == "tool_use":
+                        record_event(
+                            "teammate_tool_use", teammate=name,
+                            tool=block.name, tool_use_id=block.id,
+                            input=getattr(block, "input", {}),
+                        )
                         if block.name == "submit_plan":
                             output = _teammate_submit_plan(
                                 name, block.input.get("plan", ""))
@@ -232,6 +256,11 @@ def spawn_teammate_thread(
                         results.append({"type": "tool_result",
                                         "tool_use_id": block.id,
                                         "content": str(output)})
+                        record_event(
+                            "teammate_tool_result", teammate=name,
+                            tool=block.name, tool_use_id=block.id,
+                            content=str(output),
+                        )
                         if protocol_ctx["waiting_plan"]:
                             # Ignore later tool_use blocks from the same model
                             # response; they belong after approval, not before.
@@ -259,6 +288,8 @@ def spawn_teammate_thread(
                     continue
                 break
         BUS.send(name, "lead", summary, "result")
+        record_event("teammate_finished", teammate=name, role=role,
+                     summary=summary[:500])
         active_teammates.pop(name, None)
         teammate_threads.pop(name, None)
         teammate_stop_events.pop(name, None)

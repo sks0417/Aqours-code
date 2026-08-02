@@ -18,6 +18,7 @@ from .model_budget import (
     finalization_reserve_active,
 )
 from .runtime import AgentRuntime
+from .model_api import assistant_message_from_response
 
 # ── Agent Loop ──
 
@@ -625,8 +626,7 @@ def _register_reviewer_findings(
             f"Resolve Reviewer finding for revision "
             f"{revision_number}: {detail or 'Reviewer concern'}"
         )[:500]
-        acceptance_count = len(_acceptance_items(runtime))
-        if len(current_todos) >= 20 or acceptance_count >= 12:
+        if len(current_todos) >= 32:
             record_event(
                 "acceptance_gate", decision="reviewer_findings_not_registered",
                 finding_count=len(findings), registered_count=len(registered),
@@ -814,6 +814,51 @@ def _context_stats(
     }
 
 
+def _latest_genuine_user_signature(messages: list) -> str:
+    for message in reversed(messages):
+        if message.get("role") != "user" or is_tool_result_message(message):
+            continue
+        text = _message_text(message.get("content", "")).lstrip()
+        if text.startswith(CONTEXT_CHECKPOINT_MARKER):
+            continue
+        return json.dumps(message, sort_keys=True, ensure_ascii=False, default=str)
+    return ""
+
+
+def _record_context_integrity(messages: list, latest_user_before: str) -> None:
+    tool_use_ids = set()
+    tool_result_ids = set()
+    checkpoint_indexes = []
+    for index, message in enumerate(messages):
+        if _message_text(message.get("content", "")).lstrip().startswith(
+                CONTEXT_CHECKPOINT_MARKER):
+            checkpoint_indexes.append(index)
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block_type(block) == "tool_use":
+                value = (block.get("id") if isinstance(block, dict)
+                         else getattr(block, "id", ""))
+                if value:
+                    tool_use_ids.add(str(value))
+            elif block_type(block) == "tool_result":
+                value = (block.get("tool_use_id") if isinstance(block, dict)
+                         else getattr(block, "tool_use_id", ""))
+                if value:
+                    tool_result_ids.add(str(value))
+    latest_after = _latest_genuine_user_signature(messages)
+    record_event(
+        "context_integrity",
+        message_count=len(messages),
+        checkpoint_present=bool(checkpoint_indexes),
+        checkpoint_indexes=checkpoint_indexes,
+        latest_user_preserved=bool(
+            latest_user_before and latest_after == latest_user_before),
+        orphan_tool_result_ids=sorted(tool_result_ids - tool_use_ids),
+    )
+
+
 def _run_context_stage(stage: str, messages: list, func) -> list:
     before = _context_stats(messages)
     next_messages = func(messages)
@@ -923,6 +968,7 @@ def prepare_context(
     )
     compact_trigger = int(CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO)
     if before["estimated_size"] > compact_trigger:
+        latest_user_before = _latest_genuine_user_signature(messages)
         sizer = _request_sizer(budget_context, budget_tools, runtime)
         compacted = (
             compact_history(
@@ -965,6 +1011,7 @@ def prepare_context(
             before_tokens=before["estimated_tokens"],
             after_tokens=after["estimated_tokens"],
         )
+        _record_context_integrity(messages, latest_user_before)
     return messages
 
 
@@ -1036,7 +1083,20 @@ def acceptance_required_message() -> str:
     return (
         "Tool not run: before changing files, add concrete kind=acceptance "
         "items from the task/README requirements with todo_write. Read-only "
-        "contract discovery may continue first."
+        "contract discovery may continue first. Keep independently observable "
+        "requirements separate. For stateful or recursive code, include applicable "
+        "deep-copy/alias-isolation boundaries and shared-dependency fan-in "
+        "deduplication, not only happy-path chains and public tests."
+    )
+
+
+def acceptance_coverage_message() -> str:
+    return (
+        "\n<acceptance_coverage_check>Before editing, recheck the contract: "
+        "a fresh/copy guarantee needs its own acceptance item covering nested "
+        "input-storage-return-replay alias isolation; recursive evaluation needs "
+        "its own shared-dependency fan-in deduplication item. Add any applicable "
+        "missing item now.</acceptance_coverage_check>"
     )
 
 
@@ -1118,9 +1178,7 @@ def _reconcile_locked_acceptance(
         notices.extend(
             f"restored omitted item: {todo.get('content')}" for todo in restored)
 
-    acceptance_count = sum(
-        1 for todo in current_todos if todo.get("kind") == "acceptance")
-    if len(current_todos) > 20 or acceptance_count > 12:
+    if len(current_todos) > 32:
         current_todos[:] = [dict(todo) for todo in previous_todos]
         if runtime is not None:
             runtime.state.knowledge.sync_acceptance(current_todos)
@@ -1268,6 +1326,7 @@ def agent_loop(
     todo_required = requires_initial_todo(messages) or acceptance_required
     todo_started = False
     acceptance_locked = False
+    acceptance_coverage_notice_sent = False
     todo_completion_followup_revision = -1
     changed_file_paths = (
         runtime.state.changed_files if runtime is not None else set()
@@ -1454,7 +1513,7 @@ def agent_loop(
 
         if response.stop_reason == "max_tokens":
             if force_final_response:
-                messages.append({"role": "assistant", "content": response.content})
+                messages.append(assistant_message_from_response(response))
                 record_hook("Stop")
                 trigger_hooks("Stop", messages)
                 finish_run(extract_text(response.content))
@@ -1464,7 +1523,7 @@ def agent_loop(
                 state.has_escalated = True
                 print(f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m")
                 continue
-            messages.append({"role": "assistant", "content": response.content})
+            messages.append(assistant_message_from_response(response))
             if state.recovery_count < MAX_RECOVERY_RETRIES:
                 messages.append({"role": "user", "content": CONTINUATION_PROMPT})
                 state.recovery_count += 1
@@ -1473,7 +1532,7 @@ def agent_loop(
 
         max_tokens = DEFAULT_MAX_TOKENS
         state.has_escalated = False
-        messages.append({"role": "assistant", "content": response.content})
+        messages.append(assistant_message_from_response(response))
         if force_final_response:
             unresolved = _acceptance_gate_items(acceptance_required, runtime)
             if unresolved:
@@ -1800,6 +1859,11 @@ def agent_loop(
                         "\nAcceptance checklist required before the first file "
                         "change; continue read-only contract discovery or add at "
                         "least one kind=acceptance item.")
+                elif (not str(output).startswith("Error:")
+                      and acceptance_required
+                      and not acceptance_coverage_notice_sent):
+                    output += acceptance_coverage_message()
+                    acceptance_coverage_notice_sent = True
             else:
                 rounds_since_todo += 1
                 mutation_succeeded = (
@@ -2020,7 +2084,9 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
                    trace_storage_root: str | None = None,
                    runtime_root: str | None = None,
                    manage_lifecycle: bool = False,
-                   approval_mode: str | None = None) -> dict:
+                   approval_mode: str | None = None,
+                   context_limit_chars: int | None = None,
+                   compact_trigger_ratio: float | None = None) -> dict:
     """Run one non-interactive agent task using the existing loop and trace."""
     global rounds_since_todo
     from . import bootstrap
@@ -2032,6 +2098,7 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         "WORKDIR", "client", "MODEL_PROVIDER", "MODEL", "PRIMARY_MODEL",
         "COMMAND_EXECUTOR", "TOOL_POLICY", "CASE_DEADLINE",
         "CURRENT_ROOT_TASK", "BACKGROUND_TASKS_ENABLED", "APPROVAL_MODE",
+        "CONTEXT_LIMIT", "COMPACT_TRIGGER_RATIO",
         *_WORKDIR_DERIVED_PATHS,
     ]
     old_state = {name: _runtime_value(name) for name in state_names}
@@ -2051,6 +2118,18 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         _set_runtime_value("TOOL_POLICY", tool_policy)
         _set_runtime_value("CASE_DEADLINE", case_deadline)
         _set_runtime_value("CURRENT_ROOT_TASK", task)
+        if context_limit_chars is not None:
+            context_limit_chars = int(context_limit_chars)
+            if not 16_000 <= context_limit_chars <= 2_000_000:
+                raise ValueError(
+                    "context_limit_chars must be between 16000 and 2000000")
+            _set_runtime_value("CONTEXT_LIMIT", context_limit_chars)
+        if compact_trigger_ratio is not None:
+            compact_trigger_ratio = float(compact_trigger_ratio)
+            if not 0.25 <= compact_trigger_ratio <= 0.95:
+                raise ValueError(
+                    "compact_trigger_ratio must be between 0.25 and 0.95")
+            _set_runtime_value("COMPACT_TRIGGER_RATIO", compact_trigger_ratio)
         if approval_mode is not None:
             if approval_mode not in {"interactive", "non_interactive"}:
                 raise ValueError(f"unsupported approval mode: {approval_mode}")
@@ -2089,6 +2168,15 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         trigger_hooks("UserPromptSubmit", task)
         if tool_policy:
             record_event("tool_policy", **tool_policy)
+        record_event(
+            "context_configuration",
+            context_limit_chars=int(_runtime_value("CONTEXT_LIMIT")),
+            compact_trigger_ratio=float(
+                _runtime_value("COMPACT_TRIGGER_RATIO")),
+            eval_override=bool(
+                context_limit_chars is not None
+                or compact_trigger_ratio is not None),
+        )
 
         messages = [{"role": "user", "content": task}]
         runtime.services.trace_recorder = run

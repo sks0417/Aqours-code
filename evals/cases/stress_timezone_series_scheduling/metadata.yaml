@@ -1,0 +1,16 @@
+id: stress_timezone_series_scheduling
+suite: stress
+difficulty: 7
+category: temporal_recurrence_capacity_and_idempotency
+max_model_calls: 50
+score_runtime_target_sec: 240
+score_runtime_hard_limit_sec: 900
+score_llm_call_target: 18
+score_llm_call_hard_limit: 50
+score_tool_call_target: 45
+score_tool_call_hard_limit: 140
+score_token_target: 450000
+score_token_hard_limit: 2200000
+forbidden_paths: [README.md, pyproject.toml, tests/**]
+expected_artifacts: [src/series_scheduler/__init__.py, src/series_scheduler/api.py, src/series_scheduler/bootstrap.py, src/series_scheduler/errors.py, src/series_scheduler/models.py, src/series_scheduler/validation.py, src/series_scheduler/timezones.py, src/series_scheduler/recurrence.py, src/series_scheduler/conflicts.py, src/series_scheduler/fingerprint.py, src/series_scheduler/serialization.py, src/series_scheduler/repositories.py, src/series_scheduler/service.py]
+allowed_changes: [src/series_scheduler/*.py]

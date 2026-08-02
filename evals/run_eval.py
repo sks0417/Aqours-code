@@ -447,6 +447,8 @@ def load_metadata(case_dir: Path) -> dict:
         "category": "uncategorized",
         "max_model_calls": None,
         "max_model_tokens": None,
+        "context_limit_chars": None,
+        "compact_trigger_ratio": None,
         "forbidden_paths": [],
         "expected_artifacts": [],
         "allowed_changes": [],
@@ -468,6 +470,7 @@ def load_metadata(case_dir: Path) -> dict:
         elif key in {
             "difficulty", "max_model_calls",
             "max_model_tokens", "scripted_supported",
+            "context_limit_chars", "compact_trigger_ratio",
             *PROFILE_METADATA_KEYS.values(),
         }:
             metadata[key] = parse_scalar(value)
@@ -495,6 +498,7 @@ def trace_metrics(trace_path: Path) -> dict:
     duplicate_tool_calls = 0
     previous_tool_signature = None
     tool_counts = Counter()
+    test_commands = []
     for event in events:
         if event.get("type") != "tool_use":
             continue
@@ -508,7 +512,21 @@ def trace_metrics(trace_path: Path) -> dict:
         if signature == previous_tool_signature:
             duplicate_tool_calls += 1
         previous_tool_signature = signature
+        if tool_name == "bash":
+            command = str(tool_input.get("command") or "").strip()
+            if any(marker in command for marker in (
+                    "pytest", "unittest", "python -m test")):
+                test_commands.append(command)
     redundant_reads = post_compact_redundant_reads(events)
+    test_command_counts = Counter(test_commands)
+    integrity_events = [
+        event for event in events
+        if event.get("type") == "context_integrity"
+    ]
+    context_configuration = next((
+        event for event in events
+        if event.get("type") == "context_configuration"
+    ), {})
     return {
         "tool_calls": sum(
             1 for event in events if event.get("type") == "tool_use"),
@@ -525,6 +543,44 @@ def trace_metrics(trace_path: Path) -> dict:
         "read_file_calls": tool_counts.get("read_file", 0),
         "post_compact_redundant_reads": redundant_reads["count"],
         "post_compact_redundant_read_details": redundant_reads["details"],
+        "automatic_compactions": sum(
+            1 for event in events
+            if event.get("type") == "compact"
+            and event.get("kind") == "automatic"
+            and event.get("success") is True
+        ),
+        "oversized_tool_results_omitted": sum(
+            int(event.get("omitted_tool_result_count") or 0)
+            for event in events
+            if event.get("type") == "context_compact"
+            and event.get("stage") == "tool_result_limit"
+        ),
+        "exact_repeated_test_commands": sum(
+            count - 1 for count in test_command_counts.values() if count > 1),
+        "targeted_test_commands": sum(
+            1 for command in test_commands
+            if "::" in command or " -k " in f" {command} "
+            or "test_" in command
+        ),
+        "context_integrity_events": len(integrity_events),
+        "context_integrity_failures": sum(
+            1 for event in integrity_events
+            if (not event.get("checkpoint_present")
+                or not event.get("latest_user_preserved")
+                or bool(event.get("orphan_tool_result_ids")))
+        ),
+        "context_configuration": {
+            "context_limit_chars": context_configuration.get(
+                "context_limit_chars"),
+            "compact_trigger_ratio": context_configuration.get(
+                "compact_trigger_ratio"),
+            "eval_override": bool(context_configuration.get("eval_override")),
+        },
+        "team_event_counts": dict(sorted(Counter(
+            str(event.get("type")) for event in events
+            if str(event.get("type", "")).startswith((
+                "shared_task_", "message_bus_", "worktree_", "teammate_"))
+        ).items())),
         "model_trace_actual_total_tokens": sum(
             int(event.get("usage", {}).get("total_tokens") or 0)
             for event in events
@@ -779,6 +835,9 @@ def copy_trusted_case(case_dir: Path, trusted_eval_root: Path, case_name: str) -
     trusted_case.mkdir(parents=True, exist_ok=True)
     shutil.copy2(PROJECT_ROOT / "evals" / "grader_common.py", trusted_eval_root / "grader_common.py")
     shutil.copy2(PROJECT_ROOT / "evals" / "scoring.py", trusted_eval_root / "scoring.py")
+    stress_grader = PROJECT_ROOT / "evals" / "stress_grader.py"
+    if stress_grader.is_file():
+        shutil.copy2(stress_grader, trusted_eval_root / "stress_grader.py")
     for filename in TRUSTED_ROOT_FILES:
         source = case_dir / filename
         if source.exists():
@@ -1065,6 +1124,8 @@ def _run_docker_agent_phase(
     scripted: bool,
     model_call_budget: int,
     model_token_budget: int,
+    context_limit_chars: int | None,
+    compact_trigger_ratio: float | None,
     config: EvalExecutionConfig,
     case_deadline: float,
 ) -> tuple[dict, str, dict]:
@@ -1096,6 +1157,8 @@ def _run_docker_agent_phase(
         "case_timeout_seconds": remaining,
         "cleanup_grace": CLEANUP_GRACE_SECONDS,
         "tool_policy": DOCKER_EVAL_TOOL_POLICY,
+        "context_limit_chars": context_limit_chars,
+        "compact_trigger_ratio": compact_trigger_ratio,
     }
     write_text(runtime_root / "input.json", json.dumps(input_payload, indent=2))
     try:
@@ -1333,6 +1396,8 @@ def _isolated_local_agent_process(payload: dict, result_connection):
                 case_deadline=deadline,
                 trace_storage_root=payload["trace_storage_root"],
                 approval_mode="non_interactive",
+                context_limit_chars=payload.get("context_limit_chars"),
+                compact_trigger_ratio=payload.get("compact_trigger_ratio"),
             )
         result_connection.send({
             "ok": True,
@@ -1616,6 +1681,8 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             scripted=scripted,
             model_call_budget=model_call_budget,
             model_token_budget=model_token_budget,
+            context_limit_chars=metadata.get("context_limit_chars"),
+            compact_trigger_ratio=metadata.get("compact_trigger_ratio"),
             config=execution_config,
             case_deadline=case_deadline,
         )
@@ -1635,6 +1702,8 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
                     model="scripted-eval" if scripted else None,
                     command_executor=command_executor,
                     approval_mode="non_interactive",
+                    context_limit_chars=metadata.get("context_limit_chars"),
+                    compact_trigger_ratio=metadata.get("compact_trigger_ratio"),
                 )
         except Exception as exc:
             agent_error = f"{type(exc).__name__}: {exc}"

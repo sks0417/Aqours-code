@@ -129,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
             runtime_root=str(state_root),
             manage_lifecycle=True,
             approval_mode="non_interactive",
+            context_limit_chars=config.get("context_limit_chars"),
+            compact_trigger_ratio=config.get("compact_trigger_ratio"),
         )
         _copy_artifact(result.get("timeline_path"), runtime_root / "timeline.jsonl")
         run_dir = Path(result["run_dir"])

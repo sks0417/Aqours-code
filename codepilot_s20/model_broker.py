@@ -223,6 +223,9 @@ def _response_payload(response) -> dict:
         "content": _message_value(getattr(response, "content", [])),
         "stop_reason": getattr(response, "stop_reason", None),
     }
+    reasoning_content = getattr(response, "reasoning_content", None)
+    if reasoning_content is not None:
+        payload["reasoning_content"] = str(reasoning_content)
     usage = _response_usage(response)
     if usage:
         payload["usage"] = usage
@@ -253,6 +256,7 @@ def _response_object(payload: dict):
         content=blocks,
         stop_reason=payload.get("stop_reason") or "end_turn",
         usage=SimpleNamespace(**usage),
+        reasoning_content=payload.get("reasoning_content"),
     )
 
 

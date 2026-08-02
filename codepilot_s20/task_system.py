@@ -32,6 +32,8 @@ def create_task(subject: str, description: str = "",
         blockedBy=blockedBy or [],
     )
     save_task(task)
+    record_event("shared_task_created", task_id=task.id,
+                 subject=task.subject, blocked_by=list(task.blockedBy))
     return task
 
 
@@ -68,13 +70,20 @@ def can_start(task_id: str) -> bool:
 def claim_task(task_id: str, owner: str = "agent") -> str:
     task = load_task(task_id)
     if task.status != "pending":
+        record_event("shared_task_claim_rejected", task_id=task_id,
+                     owner=owner, reason=f"status:{task.status}")
         return f"Task {task_id} is {task.status}, cannot claim"
     if task.owner:
+        record_event("shared_task_claim_rejected", task_id=task_id,
+                     owner=owner, reason=f"owned:{task.owner}")
         return f"Task {task_id} already owned by {task.owner}"
     if not can_start(task_id):
         deps = [d for d in task.blockedBy
                 if _task_path(d).exists() and load_task(d).status != "completed"]
         missing = [d for d in task.blockedBy if not _task_path(d).exists()]
+        record_event("shared_task_claim_rejected", task_id=task_id,
+                     owner=owner, reason="dependencies", blocked_by=deps,
+                     missing_dependencies=missing)
         parts = []
         if deps: parts.append(f"blocked by: {deps}")
         if missing: parts.append(f"missing deps: {missing}")
@@ -82,6 +91,8 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
     task.owner = owner
     task.status = "in_progress"
     save_task(task)
+    record_event("shared_task_claimed", task_id=task.id, owner=owner,
+                 subject=task.subject, worktree=task.worktree or "")
     print(f"  \033[36m[claim] {task.subject} -> in_progress\033[0m")
     return f"Claimed {task.id} ({task.subject})"
 
@@ -89,9 +100,14 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
 def complete_task(task_id: str) -> str:
     task = load_task(task_id)
     if task.status != "in_progress":
+        record_event("shared_task_complete_rejected", task_id=task_id,
+                     owner=task.owner or "", reason=f"status:{task.status}")
         return f"Task {task_id} is {task.status}, cannot complete"
     task.status = "completed"
     save_task(task)
+    record_event("shared_task_completed", task_id=task.id,
+                 owner=task.owner or "", subject=task.subject,
+                 worktree=task.worktree or "")
     unblocked = [t.subject for t in list_tasks()
                  if t.status == "pending" and t.blockedBy and can_start(t.id)]
     print(f"  \033[32m[complete] {task.subject} done\033[0m")

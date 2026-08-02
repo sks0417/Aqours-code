@@ -322,14 +322,53 @@ def test_completed_acceptance_todo_requires_evidence():
         assert output == "Updated 1 todos (1 acceptance, 0 unverified)"
         assert basic_tools.CURRENT_TODOS[0]["id"] == "accept:1"
 
+        expanded = basic_tools.run_todo_write([
+            {"content": f"contract {index}", "status": "pending",
+             "kind": "acceptance"}
+            for index in range(15)
+        ])
+        assert expanded == "Updated 15 todos (15 acceptance, 15 unverified)"
+
+        mixed = basic_tools.run_todo_write([
+            *[
+                {"content": f"plan {index}", "status": "pending",
+                 "kind": "plan"}
+                for index in range(14)
+            ],
+            *[
+                {"content": f"acceptance {index}", "status": "pending",
+                 "kind": "acceptance"}
+                for index in range(11)
+            ],
+        ])
+        assert mixed == "Updated 25 todos (11 acceptance, 11 unverified)"
+
+        acceptance_only = basic_tools.run_todo_write([
+            {"content": f"contract {index}", "status": "pending",
+             "kind": "acceptance"}
+            for index in range(32)
+        ])
+        assert acceptance_only == (
+            "Updated 32 todos (32 acceptance, 32 unverified)")
+
         oversized = basic_tools.run_todo_write([
             {"content": f"contract {index}", "status": "pending",
              "kind": "acceptance"}
-            for index in range(13)
+            for index in range(33)
         ])
-        assert oversized == "Error: todos may contain at most 12 acceptance items"
+        assert oversized == "Error: todos may contain at most 32 items"
     finally:
         basic_tools.CURRENT_TODOS.clear()
+
+
+def test_acceptance_guidance_covers_alias_and_recursive_fan_in_boundaries():
+    guidance = agent_loop.acceptance_required_message()
+    coverage = agent_loop.acceptance_coverage_message()
+
+    assert "deep-copy/alias-isolation" in guidance
+    assert "shared-dependency fan-in" in guidance
+    assert "input-storage-return-replay alias isolation" in coverage
+    assert "shared-dependency fan-in deduplication" in coverage
 
 
 def test_complex_code_task_requires_acceptance_before_edit_without_forced_review(
@@ -395,6 +434,9 @@ def test_complex_code_task_requires_acceptance_before_edit_without_forced_review
     ]
     assert "Acceptance checklist required" in tool_results[0]
     assert tool_results[1].startswith("Tool not run: before changing files")
+    assert sum(
+        "<acceptance_coverage_check>" in result for result in tool_results
+    ) == 1
     assert (tmp_path / "service.py").read_text(encoding="utf-8") == "fixed = True\n"
     assert len(fake_client.messages.calls) == 7
     assert not any(

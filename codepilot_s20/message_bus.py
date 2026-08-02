@@ -17,6 +17,9 @@ class MessageBus:
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
         with open(inbox, "a") as f:
             f.write(json.dumps(msg) + "\n")
+        record_event("message_bus_sent", from_agent=from_agent,
+                     to_agent=to_agent, message_type=msg_type,
+                     content_preview=str(content)[:500])
         terminal_print(f"  \033[33m[bus] {from_agent} -> {to_agent}: "
                        f"({msg_type}) {content[:50]}\033[0m")
 
@@ -27,6 +30,11 @@ class MessageBus:
         msgs = [json.loads(line) for line in inbox.read_text().splitlines()
                 if line.strip()]
         inbox.unlink()
+        for msg in msgs:
+            record_event("message_bus_received", agent=agent,
+                         from_agent=msg.get("from", ""),
+                         message_type=msg.get("type", ""),
+                         sent_ts=msg.get("ts"))
         return msgs
 
 

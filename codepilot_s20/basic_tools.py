@@ -182,8 +182,7 @@ def call_tool_handler(
         return f"Error: {e}"
 
 
-_MAX_TODO_ITEMS = 20
-_MAX_ACCEPTANCE_ITEMS = 12
+_MAX_TODO_ITEMS = 32
 _MAX_TODO_TEXT = 500
 _MAX_TODO_ID = 100
 _TODO_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._/-]*$")
@@ -307,12 +306,6 @@ def _normalize_todos(todos, runtime: AgentRuntime | None = None):
         if evidence_sources:
             item["evidence_sources"] = evidence_sources
         normalized.append(item)
-    acceptance_count = sum(
-        1 for todo in normalized if todo["kind"] == "acceptance")
-    if acceptance_count > _MAX_ACCEPTANCE_ITEMS:
-        return None, (
-            "Error: todos may contain at most "
-            f"{_MAX_ACCEPTANCE_ITEMS} acceptance items")
     return normalized, None
 
 def run_todo_write(

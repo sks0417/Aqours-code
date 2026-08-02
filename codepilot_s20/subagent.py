@@ -3,6 +3,7 @@ from .agent_profiles import get_agent_profile, normalize_agent_role
 from .knowledge import snapshot_workspace
 from .model_budget import can_spend_optional_calls
 from .runtime import AgentRuntime
+from .model_api import assistant_message_from_response
 from .tool_registry import (
     delegated_policy_for_role,
     effective_tool_names,
@@ -340,7 +341,7 @@ def run_role_agent(
             max_tokens=profile.max_response_tokens,
             runtime=role_runtime,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        messages.append(assistant_message_from_response(response))
         text = extract_text(response.content)
         if text:
             final_text = text
@@ -472,7 +473,10 @@ def run_role_agent(
                 'verified_acceptance_ids; omit IDs with findings or missing evidence.'
                 '</synthesis>'
             )
-            synthesis_max_tokens = 2200
+            # Thinking-capable providers may spend the first few thousand output
+            # tokens on hidden reasoning. Leave room for the required JSON instead
+            # of turning a useful review into an invalid empty result.
+            synthesis_max_tokens = 5000
         elif profile.name == "explore":
             synthesis_instruction = (
                 '<synthesis>Tool use is over. Return one compact JSON object and '
@@ -525,7 +529,7 @@ def run_role_agent(
             max_tokens=synthesis_max_tokens,
             runtime=role_runtime,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        messages.append(assistant_message_from_response(response))
         final_text = extract_text(response.content)
     return _finalize_role_result(
         _parse_role_result(final_text, profile.name),

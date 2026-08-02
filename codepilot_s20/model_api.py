@@ -7,6 +7,10 @@ import urllib.request
 from types import SimpleNamespace
 
 
+DEEPSEEK_V4_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
+DEEPSEEK_REASONING_EFFORT = "max"
+
+
 def _clean_env(value: str | None) -> str | None:
     if value is None:
         return None
@@ -90,6 +94,9 @@ def _messages_to_openai(messages: list[dict]) -> list[dict]:
             msg = {"role": "assistant", "content": "\n".join(part for part in text_parts if part) or None}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
+            reasoning_content = message.get("reasoning_content")
+            if reasoning_content is not None:
+                msg["reasoning_content"] = str(reasoning_content)
             converted.append(msg)
             continue
         if role == "user" and isinstance(content, list):
@@ -138,7 +145,17 @@ def _openai_message_to_response(
         content=content,
         stop_reason=stop_reason,
         usage=usage_object,
+        reasoning_content=message.get("reasoning_content"),
     )
+
+
+def assistant_message_from_response(response) -> dict:
+    """Preserve provider state that must be replayed on the next tool turn."""
+    message = {"role": "assistant", "content": response.content}
+    reasoning_content = getattr(response, "reasoning_content", None)
+    if reasoning_content is not None:
+        message["reasoning_content"] = str(reasoning_content)
+    return message
 
 
 class OpenAICompatibleMessages:
@@ -155,9 +172,17 @@ class OpenAICompatibleMessages:
             payload_messages.append({"role": "system", "content": system})
         payload_messages.extend(_messages_to_openai(messages))
         payload = {"model": model, "messages": payload_messages, "max_tokens": max_tokens}
+        deepseek_thinking = (
+            self.provider_name.casefold() == "deepseek"
+            and model.casefold() in DEEPSEEK_V4_MODELS
+        )
+        if deepseek_thinking:
+            payload["thinking"] = {"type": "enabled"}
+            payload["reasoning_effort"] = DEEPSEEK_REASONING_EFFORT
         if tools:
             payload["tools"] = _tools_to_openai(tools)
-            payload["tool_choice"] = "auto"
+            if not deepseek_thinking:
+                payload["tool_choice"] = "auto"
         payload.update(kwargs)
         request = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(payload).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", **self.extra_headers}, method="POST")
         try:
@@ -195,7 +220,7 @@ class AnthropicClient:
 
 def default_model_for_provider(provider: str) -> str:
     if provider == "deepseek":
-        return "deepseek-chat"
+        return "deepseek-v4-flash"
     if provider in {"openai", "openai_compatible"}:
         return "gpt-4o-mini"
     return "claude-3-5-sonnet-latest"

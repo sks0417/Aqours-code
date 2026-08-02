@@ -336,6 +336,7 @@ def test_role_tool_budget_reserves_a_no_tool_synthesis_turn(tmp_path, monkeypatc
     assert result["verdict"] == "pass"
     assert len(client.calls) == 3
     assert client.calls[2]["tools"] == []
+    assert client.calls[2]["max_tokens"] == 5000
     assert len(client.calls[2]["messages"]) == 1
     assert "<synthesis>" in client.calls[2]["messages"][0]["content"]
     assert "<role_evidence>" in client.calls[2]["messages"][0]["content"]

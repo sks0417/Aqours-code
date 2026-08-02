@@ -1,0 +1,16 @@
+id: stress_dependency_resolution_locking
+suite: stress
+difficulty: 7
+category: constraint_solving_graphs_and_cache_integrity
+max_model_calls: 50
+score_runtime_target_sec: 240
+score_runtime_hard_limit_sec: 900
+score_llm_call_target: 18
+score_llm_call_hard_limit: 50
+score_tool_call_target: 45
+score_tool_call_hard_limit: 140
+score_token_target: 450000
+score_token_hard_limit: 2200000
+forbidden_paths: [README.md, pyproject.toml, tests/**]
+expected_artifacts: [src/dependency_resolver/__init__.py, src/dependency_resolver/api.py, src/dependency_resolver/bootstrap.py, src/dependency_resolver/errors.py, src/dependency_resolver/models.py, src/dependency_resolver/validation.py, src/dependency_resolver/semver.py, src/dependency_resolver/constraints.py, src/dependency_resolver/graph.py, src/dependency_resolver/fingerprint.py, src/dependency_resolver/serialization.py, src/dependency_resolver/repositories.py, src/dependency_resolver/resolver.py, src/dependency_resolver/service.py]
+allowed_changes: [src/dependency_resolver/*.py]

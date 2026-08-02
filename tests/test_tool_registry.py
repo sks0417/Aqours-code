@@ -271,3 +271,5 @@ def test_tool_strategy_batches_only_safe_independent_operations():
     assert "Tools execute in response order" in strategy
     assert "partial failure does not roll back" in strategy
     assert "Complete one coherent phase" in strategy
+    assert "mutable-alias boundaries" in strategy
+    assert "shared-dependency fan-in" in strategy

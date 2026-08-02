@@ -1,0 +1,20 @@
+id: stress_context_verbose_test_diagnosis
+suite: stress
+difficulty: 4
+category: context_compaction_verbose_diagnostics
+max_model_calls: 40
+max_model_tokens: 900000
+context_limit_chars: 60000
+compact_trigger_ratio: 0.70
+score_runtime_target_sec: 180
+score_runtime_hard_limit_sec: 600
+score_llm_call_target: 14
+score_llm_call_hard_limit: 40
+score_tool_call_target: 35
+score_tool_call_hard_limit: 120
+score_token_target: 300000
+score_token_hard_limit: 1000000
+forbidden_paths: [README.md, docs/**, pyproject.toml, tests/**]
+expected_artifacts: [src/inventory_import_pipeline/__init__.py, src/inventory_import_pipeline/api.py, src/inventory_import_pipeline/bootstrap.py, src/inventory_import_pipeline/dedupe.py, src/inventory_import_pipeline/errors.py, src/inventory_import_pipeline/models.py, src/inventory_import_pipeline/parser.py, src/inventory_import_pipeline/repository.py, src/inventory_import_pipeline/serialization.py, src/inventory_import_pipeline/service.py, src/inventory_import_pipeline/validation.py]
+allowed_changes: [src/inventory_import_pipeline/*.py]
+scripted_supported: false

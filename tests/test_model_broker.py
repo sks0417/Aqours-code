@@ -41,6 +41,7 @@ class RecordingMessages:
         return SimpleNamespace(
             content=[text_block("brokered"), tool_block("read_file", "call_1")],
             stop_reason="tool_use",
+            reasoning_content="broker reasoning",
         )
 
 
@@ -108,6 +109,7 @@ def test_broker_round_trip_supports_only_messages_create_and_cleans_files(tmp_pa
     assert response.stop_reason == "tool_use"
     assert response.content[0].text == "brokered"
     assert response.content[1].name == "read_file"
+    assert response.reasoning_content == "broker reasoning"
     assert not list((tmp_path / "requests").glob("*.json"))
     assert not list((tmp_path / "responses").glob("*.json"))
 

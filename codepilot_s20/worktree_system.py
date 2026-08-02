@@ -77,6 +77,8 @@ def create_worktree(name: str, task_id: str = "") -> str:
     if task_id:
         bind_task_to_worktree(task_id, name)
     log_event("create", name, task_id)
+    record_event("worktree_created", worktree=name, task_id=task_id,
+                 path=str(path))
     print(f"  \033[33m[worktree] created: {name} at {path}\033[0m")
     return f"Worktree '{name}' created at {path}"
 
@@ -85,6 +87,8 @@ def bind_task_to_worktree(task_id: str, worktree_name: str):
     task = load_task(task_id)
     task.worktree = worktree_name
     save_task(task)
+    record_event("worktree_task_bound", worktree=worktree_name,
+                 task_id=task_id)
 
 
 def _count_worktree_changes(path: Path) -> tuple[int, int]:
@@ -123,6 +127,8 @@ def remove_worktree(name: str, discard_changes: bool = False) -> str:
         return f"Failed to remove worktree '{name}'"
     run_git(["branch", "-D", f"wt/{name}"])
     log_event("remove", name)
+    record_event("worktree_removed", worktree=name,
+                 discard_changes=bool(discard_changes))
     print(f"  \033[33m[worktree] removed: {name}\033[0m")
     return f"Worktree '{name}' removed"
 
@@ -132,6 +138,7 @@ def keep_worktree(name: str) -> str:
     if err:
         return err
     log_event("keep", name)
+    record_event("worktree_kept", worktree=name)
     return f"Worktree '{name}' kept for review (branch: wt/{name})"
 
 
@@ -177,6 +184,9 @@ def finalize_worktree(name: str, commit_message: str = "worker delegated change"
     commit = _git_lines(path, ["rev-parse", "HEAD"])
     diff_stat = _git_lines(path, ["show", "--stat", "--oneline", "--format=", "HEAD"])
     log_event("worker_commit", name)
+    record_event("worktree_finalized", worktree=name,
+                 commit=commit[0] if commit else "",
+                 changed_files=changed_files)
     return json.dumps({
         "status": "changes_ready", "worktree": name,
         "commit": commit[0] if commit else "",
@@ -199,6 +209,8 @@ def integrate_worktree(name: str, cleanup: bool = True) -> str:
     if worker_status is None or worker_status.returncode != 0:
         return json.dumps({"status": "error", "error": "cannot inspect worker"})
     if worker_status.stdout.strip():
+        record_event("worktree_integration_failed", worktree=name,
+                     reason="uncommitted_changes")
         return json.dumps({
             "status": "error",
             "error": "worker worktree has uncommitted changes; finalize it first",
@@ -219,6 +231,8 @@ def integrate_worktree(name: str, cleanup: bool = True) -> str:
     dirty_files.update(_git_lines(WORKDIR, ["diff", "--cached", "--name-only"]))
     overlap = sorted(set(changed_files) & dirty_files)
     if overlap:
+        record_event("worktree_integration_failed", worktree=name,
+                     reason="overlapping_files", changed_files=overlap)
         return json.dumps({
             "status": "conflict", "worktree": name,
             "error": "lead and worker changed the same files",
@@ -236,6 +250,8 @@ def integrate_worktree(name: str, cleanup: bool = True) -> str:
             _run_git_at(WORKDIR, ["merge", "--abort"])
         detail = "git merge timeout" if merged is None else (
             merged.stderr or merged.stdout).strip()
+        record_event("worktree_integration_failed", worktree=name,
+                     reason="merge_conflict", detail=detail[:1000])
         return json.dumps({
             "status": "conflict", "worktree": name,
             "error": detail[:2000], "changed_files": changed_files,
@@ -243,6 +259,9 @@ def integrate_worktree(name: str, cleanup: bool = True) -> str:
 
     commit = _git_lines(WORKDIR, ["rev-parse", "HEAD"])
     log_event("integrate", name)
+    record_event("worktree_integrated", worktree=name,
+                 commit=commit[0] if commit else "",
+                 changed_files=changed_files)
     cleanup_result = remove_worktree(name, discard_changes=True) if cleanup else ""
     return json.dumps({
         "status": "integrated", "worktree": name,

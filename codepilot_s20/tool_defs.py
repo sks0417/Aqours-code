@@ -87,7 +87,7 @@ _TOOL_SCHEMAS = [
                      "acceptance items have stable IDs; update one by sending "
                      "its id, status, and evidence without copying its content."),
      "input_schema": {"type": "object",
-                      "properties": {"todos": {"type": "array", "maxItems": 20,
+                      "properties": {"todos": {"type": "array", "maxItems": 32,
                           "items": {"type": "object",
                                     "properties": {
                                         "id": {"type": "string", "maxLength": 100},

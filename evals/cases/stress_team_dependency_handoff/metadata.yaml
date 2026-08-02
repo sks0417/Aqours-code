@@ -1,0 +1,18 @@
+id: stress_team_dependency_handoff
+suite: stress
+difficulty: 4
+category: multi_agent_dependency_handoff
+max_model_calls: 48
+max_model_tokens: 1100000
+score_runtime_target_sec: 240
+score_runtime_hard_limit_sec: 700
+score_llm_call_target: 18
+score_llm_call_hard_limit: 48
+score_tool_call_target: 50
+score_tool_call_hard_limit: 150
+score_token_target: 400000
+score_token_hard_limit: 1200000
+forbidden_paths: [README.md, docs/**, pyproject.toml, tests/**]
+expected_artifacts: [src/document_index/__init__.py, src/document_index/api.py, src/document_index/bootstrap.py, src/document_index/errors.py, src/document_index/migration.py, src/document_index/models.py, src/document_index/query.py, src/document_index/serialization.py, src/document_index/storage.py, src/document_index/validation.py]
+allowed_changes: [src/document_index/*.py]
+scripted_supported: false
