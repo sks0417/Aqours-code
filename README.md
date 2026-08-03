@@ -20,7 +20,7 @@ Stable 表示默认单 Agent 路径已接线，并有代码和自动化测试支
 | Stable | Bash | 前台命令、超时、失败结果与权限边界 |
 | Stable | Read / Write / Edit | workspace 内文件读取、写入和精确替换 |
 | Stable | Glob / Search | 原生 Glob；文本搜索通过 Bash 中的 `rg`/系统搜索命令完成 |
-| Stable | Todo | 计划项与验收项状态、证据记录 |
+| Stable | Todo | 可选的轻量任务清单；仅包含稳定 ID、内容和状态 |
 | Stable | Context Compact | 原子保留工具调用对、根任务和最近上下文；失败时保留安全历史 |
 | Stable | Permission Hooks | 危险操作拦截，非交互执行默认拒绝 |
 | Stable | Retry / Recovery | 有界重试；v0.1 不会静默切换到另一个模型 |
@@ -29,7 +29,6 @@ Stable 表示默认单 Agent 路径已接线，并有代码和自动化测试支
 | Experimental | Subagent / Plan Review | 有界临时角色与 Reviewer 流程，不是默认单 Agent 成功的前置条件 |
 | Experimental | Persistent Task / Teammate / Message Bus / Multi-Agent | 共享任务和协作原型，保留但不承诺完整生命周期 |
 | Experimental | Worktree | 隔离 Worker 修改与显式集成原型 |
-| Experimental | RunKnowledge / Acceptance | 运行内证据和验收状态，不是长期 Memory |
 | Experimental | Skills / MCP | 动态扩展入口，依赖具体环境和配置 |
 | Experimental | Background / Cron | 后台与调度原型，不作为 v0.1 默认使用路径 |
 
@@ -95,11 +94,17 @@ AQOURS_CODE_PROVIDER=openai_compatible
 AQOURS_CODE_API_KEY=
 AQOURS_CODE_BASE_URL=
 AQOURS_CODE_MODEL=
+# AQOURS_CODE_CONTEXT_LIMIT_TOKENS=64000
 ```
 
 `AQOURS_CODE_PROVIDER` 可选值为 `openai_compatible`、`openai`、`deepseek` 或 `anthropic`。前三者使用 OpenAI-compatible messages 接口；`anthropic` 使用 Anthropic SDK。Key、Base URL 和模型名没有旧变量别名、provider 专属回退或默认模型。任一必填字段缺失时，CLI 会在进入交互循环前失败并指出字段名。
 
 `.env` 已被 Git 忽略。API Key 和认证 Header 会从 Trace 中移除；Trace 中的 Base URL 也会删除 userinfo 和认证类 query 参数。
+
+Context 只暴露一个可选设置：`AQOURS_CODE_CONTEXT_LIMIT_TOKENS`，默认
+`64000`。这是请求上下文的估算 Token 上限；Harness 固定在 85% 时开始
+Compact，以保留正常回复和估算误差所需空间。v0.1 不对外暴露第二套字符
+上限或 Compact 比例配置。
 
 依赖的权威声明是 `pyproject.toml`。`evals/docker/requirements.lock` 只负责固定 Eval 镜像环境，不是第二份应用依赖清单。
 

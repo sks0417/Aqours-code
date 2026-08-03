@@ -91,7 +91,7 @@ does not remove any Lead tool.
 
 Every model turn is budgeted as one assembled request: rebuilt system prompt,
 API tool schemas, dynamic runtime state, and messages. Ordinary turns leave
-history untouched. At 80% of the configured context budget, the lifecycle is:
+history untouched. At 85% of the configured context budget, the lifecycle is:
 
 ```text
 assemble the complete current request
@@ -110,9 +110,13 @@ The checkpoint is an ordinary internal user message marked
 older prefix and replaces it with one new cumulative checkpoint; summaries do
 not stack. The summary is free-form Markdown. There is no JSON schema, semantic
 merge, file-card state, Tool-result acknowledgement protocol, or deterministic
-semantic fallback. The context limit is 128,000 characters, approximately
-42,000 tokens using the existing three-characters-per-token estimate. Compact
-triggers at 80%, and reserves up to 3,000 estimated tokens for the summary.
+semantic fallback. The public context setting is
+`AQOURS_CODE_CONTEXT_LIMIT_TOKENS`, defaulting to 64,000 estimated tokens.
+Internally this is converted with the conservative three-characters-per-token
+estimate. Compact triggers at the fixed 85% ratio, around 54,400 estimated
+input tokens at the default, leaving about 9,600 tokens of headroom for a
+normal 8,000-token response and estimation error. It reserves up to 3,000
+estimated tokens for the summary.
 
 Assistant Tool-use and matching user Tool-result messages are one atomic unit
 and cannot be cut apart; a parallel Tool batch is one unit as well. The recent
@@ -154,51 +158,12 @@ counter used only by the post-compact redundant-read metric.
 checkpoint/tail behavior. No paid real-model stress or paired Eval was run for
 this change.
 
-## RunKnowledge verification state
-
-`RunState.knowledge` is deterministic working memory for one Agent run. It is
-not long-term Memory and is never retrieved by embeddings. It retains:
-
-- read paths with SHA-256 digest, monotonic file version, read count, and
-  current/stale evidence state;
-- Python symbols confirmed by parsing an observed file version;
-- contracts derived from Acceptance and bounded Explorer evidence;
-- modified paths and recent test commands/results;
-- Acceptance status/evidence and structured Reviewer findings.
-
-Evidence state is explicit:
-
-- `verified`: at least one explicit provenance source exists and every bound
-  file version, TestKnowledge record, or Reviewer finding is current;
-- `stale`: a previously bound source no longer matches current state;
-- `unbound`: no verifiable provenance exists. Arbitrary evidence text never
-  makes a completed Acceptance item verified.
-
-Workspace mutation tracking uses one snapshot/execute/reconcile boundary.
-Content fingerprints are compared before and after `write_file`, `edit_file`,
-foreground Bash, background Bash, and successful Worktree integration. Every
-actual added, changed, or deleted path is sent through the same versioned
-invalidation method. Mutation windows and RunKnowledge updates are locked so
-background workers cannot race evidence versions. This does not parse shell
-commands or infer writes from command text.
-
-`TestKnowledge.workspace_versions_at_run` and
-`workspace_fingerprints_at_run` describe Workspace state when a test ran.
-They are not coverage claims. `covered_source_versions` remains empty unless a
-caller supplies an explicit coverage/dependency mapping; a targeted pytest
-command never implicitly validates every modified source file.
-
-A later read confirms the new file version but does not silently revive
-Contract, Acceptance, or Reviewer evidence from an older version.
-
-`RunKnowledge` remains internal to `AgentRuntime` for Acceptance, tests, and
-Reviewer evidence. It is not injected wholesale into model Context and
-compaction neither reads nor merges it. Current Acceptance todos are still
-rebuilt dynamically in the system prompt.
-
-**Status: Implemented.** The deterministic proof behavior and regression suite
-are passing locally. It is not `Validated`: Working Memory must retain that
-status until the paired ledger pass-rate/read/token exit criteria are all met.
+Read tools emit a normalized path, SHA-256 digest, requested range, and Compact
+generation into Trace. This supports the post-run repeated-read metric without
+maintaining a second semantic state machine or scanning the entire Workspace
+around every Bash/write/edit operation. The only remaining full-file snapshot
+is local to a mutating delegated agent and is used solely to report its
+changed-file list; it is not injected into model Context.
 
 ## Remaining migration order
 

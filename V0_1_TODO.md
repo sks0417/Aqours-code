@@ -9,6 +9,10 @@
 - [x] Context Compact 的根任务保留、工具调用对、失败回退和重复压缩行为通过回归测试。
 - [x] 权限拒绝、测试失败、constraint violation 和 grader 失败不会被错误宣布为成功。
 - [x] Trace 能记录模型/工具过程和 v0.1 运行元数据，并对 Key、Header 与 Base URL 认证信息脱敏。
+- [x] Context 窗口只暴露一个 Token 上限配置，默认 64K，Compact 比例保持内部固定值。
+- [x] 移除未进入 Context/决策链、但会反复扫描 Workspace 的 RunKnowledge 状态机；重复读取指标继续由 Trace 提供。
+- [x] GitHub Actions 在 Python 3.11 上执行安装、编译、完整 pytest 和 CLI smoke，并补充 MIT License。
+- [x] 删除已被当前文档替代的历史功能审计、旧临时 dump 脚本和对应死代码/测试；保留 Eval、Trace、权限与协作主链路。
 - [ ] 使用一组真实用户凭据执行最小 Coding Task；本次未读取现有秘密，也未发起真实模型调用。
 - [ ] 在可用 Docker daemon 上按 README 命令完成 `read_file_basic` scripted smoke；当前 Docker daemon 未启动，因此 README 的 Docker 命令尚未实机验证。
 - [ ] 在 GitHub 将仓库名从当前远端的 `Aqours-code` 统一为正式名称 `Aqours_code`；本次按要求未 commit、未 push，也未修改远端仓库。
