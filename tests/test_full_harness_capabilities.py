@@ -77,18 +77,16 @@ def test_case_skill_and_mcp_dynamic_tool_are_live_in_full_policy(tmp_path, monke
         mcp.mcp_clients.clear()
 
 
-def test_acceptance_checklist_survives_as_compact_live_prompt_state(monkeypatch):
-    contract = "Every failed reservation leaves inventory unchanged"
+def test_incomplete_todos_survive_as_compact_live_prompt_state(monkeypatch):
+    verification = "Verify failed reservations leave inventory unchanged"
     basic_tools.CURRENT_TODOS.clear()
     try:
         assert basic_tools.run_todo_write([{
             "content": "Implement rollback",
             "status": "in_progress",
-            "kind": "plan",
         }, {
-            "content": contract,
+            "content": verification,
             "status": "pending",
-            "kind": "acceptance",
         }]).startswith("Updated 2 todos")
 
         live_context = context.update_context({}, [])
@@ -98,15 +96,18 @@ def test_acceptance_checklist_survives_as_compact_live_prompt_state(monkeypatch)
     finally:
         basic_tools.CURRENT_TODOS.clear()
 
-    assert live_context["acceptance_todos"] == [{
-        "id": "accept:1",
-        "content": contract,
+    assert live_context["todos"] == [{
+        "id": "todo:1",
+        "content": "Implement rollback",
+        "status": "in_progress",
+    }, {
+        "id": "todo:2",
+        "content": verification,
         "status": "pending",
-        "kind": "acceptance",
     }]
-    assert "Protected acceptance checklist" in prompt
-    assert f"[accept:1 pending] {contract}" in prompt
-    assert "Implement rollback" not in prompt
+    assert "Active todo checklist" in prompt
+    assert f"[todo:2 pending] {verification}" in prompt
+    assert "Implement rollback" in prompt
 
 
 def test_persistent_task_protocol_and_worktree_use_case_state(tmp_path, monkeypatch):

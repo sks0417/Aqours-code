@@ -1,6 +1,5 @@
 from .runtime_state import *
 from .agent_profiles import get_agent_profile, normalize_agent_role
-from .knowledge import snapshot_workspace
 from .model_budget import can_spend_optional_calls
 from .runtime import AgentRuntime
 from .model_api import assistant_message_from_response
@@ -10,7 +9,41 @@ from .tool_registry import (
 )
 import os as _os
 import time as _time
+import hashlib as _hashlib
 from .command_executor import CaseTimeoutError as _CaseTimeoutError
+
+
+_SNAPSHOT_EXCLUDED_DIRS = frozenset({
+    ".git", ".aqours_code", ".transcripts", ".task_outputs", ".tasks",
+    ".mailboxes", ".worktrees",
+})
+
+
+def _snapshot_workspace(workdir: str | Path) -> dict[str, str]:
+    """Fingerprint files only for a mutating delegated agent's change list."""
+    root = Path(workdir).resolve()
+    fingerprints: dict[str, str] = {}
+    if not root.is_dir():
+        return fingerprints
+    for candidate in root.rglob("*"):
+        try:
+            relative = candidate.relative_to(root)
+            if any(
+                part in _SNAPSHOT_EXCLUDED_DIRS
+                for part in relative.parts[:-1]
+            ):
+                continue
+            if not candidate.is_file():
+                continue
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(root):
+                continue
+            fingerprints[relative.as_posix()] = _hashlib.sha256(
+                candidate.read_bytes(),
+            ).hexdigest()
+        except (OSError, ValueError):
+            continue
+    return fingerprints
 
 # ── Subagent Tool ──
 
@@ -164,21 +197,12 @@ def _normalize_reviewer_result(value: dict) -> dict:
     missing = value.get("missing_evidence", [])
     if not isinstance(missing, list):
         missing = [missing] if missing else []
-    raw_verified_ids = value.get("verified_acceptance_ids", [])
-    if not isinstance(raw_verified_ids, list):
-        raw_verified_ids = [raw_verified_ids] if raw_verified_ids else []
-    verified_acceptance_ids = []
-    for raw_id in raw_verified_ids[:16]:
-        item_id = _short_text(raw_id, 100)
-        if item_id and item_id not in verified_acceptance_ids:
-            verified_acceptance_ids.append(item_id)
     return {
         "verdict": verdict,
         "summary": _short_text(value.get("summary", ""), 500),
         "findings": findings,
         "files_checked": [_short_text(item, 240) for item in files_checked[:16]],
         "missing_evidence": [_short_text(item, 300) for item in missing[:8]],
-        "verified_acceptance_ids": verified_acceptance_ids,
     }
 
 
@@ -206,7 +230,6 @@ def _fallback_reviewer_result(raw: str) -> dict:
         "findings": findings,
         "files_checked": [],
         "missing_evidence": ["Valid structured reviewer result"],
-        "verified_acceptance_ids": [],
         "invalid_json": True,
     }
 
@@ -463,14 +486,12 @@ def run_role_agent(
                 '240 chars","findings":[{"severity":"critical|major|minor",'
                 '"requirement":"max 220 chars","file":"path","symbol":"name",'
                 '"evidence":"max 240 chars"}],"files_checked":[],'
-                '"missing_evidence":[],"verified_acceptance_ids":[]}. Include at '
+                '"missing_evidence":[]}. Include at '
                 'most 3 highest-severity findings. Reason silently. Do not put '
                 'withdrawn, retracted, satisfied, safe, or "no defect" items in '
                 'findings. Put only actionable concerns in findings; do not '
                 'narrate reasoning, use Markdown, or request more tools. A pass '
-                'requires zero findings. '
-                'Copy only concretely verified lead acceptance IDs into '
-                'verified_acceptance_ids; omit IDs with findings or missing evidence.'
+                'requires zero findings.'
                 '</synthesis>'
             )
             # Thinking-capable providers may spend the first few thousand output
@@ -595,7 +616,7 @@ def delegate_agent(
         runtime.paths.workdir if runtime is not None else WORKDIR
     )
     before = (
-        snapshot_workspace(role_workdir) if not profile.read_only else {}
+        _snapshot_workspace(role_workdir) if not profile.read_only else {}
     )
     try:
         result = run_role_agent(
@@ -611,7 +632,7 @@ def delegate_agent(
             "verdict": "blocked",
             "error": f"{type(exc).__name__}: {exc}"[:2000],
         })
-    after = snapshot_workspace(role_workdir) if not profile.read_only else {}
+    after = _snapshot_workspace(role_workdir) if not profile.read_only else {}
     changed_files = sorted({
         path for path in set(before) | set(after)
         if before.get(path) != after.get(path)

@@ -241,7 +241,6 @@ def test_reviewer_role_is_actually_read_only(tmp_path, monkeypatch):
         "findings": [],
         "files_checked": ["service.py"],
         "missing_evidence": [],
-        "verified_acceptance_ids": ["contract-api"],
     })))])
     monkeypatch.setattr(subagent, "client", client)
     monkeypatch.setattr(subagent, "MODEL", "scripted")
@@ -250,7 +249,9 @@ def test_reviewer_role_is_actually_read_only(tmp_path, monkeypatch):
     result = subagent.run_role_agent("review", "Audit the final code", tmp_path)
 
     assert result["verdict"] == "pass"
-    assert result["verified_acceptance_ids"] == ["contract-api"]
+    assert set(result) == {
+        "verdict", "summary", "findings", "files_checked", "missing_evidence",
+    }
     assert {tool["name"] for tool in client.calls[0]["tools"]} == {"read_file"}
     assert "write_file" not in {tool["name"] for tool in client.calls[0]["tools"]}
 
@@ -399,21 +400,14 @@ def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
         "Contract: preserve the API and keep state atomic.\n", encoding="utf-8")
     (tmp_path / "service.py").write_text("BROKEN = True\n", encoding="utf-8")
     pending_todos = [
-        {"content": "Fix service", "status": "in_progress", "kind": "plan"},
-        {"content": "Preserve API and atomic state", "status": "pending",
-         "kind": "acceptance"},
+        {"content": "Fix service", "status": "in_progress"},
+        {"content": "Run focused tests", "status": "pending"},
     ]
     completed_todos = [
-        {"content": "Fix service", "status": "completed", "kind": "plan"},
-        {"content": "Preserve API and atomic state", "status": "completed",
-         "kind": "acceptance", "evidence": "reviewer pass on final service.py"},
+        {"content": "Fix service", "status": "completed"},
+        {"content": "Run focused tests", "status": "completed"},
     ]
     client = ScriptedClient([
-        response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "BROKEN", "new_text": "FIXED"},
-            "too-early",
-        )),
         response(tool_block(
             "delegate_agent",
             {"role": "explore", "prompt": "Map the contract and code path"},
@@ -444,7 +438,7 @@ def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
             "findings": [], "files_checked": ["README.md", "service.py"],
             "missing_evidence": [],
         }))),
-        response(tool_block("todo_write", {"todos": completed_todos}, "evidence")),
+        response(tool_block("todo_write", {"todos": completed_todos}, "complete")),
         response(text_block("completed after independent review")),
     ])
     task = (
@@ -462,125 +456,18 @@ def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
 
     assert result["final_answer"] == "completed after independent review"
     assert (tmp_path / "service.py").read_text(encoding="utf-8") == "FIXED = True\n"
-    assert len(client.calls) == 9
+    assert len(client.calls) == 8
     explorer_calls = [
         call for call in client.calls
         if "You are the explore role" in call["system"]
     ]
     assert len(explorer_calls) == 1
     assert explorer_calls[0]["max_tokens"] == 4000
-    lead_tools = [
-        {tool["name"] for tool in call["tools"]}
-        for call in client.calls
-        if any(
-            tool["name"] == "delegate_agent"
-            for tool in call["tools"]
-        )
-    ]
-    assert lead_tools and all("delegate_agent" in tools for tools in lead_tools)
     reviewer_calls = [
         call for call in client.calls
         if "You are the review role" in call["system"]
     ]
     assert len(reviewer_calls) == 1
-    assert not any(
-        "<pre_final_review" in str(message.get("content"))
-        for call in client.calls for message in call["messages"]
-    )
-
-
-def test_reviewer_verified_ids_close_acceptance_without_lead_todo_round(
-    tmp_path,
-):
-    (tmp_path / "README.md").write_text(
-        "Contract: preserve the API and roll back failed writes.\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "service.py").write_text(
-        "BROKEN = True\n", encoding="utf-8")
-    trace_path = tmp_path / "trace.jsonl"
-    client = ScriptedClient([
-        response(tool_block("todo_write", {"todos": [
-            {
-                "id": "acceptance-api",
-                "content": "Preserve the public API",
-                "status": "pending",
-                "kind": "acceptance",
-            },
-            {
-                "id": "acceptance-rollback",
-                "content": "Failed writes roll back",
-                "status": "pending",
-                "kind": "acceptance",
-            },
-        ]}, "plan")),
-        response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "BROKEN", "new_text": "FIXED"},
-            "edit",
-        )),
-        response(tool_block(
-            "delegate_agent",
-            {
-                "role": "review",
-                "prompt": (
-                    "Verify acceptance-api and acceptance-rollback against "
-                    "README.md and service.py"
-                ),
-            },
-            "review",
-        )),
-        response(
-            tool_block("read_file", {"path": "README.md"}, "review-readme"),
-            tool_block("read_file", {"path": "service.py"}, "review-service"),
-        ),
-        response(text_block(json.dumps({
-            "verdict": "pass",
-            "summary": "API and rollback contracts are satisfied",
-            "findings": [],
-            "files_checked": ["README.md", "service.py"],
-            "missing_evidence": [],
-            "verified_acceptance_ids": [
-                "acceptance-api", "acceptance-rollback",
-            ],
-        }))),
-        response(text_block("completed after reviewer verification")),
-    ])
-    task = (
-        "Implement an end-to-end repository change from the README contract. "
-        "Preserve the public API and compatibility. Fix atomic concurrent "
-        "transaction rollback, idempotency, and consistency on every error path. "
-        "Run tests and the regression suite to verify behavior."
-    )
-
-    result = agent_loop.run_agent_task(
-        task, str(tmp_path), str(trace_path), model_client=client,
-        model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "completed after reviewer verification"
-    assert len(client.calls) == 6
-    assert not any(
-        "<acceptance_review>" in str(message.get("content"))
-        or "<pre_final_review" in str(message.get("content"))
-        for message in client.calls[-1]["messages"]
-    )
-    assert len([
-        call for call in client.calls
-        if "You are the review role" in call["system"]
-    ]) == 2
-    events = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
-    audit = next(
-        event for event in events
-        if event.get("decision") == "reviewer_acceptance_verified"
-    )
-    assert audit["completed_ids"] == [
-        "acceptance-api", "acceptance-rollback",
-    ]
 
 
 def test_inconclusive_explorer_is_reused_and_does_not_lock_lead(tmp_path):
@@ -655,54 +542,44 @@ def test_invalid_reviewer_json_preserves_an_actionable_finding():
     assert "CANCELED" in result["findings"][0]["evidence"]
 
 
-def test_reviewer_findings_become_locked_acceptance_work():
-    from aqours_code import basic_tools
+def test_reviewer_findings_do_not_mutate_todo_state(tmp_path):
+    (tmp_path / "state.py").write_text(
+        "CANCELED = {'CONFIRMED'}\n", encoding="utf-8")
+    runtime = _review_runtime(tmp_path)
+    runtime.state.todos.append({
+        "id": "todo:1",
+        "content": "Run transition tests",
+        "status": "pending",
+    })
+    before = [dict(item) for item in runtime.state.todos]
+    delegation = {
+        "status": "completed",
+        "verdict": "gaps",
+        "result": {
+            "verdict": "gaps",
+            "summary": "terminal transition is invalid",
+            "findings": [{
+                "severity": "critical",
+                "requirement": "Canceled reservations remain terminal",
+                "file": "state.py",
+                "symbol": "CANCELED",
+                "evidence": "CANCELED currently allows CONFIRMED",
+            }],
+            "files_checked": ["state.py"],
+            "missing_evidence": [],
+        },
+    }
 
-    basic_tools.CURRENT_TODOS.clear()
-    try:
-        basic_tools.CURRENT_TODOS.extend([
-            {"content": "Original contract", "status": "completed",
-             "kind": "acceptance", "evidence": "existing evidence"},
-        ])
-        content = agent_loop._register_reviewer_findings([{
-            "severity": "critical",
-            "requirement": "Canceled reservations remain terminal",
-            "file": "state.py",
-            "symbol": "_ALLOWED_TARGETS",
-            "evidence": "CANCELED currently allows CONFIRMED",
-        }], revision=3)
+    screening = agent_loop._screen_reviewer_findings(delegation, runtime)
+    output = json.loads(
+        agent_loop._screened_reviewer_output(delegation, screening)
+    )
 
-        assert content.startswith(
-            "Resolve Reviewer finding for revision 3:")
-        assert "state.py:_ALLOWED_TARGETS" in content
-        assert basic_tools.CURRENT_TODOS[-1] == {
-            "id": "review:r3:f1",
-            "content": content,
-            "status": "pending",
-            "kind": "acceptance",
-        }
-
-        updated = basic_tools.run_todo_write([
-            {"content": f"contract {index}", "status": "pending",
-             "kind": "acceptance"}
-            for index in range(11)
-        ] + [{
-            "id": "review:r3:f1",
-            "content": "rewritten finding text must not replace identity",
-            "kind": "plan",
-            "status": "completed",
-            "evidence": "state.py transition table and focused test prove terminal behavior",
-        }])
-        assert updated.startswith("Updated 12 todos")
-        reviewer_item = next(
-            item for item in basic_tools.CURRENT_TODOS
-            if item.get("id") == "review:r3:f1")
-        assert reviewer_item["content"] == content
-        assert reviewer_item["kind"] == "acceptance"
-        assert reviewer_item["status"] == "completed"
-        assert "focused test" in reviewer_item["evidence"]
-    finally:
-        basic_tools.CURRENT_TODOS.clear()
+    assert runtime.state.todos == before
+    assert len(output["result"]["findings"]) == 1
+    assert output["result"]["findings"][0]["requirement"] == (
+        "Canceled reservations remain terminal"
+    )
 
 
 def _review_runtime(tmp_path: Path) -> AgentRuntime:
@@ -951,114 +828,7 @@ def test_screened_reviewer_output_hides_suppressed_findings_from_lead(
     assert screened["screening"]["suppressed_finding_count"] == 1
 
 
-def test_reviewer_finding_reopens_matching_acceptance_instead_of_duplicating(
-    tmp_path,
-):
-    (tmp_path / "service.py").write_text(
-        "class Ledger:\n"
-        "    def ingest(self):\n"
-        "        return None\n",
-        encoding="utf-8",
-    )
-    runtime = _review_runtime(tmp_path)
-    runtime.state.todos.append({
-        "id": "acceptance-rollback",
-        "content": (
-            "Failed batch ingestion restores idempotency receipt state exactly"
-        ),
-        "status": "completed",
-        "kind": "acceptance",
-        "evidence": "service.py focused rollback test",
-        "evidence_sources": {"files": ["service.py"]},
-    })
-    screening = agent_loop._screen_reviewer_findings({
-        "status": "completed",
-        "verdict": "gaps",
-        "result": {
-            "files_checked": ["service.py"],
-            "findings": [{
-                "severity": "major",
-                "requirement": (
-                    "Failed batch ingestion must restore idempotency receipt "
-                    "state exactly"
-                ),
-                "file": "service.py",
-                "symbol": "Ledger.ingest",
-                "evidence": (
-                    "service.py ingest does not restore the batch receipt state"
-                ),
-            }],
-        },
-    }, runtime)
-
-    assert screening["findings"][0]["_existing_todo_id"] == (
-        "acceptance-rollback"
-    )
-    content = agent_loop._register_reviewer_findings(
-        screening["findings"], revision=8, runtime=runtime,
-    )
-
-    assert content == runtime.state.todos[0]["content"]
-    assert len(runtime.state.todos) == 1
-    assert runtime.state.todos[0]["status"] == "pending"
-    assert "evidence" not in runtime.state.todos[0]
-    assert runtime.state.todos[0]["evidence_sources"]["reviewer_findings"] == [
-        "review:r8:f1",
-    ]
-    assert "review:r8:f1" in runtime.state.knowledge.reviewer_findings
-
-
-def test_clean_reviewer_pass_completes_only_explicit_acceptance_ids():
-    from aqours_code import basic_tools
-
-    basic_tools.CURRENT_TODOS.clear()
-    try:
-        basic_tools.CURRENT_TODOS.extend([
-            {
-                "id": "acceptance-contracts",
-                "content": "Acceptance criteria from README",
-                "status": "pending",
-                "kind": "acceptance",
-            },
-            {
-                "id": "acceptance-errors",
-                "content": "Documented errors preserve state",
-                "status": "pending",
-                "kind": "acceptance",
-            },
-        ])
-        result = agent_loop._apply_reviewer_acceptance_verifications({
-            "status": "completed",
-            "verdict": "pass",
-            "result": {
-                "verdict": "pass",
-                "summary": "README contract is satisfied",
-                "findings": [],
-                "files_checked": ["README.md", "service.py"],
-                "missing_evidence": [],
-                "verified_acceptance_ids": ["acceptance-contracts", "unknown"],
-            },
-        }, revision=4)
-
-        by_id = {
-            item["id"]: item for item in basic_tools.CURRENT_TODOS
-        }
-        assert by_id["acceptance-contracts"]["status"] == "completed"
-        assert "Independent Reviewer pass for revision 4" in (
-            by_id["acceptance-contracts"]["evidence"])
-        assert by_id["acceptance-contracts"]["evidence_sources"]["files"] == [
-            "README.md", "service.py",
-        ]
-        assert by_id["acceptance-errors"]["status"] == "pending"
-        assert result["completed_ids"] == ["acceptance-contracts"]
-        assert result["ignored_ids"] == ["unknown"]
-        assert result["coverage_complete"] is False
-        assert result["all_acceptance_completed"] is False
-    finally:
-        basic_tools.CURRENT_TODOS.clear()
-
-
-def test_readme_keywords_do_not_inject_hidden_acceptance_todos(tmp_path):
+def test_readme_keywords_do_not_inject_hidden_todos(tmp_path):
     (tmp_path / "README.md").write_text(
         "# Ledger\n\n"
         "## Exactly-once and idempotency\n\n"
@@ -1078,11 +848,9 @@ def test_readme_keywords_do_not_inject_hidden_acceptance_todos(tmp_path):
     trace_path = tmp_path / "trace.jsonl"
     client = ScriptedClient([
         response(tool_block("todo_write", {"todos": [{
-            "id": "acceptance-lead",
+            "id": "todo:lead",
             "content": "Lead-selected checkpoint requirement",
             "status": "completed",
-            "kind": "acceptance",
-            "evidence": "implementation and test evidence",
         }]}, "todo")),
         response(text_block("complete without keyword injection")),
     ])
@@ -1107,55 +875,6 @@ def test_readme_keywords_do_not_inject_hidden_acceptance_todos(tmp_path):
         event.get("decision") == "readme_contract_sections_registered"
         for event in events
     )
-
-
-def test_reviewer_gaps_never_auto_complete_acceptance():
-    from aqours_code import basic_tools
-
-    basic_tools.CURRENT_TODOS.clear()
-    try:
-        basic_tools.CURRENT_TODOS.append({
-            "id": "acceptance-contracts",
-            "content": "Acceptance criteria from README",
-            "status": "pending",
-            "kind": "acceptance",
-        })
-        result = agent_loop._apply_reviewer_acceptance_verifications({
-            "status": "completed",
-            "verdict": "gaps",
-            "result": {
-                "verdict": "gaps",
-                "summary": "rollback evidence is incomplete",
-                "findings": [{
-                    "requirement": "Failed writes must roll back",
-                    "evidence": "rollback branch was not inspected",
-                }],
-                "files_checked": ["service.py"],
-                "missing_evidence": [],
-                "verified_acceptance_ids": ["acceptance-contracts"],
-            },
-        }, revision=2)
-
-        assert result["eligible"] is False
-        assert basic_tools.CURRENT_TODOS[0]["status"] == "pending"
-        assert "evidence" not in basic_tools.CURRENT_TODOS[0]
-
-        missing_result = agent_loop._apply_reviewer_acceptance_verifications({
-            "status": "completed",
-            "verdict": "pass",
-            "result": {
-                "verdict": "pass",
-                "summary": "implementation looks correct but tests were unavailable",
-                "findings": [],
-                "files_checked": ["service.py"],
-                "missing_evidence": ["Focused rollback test result"],
-                "verified_acceptance_ids": ["acceptance-contracts"],
-            },
-        }, revision=2)
-        assert missing_result["eligible"] is False
-        assert basic_tools.CURRENT_TODOS[0]["status"] == "pending"
-    finally:
-        basic_tools.CURRENT_TODOS.clear()
 
 
 def test_runtime_role_signal_requires_repeat_cross_scope_and_tail_budget():
@@ -1262,7 +981,7 @@ def test_last_budget_call_is_forced_to_be_a_tool_free_final(tmp_path):
     )
 
 
-def test_reviewer_gap_creates_acceptance_even_when_classifier_missed_it(tmp_path):
+def test_reviewer_gap_stays_in_tool_output_without_hidden_todo(tmp_path):
     (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
     task = (
         "Implement an end-to-end atomic transaction rollback and idempotency "
@@ -1270,10 +989,6 @@ def test_reviewer_gap_creates_acceptance_even_when_classifier_missed_it(tmp_path
         "- inspect the producer path\n- retain rollback semantics\n"
         "- update the adapter\n- verify the final state transition\n"
         + "Keep each cross-file change focused and maintainable. " * 8
-    )
-    finding_content = (
-        "Resolve Reviewer finding for revision 1: "
-        "service.py:VALUE Failed reservations must roll back"
     )
     client = ScriptedClient([
         response(tool_block(
@@ -1302,13 +1017,7 @@ def test_reviewer_gap_creates_acceptance_even_when_classifier_missed_it(tmp_path
             "files_checked": ["service.py"],
             "missing_evidence": [],
         }))),
-        response(tool_block("todo_write", {"todos": [{
-            "content": finding_content,
-            "status": "completed",
-            "kind": "acceptance",
-            "evidence": "Lead inspected reserve and rejected the stale concern",
-        }]}, "finding-evidence")),
-        response(text_block("finished after addressing reviewer finding")),
+        response(text_block("finished with the reviewer concern reported")),
     ])
 
     result = agent_loop.run_agent_task(
@@ -1317,8 +1026,13 @@ def test_reviewer_gap_creates_acceptance_even_when_classifier_missed_it(tmp_path
         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
     )
 
-    assert result["final_answer"] == "finished after addressing reviewer finding"
+    assert result["final_answer"] == "finished with the reviewer concern reported"
+    assert len(client.calls) == 4
     assert any(
-        finding_content in str(message.get("content"))
+        "rollback is incomplete" in str(message.get("content"))
+        for message in client.calls[-1]["messages"]
+    )
+    assert not any(
+        "todo_completion_reminder" in str(message.get("content"))
         for call in client.calls for message in call["messages"]
     )

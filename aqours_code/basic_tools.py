@@ -1,13 +1,10 @@
 from .runtime_state import *
 from .command_executor import CaseTimeoutError
 from .command_safety import looks_like_delete_command
-from .knowledge import (
-    normalize_knowledge_path,
-    snapshot_workspace,
-    workspace_mutation_reconciliation,
-)
 from .runtime import AgentRuntime
+import hashlib
 import re
+from pathlib import PurePosixPath
 
 # ── Basic Tools ──
 
@@ -24,6 +21,16 @@ def _runtime_workdir(
 
 def _runtime_todos(runtime: AgentRuntime | None = None) -> list[dict]:
     return runtime.state.todos if runtime is not None else CURRENT_TODOS
+
+
+def _normalize_observation_path(path: str) -> str:
+    """Use one stable path spelling for repeated-read trace analysis."""
+    value = str(path or "").strip().replace("\\", "/")
+    while "//" in value:
+        value = value.replace("//", "/")
+    if value.startswith("./"):
+        value = value[2:]
+    return str(PurePosixPath(value)) if value else ""
 
 
 def safe_path(
@@ -62,19 +69,9 @@ def run_bash(command: str, cwd: Path = None,
             or COMMAND_EXECUTOR
         )
         workdir = _runtime_workdir(runtime, cwd)
-        knowledge = runtime.state.knowledge if runtime is not None else None
-        with workspace_mutation_reconciliation(knowledge, workdir):
-            result = selected_executor.execute(
-                command, workdir, effective_timeout)
+        result = selected_executor.execute(
+            command, workdir, effective_timeout)
         out = (result["stdout"] + result["stderr"]).strip()
-        if runtime is not None:
-            runtime.state.knowledge.record_test(
-                command,
-                exit_code=result.get("exit_code"),
-                timed_out=bool(result["timed_out"]),
-                result=out or "(no output)",
-                workspace_fingerprints=snapshot_workspace(workdir),
-            )
         if result["timed_out"]:
             return f"Error: Timeout ({timeout:g}s)" + (f"\n{out[:50000]}" if out else "")
         return out[:50000] if out else "(no output)"
@@ -95,15 +92,14 @@ def run_read(path: str, limit: int | None = None,
         offset = max(int(offset or 0), 0)
         limit = int(limit) if limit is not None else None
         if runtime is not None:
-            record = runtime.state.knowledge.observe_file(path, raw)
             end = len(lines) if limit is None else min(
                 len(lines), offset + max(0, limit),
             )
             record_event(
                 "read_observation",
                 tool_use_id=str(_tool_use_id),
-                path=normalize_knowledge_path(path),
-                digest=record.digest,
+                path=_normalize_observation_path(path),
+                digest=hashlib.sha256(raw).hexdigest(),
                 offset=offset,
                 limit=limit,
                 range_start=offset,
@@ -123,12 +119,9 @@ def run_read(path: str, limit: int | None = None,
 def run_write(path: str, content: str, cwd: Path = None,
               runtime: AgentRuntime | None = None) -> str:
     try:
-        workdir = _runtime_workdir(runtime, cwd)
-        knowledge = runtime.state.knowledge if runtime is not None else None
-        with workspace_mutation_reconciliation(knowledge, workdir):
-            fp = safe_path(path, cwd, runtime)
-            fp.parent.mkdir(parents=True, exist_ok=True)
-            fp.write_text(content)
+        fp = safe_path(path, cwd, runtime)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content)
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -137,14 +130,11 @@ def run_write(path: str, content: str, cwd: Path = None,
 def run_edit(path: str, old_text: str, new_text: str,
              cwd: Path = None, runtime: AgentRuntime | None = None) -> str:
     try:
-        workdir = _runtime_workdir(runtime, cwd)
-        knowledge = runtime.state.knowledge if runtime is not None else None
-        with workspace_mutation_reconciliation(knowledge, workdir):
-            fp = safe_path(path, cwd, runtime)
-            text = fp.read_text()
-            if old_text not in text:
-                return f"Error: text not found in {path}"
-            fp.write_text(text.replace(old_text, new_text, 1))
+        fp = safe_path(path, cwd, runtime)
+        text = fp.read_text()
+        if old_text not in text:
+            return f"Error: text not found in {path}"
+        fp.write_text(text.replace(old_text, new_text, 1))
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -188,11 +178,11 @@ _MAX_TODO_ID = 100
 _TODO_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._/-]*$")
 
 
-def _next_acceptance_id(used_ids: set[str]) -> str:
+def _next_todo_id(used_ids: set[str]) -> str:
     index = 1
-    while f"accept:{index}" in used_ids:
+    while f"todo:{index}" in used_ids:
         index += 1
-    value = f"accept:{index}"
+    value = f"todo:{index}"
     used_ids.add(value)
     return value
 
@@ -232,9 +222,10 @@ def _normalize_todos(todos, runtime: AgentRuntime | None = None):
             return None, (
                 f"Error: todos[{i}] requires 'content' for a new item or a "
                 "known 'id' for an update")
-        content = str(
-            existing.get("content", "") if existing else todo.get("content", "")
-        ).strip()
+        content = str(todo.get(
+            "content",
+            existing.get("content", "") if existing else "",
+        )).strip()
         if not content:
             return None, f"Error: todos[{i}] content must not be empty"
         if len(content) > _MAX_TODO_TEXT:
@@ -242,56 +233,16 @@ def _normalize_todos(todos, runtime: AgentRuntime | None = None):
                 f"Error: todos[{i}] content exceeds {_MAX_TODO_TEXT} characters")
         if todo["status"] not in ("pending", "in_progress", "completed"):
             return None, f"Error: todos[{i}] has invalid status '{todo['status']}'"
-        kind = str(
-            existing.get("kind", "plan") if existing
-            else todo.get("kind", "plan")
-        ).strip().lower()
-        if kind not in ("plan", "acceptance"):
-            return None, f"Error: todos[{i}] has invalid kind '{kind}'"
-        evidence = str(todo.get("evidence", "")).strip()
-        if len(evidence) > _MAX_TODO_TEXT:
-            return None, (
-                f"Error: todos[{i}] evidence exceeds {_MAX_TODO_TEXT} characters")
-        if kind == "acceptance" and todo["status"] == "completed" and not evidence:
-            return None, (
-                f"Error: todos[{i}] completed acceptance item requires evidence")
         item = {
             "content": content,
             "status": todo["status"],
-            "kind": kind,
         }
-        raw_sources = todo.get(
-            "evidence_sources",
-            existing.get("evidence_sources", {}) if existing else {},
-        )
-        if raw_sources is None:
-            raw_sources = {}
-        if not isinstance(raw_sources, dict):
-            return None, (
-                f"Error: todos[{i}] evidence_sources must be an object"
-            )
-        evidence_sources = {}
-        for source_kind in ("files", "tests", "reviewer_findings"):
-            values = raw_sources.get(source_kind, [])
-            if isinstance(values, str):
-                values = [values]
-            if not isinstance(values, list) or not all(
-                isinstance(value, str) and value.strip() for value in values
-            ):
-                return None, (
-                    f"Error: todos[{i}] evidence_sources.{source_kind} "
-                    "must be a list of non-empty strings"
-                )
-            if values:
-                evidence_sources[source_kind] = [
-                    value.strip() for value in values[:20]
-                ]
         if not todo_id:
             matched = existing_by_content.get(content)
             if matched and matched.get("id"):
                 todo_id = str(matched["id"])
-            elif kind == "acceptance":
-                todo_id = _next_acceptance_id(used_ids)
+            else:
+                todo_id = _next_todo_id(used_ids)
         if todo_id:
             if (len(todo_id) > _MAX_TODO_ID
                     or not _TODO_ID_PATTERN.fullmatch(todo_id)):
@@ -301,10 +252,6 @@ def _normalize_todos(todos, runtime: AgentRuntime | None = None):
             submitted_ids.add(todo_id)
             used_ids.add(todo_id)
             item["id"] = todo_id
-        if evidence:
-            item["evidence"] = evidence
-        if evidence_sources:
-            item["evidence_sources"] = evidence_sources
         normalized.append(item)
     return normalized, None
 
@@ -319,18 +266,8 @@ def run_todo_write(
     # Agent finalization and prompt assembly read the same live state.
     current_todos = _runtime_todos(runtime)
     current_todos[:] = todos
-    if runtime is not None:
-        runtime.state.knowledge.sync_acceptance(current_todos)
-    acceptance = [todo for todo in current_todos
-                  if todo.get("kind") == "acceptance"]
-    unverified = [todo for todo in acceptance
-                  if todo.get("status") != "completed"]
     print(f"  \033[33m[todo] updated {len(current_todos)} item(s)\033[0m")
-    detail = ""
-    if acceptance:
-        detail = (f" ({len(acceptance)} acceptance, "
-                  f"{len(unverified)} unverified)")
-    return f"Updated {len(current_todos)} todos{detail}"
+    return f"Updated {len(current_todos)} todos"
 
 
 

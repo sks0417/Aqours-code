@@ -17,7 +17,8 @@ PROMPT_SECTIONS = {
     "tool_strategy": (
         "Tool strategy: prefer glob/read_file to bash for inspection; do not "
         "create temporary inspection files. For multi-step work, inspect the "
-        "contract/source, then call todo_write before editing and keep it current. "
+        "contract/source, then use todo_write when a checklist would help; include "
+        "implementation and verification steps in the same list and keep it current. "
         "Batch independent reads with known inputs (at most 8) in one response. "
         "After analysis, batch mutations only when each targets a different file "
         "and none depends on another result; use at most one mutation per file. "
@@ -26,12 +27,10 @@ PROMPT_SECTIONS = {
         "partial failure does not roll back successful calls. Complete one "
         "coherent phase per tool round; do not spend rounds announcing work or "
         "waiting for short commands. "
-        "Record every observable contract clause, including negative paths, as a "
-        "kind=acceptance item. Keep guarantees separate; audit mutable-alias "
-        "boundaries and shared-dependency fan-in deduplication. Preserve discovered "
-        "items and complete them only with "
-        "concise implementation or test evidence. Public tests do not prove "
-        "uncovered clauses. Treat 'Tool not run' as recoverable guidance. Stop on "
+        "When relevant, check mutable-alias boundaries and shared-dependency "
+        "fan-in deduplication. "
+        "Public tests do not prove uncovered contract clauses. Treat 'Tool not run' "
+        "as recoverable guidance. Stop on "
         "'Permission denied'. For background bash, never rerun, poll check_inbox, "
         "or delegate merely to wait; continue independent work or finish and use "
         "the task_notification result."
@@ -104,20 +103,19 @@ def assemble_system_prompt(
         sections.append(
             "Active teammate state:\n"
             + (", ".join(teammates) if teammates else "(none)"))
-    acceptance = context.get("acceptance_todos", [])
-    if acceptance:
+    todos = context.get("todos", [])
+    if todos:
         lines = []
-        for item in acceptance:
+        for item in todos:
             status = item.get("status", "pending")
-            item_id = item.get("id", "acceptance")
+            item_id = item.get("id", "todo")
             line = f"- [{item_id} {status}] {item.get('content', '')}"
-            if item.get("evidence"):
-                line += f" | evidence: {item['evidence']}"
             lines.append(line)
         sections.append(
-            "Protected acceptance checklist (verify before final):\n"
+            "Active todo checklist:\n"
             + "\n".join(lines)
-            + "\nUpdate an existing item by id; its original content need not be repeated.")
+            + ("\nThe next todo_write replaces this list: resubmit every item "
+               "to retain. Existing content may be omitted when its id is used."))
     return "\n\n".join(sections)
 
 

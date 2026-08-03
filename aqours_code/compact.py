@@ -15,12 +15,12 @@ from .runtime_state import *
 # Markdown checkpoint, the latest genuine user message, and a recent verbatim
 # suffix. Token counts are estimates because providers do not share a tokenizer.
 CONTEXT_CHECKPOINT_MARKER = "[Context checkpoint]"
-COMPACT_TRIGGER_RATIO = 0.80
+COMPACT_TRIGGER_RATIO = 0.85
 RECENT_TOOL_RESULT_COUNT = 4
 RECENT_TAIL_MAX_TOKENS = 20_000
 MAX_TOOL_RESULT_TOKENS = 8_000
 SUMMARY_MAX_TOKENS = 3_000
-ESTIMATED_CHARS_PER_TOKEN = 3
+ESTIMATED_CHARS_PER_TOKEN = CONTEXT_CHARS_PER_TOKEN
 SUMMARY_OUTPUT_RESERVE_CHARS = (
     SUMMARY_MAX_TOKENS * ESTIMATED_CHARS_PER_TOKEN
 )
@@ -35,7 +35,7 @@ self-contained Markdown continuation handoff. Recent messages remain available
 verbatim outside this summary.
 
 Preserve:
-- the user's final goal, explicit constraints, and acceptance conditions
+- the user's final goal, explicit constraints, and completion criteria
 - completed work, modified files, current focus, and remaining work
 - important decisions and the reasons for them
 - concrete conclusions learned from important files and tool results
@@ -274,7 +274,7 @@ _HARNESS_CONTROL_PREFIXES = (
     "<reminder>",
     "<finalization_budget>",
     "<finalization_deadline>",
-    "<todo_completion_gate>",
+    "<todo_completion_reminder>",
 )
 
 

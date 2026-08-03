@@ -258,8 +258,6 @@ def test_interactive_loop_returns_while_long_background_task_keeps_running(
         lambda _messages, _context, _tools, _state, _max_tokens: next(responses),
     )
     monkeypatch.setattr(agent_loop, "CASE_DEADLINE", None)
-    monkeypatch.setattr(agent_loop, "requires_initial_todo", lambda _messages: False)
-
     messages = [{"role": "user", "content": "start one background task"}]
 
     def run_loop():

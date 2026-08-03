@@ -114,6 +114,10 @@ def validate_runtime_configuration() -> None:
             + ", ".join(missing)
             + ". Copy .env.example to .env and fill in your provider settings."
         )
+    if not 16_000 <= CONTEXT_LIMIT_TOKENS <= 1_000_000:
+        raise RuntimeError(
+            "AQOURS_CODE_CONTEXT_LIMIT_TOKENS must be between 16000 and 1000000"
+        )
 
 
 class LazyModelClient:
@@ -133,7 +137,15 @@ MAX_RETRIES = _env_int("AQOURS_CODE_MODEL_MAX_RETRIES", 3)
 MAX_CONSECUTIVE_529 = 2
 MAX_RECOVERY_RETRIES = 2
 BASE_DELAY_MS = 500
-CONTEXT_LIMIT = 128000
+# The harness budgets serialized request characters, not provider-native tokens.
+# At the shared conservative estimate of 3 chars/token, the default is a
+# 64K-token request ceiling. The internal 85% trigger leaves room for a normal
+# 8K response while keeping the public configuration to one understandable knob.
+CONTEXT_CHARS_PER_TOKEN = 3
+CONTEXT_LIMIT_TOKENS = _env_int(
+    "AQOURS_CODE_CONTEXT_LIMIT_TOKENS", 64_000,
+)
+CONTEXT_LIMIT = CONTEXT_LIMIT_TOKENS * CONTEXT_CHARS_PER_TOKEN
 CONTINUATION_PROMPT = "Continue from the previous response. Do not repeat completed work."
 TRACE_CLEANUP_ENABLED = _env_bool("AQOURS_CODE_TRACE_CLEANUP_ENABLED", True)
 TRACE_RETENTION_MAX_DAYS = _env_float("AQOURS_CODE_TRACE_RETENTION_MAX_DAYS", 7)

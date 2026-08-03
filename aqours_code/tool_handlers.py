@@ -1,5 +1,4 @@
 from .runtime_state import *
-from .knowledge import workspace_mutation_reconciliation
 from .runtime import AgentRuntime
 
 # ── Lead Worktree Tools ──
@@ -18,11 +17,7 @@ def run_integrate_worktree(
     cleanup: bool = True,
     runtime: AgentRuntime | None = None,
 ) -> str:
-    knowledge = runtime.state.knowledge if runtime is not None else None
-    workdir = runtime.paths.workdir if runtime is not None else WORKDIR
-    with workspace_mutation_reconciliation(knowledge, workdir):
-        output = integrate_worktree(name, cleanup)
-    return output
+    return integrate_worktree(name, cleanup)
 
 def run_delegate_agent(
     role: str,

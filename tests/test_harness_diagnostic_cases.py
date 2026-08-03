@@ -257,6 +257,7 @@ def test_eval_context_override_is_traced_and_restored(tmp_path):
     event = next(event for event in run_eval.read_trace_events(trace)
                  if event.get("type") == "context_configuration")
     assert event["context_limit_chars"] == 50_000
+    assert event["context_limit_tokens"] == 16_667
     assert event["compact_trigger_ratio"] == 0.7
     assert event["eval_override"] is True
     assert agent_loop_module.CONTEXT_LIMIT == original_limit

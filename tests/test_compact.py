@@ -107,6 +107,20 @@ def force_compact(messages, **kwargs):
     )
 
 
+def test_default_window_is_64k_with_normal_response_headroom():
+    trigger_chars = int(
+        compact.CONTEXT_LIMIT * compact.COMPACT_TRIGGER_RATIO
+    )
+
+    assert compact.CONTEXT_LIMIT == 192_000
+    assert compact.CONTEXT_LIMIT_TOKENS == 64_000
+    assert compact.COMPACT_TRIGGER_RATIO == 0.85
+    assert compact.estimate_context_tokens(compact.CONTEXT_LIMIT) == 64_000
+    assert compact.estimate_context_tokens(trigger_chars) == 54_400
+    assert 64_000 - 54_400 >= agent_loop.DEFAULT_MAX_TOKENS
+    assert compact.RECENT_TAIL_MAX_TOKENS == 20_000
+
+
 def test_small_history_below_trigger_is_not_compacted(monkeypatch):
     messages = [{"role": "user", "content": "small request"}]
     monkeypatch.setattr(

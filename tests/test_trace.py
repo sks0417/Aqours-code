@@ -117,8 +117,20 @@ def test_start_run_creates_files_and_metadata(tmp_path):
     assert item["prompt_preview"] == "hello"
 
 
+def test_git_metadata_ignores_invalid_parent_marker(tmp_path):
+    root = tmp_path / "not-a-repository"
+    (root / ".git").mkdir(parents=True)
+    workspace = root / "workspace"
+    workspace.mkdir()
+
+    assert trace._git_metadata(workspace) == (None, None, [])
+
+
 def test_git_metadata_failure_is_recorded_without_stopping_run(tmp_path, monkeypatch):
     (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text(
+        "ref: refs/heads/main\n", encoding="utf-8",
+    )
 
     def fail_git(*_args, **_kwargs):
         raise OSError("git unavailable")

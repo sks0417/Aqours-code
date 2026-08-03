@@ -31,11 +31,11 @@ def update_context(
         "memories": memories,
         "connected_mcp": list(mcp_clients.keys()) if allow_mcp else [],
         "active_teammates": list(active_teammates.keys()) if allow_teammates else [],
-        # Keep only the compact acceptance contract in live prompt context.
-        # Plan mechanics stay in ordinary tool history and can be compacted.
-        "acceptance_todos": [
+        # Keep active checklist items outside message history so compaction cannot
+        # discard the remaining work. Completed items stay in ordinary history.
+        "todos": [
             dict(todo) for todo in todos
-            if todo.get("kind") == "acceptance"
+            if todo.get("status") != "completed"
         ],
     }
 

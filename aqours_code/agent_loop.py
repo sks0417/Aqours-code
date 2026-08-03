@@ -9,7 +9,6 @@ import time as _time
 from .command_executor import CaseTimeoutError as _CaseTimeoutError
 from .agent_profiles import (
     assess_task_complexity,
-    classify_delegation_intent,
     complex_delegation_briefing,
     normalize_agent_role,
 )
@@ -22,7 +21,6 @@ from .model_api import assistant_message_from_response
 
 # ── Agent Loop ──
 
-rounds_since_todo = 0
 agent_lock = threading.Lock()
 _MUTATING_FILE_TOOLS = {"write_file", "edit_file"}
 _MAIN_MUTATION_TOOLS = _MUTATING_FILE_TOOLS | {"integrate_worktree"}
@@ -55,98 +53,44 @@ def _latest_user_instruction(messages: list) -> str:
     return ""
 
 
-def requires_initial_todo(messages: list) -> bool:
-    text = _latest_user_instruction(messages).lower()
-    if not text:
-        return False
-    action_markers = (
-        "create", "write", "read", "glob", "list", "summarize", "edit", "run",
-        "创建", "写入", "读取", "列出", "总结", "运行",
-    )
-    connector_markers = (
-        " then ", " and ", "after", "然后", "再", "并", "接着",
-    )
-    multi_markers = (
-        "multiple", "several", "files", "reports", "markdown", "directory",
-        "多个", "文件", "目录",
-    )
-    action_count = sum(1 for marker in action_markers if marker in text)
-    has_connector = any(marker in text for marker in connector_markers)
-    has_multi_marker = any(marker in text for marker in multi_markers)
-    has_number = re.search(r"\b([2-9]|[1-9]\d+)\b", text) is not None
-    return action_count >= 3 and (has_connector or has_number) and (has_multi_marker or has_number)
-
-
-def requires_acceptance_todos(messages: list) -> bool:
-    """Identify code tasks whose external requirements need a final audit."""
-    text = _latest_user_instruction(messages).lower()
-    if not text:
-        return False
-    change_markers = (
-        "fix", "implement", "repair", "refactor", "debug", "modify code",
-        "修复", "实现", "改代码", "重构", "调试",
-    )
-    requirement_markers = (
-        "contract", "requirement", "readme", "test", "public api", "preserve",
-        "bug", "consistency", "behavior", "acceptance",
-        "契约", "要求", "测试", "接口", "保持", "错误", "一致性", "行为", "验收",
-    )
-    requirement_count = sum(
-        1 for marker in requirement_markers if marker in text)
-    return any(marker in text for marker in change_markers) and requirement_count >= 2
-
-
 def _runtime_todos(runtime: AgentRuntime | None = None) -> list[dict]:
     return runtime.state.todos if runtime is not None else CURRENT_TODOS
 
 
-def _acceptance_items(
+def _incomplete_todos(
     runtime: AgentRuntime | None = None,
 ) -> list[dict]:
-    return [todo for todo in _runtime_todos(runtime)
-            if todo.get("kind") == "acceptance"]
-
-
-def _acceptance_gate_items(
-    required: bool,
-    runtime: AgentRuntime | None = None,
-) -> list[dict]:
-    items = _acceptance_items(runtime)
-    if required and not items:
-        return [{
-            "kind": "acceptance",
-            "status": "pending",
-            "content": "Extract acceptance criteria from the task/README",
-        }]
-    return [todo for todo in items if todo.get("status") != "completed"]
+    return [
+        todo for todo in _runtime_todos(runtime)
+        if todo.get("status") != "completed"
+    ]
 
 
 def _todo_completion_message(items: list[dict]) -> str:
     lines = "\n".join(
-        f"- [{item.get('id', 'acceptance')} "
+        f"- [{item.get('id', 'todo')} "
         f"{item.get('status', 'pending')}] {item.get('content', '')}"
         for item in items[:8]
     )
     return (
-        "<todo_completion_gate>Your final answer is paused once because the "
-        "following acceptance Todo items remain incomplete:\n"
+        "<todo_completion_reminder>You still have the following incomplete "
+        "Todo items:\n"
         f"{lines}\n"
-        "Complete and verify them with the normal tools, or leave them pending "
-        "and report the task as incomplete if they cannot be resolved. A Review "
-        "Subagent is optional and should be called only if it is useful."
-        "</todo_completion_gate>"
+        "Complete them with the normal tools, or leave them pending and report "
+        "the task as incomplete if they cannot be resolved."
+        "</todo_completion_reminder>"
     )
 
 
-def _append_acceptance_warning(content: list, items: list[dict]):
+def _append_todo_warning(content: list, items: list[dict]):
     lines = "\n".join(
-        f"- [{item.get('id', 'acceptance')}] {item.get('content', '')}"
+        f"- [{item.get('id', 'todo')}] {item.get('content', '')}"
         for item in items[:8])
     content.append({
         "type": "text",
         "text": (
-            "\n\n[Acceptance review incomplete]\n"
-            "The following requirements were not verified with evidence:\n"
+            "\n\n[Todo checklist incomplete]\n"
+            "The following planned work remains incomplete:\n"
             f"{lines}"
         ),
     })
@@ -160,16 +104,6 @@ def _tool_json(output) -> dict:
     except (TypeError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
-
-
-def _reviewer_findings(output: str) -> list[dict]:
-    envelope = _tool_json(output)
-    result = envelope.get("result", {})
-    if not isinstance(result, dict):
-        return []
-    findings = result.get("findings", [])
-    return [item for item in findings[:5] if isinstance(item, dict)] \
-        if isinstance(findings, list) else []
 
 
 _REVIEW_FINDING_STOP_WORDS = {
@@ -329,40 +263,6 @@ def _reviewer_findings_duplicate(
     )
 
 
-def _reviewer_existing_acceptance_id(
-    finding: dict,
-    runtime: AgentRuntime | None,
-) -> str:
-    finding_text = (
-        f"{finding.get('requirement', '')} {finding.get('evidence', '')}"
-    )
-    finding_path = _reviewer_path_key(finding.get("file"))
-    for todo in _acceptance_items(runtime):
-        todo_id = str(todo.get("id", "")).strip()
-        if not todo_id:
-            continue
-        sources = todo.get("evidence_sources", {})
-        source_files = sources.get("files", []) if isinstance(sources, dict) else []
-        source_match = any(
-            _reviewer_checked_path(finding_path, {_reviewer_path_key(path)})
-            for path in source_files
-        )
-        if finding_path and not source_match:
-            evidence_text = str(todo.get("evidence", "")).lower()
-            source_match = (
-                finding_path in evidence_text
-                or _Path(finding_path).name in evidence_text
-            )
-        todo_text = f"{todo.get('content', '')} {todo.get('evidence', '')}"
-        shared, overlap = _reviewer_token_overlap(finding_text, todo_text)
-        if (
-            (shared >= 4 and overlap >= 0.78)
-            or (source_match and shared >= 4 and overlap >= 0.55)
-        ):
-            return todo_id
-    return ""
-
-
 def _reviewer_trace_finding(finding: dict) -> dict:
     return {
         "severity": str(finding.get("severity", "warning"))[:30],
@@ -377,7 +277,7 @@ def _screen_reviewer_findings(
     delegation: dict,
     runtime: AgentRuntime | None = None,
 ) -> dict:
-    """Validate and deduplicate Reviewer findings before they lock the Todo list."""
+    """Validate and deduplicate Reviewer findings before returning them to Lead."""
     result = delegation.get("result", {})
     if not isinstance(result, dict):
         result = {}
@@ -476,13 +376,10 @@ def _screen_reviewer_findings(
             suppressed.append(trace_item)
             continue
 
-        existing_todo_id = _reviewer_existing_acceptance_id(finding, runtime)
-        if existing_todo_id:
-            finding["_existing_todo_id"] = existing_todo_id
         accepted.append(finding)
 
     record_event(
-        "acceptance_gate",
+        "reviewer_screening",
         decision="reviewer_findings_screened",
         raw_count=len(raw_findings[:5]),
         accepted_count=len(accepted),
@@ -525,260 +422,6 @@ def _screened_reviewer_output(
         ),
     }
     return json.dumps(payload, ensure_ascii=False)
-
-
-def _ingest_delegation_knowledge(
-    delegation: dict,
-    role: str,
-    runtime: AgentRuntime | None,
-) -> None:
-    if runtime is None or role not in {
-        "explore", "plan", "review", "general-purpose",
-    }:
-        return
-    result = delegation.get("result", {})
-    if not isinstance(result, dict):
-        return
-    checked = result.get("files_checked", [])
-    if not isinstance(checked, list):
-        checked = [checked] if checked else []
-    observed_paths = []
-    for raw_path in checked[:20]:
-        path = str(raw_path).strip()
-        candidate = (runtime.paths.workdir / path).resolve()
-        if (not path or not candidate.is_relative_to(runtime.paths.workdir)
-                or not candidate.is_file()):
-            continue
-        runtime.state.knowledge.observe_file(path, candidate.read_bytes())
-        observed_paths.append(path)
-    requirements = result.get("requirements", [])
-    if role == "explore" and isinstance(requirements, list):
-        for index, requirement in enumerate(requirements[:12], 1):
-            runtime.state.knowledge.record_contract(
-                f"explorer:{index}",
-                str(requirement),
-                observed_paths,
-                role="explore",
-            )
-
-
-def _register_reviewer_findings(
-    findings: list[dict], revision: int | None = None,
-    runtime: AgentRuntime | None = None,
-) -> str:
-    """Make reviewer concerns part of the locked acceptance state."""
-    if not findings:
-        return ""
-    revision_number = revision if revision is not None else 0
-    current_todos = _runtime_todos(runtime)
-    registered = []
-    registered_ids = []
-    reused_ids = []
-    for index, finding in enumerate(findings[:5], 1):
-        finding_id = f"review:r{revision_number}:f{index}"
-        matched_todo_id = str(
-            finding.get("_existing_todo_id", "")
-        ).strip()
-        if matched_todo_id:
-            matched_todo = next(
-                (
-                    todo for todo in current_todos
-                    if str(todo.get("id", "")).strip() == matched_todo_id
-                    and todo.get("kind") == "acceptance"
-                ),
-                None,
-            )
-            if matched_todo is not None:
-                matched_todo["status"] = "pending"
-                matched_todo.pop("evidence", None)
-                sources = matched_todo.get("evidence_sources", {})
-                if not isinstance(sources, dict):
-                    sources = {}
-                reviewer_sources = [
-                    str(value).strip()
-                    for value in sources.get("reviewer_findings", [])
-                    if str(value).strip()
-                ]
-                if finding_id not in reviewer_sources:
-                    reviewer_sources.append(finding_id)
-                sources["reviewer_findings"] = reviewer_sources[:20]
-                matched_todo["evidence_sources"] = sources
-                registered.append(str(matched_todo.get("content", "")))
-                registered_ids.append(matched_todo_id)
-                reused_ids.append(matched_todo_id)
-                continue
-        existing = next(
-            (todo for todo in current_todos if todo.get("id") == finding_id),
-            None,
-        )
-        if existing is not None:
-            registered.append(str(existing.get("content", "")))
-            registered_ids.append(finding_id)
-            continue
-        location = ":".join(filter(None, (
-            str(finding.get("file", "")).strip(),
-            str(finding.get("symbol", "")).strip(),
-        )))
-        requirement = str(
-            finding.get("requirement", "Reviewer concern")).strip()
-        detail = f"{location} {requirement}".strip()
-        content = (
-            f"Resolve Reviewer finding for revision "
-            f"{revision_number}: {detail or 'Reviewer concern'}"
-        )[:500]
-        if len(current_todos) >= 32:
-            record_event(
-                "acceptance_gate", decision="reviewer_findings_not_registered",
-                finding_count=len(findings), registered_count=len(registered),
-                reason="todo_capacity", updateable_ids=registered_ids,
-            )
-            break
-        current_todos.append({
-            "id": finding_id,
-            "content": content,
-            "status": "pending",
-            "kind": "acceptance",
-        })
-        registered.append(content)
-        registered_ids.append(finding_id)
-    record_event(
-        "acceptance_gate", decision="reviewer_findings_registered",
-        finding_count=len(findings), registered_count=len(registered),
-        updateable_ids=registered_ids, reused_ids=reused_ids,
-    )
-    if runtime is not None:
-        runtime.state.knowledge.record_reviewer_findings(
-            findings, revision_number,
-        )
-        runtime.state.knowledge.sync_acceptance(current_todos)
-    return "; ".join(registered)
-
-
-def _apply_reviewer_acceptance_verifications(
-    delegation: dict,
-    revision: int | None = None,
-    runtime: AgentRuntime | None = None,
-) -> dict:
-    """Bind a clean Reviewer pass to the exact acceptance IDs it verified."""
-    result = delegation.get("result", {})
-    if not isinstance(result, dict):
-        result = {}
-    verdict = str(
-        delegation.get("verdict") or result.get("verdict") or ""
-    ).strip().lower()
-    findings = result.get("findings", [])
-    if not isinstance(findings, list):
-        findings = [findings] if findings else []
-    missing = result.get("missing_evidence", [])
-    if not isinstance(missing, list):
-        missing = [missing] if missing else []
-    raw_ids = result.get("verified_acceptance_ids", [])
-    if not isinstance(raw_ids, list):
-        raw_ids = [raw_ids] if raw_ids else []
-    requested_ids = []
-    for raw_id in raw_ids[:16]:
-        item_id = str(raw_id or "").strip()
-        if item_id and item_id not in requested_ids:
-            requested_ids.append(item_id)
-
-    current_todos = _runtime_todos(runtime)
-    acceptance = [
-        todo for todo in current_todos
-        if todo.get("kind") == "acceptance"
-    ]
-    acceptance_by_id = {
-        str(todo.get("id")): todo
-        for todo in acceptance if todo.get("id")
-    }
-    checked = result.get("files_checked", [])
-    if not isinstance(checked, list):
-        checked = [checked] if checked else []
-    checked_files = []
-    for raw_path in checked[:16]:
-        path = str(raw_path or "").strip()
-        if path and path not in checked_files:
-            checked_files.append(path)
-
-    eligible = bool(
-        delegation.get("status") == "completed"
-        and verdict == "pass"
-        and not findings
-        and not missing
-        and requested_ids
-        and checked_files
-    )
-    matched_ids = [
-        item_id for item_id in requested_ids
-        if item_id in acceptance_by_id
-    ]
-    ignored_ids = [
-        item_id for item_id in requested_ids
-        if item_id not in acceptance_by_id
-    ]
-    completed_ids = []
-    if eligible:
-        summary = " ".join(str(result.get("summary", "")).split())
-        revision_number = revision if revision is not None else 0
-        evidence = (
-            f"Independent Reviewer pass for revision {revision_number}"
-            + (f": {summary}" if summary else ".")
-        )[:500]
-        for item_id in matched_ids:
-            todo = acceptance_by_id[item_id]
-            if todo.get("status") == "completed" and todo.get("evidence"):
-                continue
-            todo["status"] = "completed"
-            todo["evidence"] = evidence
-            sources = todo.get("evidence_sources", {})
-            if not isinstance(sources, dict):
-                sources = {}
-            merged_files = []
-            for path in [*sources.get("files", []), *checked_files]:
-                normalized = str(path or "").strip()
-                if normalized and normalized not in merged_files:
-                    merged_files.append(normalized)
-            sources["files"] = merged_files[:20]
-            todo["evidence_sources"] = sources
-            completed_ids.append(item_id)
-        if runtime is not None:
-            runtime.state.knowledge.sync_acceptance(current_todos)
-
-    acceptance_ids = set(acceptance_by_id)
-    coverage_complete = bool(
-        eligible
-        and acceptance_ids
-        and acceptance_ids.issubset(set(matched_ids))
-    )
-    all_acceptance_completed = bool(
-        acceptance
-        and all(todo.get("status") == "completed" for todo in acceptance)
-    )
-    decision = (
-        "reviewer_acceptance_verified"
-        if eligible else "reviewer_acceptance_not_applied"
-    )
-    record_event(
-        "acceptance_gate",
-        decision=decision,
-        revision=revision if revision is not None else 0,
-        verdict=verdict or "unknown",
-        requested_ids=requested_ids,
-        matched_ids=matched_ids,
-        completed_ids=completed_ids,
-        ignored_ids=ignored_ids,
-        finding_count=len(findings),
-        missing_evidence_count=len(missing),
-        coverage_complete=coverage_complete,
-        all_acceptance_completed=all_acceptance_completed,
-    )
-    return {
-        "eligible": eligible,
-        "matched_ids": matched_ids,
-        "completed_ids": completed_ids,
-        "ignored_ids": ignored_ids,
-        "coverage_complete": coverage_complete,
-        "all_acceptance_completed": all_acceptance_completed,
-    }
 
 
 def _finalization_budget_message(snapshot: dict) -> str:
@@ -1069,131 +712,6 @@ def tool_rejection_text(output) -> str:
     return text
 
 
-def todo_required_message(acceptance_required: bool = False) -> str:
-    message = ("Tool not run: before changing files, this multi-step task needs "
-               "a todo list. Inspect the task/README with read-only tools first "
-               "if needed, then call todo_write with a short plan")
-    if acceptance_required:
-        message += (" and concrete kind=acceptance items extracted from those "
-                    "requirements")
-    return message + ", then continue with the file change."
-
-
-def acceptance_required_message() -> str:
-    return (
-        "Tool not run: before changing files, add concrete kind=acceptance "
-        "items from the task/README requirements with todo_write. Read-only "
-        "contract discovery may continue first. Keep independently observable "
-        "requirements separate. For stateful or recursive code, include applicable "
-        "deep-copy/alias-isolation boundaries and shared-dependency fan-in "
-        "deduplication, not only happy-path chains and public tests."
-    )
-
-
-def acceptance_coverage_message() -> str:
-    return (
-        "\n<acceptance_coverage_check>Before editing, recheck the contract: "
-        "a fresh/copy guarantee needs its own acceptance item covering nested "
-        "input-storage-return-replay alias isolation; recursive evaluation needs "
-        "its own shared-dependency fan-in deduplication item. Add any applicable "
-        "missing item now.</acceptance_coverage_check>"
-    )
-
-
-def _todo_state_summary(runtime: AgentRuntime | None = None) -> str:
-    current_todos = _runtime_todos(runtime)
-    acceptance = _acceptance_items(runtime)
-    unverified = [todo for todo in acceptance
-                  if todo.get("status") != "completed"]
-    detail = ""
-    if acceptance:
-        detail = (f" ({len(acceptance)} acceptance, "
-                  f"{len(unverified)} unverified)")
-    ids = [str(todo.get("id")) for todo in acceptance if todo.get("id")]
-    id_detail = f"; acceptance IDs: {', '.join(ids)}" if ids else ""
-    return f"Updated {len(current_todos)} todos{detail}{id_detail}"
-
-
-def _reconcile_locked_acceptance(
-    previous_todos: list[dict],
-    runtime: AgentRuntime | None = None,
-) -> tuple[list[str], str | None]:
-    """Keep established contract items without turning wording drift into a retry."""
-    previous = [dict(todo) for todo in previous_todos
-                if todo.get("kind") == "acceptance"]
-    current_todos = _runtime_todos(runtime)
-    current = [todo for todo in current_todos
-               if todo.get("kind") == "acceptance"]
-    if not previous:
-        return [], None
-
-    previous_contents = {todo.get("content") for todo in previous}
-    current_contents = {todo.get("content") for todo in current}
-    current_by_id = {
-        str(todo["id"]): todo for todo in current if todo.get("id")
-    }
-    notices = []
-
-    # Stable IDs are authoritative. They let the model update a reviewer
-    # finding with evidence without reproducing generated wording.
-    for old_item in previous:
-        old_id = str(old_item.get("id", ""))
-        candidate = current_by_id.get(old_id) if old_id else None
-        if candidate is None:
-            continue
-        candidate["content"] = old_item.get("content", "")
-        candidate["kind"] = "acceptance"
-
-    # Models often rephrase an item while keeping the same list shape. Treat
-    # that as a status/evidence update and retain the stable contract wording.
-    if len(previous) == len(current):
-        for index, old_item in enumerate(previous):
-            old_content = old_item.get("content")
-            if old_content in current_contents:
-                continue
-            candidate = current[index]
-            candidate_content = candidate.get("content")
-            if candidate_content in previous_contents:
-                continue
-            candidate["content"] = old_content
-            if old_item.get("id"):
-                candidate["id"] = old_item["id"]
-            current_contents.discard(candidate_content)
-            current_contents.add(old_content)
-            notices.append(f"kept wording: {old_content}")
-
-    current_contents = {
-        todo.get("content") for todo in current_todos
-        if todo.get("kind") == "acceptance"
-    }
-    restored = [todo for todo in previous
-                if todo.get("content") not in current_contents
-                and (not todo.get("id")
-                     or str(todo.get("id")) not in {
-                         str(current.get("id")) for current in current_todos
-                         if current.get("id")
-                     })]
-    if restored:
-        current_todos.extend(dict(todo) for todo in restored)
-        notices.extend(
-            f"restored omitted item: {todo.get('content')}" for todo in restored)
-
-    if len(current_todos) > 32:
-        current_todos[:] = [dict(todo) for todo in previous_todos]
-        if runtime is not None:
-            runtime.state.knowledge.sync_acceptance(current_todos)
-        return [], (
-            "Error: todo update exceeds limits after preserving locked "
-            "acceptance items; keep existing criteria and add fewer new items. "
-            "Updateable acceptance IDs: "
-            + ", ".join(
-                str(todo.get("id")) for todo in previous if todo.get("id"))
-        )
-    if runtime is not None:
-        runtime.state.knowledge.sync_acceptance(current_todos)
-    return notices, None
-
-
 def _runtime_role_benefit(read_counts: dict[str, int], model_client) -> dict:
     """Describe a conservative, evidence-based opportunity for one Explorer."""
     unique_paths = len(read_counts)
@@ -1304,7 +822,6 @@ def agent_loop(
     context: dict,
     runtime: AgentRuntime | None = None,
 ):
-    global rounds_since_todo
     from . import bootstrap
     bootstrap()
     tools, handlers = (
@@ -1315,19 +832,13 @@ def agent_loop(
     if runtime is not None:
         state.current_model = runtime.config.primary_model
     max_tokens = DEFAULT_MAX_TOKENS
-    # Todos are scoped to one user/cron turn. Live acceptance state remains
-    # available through every context compaction inside this loop.
+    # Todos are scoped to one user/cron turn. Incomplete items remain available
+    # through every context compaction inside this loop.
     current_todos = _runtime_todos(runtime)
     current_todos.clear()
     if runtime is not None:
-        runtime.state.knowledge.clear()
         runtime.state.metadata["compact_generation"] = 0
-    acceptance_required = requires_acceptance_todos(messages)
-    todo_required = requires_initial_todo(messages) or acceptance_required
-    todo_started = False
-    acceptance_locked = False
-    acceptance_coverage_notice_sent = False
-    todo_completion_followup_revision = -1
+    todo_completion_followup_sent = False
     changed_file_paths = (
         runtime.state.changed_files if runtime is not None else set()
     )
@@ -1378,11 +889,6 @@ def agent_loop(
 
         inject_background_notifications(messages)
 
-        if rounds_since_todo >= 3:
-            messages.append({"role": "user",
-                             "content": "<reminder>Update your todos.</reminder>"})
-            rounds_since_todo = 0
-
         model_client = (
             runtime.services.model_client if runtime is not None else client
         )
@@ -1397,13 +903,13 @@ def agent_loop(
             )
         if (budget_snapshot.get("available")
                 and budget_snapshot["remaining_calls"] <= 0):
-            unresolved = _acceptance_gate_items(acceptance_required, runtime)
+            unresolved = _incomplete_todos(runtime)
             fallback = (
                 "Harness stopped before issuing an over-budget model request. "
                 "The implementation changes made so far remain in the workspace."
             )
             if unresolved:
-                fallback += " Unresolved acceptance work: " + "; ".join(
+                fallback += " Unresolved Todo work: " + "; ".join(
                     str(item.get("content", ""))[:180]
                     for item in unresolved[:5]
                 )
@@ -1434,16 +940,16 @@ def agent_loop(
                    if key != "available"},
             )
         if force_final_response:
-            unresolved = _acceptance_gate_items(acceptance_required, runtime)
+            unresolved = _incomplete_todos(runtime)
             messages.append({
                 "role": "user",
                 "content": (
                     "<finalization_deadline>Exactly one model call remains. "
                     "Tools are disabled for this call. Return the best accurate "
-                    "final answer now from retained evidence; state any unfinished "
-                    "acceptance work honestly and do not request another action."
+                    "final answer now from retained context; state any unfinished "
+                    "Todo work honestly and do not request another action."
                     + (
-                        " Unresolved acceptance work: " + "; ".join(
+                        " Unresolved Todo work: " + "; ".join(
                             str(item.get("content", ""))[:180]
                             for item in unresolved[:5]
                         )
@@ -1534,9 +1040,9 @@ def agent_loop(
         state.has_escalated = False
         messages.append(assistant_message_from_response(response))
         if force_final_response:
-            unresolved = _acceptance_gate_items(acceptance_required, runtime)
+            unresolved = _incomplete_todos(runtime)
             if unresolved:
-                _append_acceptance_warning(response.content, unresolved)
+                _append_todo_warning(response.content, unresolved)
             record_hook("Stop")
             trigger_hooks("Stop", messages)
             finish_run(extract_text(response.content))
@@ -1568,29 +1074,26 @@ def agent_loop(
             notification_wait = 2.0 if remaining is None else max(0, min(2.0, remaining))
             if wait_for_imminent_once(notification_wait):
                 continue
-            unresolved_acceptance = _acceptance_gate_items(
-                acceptance_required, runtime)
-            if unresolved_acceptance:
-                if todo_completion_followup_revision != mutation_revision:
+            unresolved_todos = _incomplete_todos(runtime)
+            if unresolved_todos:
+                if not todo_completion_followup_sent:
                     messages.append({
                         "role": "user",
                         "content": _todo_completion_message(
-                            unresolved_acceptance,
+                            unresolved_todos,
                         ),
                     })
-                    todo_completion_followup_revision = mutation_revision
+                    todo_completion_followup_sent = True
                     record_event(
-                        "acceptance_gate",
+                        "todo_completion_reminder",
                         decision="todo_completion_followup",
-                        mutation_revision=mutation_revision,
-                        unresolved_count=len(unresolved_acceptance),
+                        unresolved_count=len(unresolved_todos),
                     )
                     continue
-                _append_acceptance_warning(
-                    response.content, unresolved_acceptance)
+                _append_todo_warning(response.content, unresolved_todos)
                 record_event(
-                    "acceptance_gate", decision="incomplete_final",
-                    unresolved_count=len(unresolved_acceptance),
+                    "todo_completion_reminder", decision="incomplete_final",
+                    unresolved_count=len(unresolved_todos),
                 )
             record_hook("Stop")
             trigger_hooks("Stop", messages)
@@ -1608,38 +1111,11 @@ def agent_loop(
 
             mutation_requested = block.name in _MAIN_MUTATION_TOOLS
             delegated_role = ""
-            delegated_mutation_requested = False
             if block.name == "delegate_agent":
                 delegated_role = normalize_agent_role(
                     block.input.get("role", ""))
-                if delegated_role == "general-purpose":
-                    routing = classify_delegation_intent(
-                        block.input.get("prompt", ""))
-                    delegated_mutation_requested = bool(
-                        routing["role"] == "general-purpose"
-                        and routing["matched_markers"]
-                    )
             elif block.name == "task":
                 delegated_role = "general-purpose"
-                routing = classify_delegation_intent(
-                    block.input.get("description", ""))
-                delegated_mutation_requested = bool(
-                    routing["role"] == "general-purpose"
-                    and routing["matched_markers"]
-                )
-            implementation_requested = (
-                mutation_requested or delegated_mutation_requested
-            )
-            if implementation_requested and todo_required and not todo_started:
-                output = todo_required_message(acceptance_required)
-                record_event("todo_gate", tool=block.name,
-                             tool_use_id=block.id, input=block.input,
-                             reason=output)
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": output})
-                record_tool_result(block.id, block.name, output)
-                continue
 
             if block.name in {"delegate_agent", "task"} \
                     and delegated_role == "explore" \
@@ -1671,18 +1147,6 @@ def agent_loop(
                                 "content": output})
                 record_tool_result(block.id, block.name, output)
                 continue
-            if (implementation_requested and acceptance_required
-                    and not _acceptance_items(runtime)):
-                output = acceptance_required_message()
-                record_event("todo_gate", tool=block.name,
-                             tool_use_id=block.id, input=block.input,
-                             reason=output)
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": output})
-                record_tool_result(block.id, block.name, output)
-                continue
-
             if block.name == "compact":
                 compact_sizer = _request_sizer(context, tools, runtime)
                 messages[:] = (
@@ -1772,26 +1236,12 @@ def agent_loop(
                 continue
 
             handler = handlers.get(block.name)
-            todo_snapshot = (
-                [dict(todo) for todo in current_todos]
-                if block.name == "todo_write" and acceptance_locked else None
-            )
             output = call_tool_handler(
                 handler,
                 block.input,
                 block.name,
                 tool_use_id=block.id,
             )
-            if (block.name == "todo_write" and todo_snapshot is not None
-                    and not str(output).startswith("Error:")):
-                notices, reconciliation_error = _reconcile_locked_acceptance(
-                    todo_snapshot, runtime)
-                if reconciliation_error:
-                    output = reconciliation_error
-                elif notices:
-                    output = (_todo_state_summary(runtime)
-                              + "\nProtected acceptance criteria preserved: "
-                              + "; ".join(notices))
             trigger_hooks("PostToolUse", block, output)
             record_hook("PostToolUse", tool=block.name)
             print(str(output)[:300])
@@ -1807,9 +1257,6 @@ def agent_loop(
                         if str(path).strip()
                     ]
                 verdict = str(delegation.get("verdict", "")).lower()
-                _ingest_delegation_knowledge(
-                    delegation, delegated_role, runtime,
-                )
                 if delegated_role == "explore":
                     explorer_attempted = True
                     explorer_cached_result = str(output)
@@ -1828,14 +1275,6 @@ def agent_loop(
                         delegation, screening,
                     )
                     reviewer_cached_result = str(output)
-                    if findings:
-                        if not acceptance_required:
-                            acceptance_required = True
-                            todo_required = True
-                        _register_reviewer_findings(
-                            findings, mutation_revision, runtime)
-                    _apply_reviewer_acceptance_verifications(
-                        delegation, mutation_revision, runtime)
                     record_event(
                         "subagent_policy",
                         decision=("reviewer_pass" if (
@@ -1849,43 +1288,27 @@ def agent_loop(
                         mutation_revision=mutation_revision,
                     )
 
-            if block.name == "todo_write":
-                rounds_since_todo = 0
-                if not str(output).startswith("Error:"):
-                    todo_started = True
-                if (not str(output).startswith("Error:")
-                        and acceptance_required
-                        and not _acceptance_items(runtime)):
-                    output += (
-                        "\nAcceptance checklist required before the first file "
-                        "change; continue read-only contract discovery or add at "
-                        "least one kind=acceptance item.")
-                elif (not str(output).startswith("Error:")
-                      and acceptance_required
-                      and not acceptance_coverage_notice_sent):
-                    output += acceptance_coverage_message()
-                    acceptance_coverage_notice_sent = True
-            else:
-                rounds_since_todo += 1
-                mutation_succeeded = (
-                    (mutation_requested or bool(delegated_changed_files))
-                    and not str(output).lower().startswith((
-                        "error:", "permission denied", "tool not run"))
-                )
-                integration = _tool_json(output) if block.name == "integrate_worktree" else {}
-                if block.name == "integrate_worktree":
-                    mutation_succeeded = integration.get("status") == "integrated"
-                if mutation_succeeded:
-                    acceptance_locked = True
-                    mutation_revision += 1
-                    changed_path = str(block.input.get("path", "")).strip()
+            mutation_succeeded = (
+                (mutation_requested or bool(delegated_changed_files))
+                and not str(output).lower().startswith((
+                    "error:", "permission denied", "tool not run"))
+            )
+            integration = (
+                _tool_json(output)
+                if block.name == "integrate_worktree" else {}
+            )
+            if block.name == "integrate_worktree":
+                mutation_succeeded = integration.get("status") == "integrated"
+            if mutation_succeeded:
+                mutation_revision += 1
+                changed_path = str(block.input.get("path", "")).strip()
+                if changed_path:
+                    changed_file_paths.add(changed_path)
+                for changed_path in integration.get("changed_files", []):
                     if changed_path:
-                        changed_file_paths.add(changed_path)
-                    for changed_path in integration.get("changed_files", []):
-                        if changed_path:
-                            changed_file_paths.add(str(changed_path))
-                    for changed_path in delegated_changed_files:
-                        changed_file_paths.add(changed_path)
+                        changed_file_paths.add(str(changed_path))
+                for changed_path in delegated_changed_files:
+                    changed_file_paths.add(changed_path)
 
             if (block.name == "read_file"
                     and not str(output).lower().startswith("error:")):
@@ -2089,7 +1512,6 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
                    context_limit_chars: int | None = None,
                    compact_trigger_ratio: float | None = None) -> dict:
     """Run one non-interactive agent task using the existing loop and trace."""
-    global rounds_since_todo
     from . import bootstrap
     bootstrap()
 
@@ -2106,7 +1528,6 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
     run = None
     runtime = None
     final_text = ""
-    rounds_since_todo = 0
     cleanup_errors = []
     collection_snapshots = None
     try:
@@ -2172,6 +1593,9 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         record_event(
             "context_configuration",
             context_limit_chars=int(_runtime_value("CONTEXT_LIMIT")),
+            context_limit_tokens=estimate_context_tokens(
+                int(_runtime_value("CONTEXT_LIMIT")),
+            ),
             compact_trigger_ratio=float(
                 _runtime_value("COMPACT_TRIGGER_RATIO")),
             eval_override=bool(

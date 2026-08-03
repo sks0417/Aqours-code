@@ -75,17 +75,11 @@ _TOOL_SCHEMAS = [
                       "properties": {"pattern": {"type": "string"}},
                       "required": ["pattern"]}},
     {"name": "todo_write",
-                     "description": ("Create and manage implementation plan steps and contract "
-                     "acceptance criteria. Use kind=plan for work still to do and "
-                     "kind=acceptance for every externally required outcome, "
-                     "including error paths omitted by public tests. For README or "
-                     "contract tasks, cover each relevant section, not only failing "
-                     "tests. Completed "
-                     "acceptance items require concise evidence plus explicit "
-                     "evidence_sources bound to files, tests, or Reviewer "
-                     "findings. Existing "
-                     "acceptance items have stable IDs; update one by sending "
-                     "its id, status, and evidence without copying its content."),
+                     "description": ("Create and update a lightweight checklist for "
+                     "multi-step work. Include implementation and verification steps "
+                     "in the same list. The supplied array replaces the current "
+                     "checklist, so include every item to retain. Existing item "
+                     "content may be omitted when its stable id is supplied."),
      "input_schema": {"type": "object",
                       "properties": {"todos": {"type": "array", "maxItems": 32,
                           "items": {"type": "object",
@@ -93,26 +87,7 @@ _TOOL_SCHEMAS = [
                                         "id": {"type": "string", "maxLength": 100},
                                         "content": {"type": "string", "maxLength": 500},
                                         "status": {"type": "string",
-                                                   "enum": ["pending", "in_progress", "completed"]},
-                                        "kind": {"type": "string",
-                                                 "enum": ["plan", "acceptance"]},
-                                        "evidence": {"type": "string", "maxLength": 500},
-                                        "evidence_sources": {
-                                            "type": "object",
-                                            "properties": {
-                                                "files": {
-                                                    "type": "array",
-                                                    "items": {"type": "string"},
-                                                    "maxItems": 20},
-                                                "tests": {
-                                                    "type": "array",
-                                                    "items": {"type": "string"},
-                                                    "maxItems": 20},
-                                                "reviewer_findings": {
-                                                    "type": "array",
-                                                    "items": {"type": "string"},
-                                                    "maxItems": 20}},
-                                            "additionalProperties": False}},
+                                                   "enum": ["pending", "in_progress", "completed"]}},
                                     "required": ["status"]}}},
                       "required": ["todos"]}},
     {"name": "task",

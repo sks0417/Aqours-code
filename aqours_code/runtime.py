@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from .knowledge import RunKnowledge
 
 
 @dataclass(frozen=True)
@@ -69,7 +68,6 @@ class RunState:
     todos: list[dict] = field(default_factory=list)
     changed_files: set[str] = field(default_factory=set)
     lead_read_counts: dict[str, int] = field(default_factory=dict)
-    knowledge: RunKnowledge = field(default_factory=RunKnowledge)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

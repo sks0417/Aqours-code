@@ -44,13 +44,31 @@ def _git_metadata(workdir: Path) -> tuple[str | None, bool | None, list[str]]:
     """Collect best-effort Git identity without interrupting an Agent run."""
     errors: list[str] = []
 
+    def valid_git_marker(marker: Path) -> bool:
+        """Ignore unrelated or half-created parent directories named .git."""
+        try:
+            if marker.is_dir():
+                return (marker / "HEAD").is_file()
+            if not marker.is_file():
+                return False
+            prefix = "gitdir:"
+            text = marker.read_text(encoding="utf-8", errors="replace").strip()
+            if not text.lower().startswith(prefix):
+                return False
+            target = Path(text[len(prefix):].strip())
+            if not target.is_absolute():
+                target = (marker.parent / target).resolve()
+            return target.is_dir() and (target / "HEAD").is_file()
+        except OSError:
+            return False
+
     try:
         resolved = workdir.resolve()
         git_root = next(
             (
                 candidate
                 for candidate in (resolved, *resolved.parents)
-                if (candidate / ".git").exists()
+                if valid_git_marker(candidate / ".git")
             ),
             None,
         )

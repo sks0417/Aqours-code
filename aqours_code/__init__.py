@@ -17,7 +17,6 @@ def bootstrap():
         context,
         cron,
         hooks,
-        knowledge,
         mcp,
         message_bus,
         prompts,

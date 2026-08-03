@@ -42,7 +42,6 @@ class FakeClient:
 
 
 def install_common_agent_mocks(monkeypatch):
-    monkeypatch.setattr(agent_loop, "rounds_since_todo", 0)
     monkeypatch.setattr(agent_loop, "consume_cron_queue", lambda: [])
     monkeypatch.setattr(agent_loop, "collect_background_results", lambda: [])
     monkeypatch.setattr(agent_loop, "prepare_context", lambda messages: messages)
@@ -213,20 +212,16 @@ def test_tool_use_then_text_completes_full_round(monkeypatch):
     assert messages[-1]["content"][0].text == "all done"
 
 
-def test_multi_step_task_requires_todo_before_tools(tmp_path, monkeypatch):
+def test_multi_step_task_can_edit_without_todo(tmp_path, monkeypatch):
     from aqours_code import basic_tools
 
     install_common_agent_mocks(monkeypatch)
     monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
     monkeypatch.setattr(basic_tools, "WORKDIR", tmp_path)
     fake_client = FakeClient([
-        response([tool_block("write_file", {"path": "a.txt", "content": "too early"})]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Create files", "status": "in_progress"},
-            {"content": "Read files", "status": "pending"},
-            {"content": "Summarize", "status": "pending"},
-        ]})]),
-        response([tool_block("write_file", {"path": "a.txt", "content": "after todo"})]),
+        response([tool_block("write_file", {
+            "path": "a.txt", "content": "written without a checklist",
+        })]),
         response([text_block("all done")]),
     ])
     monkeypatch.setattr(agent_loop, "client", fake_client)
@@ -244,13 +239,12 @@ def test_multi_step_task_requires_todo_before_tools(tmp_path, monkeypatch):
         for block in message["content"]
         if isinstance(block, dict) and block.get("type") == "tool_result"
     ]
-    assert tool_results[0]["content"].startswith(
-        "Tool not run: before changing files")
-    assert (tmp_path / "a.txt").read_text() == "after todo"
+    assert tool_results[0]["content"].startswith("Wrote")
+    assert (tmp_path / "a.txt").read_text() == "written without a checklist"
     assert messages[-1]["content"][0].text == "all done"
 
 
-def test_complex_code_task_allows_contract_read_before_todo(tmp_path, monkeypatch):
+def test_todo_is_optional_for_code_changes(tmp_path, monkeypatch):
     from aqours_code import basic_tools
 
     install_common_agent_mocks(monkeypatch)
@@ -261,17 +255,12 @@ def test_complex_code_task_allows_contract_read_before_todo(tmp_path, monkeypatc
     (tmp_path / "service.py").write_text("broken = True\n", encoding="utf-8")
     fake_client = FakeClient([
         response([tool_block("read_file", {"path": "README.md"}, "read_contract")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Fix service", "status": "in_progress", "kind": "plan"},
-            {"content": "Preserve the public API", "status": "completed",
-             "kind": "acceptance", "evidence": "README contract inspected"},
-        ]}, "todo_after_read")]),
         response([tool_block(
             "edit_file",
             {"path": "service.py", "old_text": "broken", "new_text": "fixed"},
-            "edit_after_contract",
+            "edit_without_todo",
         )]),
-        response([text_block("done without forced review")]),
+        response([text_block("done without a checklist")]),
     ])
     monkeypatch.setattr(agent_loop, "client", fake_client)
 
@@ -279,81 +268,81 @@ def test_complex_code_task_allows_contract_read_before_todo(tmp_path, monkeypatc
         "role": "user",
         "content": "Fix this README contract bug, preserve the API, and run tests.",
     }]
+    agent_loop.agent_loop(messages, {})
+
+    assert (tmp_path / "service.py").read_text(encoding="utf-8") == "fixed = True\n"
+    assert len(fake_client.messages.calls) == 3
+    assert messages[-1]["content"][0].text == "done without a checklist"
+
+
+def test_todo_write_uses_a_lightweight_schema_and_stable_ids():
+    from aqours_code import basic_tools
+
+    basic_tools.CURRENT_TODOS.clear()
     try:
-        agent_loop.agent_loop(messages, {})
+        output = basic_tools.run_todo_write([
+            {"content": "Implement rollback", "status": "in_progress"},
+            {"content": "Run rollback tests", "status": "pending"},
+        ])
+
+        assert output == "Updated 2 todos"
+        assert basic_tools.CURRENT_TODOS == [
+            {
+                "id": "todo:1",
+                "content": "Implement rollback",
+                "status": "in_progress",
+            },
+            {
+                "id": "todo:2",
+                "content": "Run rollback tests",
+                "status": "pending",
+            },
+        ]
+
+        updated = basic_tools.run_todo_write([
+            {
+                "id": "todo:1",
+                "content": "Implement safe rollback",
+                "status": "completed",
+            },
+            {"id": "todo:2", "status": "in_progress"},
+        ])
+        assert updated == "Updated 2 todos"
+        assert [item["id"] for item in basic_tools.CURRENT_TODOS] == [
+            "todo:1", "todo:2",
+        ]
+        assert [item["status"] for item in basic_tools.CURRENT_TODOS] == [
+            "completed", "in_progress",
+        ]
+        assert basic_tools.CURRENT_TODOS[0]["content"] == (
+            "Implement safe rollback"
+        )
     finally:
         basic_tools.CURRENT_TODOS.clear()
 
-    read_result = messages[2]["content"][0]["content"]
-    assert read_result == "Contract: preserve the public API."
-    assert "Tool not run" not in read_result
-    assert (tmp_path / "service.py").read_text(encoding="utf-8") == "fixed = True\n"
-    assert len(fake_client.messages.calls) == 4
-    assert not any(
-        "<acceptance_review>" in str(message.get("content"))
-        or "<pre_final_review" in str(message.get("content"))
-        for call in fake_client.messages.calls
-        for message in call["messages"]
-    )
-    assert messages[-1]["content"][0].text == "done without forced review"
 
-
-def test_completed_acceptance_todo_requires_evidence():
+def test_deprecated_todo_fields_are_discarded():
     from aqours_code import basic_tools
 
     basic_tools.CURRENT_TODOS.clear()
     try:
         output = basic_tools.run_todo_write([{
-            "content": "UnknownSku leaves inventory unchanged",
+            "content": "Run regression tests",
             "status": "completed",
             "kind": "acceptance",
+            "evidence": "tests passed",
+            "evidence_sources": {"tests": ["pytest"]},
         }])
 
-        assert output.startswith("Error:")
-        assert "requires evidence" in output
-        assert basic_tools.CURRENT_TODOS == []
-
-        output = basic_tools.run_todo_write([{
-            "content": "UnknownSku leaves inventory unchanged",
+        assert output == "Updated 1 todos"
+        assert basic_tools.CURRENT_TODOS == [{
+            "id": "todo:1",
+            "content": "Run regression tests",
             "status": "completed",
-            "kind": "acceptance",
-            "evidence": "rollback test passes",
-        }])
-        assert output == "Updated 1 todos (1 acceptance, 0 unverified)"
-        assert basic_tools.CURRENT_TODOS[0]["id"] == "accept:1"
-
-        expanded = basic_tools.run_todo_write([
-            {"content": f"contract {index}", "status": "pending",
-             "kind": "acceptance"}
-            for index in range(15)
-        ])
-        assert expanded == "Updated 15 todos (15 acceptance, 15 unverified)"
-
-        mixed = basic_tools.run_todo_write([
-            *[
-                {"content": f"plan {index}", "status": "pending",
-                 "kind": "plan"}
-                for index in range(14)
-            ],
-            *[
-                {"content": f"acceptance {index}", "status": "pending",
-                 "kind": "acceptance"}
-                for index in range(11)
-            ],
-        ])
-        assert mixed == "Updated 25 todos (11 acceptance, 11 unverified)"
-
-        acceptance_only = basic_tools.run_todo_write([
-            {"content": f"contract {index}", "status": "pending",
-             "kind": "acceptance"}
-            for index in range(32)
-        ])
-        assert acceptance_only == (
-            "Updated 32 todos (32 acceptance, 32 unverified)")
+        }]
 
         oversized = basic_tools.run_todo_write([
-            {"content": f"contract {index}", "status": "pending",
-             "kind": "acceptance"}
+            {"content": f"step {index}", "status": "pending"}
             for index in range(33)
         ])
         assert oversized == "Error: todos may contain at most 32 items"
@@ -361,326 +350,22 @@ def test_completed_acceptance_todo_requires_evidence():
         basic_tools.CURRENT_TODOS.clear()
 
 
-def test_acceptance_guidance_covers_alias_and_recursive_fan_in_boundaries():
-    guidance = agent_loop.acceptance_required_message()
-    coverage = agent_loop.acceptance_coverage_message()
-
-    assert "deep-copy/alias-isolation" in guidance
-    assert "shared-dependency fan-in" in guidance
-    assert "input-storage-return-replay alias isolation" in coverage
-    assert "shared-dependency fan-in deduplication" in coverage
-
-
-def test_complex_code_task_requires_acceptance_before_edit_without_forced_review(
-    tmp_path, monkeypatch,
-):
+def test_unfinished_todo_gets_one_final_reminder(monkeypatch):
     from aqours_code import basic_tools
 
     install_common_agent_mocks(monkeypatch)
-    monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
-    monkeypatch.setattr(basic_tools, "WORKDIR", tmp_path)
-    (tmp_path / "service.py").write_text("broken = True\n", encoding="utf-8")
-    (tmp_path / "README.md").write_text(
-        "Contract: UnknownSku leaves inventory unchanged.\n", encoding="utf-8")
-    contract = "UnknownSku leaves inventory unchanged"
+    pending = "Run the focused regression test"
     fake_client = FakeClient([
         response([tool_block("todo_write", {"todos": [
-            {"content": "Fix service", "status": "in_progress"},
-        ]}, "todo_plan_only")]),
-        response([tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "broken", "new_text": "fixed"},
-            "edit_too_early",
-        )]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Fix service", "status": "in_progress", "kind": "plan"},
-            {"content": contract, "status": "pending", "kind": "acceptance"},
-        ]}, "todo_with_contract")]),
-        response([tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "broken", "new_text": "fixed"},
-            "edit_after_contract",
-        )]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Fix service", "status": "completed", "kind": "plan"},
-            {"content": contract, "status": "pending", "kind": "acceptance"},
-        ]}, "todo_ready_for_review")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Fix service", "status": "completed", "kind": "plan"},
-            {"content": contract, "status": "completed", "kind": "acceptance",
-             "evidence": "service.py diff reviewed and rollback test passes"},
-        ]}, "todo_verified")]),
-        response([text_block("verified and complete")]),
-    ])
-    monkeypatch.setattr(agent_loop, "client", fake_client)
-
-    messages = [{
-        "role": "user",
-        "content": ("Fix the code according to the README contract, preserve the "
-                    "public API, and run tests."),
-    }]
-    try:
-        agent_loop.agent_loop(messages, {})
-        final_todos = [dict(todo) for todo in basic_tools.CURRENT_TODOS]
-    finally:
-        basic_tools.CURRENT_TODOS.clear()
-
-    tool_results = [
-        block["content"]
-        for message in messages
-        if message.get("role") == "user" and isinstance(message.get("content"), list)
-        for block in message["content"]
-        if isinstance(block, dict) and block.get("type") == "tool_result"
-    ]
-    assert "Acceptance checklist required" in tool_results[0]
-    assert tool_results[1].startswith("Tool not run: before changing files")
-    assert sum(
-        "<acceptance_coverage_check>" in result for result in tool_results
-    ) == 1
-    assert (tmp_path / "service.py").read_text(encoding="utf-8") == "fixed = True\n"
-    assert len(fake_client.messages.calls) == 7
-    assert not any(
-        "You are the review role" in call["system"]
-        or any(
-            "<acceptance_review>" in str(message.get("content"))
-            for message in call["messages"]
-        )
-        for call in fake_client.messages.calls
-    )
-    assert final_todos[-1]["evidence"].startswith("service.py diff")
-    assert messages[-1]["content"][0].text == "verified and complete"
-
-
-def test_acceptance_items_cannot_be_silently_removed_or_rewritten(
-    tmp_path, monkeypatch,
-):
-    from aqours_code import basic_tools
-
-    install_common_agent_mocks(monkeypatch)
-    monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
-    monkeypatch.setattr(basic_tools, "WORKDIR", tmp_path)
-    (tmp_path / "fingerprint.py").write_text("old = True\n", encoding="utf-8")
-    (tmp_path / "README.md").write_text(
-        "Contract: fingerprint includes sku and quantity.\n", encoding="utf-8")
-    contract = "Fingerprint includes sku and quantity"
-    fake_client = FakeClient([
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Fix fingerprint", "status": "in_progress", "kind": "plan"},
-            {"content": contract, "status": "pending", "kind": "acceptance"},
-        ]}, "todo_contract")]),
-        response([tool_block("edit_file", {
-            "path": "fingerprint.py", "old_text": "old", "new_text": "new",
-        }, "edit_contract")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Fix fingerprint", "status": "completed", "kind": "plan"},
-            {"content": "Ensure sku and quantity are fingerprinted",
-             "status": "pending", "kind": "acceptance"},
-        ]}, "todo_reworded_contract")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Fix fingerprint", "status": "completed", "kind": "plan"},
-        ]}, "todo_removed_contract")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Fix fingerprint", "status": "completed", "kind": "plan"},
-            {"content": contract, "status": "completed", "kind": "acceptance",
-             "evidence": "fingerprint regression passes"},
-        ]}, "todo_restored_contract")]),
-        response([text_block("done")]),
-    ])
-    monkeypatch.setattr(agent_loop, "client", fake_client)
-    messages = [{
-        "role": "user",
-        "content": "Fix this README contract bug, preserve behavior, and run tests.",
-    }]
-    try:
-        agent_loop.agent_loop(messages, {})
-    finally:
-        basic_tools.CURRENT_TODOS.clear()
-
-    results = [
-        block["content"]
-        for message in messages
-        if message.get("role") == "user" and isinstance(message.get("content"), list)
-        for block in message["content"]
-        if isinstance(block, dict) and block.get("type") == "tool_result"
-    ]
-    assert any(
-        "Protected acceptance criteria preserved" in result
-        and "kept wording" in result
-        and contract in result
-        for result in results
-    )
-    assert any(
-        "Protected acceptance criteria preserved" in result
-        and "restored omitted item" in result
-        and contract in result
-        for result in results
-    )
-    assert (tmp_path / "fingerprint.py").read_text(encoding="utf-8") == "new = True\n"
-    assert messages[-1]["content"][0].text == "done"
-
-
-def test_completed_acceptance_does_not_force_fresh_contract_audit(
-    tmp_path, monkeypatch,
-):
-    from aqours_code import basic_tools
-
-    install_common_agent_mocks(monkeypatch)
-    monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
-    monkeypatch.setattr(basic_tools, "WORKDIR", tmp_path)
-    (tmp_path / "README.md").write_text(
-        "Contract A: retries are stable.\n"
-        "Contract B: different payloads conflict.\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "service.py").write_text(
-        "retry_fixed = False\nconflict_fixed = False\n", encoding="utf-8")
-    contract_a = "Retries are stable"
-    contract_b = "Different payloads conflict"
-    fake_client = FakeClient([
-        response([tool_block("read_file", {"path": "README.md"}, "initial_read")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Implement consistency fixes", "status": "in_progress",
-             "kind": "plan"},
-            {"content": contract_a, "status": "pending", "kind": "acceptance"},
-        ]}, "initial_todo")]),
-        response([tool_block("edit_file", {
-            "path": "service.py", "old_text": "retry_fixed = False",
-            "new_text": "retry_fixed = True",
-        }, "first_edit")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Implement consistency fixes", "status": "completed",
-             "kind": "plan"},
-            {"content": contract_a, "status": "completed", "kind": "acceptance",
-             "evidence": "retry diff reviewed"},
-        ]}, "premature_complete")]),
-        response([text_block("complete before fresh audit")]),
-        response([tool_block("read_file", {"path": "README.md"}, "audit_read")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Implement omitted conflict behavior", "status": "in_progress",
-             "kind": "plan"},
-            {"content": contract_a, "status": "completed", "kind": "acceptance",
-             "evidence": "retry diff reviewed"},
-            {"content": contract_b, "status": "pending", "kind": "acceptance"},
-        ]}, "audit_adds_missing")]),
-        response([tool_block("edit_file", {
-            "path": "service.py", "old_text": "conflict_fixed = False",
-            "new_text": "conflict_fixed = True",
-        }, "missing_fix")]),
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Implement omitted conflict behavior", "status": "completed",
-             "kind": "plan"},
-            {"content": contract_a, "status": "completed", "kind": "acceptance",
-             "evidence": "retry diff audited"},
-            {"content": contract_b, "status": "completed", "kind": "acceptance",
-             "evidence": "README and conflict diff audited"},
-        ]}, "audit_complete")]),
-        response([text_block("complete after fresh audit")]),
-    ])
-    monkeypatch.setattr(agent_loop, "client", fake_client)
-    messages = [{
-        "role": "user",
-        "content": "Fix this README consistency bug, preserve behavior, and run tests.",
-    }]
-    try:
-        agent_loop.agent_loop(messages, {})
-        final_todos = [dict(todo) for todo in basic_tools.CURRENT_TODOS]
-    finally:
-        basic_tools.CURRENT_TODOS.clear()
-
-    assert len(fake_client.messages.calls) == 5
-    assert not any(
-        "<acceptance_review>" in str(message.get("content"))
-        or "<pre_final_review" in str(message.get("content"))
-        for call in fake_client.messages.calls
-        for message in call["messages"]
-    )
-    assert not any(todo["content"] == contract_b for todo in final_todos)
-    assert all(todo["status"] == "completed" for todo in final_todos)
-    assert "conflict_fixed = False" in (
-        tmp_path / "service.py").read_text(encoding="utf-8")
-    assert messages[-1]["content"][0].text == "complete before fresh audit"
-
-
-def test_completed_acceptance_has_no_forced_audit_read_budget(
-    tmp_path, monkeypatch,
-):
-    from aqours_code import basic_tools
-
-    install_common_agent_mocks(monkeypatch)
-    monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
-    monkeypatch.setattr(basic_tools, "WORKDIR", tmp_path)
-    for path in ("README.md", "service.py", "extra_a.py", "extra_b.py",
-                 "extra_c.py"):
-        (tmp_path / path).write_text(f"content for {path}\n", encoding="utf-8")
-    contract = "Reservation retries preserve state"
-    completed = [
-        {"content": "Implement reservation fix", "status": "completed",
-         "kind": "plan"},
-        {"content": contract, "status": "completed", "kind": "acceptance",
-         "evidence": "service diff and tests reviewed"},
-    ]
-    fake_client = FakeClient([
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Implement reservation fix", "status": "in_progress",
-             "kind": "plan"},
-            {"content": contract, "status": "pending", "kind": "acceptance"},
-        ]}, "initial_todo")]),
-        response([tool_block("edit_file", {
-            "path": "service.py", "old_text": "content for service.py",
-            "new_text": "fixed service",
-        }, "service_edit")]),
-        response([tool_block("todo_write", {"todos": completed}, "complete")]),
-        response([text_block("ready for final")]),
-        response([
-            tool_block("read_file", {"path": "README.md"}, "audit_readme"),
-            tool_block("read_file", {"path": "./README.md"}, "audit_duplicate"),
-            tool_block("glob", {"pattern": "**/*.py"}, "audit_glob"),
-            tool_block("read_file", {"path": "service.py"}, "audit_changed"),
-            tool_block("read_file", {"path": "extra_a.py"}, "audit_third"),
-            tool_block("read_file", {"path": "extra_b.py"}, "audit_fourth"),
-            tool_block("read_file", {"path": "extra_c.py"}, "audit_over_budget"),
-            tool_block("todo_write", {"todos": completed}, "audit_todo"),
-        ]),
-        response([text_block("done after scoped audit")]),
-    ])
-    monkeypatch.setattr(agent_loop, "client", fake_client)
-    messages = [{
-        "role": "user",
-        "content": "Fix the README reservation contract, preserve behavior, and run tests.",
-    }]
-    try:
-        agent_loop.agent_loop(messages, {})
-    finally:
-        basic_tools.CURRENT_TODOS.clear()
-
-    assert len(fake_client.messages.calls) == 4
-    assert not any(
-        "<acceptance_review>" in str(message.get("content"))
-        or "read budget" in str(message.get("content")).lower()
-        for call in fake_client.messages.calls
-        for message in call["messages"]
-    )
-    assert messages[-1]["content"][0].text == "ready for final"
-
-
-def test_unfinished_acceptance_gets_one_generic_todo_followup(monkeypatch):
-    from aqours_code import basic_tools
-
-    install_common_agent_mocks(monkeypatch)
-    contract = "All documented errors preserve repository state"
-    fake_client = FakeClient([
-        response([tool_block("todo_write", {"todos": [
-            {"content": "Apply fix", "status": "completed", "kind": "plan"},
-            {"content": contract, "status": "pending", "kind": "acceptance"},
-        ]}, "todo_unverified")]),
+            {"content": "Apply fix", "status": "completed"},
+            {"content": pending, "status": "pending"},
+        ]}, "todo_pending")]),
         response([text_block("everything is complete too early")]),
         response([text_block("still incomplete")]),
     ])
     monkeypatch.setattr(agent_loop, "client", fake_client)
-    messages = [{
-        "role": "user",
-        "content": "Fix the README contract bug, preserve the API, and run tests.",
-    }]
+    messages = [{"role": "user", "content": "Fix the bug and run tests."}]
+
     try:
         agent_loop.agent_loop(messages, {})
     finally:
@@ -688,14 +373,14 @@ def test_unfinished_acceptance_gets_one_generic_todo_followup(monkeypatch):
 
     assert len(fake_client.messages.calls) == 3
     assert any(
-        "<todo_completion_gate>" in str(message.get("content"))
-        and contract in str(message.get("content"))
+        "<todo_completion_reminder>" in str(message.get("content"))
+        and pending in str(message.get("content"))
         for message in fake_client.messages.calls[-1]["messages"]
     )
     final_text = agent_loop.extract_text(messages[-1]["content"])
     assert "still incomplete" in final_text
-    assert "Acceptance review incomplete" in final_text
-    assert contract in final_text
+    assert "Todo checklist incomplete" in final_text
+    assert pending in final_text
 
 
 def test_max_tokens_triggers_continuation_path(monkeypatch):
@@ -776,7 +461,6 @@ def test_real_context_pipeline_keeps_eight_reads_visible_before_edit(
                 )])
             return response([text_block("inspected and edited")])
 
-    monkeypatch.setattr(agent_loop, "rounds_since_todo", 0)
     monkeypatch.setattr(basic_tools, "WORKDIR", tmp_path)
     client = InspectThenEditClient()
 

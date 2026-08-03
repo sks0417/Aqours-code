@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -67,11 +68,46 @@ def test_explicit_runtime_controls_file_tools_and_todos(tmp_path, monkeypatch):
     result = basic_tools.run_todo_write([{
         "content": "verify A",
         "status": "pending",
-        "kind": "acceptance",
     }], runtime=runtime_a)
-    assert result == "Updated 1 todos (1 acceptance, 1 unverified)"
-    assert runtime_a.state.todos[0]["id"] == "accept:1"
+    assert result == "Updated 1 todos"
+    assert runtime_a.state.todos[0]["id"] == "todo:1"
     assert runtime_b.state.todos == []
+
+
+def test_read_observation_records_digest_without_parallel_working_memory(
+    tmp_path, monkeypatch,
+):
+    runtime = make_runtime(tmp_path)
+    source = tmp_path / "src" / "value.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("value = 1\n", encoding="utf-8")
+    events = []
+    monkeypatch.setattr(
+        basic_tools,
+        "record_event",
+        lambda event_type, **data: events.append({
+            "type": event_type, **data,
+        }),
+    )
+
+    assert basic_tools.run_read(
+        "./src/value.py",
+        runtime=runtime,
+        _tool_use_id="read-1",
+    ) == "value = 1"
+
+    assert not hasattr(runtime.state, "knowledge")
+    assert events == [{
+        "type": "read_observation",
+        "tool_use_id": "read-1",
+        "path": "src/value.py",
+        "digest": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "offset": 0,
+        "limit": None,
+        "range_start": 0,
+        "range_end": 1,
+        "compact_generation": 0,
+    }]
 
 
 def test_context_and_prompt_read_runtime_owned_paths_and_policy(tmp_path):
@@ -91,17 +127,16 @@ def test_context_and_prompt_read_runtime_owned_paths_and_policy(tmp_path):
         },
     )
     runtime.state.todos.append({
-        "id": "accept:1",
+        "id": "todo:1",
         "content": "preserve behavior",
         "status": "pending",
-        "kind": "acceptance",
     })
 
     live_context = context.update_context({}, [], runtime)
     prompt = prompts.assemble_system_prompt(live_context, runtime)
 
     assert live_context["memories"] == "RUNTIME_MEMORY"
-    assert live_context["acceptance_todos"] == runtime.state.todos
+    assert live_context["todos"] == runtime.state.todos
     assert str(runtime.paths.workdir) in prompt
     assert "RUNTIME_MEMORY" in prompt
     assert "preserve behavior" in prompt

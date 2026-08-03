@@ -16,6 +16,7 @@ def _clean_env() -> dict[str, str]:
         "AQOURS_CODE_BASE_URL",
         "AQOURS_CODE_MODEL",
         "AQOURS_CODE_PROVIDER",
+        "AQOURS_CODE_CONTEXT_LIMIT_TOKENS",
     ):
         env.pop(name, None)
     env["PYTHONPATH"] = str(PROJECT_ROOT)
@@ -52,6 +53,48 @@ def test_cli_fails_early_with_actionable_missing_configuration(tmp_path):
     assert "AQOURS_CODE_API_KEY" in result.stderr
     assert "AQOURS_CODE_BASE_URL" in result.stderr
     assert "AQOURS_CODE_MODEL" in result.stderr
+
+
+def test_cli_rejects_out_of_range_context_window(tmp_path):
+    env = _clean_env()
+    env.update({
+        "AQOURS_CODE_PROVIDER": "openai_compatible",
+        "AQOURS_CODE_API_KEY": "test-key",
+        "AQOURS_CODE_BASE_URL": "https://example.invalid/v1",
+        "AQOURS_CODE_MODEL": "test-model",
+        "AQOURS_CODE_CONTEXT_LIMIT_TOKENS": "8000",
+    })
+    result = subprocess.run(
+        [sys.executable, "-m", "aqours_code"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 2
+    assert "AQOURS_CODE_CONTEXT_LIMIT_TOKENS" in result.stderr
+
+
+def test_context_window_environment_setting_is_token_based(tmp_path):
+    env = _clean_env()
+    env["AQOURS_CODE_CONTEXT_LIMIT_TOKENS"] = "96000"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from aqours_code.config import CONTEXT_LIMIT; print(CONTEXT_LIMIT)",
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "288000"
 
 
 def test_configured_cli_starts_without_printing_api_key(tmp_path):
