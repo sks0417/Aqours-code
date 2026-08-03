@@ -8,13 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from codepilot_s20 import agent_loop, basic_tools, runtime_state
-from codepilot_s20.command_executor import (
+from aqours_code import agent_loop, basic_tools, runtime_state
+from aqours_code.command_executor import (
     DockerCommandExecutor,
     LocalCommandExecutor,
     SandboxError,
 )
-from codepilot_s20.docker_utils import host_container_user, normalize_bind_source
+from aqours_code.docker_utils import host_container_user, normalize_bind_source
 from evals import run_eval
 from evals.docker_sandbox import (
     DockerAgentRunner,
@@ -112,7 +112,7 @@ def test_full_agent_container_is_one_shot_entrypoint_with_isolated_mounts(tmp_pa
     assert "--read-only" in args
     assert "sleep" not in args and "infinity" not in args
     assert args[-5:] == [
-        "python", "-m", "codepilot_s20.eval_container_entry",
+        "python", "-m", "aqours_code.eval_container_entry",
         "--config", "/runtime/input.json",
     ]
     mounts = [args[index + 1] for index, value in enumerate(args)
@@ -161,10 +161,10 @@ def test_eval_image_build_uses_project_root_and_installs_runtime_and_git(tmp_pat
     assert "PIP_DEFAULT_TIMEOUT=60" in dockerfile
     assert "PIP_RETRIES=8" in dockerfile
     assert "--mount=type=cache,target=/root/.cache/pip,sharing=locked" in dockerfile
-    assert "PYTHONPATH=/opt/codepilot-src" in dockerfile
-    assert 'python -c "import codepilot_s20.eval_container_entry"' in dockerfile
-    assert "pip install --no-cache-dir --no-deps /opt/codepilot-src" not in dockerfile
-    assert "COPY codepilot_s20 /opt/codepilot-src/codepilot_s20" in dockerfile
+    assert "PYTHONPATH=/opt/aqours-code-src" in dockerfile
+    assert 'python -c "import aqours_code.eval_container_entry"' in dockerfile
+    assert "pip install --no-cache-dir --no-deps /opt/aqours-code-src" not in dockerfile
+    assert "COPY aqours_code /opt/aqours-code-src/aqours_code" in dockerfile
     assert "--trusted-host" not in dockerfile
 
     dependency_copy = dockerfile.index(
@@ -172,9 +172,9 @@ def test_eval_image_build_uses_project_root_and_installs_runtime_and_git(tmp_pat
     dependency_install = dockerfile.index(
         "python -m pip install --requirement /tmp/requirements.lock")
     source_copy = dockerfile.index(
-        "COPY codepilot_s20 /opt/codepilot-src/codepilot_s20")
+        "COPY aqours_code /opt/aqours-code-src/aqours_code")
     runtime_import_check = dockerfile.index(
-        'python -c "import codepilot_s20.eval_container_entry"')
+        'python -c "import aqours_code.eval_container_entry"')
     assert dependency_copy < dependency_install < source_copy < runtime_import_check
 
 
@@ -301,7 +301,7 @@ def test_workspace_write_probe_runs_as_non_root(tmp_path):
     probe_args = runner.calls[1][0]
     assert run_args[run_args.index("--user") + 1] == "1234:5678"
     assert probe_args[:2] == ["docker", "exec"]
-    assert "codepilot-write-probe" in probe_args[-1]
+    assert "aqours-code-write-probe" in probe_args[-1]
 
 
 def test_normal_stop_records_real_exit_code_and_successful_removal(tmp_path):
@@ -527,14 +527,14 @@ def test_docker_eval_integration_smoke(tmp_path):
     if available.returncode != 0:
         pytest.skip("Docker daemon is unavailable")
 
-    image = os.getenv("CODEPILOT_EVAL_TEST_IMAGE", "codepilot-s20-eval:test")
-    if "CODEPILOT_EVAL_TEST_IMAGE" not in os.environ:
+    image = os.getenv("AQOURS_CODE_EVAL_TEST_IMAGE", "aqours-code-eval:test")
+    if "AQOURS_CODE_EVAL_TEST_IMAGE" not in os.environ:
         build_eval_image(project_root=run_eval.PROJECT_ROOT, image=image)
     image_probe = subprocess.run(
         [
             "docker", "run", "--rm", "--network", "none", image,
             "/bin/sh", "-lc",
-            "python -c 'import codepilot_s20' && git --version",
+            "python -c 'import aqours_code' && git --version",
         ],
         capture_output=True, text=True, timeout=30,
     )
@@ -553,7 +553,7 @@ def test_docker_eval_integration_smoke(tmp_path):
         event for event in run_eval.read_trace_events(Path(tests_result["trace"]))
         if event.get("type") == "tool_policy"
     ]
-    from codepilot_s20.tool_defs import TOOL_REGISTRY
+    from aqours_code.tool_defs import TOOL_REGISTRY
     assert set(policy_events[-1]["allowed_tools"]) == set(
         TOOL_REGISTRY.names_for_role("lead")
     )

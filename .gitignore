@@ -18,7 +18,7 @@ dist/
 htmlcov/
 
 # Runtime state and local agent artifacts
-.codepilot/
+.aqours_code/
 .mailboxes/
 .tasks/
 .task_outputs/

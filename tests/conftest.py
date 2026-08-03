@@ -10,16 +10,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-os.environ.setdefault("CODEPILOT_S20_WORKDIR", tempfile.mkdtemp(prefix="codepilot_s20_collect_"))
+os.environ.setdefault("AQOURS_CODE_WORKDIR", tempfile.mkdtemp(prefix="aqours_code_collect_"))
 
 
 @pytest.fixture(autouse=True)
-def isolated_s20_state(tmp_path, monkeypatch):
-    from codepilot_s20 import bootstrap
+def isolated_aqours_code_state(tmp_path, monkeypatch):
+    from aqours_code import bootstrap
     bootstrap()
-    from codepilot_s20 import runtime_state, message_bus, protocol, task_system, hooks, trace
+    from aqours_code import runtime_state, message_bus, protocol, task_system, hooks, trace
 
-    monkeypatch.setenv("CODEPILOT_S20_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("AQOURS_CODE_WORKDIR", str(tmp_path))
     mailbox_dir = tmp_path / ".mailboxes"
     tasks_dir = tmp_path / ".tasks"
     mailbox_dir.mkdir(parents=True, exist_ok=True)

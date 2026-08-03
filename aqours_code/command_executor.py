@@ -115,7 +115,7 @@ class DockerCommandExecutor:
         self.overall_timeout = float(overall_timeout) if overall_timeout is not None else None
         self.docker_timeout = float(docker_timeout)
         self.runner = runner
-        self.container_name = container_name or f"codepilot-agent-{self.case_name}-{uuid.uuid4().hex[:10]}"
+        self.container_name = container_name or f"aqours-code-agent-{self.case_name}-{uuid.uuid4().hex[:10]}"
         self.container_user = container_user or host_container_user()
         self.verify_workspace_write = verify_workspace_write
         self.operation_deadline = operation_deadline
@@ -209,7 +209,7 @@ class DockerCommandExecutor:
                 probe = self.runner(
                     ["docker", "exec", "--workdir", "/workspace",
                      self.container_name, "/bin/sh", "-lc",
-                     "umask 077; p=.codepilot-write-probe-$$; : > \"$p\" && rm -f \"$p\""],
+                     "umask 077; p=.aqours-code-write-probe-$$; : > \"$p\" && rm -f \"$p\""],
                     capture_output=True,
                     text=True,
                     timeout=self._timeout(10),

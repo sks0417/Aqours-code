@@ -24,8 +24,8 @@ from types import SimpleNamespace
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
-os.environ.setdefault("MODEL_REQUEST_TIMEOUT", "30")
-os.environ.setdefault("MODEL_MAX_RETRIES", "1")
+os.environ.setdefault("AQOURS_CODE_REQUEST_TIMEOUT", "30")
+os.environ.setdefault("AQOURS_CODE_MODEL_MAX_RETRIES", "1")
 
 
 def load_env_file(path: Path):
@@ -46,8 +46,8 @@ load_env_file(PROJECT_ROOT / ".env")
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from codepilot_s20.agent_loop import run_agent_task  # noqa: E402
-from codepilot_s20.command_executor import (  # noqa: E402
+from aqours_code.agent_loop import run_agent_task  # noqa: E402
+from aqours_code.command_executor import (  # noqa: E402
     CaseTimeoutError,
     DockerCommandExecutor,
     LocalCommandExecutor,
@@ -58,22 +58,25 @@ from evals.docker_sandbox import (  # noqa: E402
     DockerGraderRunner,
     build_eval_image,
 )
-from codepilot_s20.docker_utils import prepare_disposable_tree  # noqa: E402
-from codepilot_s20.config import (  # noqa: E402
+from aqours_code.docker_utils import prepare_disposable_tree  # noqa: E402
+from aqours_code.config import (  # noqa: E402
+    BASE_URL,
     DEFAULT_MAX_TOKENS,
     ESCALATED_MAX_TOKENS,
     MODEL,
     MODEL_PROVIDER,
     get_model_client,
+    validate_runtime_configuration,
 )
-from codepilot_s20.model_broker import (  # noqa: E402
+from aqours_code.model_api import sanitize_base_url  # noqa: E402
+from aqours_code.model_broker import (  # noqa: E402
     DEFAULT_IPC_DELIVERY_GRACE,
     DEFAULT_PROVIDER_RETRIES,
     DEFAULT_PROVIDER_RETRY_DELAY,
     ModelBroker,
     broker_ipc_wait_timeout,
 )
-from codepilot_s20.trace_analysis import (  # noqa: E402
+from aqours_code.trace_analysis import (  # noqa: E402
     post_compact_redundant_reads,
 )
 from evals.scoring import (  # noqa: E402
@@ -135,7 +138,7 @@ def require_case_time(deadline: float | None, stage: str):
 
 RUNTIME_IGNORE_PATTERNS = [
     ".git/**",
-    ".codepilot/**",
+    ".aqours_code/**",
     ".tasks/**",
     ".task_outputs/**",
     ".transcripts/**",
@@ -185,7 +188,7 @@ DOCKER_EVAL_TOOL_POLICY = {
 @dataclass(frozen=True)
 class EvalExecutionConfig:
     backend: str = "docker"
-    docker_image: str = "codepilot-s20-eval:py311"
+    docker_image: str = "aqours-code-eval:py311"
     docker_memory: str = "1g"
     docker_cpus: str = "1"
     docker_pids_limit: int = 128
@@ -361,7 +364,7 @@ PY"""
         if self.case_name == "_docker_noninteractive_permission_smoke":
             return response([tool_block(
                 "bash",
-                {"command": "echo unsafe > /etc/codepilot-eval"},
+                {"command": "echo unsafe > /etc/aqours-code-eval"},
                 "call_destructive_noninteractive",
             )])
 
@@ -1138,7 +1141,7 @@ def _run_docker_agent_phase(
     (ipc_root / "stats").mkdir(parents=True, exist_ok=True)
     remaining = remaining_timeout(case_deadline)
     provider_timeout, broker_request_timeout = model_broker_timeouts(
-        float(os.getenv("MODEL_REQUEST_TIMEOUT", "30")), remaining)
+        float(os.getenv("AQOURS_CODE_REQUEST_TIMEOUT", "30")), remaining)
     input_payload = {
         "task": task,
         "workspace": "/workspace",
@@ -1149,6 +1152,8 @@ def _run_docker_agent_phase(
         "model_call_budget": model_call_budget,
         "broker_max_provider_retries": DEFAULT_PROVIDER_RETRIES,
         "model": "scripted-eval" if scripted else MODEL,
+        "model_provider": "scripted" if scripted else MODEL_PROVIDER,
+        "base_url": "" if scripted else sanitize_base_url(BASE_URL),
         # request_timeout remains the Provider timeout for backward-compatible
         # runtime configuration. The container waits through one Broker-owned
         # retry plus the final response delivery grace.
@@ -1187,7 +1192,7 @@ def _run_docker_agent_phase(
             "case_deadline": case_deadline,
             "provider_timeout": provider_timeout,
         },),
-        name=f"codepilot-model-broker-{case_name}",
+        name=f"aqours-code-model-broker-{case_name}",
     )
     try:
         broker_process.start()
@@ -1230,7 +1235,7 @@ def _run_docker_agent_phase(
             "container_cleanup_succeeded": runner.cleanup_succeeded,
             "resource_limits": runner.resource_limits,
             "sandbox_error": str(exc),
-            "container_entrypoint": "python -m codepilot_s20.eval_container_entry",
+            "container_entrypoint": "python -m aqours_code.eval_container_entry",
         }
         proc = subprocess.CompletedProcess([], 125, "", str(exc))
     except BaseException as exc:
@@ -1436,7 +1441,7 @@ def _run_isolated_agent_phase(
             "_run_isolated_agent_phase is local-only; Docker must use the "
             "one-shot eval_container_entry path")
     container_name = (
-        f"codepilot-agent-{DockerCommandExecutor._safe_name(case_name)}-"
+        f"aqours-code-agent-{DockerCommandExecutor._safe_name(case_name)}-"
         f"{uuid.uuid4().hex[:10]}"
     )
     case_deadline = case_deadline or (time.monotonic() + config.docker_timeout)
@@ -1466,7 +1471,7 @@ def _run_isolated_agent_phase(
     process = context.Process(
         target=_isolated_local_agent_process,
         args=(payload, child_connection),
-        name=f"codepilot-eval-{case_name}",
+        name=f"aqours-code-eval-{case_name}",
     )
     payload_result = None
     channel_error = ""
@@ -2190,7 +2195,7 @@ def build_summary(*, started: float, cases_dir: Path, run_root: Path,
             None if execution_config.backend != "docker" else bool(results) and all(
                 result.get("model_broker_ipc_cleaned") is True for result in results)),
         "container_entrypoint": (
-            "python -m codepilot_s20.eval_container_entry"
+            "python -m aqours_code.eval_container_entry"
             if execution_config.backend == "docker" else None),
         "tool_policy": (
             DOCKER_EVAL_TOOL_POLICY if execution_config.backend == "docker" else None),
@@ -2334,7 +2339,7 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
         "model_broker_stopped": False if execution_config.backend == "docker" else None,
         "model_broker_ipc_cleaned": False if execution_config.backend == "docker" else None,
         "container_entrypoint": (
-            "python -m codepilot_s20.eval_container_entry"
+            "python -m aqours_code.eval_container_entry"
             if execution_config.backend == "docker" else None),
         "tool_policy": (
             DOCKER_EVAL_TOOL_POLICY if execution_config.backend == "docker" else None),
@@ -2355,14 +2360,14 @@ def write_summary(results_dir: Path, summary: dict):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Codepilot eval cases.")
+    parser = argparse.ArgumentParser(description="Run Aqours_code eval cases.")
     parser.add_argument("--cases-dir", default=str(Path(__file__).parent / "cases"))
     parser.add_argument("--results-dir", default=str(Path(__file__).parent / "results"))
     parser.add_argument("--case", action="append", default=[],
                         help="Run only the named case. Can be provided more than once.")
     parser.add_argument("--list-cases", action="store_true",
                         help="List discovered cases and exit.")
-    parser.add_argument("--request-timeout", type=float, default=float(os.getenv("MODEL_REQUEST_TIMEOUT", "30")),
+    parser.add_argument("--request-timeout", type=float, default=float(os.getenv("AQOURS_CODE_REQUEST_TIMEOUT", "30")),
                         help="Per model HTTP request timeout in seconds. Default: 30.")
     parser.add_argument("--scripted", action="store_true",
                         help="Use the deterministic local scripted client for offline harness smoke tests. By default evals call the configured model API.")
@@ -2370,7 +2375,7 @@ def main() -> int:
                         help=("Run the full Agent Runtime and grader in Docker. "
                               "Use local only as an explicit development compatibility mode. "
                               "Default: docker."))
-    parser.add_argument("--docker-image", default="codepilot-s20-eval:py311",
+    parser.add_argument("--docker-image", default="aqours-code-eval:py311",
                         help="Eval sandbox image name.")
     parser.add_argument("--docker-build", action="store_true",
                         help="Build the pinned eval image before running cases.")
@@ -2383,7 +2388,13 @@ def main() -> int:
     parser.add_argument("--docker-timeout", type=float, default=120,
                         help="Total wall-clock budget for one Docker case, including Agent, grading, and cleanup.")
     args = parser.parse_args()
-    os.environ["MODEL_REQUEST_TIMEOUT"] = str(args.request_timeout)
+    os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = str(args.request_timeout)
+
+    if not args.scripted and not args.list_cases:
+        try:
+            validate_runtime_configuration()
+        except RuntimeError as exc:
+            parser.error(str(exc))
 
     cases_dir = Path(args.cases_dir).resolve()
     results_dir = Path(args.results_dir).resolve()
@@ -2425,7 +2436,7 @@ def main() -> int:
     mode = "scripted" if args.scripted else "real-model"
     print(
         f"[eval] mode={mode} execution={args.execution} cases={len(cases)} request_timeout={args.request_timeout}s "
-        f"provider={os.getenv('MODEL_PROVIDER', '')} model={os.getenv('MODEL_ID', '')}",
+        f"provider={MODEL_PROVIDER} model={MODEL}",
         flush=True,
     )
     if args.execution == "docker" and args.docker_build:

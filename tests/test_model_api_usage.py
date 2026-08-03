@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 
-from codepilot_s20.model_api import (
+from aqours_code.model_api import (
     OpenAICompatibleMessages,
     _messages_to_openai,
     _openai_message_to_response,
     assistant_message_from_response,
-    default_model_for_provider,
+    sanitize_base_url,
 )
 
 
@@ -27,8 +27,10 @@ def test_openai_compatible_response_preserves_provider_usage():
     assert response.usage.total_tokens == 150
 
 
-def test_deepseek_defaults_to_v4_flash():
-    assert default_model_for_provider("deepseek") == "deepseek-v4-flash"
+def test_base_url_metadata_removes_credentials_and_auth_query_values():
+    assert sanitize_base_url(
+        "https://user:password@example.invalid/v1?api-version=1&api_key=secret"
+    ) == "https://example.invalid/v1?api-version=1"
 
 
 def test_deepseek_v4_flash_uses_max_thinking_and_replays_reasoning(
@@ -73,7 +75,7 @@ def test_deepseek_v4_flash_uses_max_thinking_and_replays_reasoning(
         return FakeHttpResponse()
 
     monkeypatch.setattr(
-        "codepilot_s20.model_api.urllib.request.urlopen",
+        "aqours_code.model_api.urllib.request.urlopen",
         fake_urlopen,
     )
     messages = OpenAICompatibleMessages(
@@ -128,7 +130,7 @@ def test_non_deepseek_provider_retains_existing_tool_choice(monkeypatch):
         return FakeHttpResponse()
 
     monkeypatch.setattr(
-        "codepilot_s20.model_api.urllib.request.urlopen",
+        "aqours_code.model_api.urllib.request.urlopen",
         fake_urlopen,
     )
     messages = OpenAICompatibleMessages(

@@ -1,10 +1,10 @@
-# Codepilot S20 Agent 功能概述
+# Aqours_code S20 Agent 功能概述
 
-本文档概述当前 `codepilot_s20` agent 项目的主要能力、运行链路、安全边界、eval harness 和已知限制。
+本文档概述当前 `aqours_code` agent 项目的主要能力、运行链路、安全边界、eval harness 和已知限制。
 
 ## 1. 项目定位
 
-`codepilot_s20` 是一个本地 coding agent 原型，实现了：
+`aqours_code` 是一个本地 coding agent 原型，实现了：
 
 - 多 provider 模型调用适配
 - agent loop
@@ -27,12 +27,12 @@
 
 入口文件：
 
-- `codepilot_s20/main.py`
+- `aqours_code/main.py`
 
 安装为脚本后可通过：
 
 ```powershell
-codepilot-s20
+Aqours_code
 ```
 
 或直接运行模块入口。
@@ -92,20 +92,20 @@ DEEPSEEK_BASE_URL
 OPENAI_API_KEY
 OPENAI_BASE_URL
 FALLBACK_MODEL_ID
-MODEL_REQUEST_TIMEOUT
-MODEL_MAX_RETRIES
+AQOURS_CODE_REQUEST_TIMEOUT
+AQOURS_CODE_MODEL_MAX_RETRIES
 ```
 
 当前模型请求通过 OpenAI-compatible chat completions 形式适配 DeepSeek/OpenAI-compatible provider。
 
 请求超时：
 
-- 默认 `MODEL_REQUEST_TIMEOUT=30`
+- 默认 `AQOURS_CODE_REQUEST_TIMEOUT=30`
 - 可在 eval 中通过 `--request-timeout` 覆盖
 
 重试：
 
-- `MAX_RETRIES` 由 `MODEL_MAX_RETRIES` 控制
+- `MAX_RETRIES` 由 `AQOURS_CODE_MODEL_MAX_RETRIES` 控制
 - eval 默认设置为 1，避免长时间卡住
 
 ## 4. Agent Loop
@@ -346,7 +346,7 @@ PreToolUse
 每次 run 会在 workspace 下创建：
 
 ```text
-.codepilot/runs/<run_id>/
+.aqours_code/runs/<run_id>/
   trace.jsonl
   timeline.jsonl
   timeline.md
@@ -798,7 +798,7 @@ Each case metadata file defines three separate concepts:
 - `forbidden_paths`: files that immediately create a constraint violation if the agent modifies them.
 - `expected_artifacts`: files expected for task success, but not a broad permission to modify everything nearby.
 
-The runner ignores local runtime artifacts such as `.codepilot/`, `.tasks/`,
+The runner ignores local runtime artifacts such as `.aqours_code/`, `.tasks/`,
 `.task_outputs/`, `.transcripts/`, `.mailboxes/`, `.worktrees/`,
 `__pycache__/`, and `*.pyc`; these files are never copied into the grader
 workspace. Common tampering paths such as `pytest.py`, `conftest.py`,
@@ -839,7 +839,7 @@ usage error rather than a fabricated evaluation failure.
 ```text
 host: prepare trusted_eval + agent_workspace + grading_workspace
   -> start per-case Model Broker
-  -> one-shot Agent container: python -m codepilot_s20.eval_container_entry
+  -> one-shot Agent container: python -m aqours_code.eval_container_entry
      -> full Agent Loop + all tools + per-case Harness state
   -> destroy Agent container
 host: snapshot + change manifest + clean grading workspace

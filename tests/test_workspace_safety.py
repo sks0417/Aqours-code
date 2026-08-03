@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from codepilot_s20 import basic_tools, hooks, message_bus, protocol
+from aqours_code import basic_tools, hooks, message_bus, protocol
 
 
 def _bash_block(command: str):

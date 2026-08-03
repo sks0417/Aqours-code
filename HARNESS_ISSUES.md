@@ -81,7 +81,7 @@
 
 **严重性：** P1  
 **状态：** In progress
-**模块：** `codepilot_s20/compact.py`、`codepilot_s20/agent_loop.py`、`codepilot_s20/config.py`
+**模块：** `aqours_code/compact.py`、`aqours_code/agent_loop.py`、`aqours_code/config.py`
 
 ### 现象
 
@@ -538,7 +538,7 @@ Tool Result: | OK | size=0
 
 ### 实施与验证（2026-07-22）
 
-新增共享 `codepilot_s20.trace_analysis`，两个 CLI 不再各自手写 schema。当前字段
+新增共享 `aqours_code.trace_analysis`，两个 CLI 不再各自手写 schema。当前字段
 `tool/content/status/input` 是主路径，旧字段只作兼容；输出包含 event/tool 计数、重复读取、测试命令、
 compact、错误和权限拒绝，预览会折叠长文本并脱敏常见 credential。损坏 JSONL 会报告精确行号并以非零
 状态退出。对真实 `20260722-213701` Trace 的分析得到 327 个事件、50 个工具结果、7 个 compact、
@@ -555,7 +555,7 @@ compact、错误和权限拒绝，预览会折叠长文本并脱敏常见 creden
 ### 现象
 
 2026-07-18 在 HARN-001 修复后执行了未带 `--docker-build` 的 Docker Eval。命令表面正常启动，
-但实际使用的 `codepilot-s20-eval:py311` 镜像已创建约 47 小时，早于 Context 修复。
+但实际使用的 `aqours-code-eval:py311` 镜像已创建约 47 小时，早于 Context 修复。
 
 Trace 明确表现为旧实现：
 
@@ -566,7 +566,7 @@ Trace 明确表现为旧实现：
 
 ### 根因
 
-Dockerfile 使用 `COPY codepilot_s20 /opt/codepilot-src/codepilot_s20` 将 Runtime 固化进镜像。
+Dockerfile 使用 `COPY aqours_code /opt/aqours-code-src/aqours_code` 将 Runtime 固化进镜像。
 `run_eval.py` 只有收到显式 `--docker-build` 时才执行构建；默认路径不会比较当前源码和镜像，
 也不会在 summary 中标记源码版本是否匹配。
 
@@ -591,7 +591,7 @@ Dockerfile 使用 `COPY codepilot_s20 /opt/codepilot-src/codepilot_s20` 将 Runt
 
 - 当前源码与镜像不匹配时，在第一次模型调用前失败；
 - `--docker-build` 后 fingerprint 匹配并正常运行；
-- 修改 `codepilot_s20/compact.py` 后旧镜像会被检测为 stale；
+- 修改 `aqours_code/compact.py` 后旧镜像会被检测为 stale；
 - summary 能证明本次结果对应哪一版 Runtime；
 - 测试使用 mock Docker inspect/build，不要求真实网络。
 
@@ -601,7 +601,7 @@ Dockerfile 使用 `COPY codepilot_s20 /opt/codepilot-src/codepilot_s20` 将 Runt
 
 **严重性：** P1  
 **状态：** Validated
-**模块：** `codepilot_s20/model_broker.py`、`codepilot_s20/eval_container_entry.py`、`codepilot_s20/recovery.py`、`evals/run_eval.py`
+**模块：** `aqours_code/model_broker.py`、`aqours_code/eval_container_entry.py`、`aqours_code/recovery.py`、`evals/run_eval.py`
 
 ### 现象
 
@@ -636,7 +636,7 @@ Agent 因单个慢请求直接失败，grader 再次未启动。
 ### 根因
 
 容器内 `BrokerModelClient` 的 IPC 等待 deadline 是 30 秒；Host 侧模型 HTTP timeout 也通过同一个
-`MODEL_REQUEST_TIMEOUT=30` 设置。两侧没有交付宽限期：容器可能先抛出
+`AQOURS_CODE_REQUEST_TIMEOUT=30` 设置。两侧没有交付宽限期：容器可能先抛出
 `model broker request exceeded its deadline` 并删除 IPC 文件，Host 还没有机会返回结构化的 HTTP
 timeout/error。Runner 随后终止 Broker，因此统计中 `model_broker_error` 仍为空。
 
@@ -703,7 +703,7 @@ timeout/error。Runner 随后终止 Broker，因此统计中 `model_broker_error
 
 **严重性：** P2  
 **状态：** Validated
-**模块：** `codepilot_s20/compact.py`、`codepilot_s20/trace.py`、`codepilot_s20/agent_loop.py`
+**模块：** `aqours_code/compact.py`、`aqours_code/trace.py`、`aqours_code/agent_loop.py`
 
 ### 现象
 
@@ -801,7 +801,7 @@ ERROR: No matching distribution found for pytest==8.2.2
 修复前 Dockerfile 的顺序是：
 
 1. COPY requirements；
-2. COPY `pyproject.toml`、README 和整个 `codepilot_s20`；
+2. COPY `pyproject.toml`、README 和整个 `aqours_code`；
 3. 在同一个 RUN 中安装第三方依赖和本地 Runtime。
 
 因此任何 Runtime 或 README 修改都会使整个 pip RUN 层失效，即使 `requirements.lock` 没变，也会
@@ -810,7 +810,7 @@ ERROR: No matching distribution found for pytest==8.2.2
 ### 首选方案
 
 1. 在 COPY Harness 源码之前，单独安装 `requirements.lock`，形成只受 lockfile 影响的缓存层；
-2. COPY 源码后使用 `pip install --no-deps /opt/codepilot-src`，避免第二次解析/下载依赖；
+2. COPY 源码后使用 `pip install --no-deps /opt/aqours-code-src`，避免第二次解析/下载依赖；
 3. 为依赖下载设置有限的重试和合理 timeout，保留 TLS 验证，不能使用不安全的 trusted-host 绕过；
 4. 可使用 BuildKit pip cache mount，但必须保持 lockfile 是依赖事实来源；
 5. 构建失败时继续保留旧镜像，并明确标记当前镜像仍 stale；
@@ -818,7 +818,7 @@ ERROR: No matching distribution found for pytest==8.2.2
 
 ### 验收标准
 
-- 只修改 `codepilot_s20/compact.py` 时，第三方依赖安装层命中缓存；
+- 只修改 `aqours_code/compact.py` 时，第三方依赖安装层命中缓存；
 - 修改 `requirements.lock` 时依赖层正确重建；
 - 本地 Runtime 安装不访问包索引；
 - 模拟依赖下载失败时，在模型调用前返回明确的 `docker_build_error`；
@@ -830,7 +830,7 @@ ERROR: No matching distribution found for pytest==8.2.2
 - 使用 BuildKit pip cache mount 保存下载缓存，lockfile 变化导致重建时可复用已下载的包；
 - 保留 TLS 验证，设置 `PIP_DEFAULT_TIMEOUT=60` 和有限的 `PIP_RETRIES=8`；
 - pip 策略位于系统包安装层之后，调整 pip 参数不会额外使稳定的 apt 层失效；
-- 本地 Runtime 改为 `pip install --no-cache-dir --no-deps /opt/codepilot-src`，源码更新时不再访问包索引；
+- 本地 Runtime 改为 `pip install --no-cache-dir --no-deps /opt/aqours-code-src`，源码更新时不再访问包索引；
 - 用户、目录和权限初始化也移出源码安装层，进一步缩小 Harness 迭代时需要重建的范围；
 - Dockerfile 结构测试验证依赖安装严格早于源码 COPY、本地安装使用 `--no-deps`，并禁止
   `--trusted-host` 绕过 TLS；
@@ -869,13 +869,13 @@ HARN-008 保持 `Fixed`，暂不标记 `Validated`。
 ### 2026-07-22 复核：`--no-deps` 仍会触发 build isolation
 
 评分 Harness 更新后再次执行 `--docker-build`，源码 COPY 之前的依赖层虽然命中缓存，但本地
-`pip install --no-deps /opt/codepilot-src` 仍按 `pyproject.toml` 创建隔离构建环境，并尝试从 PyPI
+`pip install --no-deps /opt/aqours-code-src` 仍按 `pyproject.toml` 创建隔离构建环境，并尝试从 PyPI
 下载 `setuptools>=68`。失效代理因此再次阻断纯源码刷新。`--no-deps` 只忽略项目运行依赖，并不禁止
 PEP 517 build-system 依赖下载，原实施记录对此判断不完整。
 
-Eval 容器只通过 `python -m codepilot_s20.eval_container_entry` 启动，不需要安装 console script 或
-wheel metadata。因此 Dockerfile 现在直接保留 `/opt/codepilot-src/codepilot_s20`，设置只读
-`PYTHONPATH=/opt/codepilot-src`，并在镜像构建时执行 import check；源码刷新不再运行第二次 pip，也
+Eval 容器只通过 `python -m aqours_code.eval_container_entry` 启动，不需要安装 console script 或
+wheel metadata。因此 Dockerfile 现在直接保留 `/opt/aqours-code-src/aqours_code`，设置只读
+`PYTHONPATH=/opt/aqours-code-src`，并在镜像构建时执行 import check；源码刷新不再运行第二次 pip，也
 不会访问包索引。结构测试同时禁止重新引入本地 pip install。针对性测试 `59 passed, 1 deselected`。
 
 本次 Docker Desktop 重启后的冷 apt 层仍被陈旧的 `127.0.0.1:16295` 代理阻断，这属于上文已记录的
@@ -892,7 +892,7 @@ wheel metadata。因此 Dockerfile 现在直接保留 `/opt/codepilot-src/codepi
 
 **严重性：** P2  
 **状态：** Fixed
-**模块：** `codepilot_s20/background.py`、background routing 测试
+**模块：** `aqours_code/background.py`、background routing 测试
 
 ### 现象与根因
 
@@ -937,7 +937,7 @@ heredoc 正文不再参与动词匹配。
 
 **严重性：** P2  
 **状态：** Fixed
-**模块：** `codepilot_s20/eval_container_entry.py`、`evals/run_eval.py`、result schema
+**模块：** `aqours_code/eval_container_entry.py`、`evals/run_eval.py`、result schema
 
 ### 现象与根因
 
@@ -974,7 +974,7 @@ Host 因而只能把缺失计数默认成 0。这会把“执行了命令但 Age
 
 **严重性：** P2  
 **状态：** Validated  
-**模块：** `codepilot_s20/agent_loop.py`、`codepilot_s20/background.py`、`codepilot_s20/trace.py`
+**模块：** `aqours_code/agent_loop.py`、`aqours_code/background.py`、`aqours_code/trace.py`
 
 ### 现象
 
@@ -1038,8 +1038,8 @@ background lifecycle 集成测试实际启动一个受控 pytest 后台任务，
 
 **严重性：** P1  
 **状态：** Fixed
-**模块：** `codepilot_s20/basic_tools.py`、`codepilot_s20/tool_defs.py`、
-`codepilot_s20/context.py`、`codepilot_s20/prompts.py`、`codepilot_s20/agent_loop.py`
+**模块：** `aqours_code/basic_tools.py`、`aqours_code/tool_defs.py`、
+`aqours_code/context.py`、`aqours_code/prompts.py`、`aqours_code/agent_loop.py`
 
 ### 现象与根因
 
@@ -1205,7 +1205,7 @@ UnknownSku、不同请求冲突和 quantity 指纹契约；还需要重新构建
 
 **严重性：** P1
 **状态：** Validated
-**模块：** `codepilot_s20/agent_loop.py`
+**模块：** `aqours_code/agent_loop.py`
 
 ### 现象与根因
 
@@ -1267,7 +1267,7 @@ README 和 3 个 changed files 后更新 Todo，没有 glob、重复读取、预
 
 **严重性：** P1  
 **状态：** Validated  
-**模块：** `codepilot_s20/basic_tools.py`、`codepilot_s20/tool_defs.py`
+**模块：** `aqours_code/basic_tools.py`、`aqours_code/tool_defs.py`
 
 ### 现象与根因
 
@@ -1295,9 +1295,9 @@ README 和 3 个 changed files 后更新 Todo，没有 glob、重复读取、预
 
 **严重性：** P1  
 **状态：** Fixed
-**模块：** `codepilot_s20/agent_profiles.py`、`codepilot_s20/agent_loop.py`、
-`codepilot_s20/subagent.py`、`codepilot_s20/teammate.py`、
-`codepilot_s20/worktree_system.py`、`codepilot_s20/tool_defs.py`
+**模块：** `aqours_code/agent_profiles.py`、`aqours_code/agent_loop.py`、
+`aqours_code/subagent.py`、`aqours_code/teammate.py`、
+`aqours_code/worktree_system.py`、`aqours_code/tool_defs.py`
 
 ### 现象与根因
 
@@ -1484,8 +1484,8 @@ Leader 的“只审我认为的三个修复”缩窄成确认性评审。HARN-01
 
 **严重性：** P1
 **状态：** Validated
-**模块：** `codepilot_s20/agent_loop.py`、`codepilot_s20/subagent.py`、
-`codepilot_s20/compact.py`、`codepilot_s20/model_broker.py`
+**模块：** `aqours_code/agent_loop.py`、`aqours_code/subagent.py`、
+`aqours_code/compact.py`、`aqours_code/model_broker.py`
 
 ### 现象与根因
 
@@ -1590,7 +1590,7 @@ state，submitted change 涵盖五个允许修改的源码文件。HARN-016 的�
 
 **严重性：** P1
 **状态：** Fixed
-**模块：** `codepilot_s20/subagent.py`、`codepilot_s20/tool_defs.py`、`codepilot_s20/agent_loop.py`
+**模块：** `aqours_code/subagent.py`、`aqours_code/tool_defs.py`、`aqours_code/agent_loop.py`
 
 ### 现象与影响
 
@@ -1644,7 +1644,7 @@ Run `evals/results/runs/20260721-230949/stress_inventory_reservation_consistency
 
 **严重性：** P1
 **状态：** Fixed
-**模块：** `codepilot_s20/agent_loop.py`、`codepilot_s20/basic_tools.py`
+**模块：** `aqours_code/agent_loop.py`、`aqours_code/basic_tools.py`
 
 ### 现象与证据
 
@@ -1706,7 +1706,7 @@ compact 保留和旧调用兼容。两次 ledger 真实复测没有产生 Review
 
 **状态：** In progress
 
-**模块：** `codepilot_s20/agent_loop.py`、`codepilot_s20/agent_profiles.py`、`codepilot_s20/subagent.py`
+**模块：** `aqours_code/agent_loop.py`、`aqours_code/agent_profiles.py`、`aqours_code/subagent.py`
 
 ### 对照实验
 
@@ -1797,7 +1797,7 @@ usage，证明实际成本字段可用于难度 6 case。
 
 **严重性：** P1
 **状态：** Validated
-**模块：** `codepilot_s20/command_safety.py`、`hooks.py`、`basic_tools.py`
+**模块：** `aqours_code/command_safety.py`、`hooks.py`、`basic_tools.py`
 
 `20260722-213701` 的最后一个 bash 是合法的 `python -c` 状态转换验证，Python 文本包含
 `Confirmed->Cancel raises`。旧实现对整段字符串搜索 `"rm "`，恰好命中 `Confirm ` 末尾，返回不可恢复的
@@ -1848,7 +1848,7 @@ checkpoint 验证、durable tail replay、跨 partition 原子性等更宽的系
 
 **严重性：** P2
 **状态：** Fixed
-**模块：** `codepilot_s20/agent_loop.py`、Reviewer/final audit telemetry
+**模块：** `aqours_code/agent_loop.py`、Reviewer/final audit telemetry
 
 ledger 首轮在 used_calls=44、remaining=6 时正确跳过 automatic Reviewer，但随后又记录
 `reviewer_auto_observed`，final audit 标成 `reviewer_attached=true`，并把 `budget_reserved/blocked` envelope

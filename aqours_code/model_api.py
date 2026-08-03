@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from types import SimpleNamespace
 
@@ -34,7 +35,7 @@ def _validate_api_key(api_key: str | None, provider: str) -> str:
 
 def _request_timeout() -> float:
     try:
-        return max(1.0, float(os.getenv("MODEL_REQUEST_TIMEOUT", "30")))
+        return max(1.0, float(os.getenv("AQOURS_CODE_REQUEST_TIMEOUT", "30")))
     except (TypeError, ValueError):
         return 30.0
 
@@ -205,38 +206,67 @@ class OpenAICompatibleClient:
 
 
 class AnthropicClient:
-    def __init__(self, base_url: str | None = None):
+    def __init__(self, api_key: str | None, base_url: str | None = None):
         try:
             from anthropic import Anthropic
         except ImportError:
             self.messages = self
             return
-        self._client = Anthropic(base_url=base_url)
+        self._client = Anthropic(
+            api_key=_validate_api_key(_clean_env(api_key), "Anthropic"),
+            base_url=base_url or None,
+        )
         self.messages = self._client.messages
 
     def create(self, *args, **kwargs):
         raise RuntimeError("anthropic is not installed. Run `pip install -e .` first.")
 
 
-def default_model_for_provider(provider: str) -> str:
-    if provider == "deepseek":
-        return "deepseek-v4-flash"
-    if provider in {"openai", "openai_compatible"}:
-        return "gpt-4o-mini"
-    return "claude-3-5-sonnet-latest"
+def sanitize_base_url(base_url: str | None) -> str:
+    """Remove credentials and auth-like query values before metadata/logging."""
+    cleaned = _clean_env(base_url) or ""
+    if not cleaned:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(cleaned)
+        hostname = parsed.hostname or ""
+        if parsed.port is not None:
+            hostname = f"{hostname}:{parsed.port}"
+        safe_query = urllib.parse.urlencode([
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(
+                parsed.query, keep_blank_values=True
+            )
+            if not any(
+                marker in key.casefold()
+                for marker in ("key", "token", "secret", "password", "auth")
+            )
+        ])
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, hostname, parsed.path, safe_query, "")
+        )
+    except (TypeError, ValueError):
+        return "[invalid base URL]"
 
 
-def build_model_client(provider: str):
+def build_model_client(
+    provider: str,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+):
+    api_key = _clean_env(api_key) or _clean_env(os.getenv("AQOURS_CODE_API_KEY"))
+    base_url = _clean_env(base_url) or _clean_env(os.getenv("AQOURS_CODE_BASE_URL"))
     if provider == "anthropic":
-        return AnthropicClient(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+        return AnthropicClient(api_key=api_key, base_url=base_url)
     if provider == "deepseek":
-        return OpenAICompatibleClient(api_key=_clean_env(os.getenv("DEEPSEEK_API_KEY")) or _clean_env(os.getenv("MODEL_API_KEY")), base_url=_clean_env(os.getenv("DEEPSEEK_BASE_URL")) or _clean_env(os.getenv("MODEL_BASE_URL")) or "https://api.deepseek.com", provider_name="DeepSeek")
+        return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "", provider_name="DeepSeek")
     if provider == "openai":
-        return OpenAICompatibleClient(api_key=_clean_env(os.getenv("OPENAI_API_KEY")) or _clean_env(os.getenv("MODEL_API_KEY")), base_url=_clean_env(os.getenv("OPENAI_BASE_URL")) or _clean_env(os.getenv("MODEL_BASE_URL")) or "https://api.openai.com/v1", provider_name="OpenAI")
+        return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "", provider_name="OpenAI")
     if provider == "openai_compatible":
-        return OpenAICompatibleClient(api_key=_clean_env(os.getenv("MODEL_API_KEY")) or _clean_env(os.getenv("OPENAI_API_KEY")), base_url=_clean_env(os.getenv("MODEL_BASE_URL")) or _clean_env(os.getenv("OPENAI_BASE_URL")) or "https://api.openai.com/v1", provider_name="OpenAI-compatible provider")
-    raise ValueError(f"Unknown MODEL_PROVIDER: {provider}")
+        return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "", provider_name="OpenAI-compatible provider")
+    raise ValueError(f"Unknown AQOURS_CODE_PROVIDER: {provider}")
 
 
 def provider_from_env() -> str:
-    return os.getenv("MODEL_PROVIDER", "anthropic").strip().lower()
+    return os.getenv("AQOURS_CODE_PROVIDER", "openai_compatible").strip().lower()

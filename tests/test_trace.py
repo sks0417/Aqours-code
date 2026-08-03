@@ -1,7 +1,7 @@
 import json
 import time
 
-from codepilot_s20 import trace
+from aqours_code import trace
 
 
 def read_events(path):
@@ -14,7 +14,7 @@ def read_index(workdir):
 
 def make_fake_run(base, name, start_time=None, pinned=False,
                   bad_metadata=False, trace_bytes=0, artifacts_bytes=0):
-    run_dir = base / ".codepilot" / "runs" / name
+    run_dir = base / ".aqours_code" / "runs" / name
     run_dir.mkdir(parents=True, exist_ok=True)
     if bad_metadata:
         (run_dir / "metadata.json").write_text("{bad json", encoding="utf-8")
@@ -62,7 +62,8 @@ def test_start_run_creates_files_and_metadata(tmp_path):
         "hello",
         workdir=tmp_path,
         model_provider="openai",
-        model="deepseek-chat",
+        model="test-model",
+        base_url="https://user:secret@example.invalid/v1?api_key=hidden",
     )
 
     assert run.run_dir.exists()
@@ -87,7 +88,16 @@ def test_start_run_creates_files_and_metadata(tmp_path):
     assert metadata["final_path"].endswith("final.md")
     assert metadata["pinned"] is False
     assert metadata["model_provider"] == "openai"
-    assert metadata["model"] == "deepseek-chat"
+    assert metadata["model"] == "test-model"
+    assert metadata["base_url"] == "https://example.invalid/v1"
+    assert metadata["started_at"]
+    assert metadata["project_version"] == "0.1.0"
+    assert metadata["git_commit"] is None
+    assert metadata["git_dirty"] is None
+    assert metadata["python_version"]
+    assert metadata["platform"]
+    assert metadata["workspace"] == str(tmp_path.resolve())
+    assert metadata["metadata_errors"] == []
     assert metadata["workdir"] == str(tmp_path)
     assert "api_key" not in metadata
     assert "key" not in metadata
@@ -105,6 +115,27 @@ def test_start_run_creates_files_and_metadata(tmp_path):
     item = [entry for entry in index if entry["run_id"] == run.run_id][0]
     assert item["status"] == "running"
     assert item["prompt_preview"] == "hello"
+
+
+def test_git_metadata_failure_is_recorded_without_stopping_run(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+
+    def fail_git(*_args, **_kwargs):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(trace.subprocess, "run", fail_git)
+    run = trace.start_run(
+        "hello",
+        workdir=tmp_path,
+        model_provider="test",
+        model="test-model",
+    )
+
+    metadata = json.loads(run.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["git_commit"] is None
+    assert metadata["git_dirty"] is None
+    assert metadata["metadata_errors"] == ["git_metadata_unavailable"]
+    assert run.trace_path.exists()
 
 
 def test_finish_run_writes_final_and_end_time(tmp_path):
@@ -274,7 +305,7 @@ def test_run_index_pinned_reflects_keep_file(tmp_path):
 
 
 def test_corrupt_run_index_does_not_crash(tmp_path):
-    index_path = tmp_path / ".codepilot" / "run_index.json"
+    index_path = tmp_path / ".aqours_code" / "run_index.json"
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text("{bad json", encoding="utf-8")
 
@@ -306,7 +337,7 @@ def test_cleanup_sliding_window_removes_old_runs(tmp_path):
 
         trace.cleanup_old_runs(workdir=tmp_path)
 
-        runs_dir = tmp_path / ".codepilot" / "runs"
+        runs_dir = tmp_path / ".aqours_code" / "runs"
         assert not (runs_dir / "run_oldest").exists()
         assert not (runs_dir / "run_old").exists()
         assert (runs_dir / "run_new").exists()

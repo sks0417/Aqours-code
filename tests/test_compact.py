@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from codepilot_s20 import agent_loop, compact, context
-from codepilot_s20.command_executor import LocalCommandExecutor
-from codepilot_s20.runtime import AgentRuntime
+from aqours_code import agent_loop, compact, context
+from aqours_code.command_executor import LocalCommandExecutor
+from aqours_code.runtime import AgentRuntime
 
 
 def make_runtime(tmp_path: Path, responses=()) -> AgentRuntime:
@@ -884,7 +884,7 @@ def test_compaction_does_not_create_context_archive_directory(
 
     force_compact(long_history(), runtime=runtime)
 
-    assert not (runtime.paths.state_root / ".codepilot" / "context-archives").exists()
+    assert not (runtime.paths.state_root / ".aqours_code" / "context-archives").exists()
 
 
 def test_three_compactions_keep_exactly_one_checkpoint(monkeypatch):

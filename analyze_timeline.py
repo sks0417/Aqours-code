@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Analyze a current CodePilot timeline.jsonl."""
+"""Analyze a current Aqours_code timeline.jsonl."""
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from codepilot_s20.trace_analysis import (
+from aqours_code.trace_analysis import (
     analyze_events,
     format_counts,
     format_event,
@@ -15,7 +15,7 @@ from codepilot_s20.trace_analysis import (
 
 def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run_dir", type=Path, help="Path to a CodePilot run directory")
+    parser.add_argument("run_dir", type=Path, help="Path to a Aqours_code run directory")
     return parser.parse_args(argv)
 
 

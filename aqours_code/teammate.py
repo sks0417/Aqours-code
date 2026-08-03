@@ -296,7 +296,7 @@ def spawn_teammate_thread(
 
     active_teammates[name] = True
     thread = threading.Thread(
-        target=run, name=f"codepilot-teammate-{name}", daemon=True)
+        target=run, name=f"aqours-code-teammate-{name}", daemon=True)
     teammate_threads[name] = thread
     teammate_stop_events[name] = stop_event
     thread.start()

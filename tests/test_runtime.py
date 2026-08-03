@@ -1,15 +1,15 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from codepilot_s20 import (
+from aqours_code import (
     agent_loop,
     basic_tools,
     context,
     mcp,
     prompts,
 )
-from codepilot_s20.command_executor import LocalCommandExecutor
-from codepilot_s20.runtime import AgentRuntime
+from aqours_code.command_executor import LocalCommandExecutor
+from aqours_code.runtime import AgentRuntime
 
 
 def make_runtime(
@@ -180,7 +180,7 @@ def test_trace_storage_root_never_changes_runtime_state_paths(
     assert not hasattr(runtime.paths, "context_archive_root")
     assert not hasattr(runtime.paths, "context_archive_dir")
     assert not (
-        trusted_trace_root / ".codepilot" / "context-archives"
+        trusted_trace_root / ".aqours_code" / "context-archives"
     ).exists()
 
 
@@ -220,5 +220,5 @@ def test_explicit_runtime_root_still_owns_general_state(
     assert runtime.paths.worktrees_dir.parent == runtime_root.resolve()
     assert not hasattr(runtime.paths, "context_archive_root")
     assert not (
-        trusted_trace_root / ".codepilot" / "context-archives"
+        trusted_trace_root / ".aqours_code" / "context-archives"
     ).exists()

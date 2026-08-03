@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from codepilot_s20 import (
+from aqours_code import (
     agent_loop,
     basic_tools,
     context,
@@ -24,7 +24,7 @@ from codepilot_s20 import (
     task_system,
     worktree_system,
 )
-from codepilot_s20.command_executor import LocalCommandExecutor
+from aqours_code.command_executor import LocalCommandExecutor
 from evals import run_eval
 
 
@@ -379,10 +379,10 @@ def test_eval_trace_storage_is_separate_and_exposes_normal_process_metrics(
         trace_storage_root=str(trusted_runtime),
     )
 
-    assert not (workspace / ".codepilot").exists()
+    assert not (workspace / ".aqours_code").exists()
     assert Path(result["run_dir"]).is_relative_to(trusted_runtime)
     assert exported_trace.exists()
-    assert (trusted_runtime / ".codepilot" / "run_index.json").exists()
+    assert (trusted_runtime / ".aqours_code" / "run_index.json").exists()
     metrics = run_eval.trace_metrics(exported_trace)
     assert set(metrics) == {
         "tool_calls", "llm_requests", "permission_blocks",
@@ -440,7 +440,7 @@ def test_real_process_timeout_stops_non_bash_tool_loop_and_next_case_runs(tmp_pa
     assert elapsed < 5
     assert "CaseTimeoutError" in error
     assert metadata["overall_timed_out"] is True
-    assert not any(child.name.startswith("codepilot-eval-")
+    assert not any(child.name.startswith("aqours-code-eval-")
                    for child in multiprocessing.active_children())
     assert runtime_snapshot() == parent_state
 
@@ -481,7 +481,7 @@ def test_large_pipe_result_is_complete_and_does_not_leave_child(tmp_path):
     assert len(run_info["final_answer"]) == 1024 * 1024 + 8192
     assert set(run_info["final_answer"]) == {"L"}
     assert metadata["agent_process_exit_code"] == 0
-    assert not any(child.name.startswith("codepilot-eval-")
+    assert not any(child.name.startswith("aqours-code-eval-")
                    for child in multiprocessing.active_children())
 
 
@@ -498,7 +498,7 @@ def test_child_exception_returns_structured_error_without_residual_process(tmp_p
 
     assert "RuntimeError: scripted child process failure" in error
     assert metadata["agent_process_exit_code"] == 0
-    assert not any(child.name.startswith("codepilot-eval-")
+    assert not any(child.name.startswith("aqours-code-eval-")
                    for child in multiprocessing.active_children())
 
 
@@ -515,7 +515,7 @@ def test_child_exit_without_result_is_structured_and_reaped(tmp_path):
 
     assert "AgentProcessError" in error
     assert metadata["agent_process_exit_code"] == 7
-    assert not any(child.name.startswith("codepilot-eval-")
+    assert not any(child.name.startswith("aqours-code-eval-")
                    for child in multiprocessing.active_children())
 
 
@@ -536,7 +536,7 @@ def test_parent_keyboard_interrupt_closes_channel_and_reaps_child(tmp_path, monk
             config=run_eval.EvalExecutionConfig(backend="local", docker_timeout=8),
         )
 
-    assert not any(child.name.startswith("codepilot-eval-")
+    assert not any(child.name.startswith("aqours-code-eval-")
                    for child in multiprocessing.active_children())
 
 
@@ -555,7 +555,7 @@ def test_model_and_command_timeouts_are_capped_by_remaining_case_time(
 
     class Messages:
         def create(self, **_kwargs):
-            observed["model_timeout"] = float(os.environ["MODEL_REQUEST_TIMEOUT"])
+            observed["model_timeout"] = float(os.environ["AQOURS_CODE_REQUEST_TIMEOUT"])
             return SimpleNamespace(content=[text_block("done")], stop_reason="end_turn")
 
     class Executor:
@@ -566,7 +566,7 @@ def test_model_and_command_timeouts_are_capped_by_remaining_case_time(
     deadline = time.monotonic() + 0.75
     monkeypatch.setattr(agent_loop, "CASE_DEADLINE", deadline)
     monkeypatch.setattr(agent_loop, "client", SimpleNamespace(messages=Messages()))
-    monkeypatch.setenv("MODEL_REQUEST_TIMEOUT", "30")
+    monkeypatch.setenv("AQOURS_CODE_REQUEST_TIMEOUT", "30")
     agent_loop.call_llm([], {}, [], agent_loop.RecoveryState(), 100)
 
     monkeypatch.setattr(basic_tools, "CASE_DEADLINE", deadline)
@@ -574,7 +574,7 @@ def test_model_and_command_timeouts_are_capped_by_remaining_case_time(
 
     assert 0 < observed["model_timeout"] <= 0.75
     assert 0 < observed["command_timeout"] <= 0.75
-    assert os.environ["MODEL_REQUEST_TIMEOUT"] == "30"
+    assert os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] == "30"
 
 
 def test_cleanup_failure_does_not_block_runtime_restoration(tmp_path, monkeypatch):

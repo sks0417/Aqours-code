@@ -10,6 +10,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def clean_env(tmp_path):
     env = os.environ.copy()
     for key in [
+        "AQOURS_CODE_API_KEY",
+        "AQOURS_CODE_BASE_URL",
+        "AQOURS_CODE_MODEL",
+        "AQOURS_CODE_PROVIDER",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "DEEPSEEK_API_KEY",
@@ -18,7 +22,7 @@ def clean_env(tmp_path):
     ]:
         env.pop(key, None)
     env["PYTHONPATH"] = str(PROJECT_ROOT)
-    env["CODEPILOT_S20_WORKDIR"] = str(tmp_path / "agent-workdir")
+    env["AQOURS_CODE_WORKDIR"] = str(tmp_path / "agent-workdir")
     return env
 
 
@@ -35,7 +39,7 @@ def run_python(script: str, tmp_path):
 
 def test_package_import_without_env_or_api_key(tmp_path):
     result = run_python(
-        "import codepilot_s20; print('import ok')",
+        "import aqours_code; print('import ok')",
         tmp_path,
     )
 
@@ -46,11 +50,11 @@ def test_package_import_without_env_or_api_key(tmp_path):
 def test_config_import_does_not_build_model_client(tmp_path):
     result = run_python(
         """
-import codepilot_s20.model_api as model_api
-def fail(provider):
+import aqours_code.model_api as model_api
+def fail(*args, **kwargs):
     raise RuntimeError("build_model_client called")
 model_api.build_model_client = fail
-import codepilot_s20.config
+import aqours_code.config
 print("config import ok")
 """,
         tmp_path,
@@ -66,9 +70,9 @@ def test_package_import_does_not_start_scheduler_or_create_workdir(tmp_path):
 import os
 import threading
 from pathlib import Path
-import codepilot_s20
-print(any(t.name == "codepilot-s20-cron" for t in threading.enumerate()))
-print(Path(os.environ["CODEPILOT_S20_WORKDIR"]).exists())
+import aqours_code
+print(any(t.name == "aqours-code-cron" for t in threading.enumerate()))
+print(Path(os.environ["AQOURS_CODE_WORKDIR"]).exists())
 """,
         tmp_path,
     )

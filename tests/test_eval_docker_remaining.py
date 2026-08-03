@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from codepilot_s20.command_executor import DockerCommandExecutor, SandboxError
-from codepilot_s20.docker_utils import prepare_disposable_tree
+from aqours_code.command_executor import DockerCommandExecutor, SandboxError
+from aqours_code.docker_utils import prepare_disposable_tree
 from evals import run_eval
 from evals.docker_sandbox import DockerGraderRunner
 

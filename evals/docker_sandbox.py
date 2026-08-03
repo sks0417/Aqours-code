@@ -5,8 +5,8 @@ import time
 import uuid
 from pathlib import Path
 
-from codepilot_s20.command_executor import SandboxError, _decode_timeout_stream
-from codepilot_s20.docker_utils import host_container_user, normalize_bind_source
+from aqours_code.command_executor import SandboxError, _decode_timeout_stream
+from aqours_code.docker_utils import host_container_user, normalize_bind_source
 
 
 def _run_docker_text(runner, args: list[str], *, timeout: float):
@@ -87,7 +87,7 @@ class DockerAgentRunner:
             ch.lower() if ch.isalnum() else "-" for ch in case_name
         ).strip("-")[:40]
         self.container_name = (
-            f"codepilot-agent-{safe_case or 'case'}-{uuid.uuid4().hex[:10]}")
+            f"aqours-code-agent-{safe_case or 'case'}-{uuid.uuid4().hex[:10]}")
         self.container_started = False
         self.container_exit_code = None
         self.timed_out = False
@@ -151,7 +151,7 @@ class DockerAgentRunner:
             "--env", "PYTHONNOUSERSITE=1",
             "--env", "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1",
             "--env", "HOME=/tmp/home",
-            "--env", "CODEPILOT_S20_WORKDIR=/workspace",
+            "--env", "AQOURS_CODE_WORKDIR=/workspace",
             # Docker Desktop bind mounts do not preserve the numeric owner
             # used by the non-root container. This process-local Git setting
             # keeps only the disposable repository and its worktrees usable
@@ -166,7 +166,7 @@ class DockerAgentRunner:
             args.extend(["--mount", mount])
         args.extend([
             self.image,
-            "python", "-m", "codepilot_s20.eval_container_entry",
+            "python", "-m", "aqours_code.eval_container_entry",
             "--config", "/runtime/input.json",
         ])
         return args
@@ -228,7 +228,7 @@ class DockerAgentRunner:
             "execution_backend": "docker",
             "docker_image": self.image,
             "container_entrypoint": (
-                "python -m codepilot_s20.eval_container_entry"),
+                "python -m aqours_code.eval_container_entry"),
             "container_started": self.container_started,
             "container_exit_code": self.container_exit_code,
             "container_timed_out": self.timed_out,
@@ -267,7 +267,7 @@ class DockerGraderRunner:
         self.cleanup_deadline = cleanup_deadline
         self.container_user = host_container_user()
         safe_case = "".join(ch.lower() if ch.isalnum() else "-" for ch in case_name).strip("-")[:40]
-        self.container_name = f"codepilot-grader-{safe_case or 'case'}-{uuid.uuid4().hex[:10]}"
+        self.container_name = f"aqours-code-grader-{safe_case or 'case'}-{uuid.uuid4().hex[:10]}"
         self.container_started = False
         self.container_exit_code = None
         self.timed_out = False

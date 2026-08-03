@@ -295,7 +295,7 @@ def start_scheduler(load_durable: bool = True):
             load_durable_once_jobs()
         _scheduler_thread = threading.Thread(
             target=cron_scheduler_loop,
-            name="codepilot-s20-cron",
+            name="aqours-code-cron",
             daemon=True,
         )
         _scheduler_thread.start()

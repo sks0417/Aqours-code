@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 _SENSITIVE_ENV_NAMES = {
+    "AQOURS_CODE_API_KEY",
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_API_KEY",
     "OPENAI_API_KEY", "MODEL_API_KEY", "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY", "AZURE_OPENAI_API_KEY",
@@ -38,7 +39,7 @@ def _initialize_case_repository(workspace: Path):
         return
     commands = (
         ["git", "init", "--initial-branch=eval-main"],
-        ["git", "config", "user.name", "CodePilot Eval"],
+        ["git", "config", "user.name", "Aqours_code Eval"],
         ["git", "config", "user.email", "eval@localhost"],
         ["git", "add", "-A"],
         ["git", "commit", "--allow-empty", "-m", "eval baseline"],
@@ -58,7 +59,7 @@ def _initialize_case_repository(workspace: Path):
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run one isolated CodePilot eval Agent.")
+    parser = argparse.ArgumentParser(description="Run one isolated Aqours_code eval Agent.")
     parser.add_argument("--config", default="/runtime/input.json")
     args = parser.parse_args(argv)
 
@@ -84,13 +85,16 @@ def main(argv: list[str] | None = None) -> int:
         provider_timeout,
         float(config.get("broker_request_timeout", provider_timeout)),
     )
-    os.environ["CODEPILOT_S20_WORKDIR"] = str(workspace)
-    os.environ["MODEL_PROVIDER"] = "broker"
-    os.environ["MODEL_ID"] = str(config["model"])
+    os.environ["AQOURS_CODE_WORKDIR"] = str(workspace)
+    os.environ["AQOURS_CODE_PROVIDER"] = str(
+        config.get("model_provider", "broker")
+    )
+    os.environ["AQOURS_CODE_MODEL"] = str(config["model"])
+    os.environ["AQOURS_CODE_BASE_URL"] = str(config.get("base_url", ""))
     # Provider calls happen in the Host Broker and retain the configured
     # per-attempt timeout. The container IPC client waits long enough for the
     # Broker-owned retry and final response delivery.
-    os.environ["MODEL_REQUEST_TIMEOUT"] = str(provider_timeout)
+    os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = str(provider_timeout)
     # python-dotenv searches the process cwd. Import the runtime from the
     # isolated non-workspace directory so a case-provided /workspace/.env can
     # never become process configuration.
@@ -119,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
             str(workspace),
             str(runtime_root / "trace.jsonl"),
             model_client=client,
-            model_provider="broker",
+            model_provider=str(config.get("model_provider", "broker")),
             model=str(config["model"]),
             command_executor=command_executor,
             tool_policy=config.get("tool_policy"),

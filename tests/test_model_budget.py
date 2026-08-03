@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 
-from codepilot_s20.model_broker import BrokerModelClient, PROTOCOL_VERSION
-from codepilot_s20.model_budget import (
+from aqours_code.model_broker import BrokerModelClient, PROTOCOL_VERSION
+from aqours_code.model_budget import (
     can_spend_optional_calls,
     finalization_reserve_active,
     model_budget_snapshot,

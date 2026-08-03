@@ -173,7 +173,7 @@ def finalize_worktree(name: str, commit_message: str = "worker delegated change"
         detail = "git add timeout" if added is None else added.stderr.strip()
         return json.dumps({"status": "error", "error": detail[:2000]})
     committed = _run_git_at(path, [
-        "-c", "user.name=CodePilot Worker",
+        "-c", "user.name=Aqours_code Worker",
         "-c", "user.email=worker@localhost",
         "commit", "-m", str(commit_message or "worker delegated change")[:200],
     ])
@@ -240,7 +240,7 @@ def integrate_worktree(name: str, cleanup: bool = True) -> str:
         })
 
     merged = _run_git_at(WORKDIR, [
-        "-c", "user.name=CodePilot Lead",
+        "-c", "user.name=Aqours_code Lead",
         "-c", "user.email=lead@localhost",
         "merge", "--no-ff", "--no-edit", branch,
     ], timeout=60)

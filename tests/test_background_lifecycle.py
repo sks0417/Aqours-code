@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from codepilot_s20 import agent_loop, background
-from codepilot_s20.command_executor import CaseTimeoutError, LocalCommandExecutor
+from aqours_code import agent_loop, background
+from aqours_code.command_executor import CaseTimeoutError, LocalCommandExecutor
 from evals import run_eval
 
 
@@ -190,7 +190,7 @@ def test_final_answer_waits_past_old_window_and_reinjects_notification(
     assert background.background_workers_alive() is False
     assert not any(
         thread.name.startswith((
-            "codepilot-background-", "codepilot-teammate-", "codepilot-s20-cron"))
+            "aqours-code-background-", "aqours-code-teammate-", "aqours-code-cron"))
         for thread in threading.enumerate()
     )
 
@@ -221,7 +221,7 @@ def test_background_task_past_case_deadline_is_structured_timeout_and_stops(
     assert executor.release.is_set()
     assert background.background_workers_alive() is False
     assert not any(
-        thread.name.startswith("codepilot-background-")
+        thread.name.startswith("aqours-code-background-")
         for thread in threading.enumerate()
     )
 

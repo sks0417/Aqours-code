@@ -5,11 +5,11 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from codepilot_s20 import bootstrap
+from aqours_code import bootstrap
 
 bootstrap()
 
-from codepilot_s20 import (
+from aqours_code import (
     agent_loop,
     background,
     basic_tools,
@@ -23,7 +23,7 @@ from codepilot_s20 import (
     teammate,
     worktree_system,
 )
-from codepilot_s20.command_executor import LocalCommandExecutor
+from aqours_code.command_executor import LocalCommandExecutor
 from evals import run_eval
 
 

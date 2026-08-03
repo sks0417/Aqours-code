@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 import os
+import platform as platform_module
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
+from . import __version__
 from .config import (
+    BASE_URL,
     TRACE_CLEANUP_ENABLED,
     TRACE_KEEP_PINNED,
     TRACE_MAX_RUN_MB,
@@ -17,6 +23,7 @@ from .config import (
     TRACE_RETENTION_MAX_MB,
     TRACE_RETENTION_MAX_RUNS,
 )
+from .model_api import sanitize_base_url
 
 
 CURRENT_TRACE = None
@@ -31,6 +38,94 @@ SENSITIVE_KEYS = (
     "authorization",
     "bearer",
 )
+
+
+def _git_metadata(workdir: Path) -> tuple[str | None, bool | None, list[str]]:
+    """Collect best-effort Git identity without interrupting an Agent run."""
+    errors: list[str] = []
+
+    try:
+        resolved = workdir.resolve()
+        git_root = next(
+            (
+                candidate
+                for candidate in (resolved, *resolved.parents)
+                if (candidate / ".git").exists()
+            ),
+            None,
+        )
+    except OSError:
+        git_root = None
+    if git_root is None:
+        return None, None, errors
+
+    def run_git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=git_root,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+
+    try:
+        commit_result = run_git("rev-parse", "HEAD")
+        status_result = run_git("status", "--porcelain", "--untracked-files=normal")
+        commit = commit_result.stdout.strip() if commit_result.returncode == 0 else None
+        dirty = bool(status_result.stdout.strip()) if status_result.returncode == 0 else None
+        if commit_result.returncode != 0:
+            errors.append("git_commit_unavailable")
+        if status_result.returncode != 0:
+            errors.append("git_dirty_unavailable")
+        return commit or None, dirty, errors
+    except (OSError, subprocess.SubprocessError):
+        return None, None, ["git_metadata_unavailable"]
+
+
+def _runtime_metadata(
+    workdir: Path,
+    model_provider: str,
+    model: str,
+    base_url: str | None,
+    started_at: float,
+) -> dict:
+    try:
+        commit, dirty, errors = _git_metadata(workdir)
+        return {
+            "started_at": datetime.fromtimestamp(
+                started_at, tz=timezone.utc
+            ).isoformat(),
+            "project_version": __version__,
+            "git_commit": commit,
+            "git_dirty": dirty,
+            "model_provider": model_provider,
+            "model": model,
+            "base_url": sanitize_base_url(base_url),
+            "python_version": platform_module.python_version(),
+            # sys.platform is stable and avoids the comparatively expensive
+            # Windows platform probe on the latency-sensitive startup path.
+            "platform": sys.platform,
+            "workspace": str(workdir.resolve()),
+            "metadata_errors": errors,
+        }
+    except Exception as exc:
+        # Metadata is diagnostic only. Never let collection stop the task.
+        return {
+            "started_at": datetime.fromtimestamp(
+                started_at, tz=timezone.utc
+            ).isoformat(),
+            "project_version": __version__,
+            "git_commit": None,
+            "git_dirty": None,
+            "model_provider": model_provider,
+            "model": model,
+            "base_url": "",
+            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "platform": sys.platform,
+            "workspace": str(workdir),
+            "metadata_errors": [f"runtime_metadata_unavailable:{type(exc).__name__}"],
+        }
 
 
 def _json_default(value):
@@ -330,7 +425,7 @@ def _render_timeline_markdown(run_id: str, events: list[dict]) -> str:
 
 
 def _run_index_path(workdir: Path) -> Path:
-    return Path(workdir) / ".codepilot" / "run_index.json"
+    return Path(workdir) / ".aqours_code" / "run_index.json"
 
 
 def _relative_display_path(path: Path, workdir: Path) -> str:
@@ -414,7 +509,7 @@ def _index_item_from_metadata(run_dir: Path, workdir: Path) -> dict | None:
 
 def _reconcile_run_index(workdir: Path, items: list[dict] | None = None) -> list[dict]:
     items = list(items) if items is not None else load_run_index(workdir)
-    runs_dir = Path(workdir) / ".codepilot" / "runs"
+    runs_dir = Path(workdir) / ".aqours_code" / "runs"
     existing = {}
     for info in _scan_runs(runs_dir):
         existing[info["id"]] = info["path"]
@@ -642,7 +737,7 @@ def cleanup_old_runs(workdir: Path | None = None, current_run_id: str | None = N
         return stats
     try:
         base = Path(workdir) if workdir is not None else Path.cwd()
-        runs_dir = base / ".codepilot" / "runs"
+        runs_dir = base / ".aqours_code" / "runs"
         if not runs_dir.exists() or not runs_dir.is_dir():
             return stats
         runs_dir_resolved = _safe_resolve(runs_dir)
@@ -704,7 +799,7 @@ def cleanup_old_runs(workdir: Path | None = None, current_run_id: str | None = N
 def get_trace_storage_stats(workdir: Path | None = None) -> dict:
     try:
         base = Path(workdir) if workdir is not None else Path.cwd()
-        runs_dir = base / ".codepilot" / "runs"
+        runs_dir = base / ".aqours_code" / "runs"
         runs = sorted(_scan_runs(runs_dir), key=lambda item: item["start_time"])
         total = sum(info["size"] for info in runs)
         largest = max(runs, key=lambda item: item["size"], default=None)
@@ -733,7 +828,8 @@ def get_trace_storage_stats(workdir: Path | None = None) -> dict:
 
 class TraceRun:
     def __init__(self, workdir: Path, model_provider: str, model: str,
-                 user_prompt: str = "", storage_root: Path | None = None):
+                 user_prompt: str = "", storage_root: Path | None = None,
+                 base_url: str | None = None):
         self.run_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
         self._event_lock = threading.RLock()
         self.workdir = Path(workdir)
@@ -744,6 +840,13 @@ class TraceRun:
         self.model_provider = model_provider
         self.model = model
         self.start_time = time.time()
+        self.runtime_metadata = _runtime_metadata(
+            self.workdir,
+            model_provider,
+            model,
+            BASE_URL if base_url is None else base_url,
+            self.start_time,
+        )
         self.end_time = None
         self.finished = False
         self.status = "running"
@@ -753,7 +856,7 @@ class TraceRun:
         self.blocked_count = 0
         self.event_count = 0
         self.timeline_event_count = 0
-        self.run_dir = self.storage_root / ".codepilot" / "runs" / self.run_id
+        self.run_dir = self.storage_root / ".aqours_code" / "runs" / self.run_id
         self.trace_path = self.run_dir / "trace.jsonl"
         self.timeline_path = self.run_dir / "timeline.jsonl"
         self.timeline_md_path = self.run_dir / "timeline.md"
@@ -776,6 +879,7 @@ class TraceRun:
     def write_metadata(self):
         def _write():
             metadata = {
+                **self.runtime_metadata,
                 "run_id": self.run_id,
                 "start_time": self.start_time,
                 "end_time": self.end_time,
@@ -855,7 +959,24 @@ class TraceRun:
             timeline_event = _timeline_from_trace_event(event)
             if timeline_event:
                 self.timeline_event(timeline_event)
-            self.sync_metadata_and_index()
+            # Keep the append-only Trace complete, but avoid rewriting both
+            # metadata.json and run_index.json for every diagnostic event.
+            # State-changing checkpoints and finish() still flush immediately.
+            should_sync = event_type in {
+                "user_prompt",
+                "tool_use",
+                "tool_result",
+                "error",
+                "final_answer",
+            }
+            if (
+                event_type == "hook"
+                and event.get("name") == "PreToolUse"
+                and event.get("decision") == "blocked"
+            ):
+                should_sync = True
+            if should_sync:
+                self.sync_metadata_and_index()
 
     def _append_jsonl(self, path: Path, event: dict):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -896,10 +1017,17 @@ class TraceRun:
 
 
 def start_run(user_prompt: str, *, workdir: Path, model_provider: str, model: str,
-              storage_root: Path | None = None) -> TraceRun:
+              storage_root: Path | None = None,
+              base_url: str | None = None) -> TraceRun:
     global CURRENT_TRACE
-    CURRENT_TRACE = TraceRun(workdir, model_provider, model, user_prompt,
-                             storage_root=storage_root)
+    CURRENT_TRACE = TraceRun(
+        workdir,
+        model_provider,
+        model,
+        user_prompt,
+        storage_root=storage_root,
+        base_url=base_url,
+    )
     CURRENT_TRACE.event("user_prompt", prompt=user_prompt)
     cleanup_old_runs(workdir=CURRENT_TRACE.storage_root,
                      current_run_id=CURRENT_TRACE.run_id)

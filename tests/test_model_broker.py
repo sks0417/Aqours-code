@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from codepilot_s20.model_broker import (
+from aqours_code.model_broker import (
     BrokerIpcTimeout,
     BrokerModelClient,
     BrokerProtocolError,
@@ -18,8 +18,8 @@ from codepilot_s20.model_broker import (
     ModelBroker,
     broker_ipc_wait_timeout,
 )
-from codepilot_s20 import recovery
-from codepilot_s20.eval_container_entry import main as container_entry_main
+from aqours_code import recovery
+from aqours_code.eval_container_entry import main as container_entry_main
 from evals import run_eval
 
 
@@ -533,7 +533,7 @@ def test_noninteractive_container_entry_runs_normal_agent_through_broker(
 def test_container_entry_failure_preserves_command_execution_metadata(
     tmp_path, monkeypatch,
 ):
-    from codepilot_s20 import agent_loop
+    from aqours_code import agent_loop
 
     workspace = tmp_path / "workspace"
     state = tmp_path / "state"

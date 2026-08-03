@@ -1,5 +1,5 @@
-from codepilot_s20 import prompts
-from codepilot_s20.runtime_context import (
+from aqours_code import prompts
+from aqours_code.runtime_context import (
     detect_runtime_context,
     format_runtime_context_for_prompt,
 )

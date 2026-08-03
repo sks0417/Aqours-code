@@ -6,15 +6,15 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from codepilot_s20 import (
+from aqours_code import (
     background,
     basic_tools,
     context,
     tool_handlers,
 )
-from codepilot_s20.command_executor import LocalCommandExecutor
-from codepilot_s20.runtime import AgentRuntime
-from codepilot_s20.tool_defs import builtin_handlers
+from aqours_code.command_executor import LocalCommandExecutor
+from aqours_code.runtime import AgentRuntime
+from aqours_code.tool_defs import builtin_handlers
 
 
 def make_runtime(tmp_path: Path, executor=None) -> AgentRuntime:

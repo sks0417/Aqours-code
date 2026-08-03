@@ -33,7 +33,7 @@ EVIDENCE_STATES = frozenset({
 })
 _WORKSPACE_STATE_EXCLUDED_DIRS = frozenset({
     ".git",
-    ".codepilot",
+    ".aqours_code",
     ".transcripts",
     ".task_outputs",
     ".tasks",

@@ -1257,13 +1257,13 @@ def call_llm(messages: list, context: dict, tools: list,
     )
     record_llm_request(model=state.current_model, max_tokens=max_tokens,
                        message_count=len(messages), tool_count=len(tools))
-    old_timeout = _os.environ.get("MODEL_REQUEST_TIMEOUT")
+    old_timeout = _os.environ.get("AQOURS_CODE_REQUEST_TIMEOUT")
     if remaining is not None:
         try:
             configured = float(old_timeout or "30")
         except (TypeError, ValueError):
             configured = 30.0
-        _os.environ["MODEL_REQUEST_TIMEOUT"] = str(max(0.1, min(configured, remaining)))
+        _os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = str(max(0.1, min(configured, remaining)))
     try:
         return with_retry(
             lambda: model_client.messages.create(
@@ -1276,9 +1276,9 @@ def call_llm(messages: list, context: dict, tools: list,
     finally:
         if remaining is not None:
             if old_timeout is None:
-                _os.environ.pop("MODEL_REQUEST_TIMEOUT", None)
+                _os.environ.pop("AQOURS_CODE_REQUEST_TIMEOUT", None)
             else:
-                _os.environ["MODEL_REQUEST_TIMEOUT"] = old_timeout
+                _os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = old_timeout
 
 
 def _remaining_case_time(
@@ -1751,14 +1751,15 @@ def agent_loop(
                     "explicit" if block.input.get("run_in_background")
                     else "slow_command"
                 )
+                bg_id = start_background_task(block, handlers)
                 record_event(
                     "background_routed",
                     tool=block.name,
                     tool_use_id=block.id,
+                    task_id=bg_id,
                     command=block.input.get("command", ""),
                     reason=routing_reason,
                 )
-                bg_id = start_background_task(block, handlers)
                 output = (f"[Background task {bg_id} started] "
                           "Result will arrive as a task_notification. Do not "
                           "rerun the same command, poll with check_inbox, or "

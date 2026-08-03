@@ -7,7 +7,7 @@ from pathlib import Path
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run_dir", type=Path, help="Path to a .codepilot run directory")
+    parser.add_argument("run_dir", type=Path, help="Path to a .aqours_code run directory")
     return parser.parse_args()
 
 

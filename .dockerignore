@@ -1,7 +1,7 @@
 .env
 .git
 .pytest_cache
-.codepilot
+.aqours_code
 .mailboxes
 .tasks
 .task_outputs

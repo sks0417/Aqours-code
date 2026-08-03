@@ -46,13 +46,13 @@ def _request_with_deadline(*, system: str, messages: list, tools: list,
     remaining = None if deadline is None else deadline - _time.monotonic()
     if remaining is not None and remaining <= 0:
         raise _CaseTimeoutError("eval case deadline exceeded")
-    old_timeout = _os.environ.get("MODEL_REQUEST_TIMEOUT")
+    old_timeout = _os.environ.get("AQOURS_CODE_REQUEST_TIMEOUT")
     if remaining is not None:
         try:
             configured = float(old_timeout or "30")
         except (TypeError, ValueError):
             configured = 30.0
-        _os.environ["MODEL_REQUEST_TIMEOUT"] = str(max(0.1, min(configured, remaining)))
+        _os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = str(max(0.1, min(configured, remaining)))
     model = runtime.config.model if runtime is not None else MODEL
     model_client = (
         runtime.services.model_client if runtime is not None else client
@@ -71,9 +71,9 @@ def _request_with_deadline(*, system: str, messages: list, tools: list,
     finally:
         if remaining is not None:
             if old_timeout is None:
-                _os.environ.pop("MODEL_REQUEST_TIMEOUT", None)
+                _os.environ.pop("AQOURS_CODE_REQUEST_TIMEOUT", None)
             else:
-                _os.environ["MODEL_REQUEST_TIMEOUT"] = old_timeout
+                _os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = old_timeout
 
 
 def _role_handlers(

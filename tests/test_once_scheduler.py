@@ -1,6 +1,6 @@
 import time
 
-from codepilot_s20 import agent_loop, cron, tool_defs
+from aqours_code import agent_loop, cron, tool_defs
 
 
 def reset_scheduler(tmp_path):

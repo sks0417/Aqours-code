@@ -1,9 +1,9 @@
 from types import SimpleNamespace
 
-from codepilot_s20 import agent_loop
-from codepilot_s20 import hooks
-from codepilot_s20 import trace
-from codepilot_s20.command_executor import LocalCommandExecutor
+from aqours_code import agent_loop
+from aqours_code import hooks
+from aqours_code import trace
+from aqours_code.command_executor import LocalCommandExecutor
 
 
 class DeniedThenTextClient:
@@ -107,7 +107,7 @@ def test_noninteractive_destructive_bash_denies_without_input(monkeypatch):
     )
 
     result = hooks.permission_hook(approval_block(
-        "bash", {"command": "echo unsafe > /etc/codepilot-eval"}))
+        "bash", {"command": "echo unsafe > /etc/aqours-code-eval"}))
 
     assert result["kind"] == "tool_policy_rejection"
     assert result["recoverable"] is False
@@ -149,7 +149,7 @@ def test_noninteractive_permission_denial_stops_safely_without_eof(tmp_path):
 
     blocks = [
         approval_block(
-            "bash", {"command": "echo unsafe > /etc/codepilot-eval"}),
+            "bash", {"command": "echo unsafe > /etc/aqours-code-eval"}),
         approval_block(
             "mcp__deploy__trigger", {"environment": "production"}),
     ]
@@ -177,7 +177,7 @@ def test_interactive_permission_approval_still_uses_input(monkeypatch):
         "builtins.input", lambda prompt: prompts.append(prompt) or "yes")
 
     result = hooks.permission_hook(approval_block(
-        "bash", {"command": "echo approved > /etc/codepilot-eval"}))
+        "bash", {"command": "echo approved > /etc/aqours-code-eval"}))
 
     assert result is None
     assert prompts == ["  Allow? [y/N] "]

@@ -4,7 +4,7 @@ import json
 
 import analyze_timeline
 import analyze_trace
-from codepilot_s20.trace_analysis import (
+from aqours_code.trace_analysis import (
     analyze_events,
     post_compact_redundant_reads,
     read_jsonl,

@@ -6,7 +6,7 @@ try:
     READLINE_AVAILABLE = True
 except ImportError:
     READLINE_AVAILABLE = False
-PROMPT = "\033[36ms20 >> \033[0m"
+PROMPT = "\033[36mAqours_code >> \033[0m"
 CLI_ACTIVE = False
 
 def terminal_print(text: str):

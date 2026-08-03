@@ -1,4 +1,4 @@
-# CodePilot S20 当前 Agent 功能与真实接线审计
+# Aqours_code 当前 Agent 功能与真实接线审计
 
 > 审计日期：2026-07-31  
 > 审计对象：当前工作树，而非仅依据 README 或历史提交  
@@ -6,7 +6,7 @@
 
 ## 1. 执行摘要
 
-CodePilot S20 当前是一个由以下部分组成的实验型 Coding Agent Harness：
+Aqours_code 当前是一个由以下部分组成的实验型 Coding Agent Harness：
 
 - 单个 Lead Agent 主循环；
 - 31 个内置工具定义；
@@ -70,9 +70,9 @@ Lead Agent 主循环
 
 主要入口：
 
-- 交互 CLI：`codepilot_s20/main.py`
-- 非交互入口：`codepilot_s20/agent_loop.py::run_agent_task()`
-- Docker Eval 容器入口：`codepilot_s20/eval_container_entry.py`
+- 交互 CLI：`aqours_code/main.py`
+- 非交互入口：`aqours_code/agent_loop.py::run_agent_task()`
+- Docker Eval 容器入口：`aqours_code/eval_container_entry.py`
 - Eval Runner：`evals/run_eval.py`
 
 ## 3. 当前模型配置与调用能力
@@ -114,10 +114,10 @@ DeepSeek V4 Flash/Pro 的特殊处理：
 
 相关代码：
 
-- `codepilot_s20/config.py`
-- `codepilot_s20/model_api.py`
-- `codepilot_s20/recovery.py`
-- `codepilot_s20/model_budget.py`
+- `aqours_code/config.py`
+- `aqours_code/model_api.py`
+- `aqours_code/recovery.py`
+- `aqours_code/model_budget.py`
 
 ## 4. Lead Agent 主循环
 
@@ -147,7 +147,7 @@ DeepSeek V4 Flash/Pro 的特殊处理：
 - Lead 读取压力只写入 Trace，不会自动启动 Explorer；
 - 当前不会自动运行 Reviewer。
 
-主实现：`codepilot_s20/agent_loop.py`
+主实现：`aqours_code/agent_loop.py`
 
 ## 5. 31 个工具的完整清单
 
@@ -274,7 +274,7 @@ Task 使用 `.tasks/task_*.json`，支持：
 - 连接模拟 MCP server；
 - 动态生成 `mcp__server__tool` 工具。
 
-权威注册表：`codepilot_s20/tool_defs.py` 和 `codepilot_s20/tool_registry.py`。
+权威注册表：`aqours_code/tool_defs.py` 和 `aqours_code/tool_registry.py`。
 
 ## 6. Todo 与 Acceptance 的真实行为
 
@@ -349,7 +349,7 @@ Context Compact 生成的 `[Context checkpoint]` 只是旧消息的 Markdown 摘
 - Final Gate 不读取 `evidence_valid`；
 - 它能识别证据已失效，却不能阻止 Lead 宣布完成。
 
-实现：`codepilot_s20/knowledge.py`
+实现：`aqours_code/knowledge.py`
 
 ## 8. Context Compact、Memory 和 Skill
 
@@ -396,9 +396,9 @@ Context Compact 生成的 `[Context checkpoint]` 只是旧消息的 Markdown 摘
 
 实现：
 
-- `codepilot_s20/compact.py`
-- `codepilot_s20/context.py`
-- `codepilot_s20/skills.py`
+- `aqours_code/compact.py`
+- `aqours_code/context.py`
+- `aqours_code/skills.py`
 
 ## 9. 临时 Subagent
 
@@ -434,8 +434,8 @@ Reviewer 只有模型显式调用 `delegate_agent(role="review")` 时才运行�
 
 实现：
 
-- `codepilot_s20/agent_profiles.py`
-- `codepilot_s20/subagent.py`
+- `aqours_code/agent_profiles.py`
+- `aqours_code/subagent.py`
 - `tests/test_multiagent_roles.py`
 
 ## 10. 持久 Teammate、Task、Mailbox 与 Plan Approval
@@ -475,11 +475,11 @@ Teammate 是后台 daemon thread，具备：
 
 实现：
 
-- `codepilot_s20/teammate.py`
-- `codepilot_s20/task_system.py`
-- `codepilot_s20/message_bus.py`
-- `codepilot_s20/protocol.py`
-- `codepilot_s20/autonomous.py`
+- `aqours_code/teammate.py`
+- `aqours_code/task_system.py`
+- `aqours_code/message_bus.py`
+- `aqours_code/protocol.py`
+- `aqours_code/autonomous.py`
 
 ## 11. Git Worktree
 
@@ -504,11 +504,11 @@ Teammate 是后台 daemon thread，具备：
 - 没有自动 Worker Worktree 提交流程；
 - `general-purpose` 临时 Agent 直接修改 Lead 工作区，不使用 Worktree。
 
-实现：`codepilot_s20/worktree_system.py`
+实现：`aqours_code/worktree_system.py`
 
 ## 12. Intent 功能现状
 
-当前工作树没有 `codepilot_s20/intent.py`。
+当前工作树没有 `aqours_code/intent.py`。
 
 只剩 `classify_delegation_intent()`，它是关键词启发式分类器：
 
@@ -572,8 +572,8 @@ Teammate 是后台 daemon thread，具备：
 
 实现：
 
-- `codepilot_s20/background.py`
-- `codepilot_s20/cron.py`
+- `aqours_code/background.py`
+- `aqours_code/cron.py`
 
 ## 14. MCP 的真实状态
 
@@ -612,7 +612,7 @@ mcp__deploy__status
 
 权限层只要 MCP 工具名包含 `deploy` 就要求交互批准，因此非交互 Eval 中连只读 `mcp__deploy__status` 也会被拒绝。
 
-实现：`codepilot_s20/mcp.py`
+实现：`aqours_code/mcp.py`
 
 ## 15. 安全模型
 
@@ -682,7 +682,7 @@ Model Broker 用于让 API key 留在宿主机。
 - 仅剩一次调用时移除所有工具，强制生成 Final；
 - 预算耗尽前阻止再发一个超预算请求。
 
-实现：`codepilot_s20/model_broker.py`
+实现：`aqours_code/model_broker.py`
 
 ## 17. Trace、Timeline 和运行记录
 
@@ -725,8 +725,8 @@ Trace 记录：
 
 实现：
 
-- `codepilot_s20/trace.py`
-- `codepilot_s20/trace_analysis.py`
+- `aqours_code/trace.py`
+- `aqours_code/trace_analysis.py`
 
 ## 18. Eval Harness
 
@@ -759,7 +759,7 @@ Trace 记录：
 - `evals/run_eval.py`
 - `evals/docker_sandbox.py`
 - `evals/scoring.py`
-- `codepilot_s20/eval_container_entry.py`
+- `aqours_code/eval_container_entry.py`
 
 ## 19. 当前状态的持久化边界
 
@@ -776,7 +776,7 @@ Trace 记录：
 | Cron | JSON 文件 | 是 | 是 | 是 |
 | Teammate Model Context | 线程内存 | 是 | CLI 进程内是 | 否 |
 | MCP connection | 进程内存 | 是 | CLI 进程内是 | 否 |
-| Trace | `.codepilot/runs` | 不适用 | 是 | 是 |
+| Trace | `.aqours_code/runs` | 不适用 | 是 | 是 |
 | Compact transcript | `.transcripts` | 不适用 | 是 | 是，但不会自动恢复 |
 
 ## 20. README 与当前实现的主要偏差

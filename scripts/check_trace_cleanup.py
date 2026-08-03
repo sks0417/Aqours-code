@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from codepilot_s20 import trace  # noqa: E402
+from aqours_code import trace  # noqa: E402
 
 
 class CheckSuite:
@@ -46,7 +46,7 @@ def make_fake_run(base: Path, name: str, *, start_time: float | None = None,
                   pinned: bool = False, missing_metadata: bool = False,
                   bad_metadata: bool = False, trace_bytes: int = 0,
                   artifacts_bytes: int = 0) -> Path:
-    run_dir = base / ".codepilot" / "runs" / name
+    run_dir = base / ".aqours_code" / "runs" / name
     run_dir.mkdir(parents=True, exist_ok=True)
     if bad_metadata:
         (run_dir / "metadata.json").write_text("{bad json", encoding="utf-8")
@@ -335,7 +335,7 @@ def test_run_index_state_machine(suite: CheckSuite):
 def test_corrupt_run_index_recovery(suite: CheckSuite):
     with tempfile.TemporaryDirectory(prefix="trace_run_index_corrupt_") as tmp:
         root = Path(tmp)
-        index_path = root / ".codepilot" / "run_index.json"
+        index_path = root / ".aqours_code" / "run_index.json"
         index_path.parent.mkdir(parents=True, exist_ok=True)
         index_path.write_text("{bad json", encoding="utf-8")
         try:
@@ -355,7 +355,7 @@ def test_corrupt_run_index_recovery(suite: CheckSuite):
 
 
 def test_real_runs_directory_not_touched(suite: CheckSuite):
-    real_runs = PROJECT_ROOT / ".codepilot" / "runs"
+    real_runs = PROJECT_ROOT / ".aqours_code" / "runs"
     before = sorted(path.name for path in real_runs.iterdir()) if real_runs.exists() else []
     with tempfile.TemporaryDirectory(prefix="trace_cleanup_isolation_") as tmp:
         root = Path(tmp)
@@ -373,13 +373,13 @@ def test_real_runs_directory_not_touched(suite: CheckSuite):
         finally:
             restore_retention(old)
     after = sorted(path.name for path in real_runs.iterdir()) if real_runs.exists() else []
-    suite.check("Real .codepilot/runs directory is not touched", before == after)
+    suite.check("Real .aqours_code/runs directory is not touched", before == after)
 
 
 def main() -> int:
     print("Trace cleanup retention test")
     print(f"Project root: {PROJECT_ROOT}")
-    print("All scenarios use temporary directories; real .codepilot/runs is not cleaned.")
+    print("All scenarios use temporary directories; real .aqours_code/runs is not cleaned.")
     print()
 
     suite = CheckSuite()

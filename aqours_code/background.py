@@ -215,7 +215,7 @@ def start_background_task(block, handlers: dict) -> str:
             background_results[bg_id] = str(result)
 
     thread = threading.Thread(
-        target=worker, name=f"codepilot-background-{bg_id}", daemon=True)
+        target=worker, name=f"aqours-code-background-{bg_id}", daemon=True)
     task["thread"] = thread
     with background_lock:
         background_tasks[bg_id] = task

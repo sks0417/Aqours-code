@@ -37,8 +37,8 @@ def _looks_like_temp_cleanup(command: str) -> bool:
         "temp",
         "tmp",
         ".tmp",
-        ".codepilot\\tmp",
-        ".codepilot/tmp",
+        ".aqours_code\\tmp",
+        ".aqours_code/tmp",
     )
     has_temp_target = any(marker in lowered for marker in temp_markers)
     has_read_only_work = any(token in lowered for token in (

@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from codepilot_s20 import agent_loop
+from aqours_code import agent_loop
 from evals import run_eval
 
 
@@ -66,12 +66,12 @@ def test_text_only_response_stops_without_tool_use(monkeypatch):
 
 
 def test_read_file_tool_use_executes_and_appends_tool_result(tmp_path, monkeypatch):
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     install_common_agent_mocks(monkeypatch)
     monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
     monkeypatch.setattr(basic_tools, "WORKDIR", tmp_path)
-    (tmp_path / "hello.txt").write_text("hello codepilot")
+    (tmp_path / "hello.txt").write_text("hello Aqours_code")
     fake_client = FakeClient([
         response([tool_block("read_file", {"path": "hello.txt"})]),
         response([text_block("finished")]),
@@ -85,12 +85,12 @@ def test_read_file_tool_use_executes_and_appends_tool_result(tmp_path, monkeypat
     tool_message = messages[-2]
     assert tool_message["role"] == "user"
     assert tool_message["content"][0]["type"] == "tool_result"
-    assert tool_message["content"][0]["content"] == "hello codepilot"
+    assert tool_message["content"][0]["content"] == "hello Aqours_code"
     assert messages[-1]["content"][0].text == "finished"
 
 
 def test_glob_double_star_recurses_into_nested_source_tree(tmp_path):
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     nested = tmp_path / "src" / "inventory_service"
     nested.mkdir(parents=True)
@@ -214,7 +214,7 @@ def test_tool_use_then_text_completes_full_round(monkeypatch):
 
 
 def test_multi_step_task_requires_todo_before_tools(tmp_path, monkeypatch):
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     install_common_agent_mocks(monkeypatch)
     monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
@@ -251,7 +251,7 @@ def test_multi_step_task_requires_todo_before_tools(tmp_path, monkeypatch):
 
 
 def test_complex_code_task_allows_contract_read_before_todo(tmp_path, monkeypatch):
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     install_common_agent_mocks(monkeypatch)
     monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
@@ -299,7 +299,7 @@ def test_complex_code_task_allows_contract_read_before_todo(tmp_path, monkeypatc
 
 
 def test_completed_acceptance_todo_requires_evidence():
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     basic_tools.CURRENT_TODOS.clear()
     try:
@@ -374,7 +374,7 @@ def test_acceptance_guidance_covers_alias_and_recursive_fan_in_boundaries():
 def test_complex_code_task_requires_acceptance_before_edit_without_forced_review(
     tmp_path, monkeypatch,
 ):
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     install_common_agent_mocks(monkeypatch)
     monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
@@ -454,7 +454,7 @@ def test_complex_code_task_requires_acceptance_before_edit_without_forced_review
 def test_acceptance_items_cannot_be_silently_removed_or_rewritten(
     tmp_path, monkeypatch,
 ):
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     install_common_agent_mocks(monkeypatch)
     monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
@@ -522,7 +522,7 @@ def test_acceptance_items_cannot_be_silently_removed_or_rewritten(
 def test_completed_acceptance_does_not_force_fresh_contract_audit(
     tmp_path, monkeypatch,
 ):
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     install_common_agent_mocks(monkeypatch)
     monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
@@ -604,7 +604,7 @@ def test_completed_acceptance_does_not_force_fresh_contract_audit(
 def test_completed_acceptance_has_no_forced_audit_read_budget(
     tmp_path, monkeypatch,
 ):
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     install_common_agent_mocks(monkeypatch)
     monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
@@ -664,7 +664,7 @@ def test_completed_acceptance_has_no_forced_audit_read_budget(
 
 
 def test_unfinished_acceptance_gets_one_generic_todo_followup(monkeypatch):
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     install_common_agent_mocks(monkeypatch)
     contract = "All documented errors preserve repository state"
@@ -734,7 +734,7 @@ def test_run_agent_task_uses_injected_fake_model_client(tmp_path):
 
 def test_real_context_pipeline_keeps_eight_reads_visible_before_edit(
         tmp_path, monkeypatch):
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     for index in range(8):
         (tmp_path / f"file_{index}.txt").write_text(

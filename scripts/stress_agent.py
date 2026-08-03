@@ -13,8 +13,8 @@ from types import SimpleNamespace
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_WORKSPACE = PROJECT_ROOT / ".codepilot" / "stress_workspace"
-DEFAULT_REPORT_ROOT = PROJECT_ROOT / ".codepilot" / "stress_reports"
+DEFAULT_WORKSPACE = PROJECT_ROOT / ".aqours_code" / "stress_workspace"
+DEFAULT_REPORT_ROOT = PROJECT_ROOT / ".aqours_code" / "stress_reports"
 SUPPORTED_STAGES = {
     "all",
     "smoke",
@@ -628,7 +628,7 @@ def make_fake_trace_run(workdir: Path, run_id: str, *, start_time: float | None 
                         status: str = "success", pinned: bool = False,
                         missing_metadata: bool = False, bad_metadata: bool = False,
                         trace_bytes: int = 256, artifacts_bytes: int = 0) -> Path:
-    run_dir = workdir / ".codepilot" / "runs" / run_id
+    run_dir = workdir / ".aqours_code" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     start = float(start_time if start_time is not None else time.time())
     if bad_metadata:
@@ -673,7 +673,7 @@ def make_fake_trace_run(workdir: Path, run_id: str, *, start_time: float | None 
 
 
 def list_run_dirs(workdir: Path) -> list[Path]:
-    runs_dir = workdir / ".codepilot" / "runs"
+    runs_dir = workdir / ".aqours_code" / "runs"
     try:
         return sorted([path for path in runs_dir.iterdir() if path.is_dir()],
                       key=lambda item: item.name)
@@ -705,12 +705,12 @@ def read_text_preview(path: Path, limit: int = 500) -> str:
 
 def _agent_loop_worker(case: StressCase, workdir: str, model_provider: str,
                        model: str, mock: bool, conn):
-    os.environ["CODEPILOT_S20_WORKDIR"] = workdir
+    os.environ["AQOURS_CODE_WORKDIR"] = workdir
     ensure_project_importable()
     run = None
     try:
-        from codepilot_s20 import agent_loop, context as context_mod, trace
-        from codepilot_s20 import compact as compact_mod
+        from aqours_code import agent_loop, context as context_mod, trace
+        from aqours_code import compact as compact_mod
 
         if mock:
             agent_loop.client = MockClient(case.stage)
@@ -719,9 +719,9 @@ def _agent_loop_worker(case: StressCase, workdir: str, model_provider: str,
                 "delta, epsilon, zeta, eta, and theta."
             )
             agent_loop.MODEL_PROVIDER = "mock"
-            agent_loop.MODEL = "codepilot-s20-stress"
+            agent_loop.MODEL = "aqours-code-stress"
             model_provider = "mock"
-            model = "codepilot-s20-stress"
+            model = "aqours-code-stress"
 
         run = trace.start_run(
             case.prompt,
@@ -743,7 +743,7 @@ def _agent_loop_worker(case: StressCase, workdir: str, model_provider: str,
         conn.send({"type": "done"})
     except BaseException as exc:
         try:
-            from codepilot_s20 import trace
+            from aqours_code import trace
             trace.record_error(exc)
             trace.finish_run(f"[Error] {type(exc).__name__}: {exc}")
         except Exception:
@@ -999,11 +999,11 @@ def run_trace_retention_mixed(trace, base: Path, fake_run_count: int,
                 pinned=(index % 37 == 0),
                 trace_bytes=512 + (index % 5) * 64,
             )
-        total_before = dir_size(workdir / ".codepilot" / "runs")
+        total_before = dir_size(workdir / ".aqours_code" / "runs")
         index_before = len(trace.reconcile_run_index(workdir))
         cleanup_stats = trace.cleanup_old_runs(
             workdir=workdir, current_run_id="current_running")
-        total_after = dir_size(workdir / ".codepilot" / "runs")
+        total_after = dir_size(workdir / ".aqours_code" / "runs")
         index_after = len(trace.load_run_index(workdir))
         inconsistencies, issues = run_index_inconsistencies(trace, workdir)
         kept = len(list_run_dirs(workdir))
@@ -1076,10 +1076,10 @@ def run_trace_retention_quota(trace, base: Path, timeout: float) -> StressResult
                 start_time=now - 190 + index * 10,
                 trace_bytes=20_000,
             )
-        total_before = dir_size(workdir / ".codepilot" / "runs")
+        total_before = dir_size(workdir / ".aqours_code" / "runs")
         index_before = len(trace.reconcile_run_index(workdir))
         cleanup_stats = trace.cleanup_old_runs(workdir=workdir)
-        total_after = dir_size(workdir / ".codepilot" / "runs")
+        total_after = dir_size(workdir / ".aqours_code" / "runs")
         index_after = len(trace.load_run_index(workdir))
         inconsistencies, issues = run_index_inconsistencies(trace, workdir)
         checks = [
@@ -1137,10 +1137,10 @@ def run_trace_retention_large_run(trace, base: Path, timeout: float) -> StressRe
         run_dir = make_fake_trace_run(
             workdir, "large_run", start_time=time.time(),
             trace_bytes=5000, artifacts_bytes=5000)
-        total_before = dir_size(workdir / ".codepilot" / "runs")
+        total_before = dir_size(workdir / ".aqours_code" / "runs")
         index_before = len(trace.reconcile_run_index(workdir))
         cleanup_stats = trace.cleanup_old_runs(workdir=workdir)
-        total_after = dir_size(workdir / ".codepilot" / "runs")
+        total_after = dir_size(workdir / ".aqours_code" / "runs")
         index_after = len(trace.load_run_index(workdir))
         trace_text = read_text_preview(run_dir / "trace.jsonl", limit=2000)
         inconsistencies, issues = run_index_inconsistencies(trace, workdir)
@@ -1211,7 +1211,7 @@ def run_trace_retention_failure(trace, base: Path, timeout: float) -> StressResu
             ("cleanup failure propagated instead of returning stats",
              isinstance(cleanup_stats, dict)),
             ("cleanup failure removed test run unexpectedly",
-             (workdir / ".codepilot" / "runs" / "failure_input").exists()),
+             (workdir / ".aqours_code" / "runs" / "failure_input").exists()),
         ]
         result = StressResult(
             case_name="trace_retention_cleanup_failure",
@@ -1222,8 +1222,8 @@ def run_trace_retention_failure(trace, base: Path, timeout: float) -> StressResu
             fake_run_count=1,
             deleted_count=int(cleanup_stats.get("deleted") or 0),
             kept_count=len(list_run_dirs(workdir)),
-            total_size_before=dir_size(workdir / ".codepilot" / "runs"),
-            total_size_after=dir_size(workdir / ".codepilot" / "runs"),
+            total_size_before=dir_size(workdir / ".aqours_code" / "runs"),
+            total_size_after=dir_size(workdir / ".aqours_code" / "runs"),
             notes="Monkeypatched cleanup scan to raise.",
         )
         return finish_retention_result(result, checks)
@@ -1450,11 +1450,11 @@ def main() -> int:
     session_workspace.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    os.environ["CODEPILOT_S20_WORKDIR"] = str(session_workspace)
+    os.environ["AQOURS_CODE_WORKDIR"] = str(session_workspace)
     ensure_project_importable()
 
-    from codepilot_s20 import agent_loop, context, trace  # noqa: E402
-    from codepilot_s20.runtime_context import detect_runtime_context  # noqa: E402
+    from aqours_code import agent_loop, context, trace  # noqa: E402
+    from aqours_code.runtime_context import detect_runtime_context  # noqa: E402
 
     if mock:
         agent_loop.client = MockClient(stage)

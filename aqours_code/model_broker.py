@@ -490,7 +490,7 @@ class ModelBroker:
             raise ValueError("max_total_tokens must be greater than zero")
         if provider_timeout is None:
             try:
-                provider_timeout = float(os.getenv("MODEL_REQUEST_TIMEOUT", "30"))
+                provider_timeout = float(os.getenv("AQOURS_CODE_REQUEST_TIMEOUT", "30"))
             except (TypeError, ValueError):
                 provider_timeout = 30.0
         self.provider_timeout = float(provider_timeout)
@@ -532,7 +532,7 @@ class ModelBroker:
         (self.ipc_root / "stats").mkdir(parents=True, exist_ok=True)
         self._thread = threading.Thread(
             target=self.serve_forever,
-            name=f"codepilot-model-broker-{self.nonce[:8]}",
+            name=f"aqours-code-model-broker-{self.nonce[:8]}",
             daemon=True,
         )
         self._thread.start()
@@ -634,21 +634,21 @@ class ModelBroker:
         return ""
 
     def _call_provider_once(self, params: dict):
-        old_timeout = os.environ.get("MODEL_REQUEST_TIMEOUT")
+        old_timeout = os.environ.get("AQOURS_CODE_REQUEST_TIMEOUT")
         timeout = self.provider_timeout
         if self.case_deadline is not None:
             timeout = min(
                 timeout,
                 max(0.1, self.case_deadline - time.monotonic()),
             )
-        os.environ["MODEL_REQUEST_TIMEOUT"] = str(timeout)
+        os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = str(timeout)
         try:
             return self.model_client.messages.create(**params)
         finally:
             if old_timeout is None:
-                os.environ.pop("MODEL_REQUEST_TIMEOUT", None)
+                os.environ.pop("AQOURS_CODE_REQUEST_TIMEOUT", None)
             else:
-                os.environ["MODEL_REQUEST_TIMEOUT"] = old_timeout
+                os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = old_timeout
 
     def _call_provider_with_retry(self, params: dict):
         retries_used = 0

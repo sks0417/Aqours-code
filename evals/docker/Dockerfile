@@ -4,7 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
     PYTHONNOUSERSITE=1 \
-    PYTHONPATH=/opt/codepilot-src
+    PYTHONPATH=/opt/aqours-code-src
 
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes git ca-certificates \
@@ -25,9 +25,9 @@ RUN groupadd --gid 10001 eval \
     && touch /inputs/trace.jsonl /inputs/final.md /inputs/stdout.txt /inputs/stderr.txt \
     && chown -R 10001:10001 /workspace /state /runtime /broker /trusted_eval /grading_workspace /inputs
 
-COPY codepilot_s20 /opt/codepilot-src/codepilot_s20
-RUN python -c "import codepilot_s20.eval_container_entry"
+COPY aqours_code /opt/aqours-code-src/aqours_code
+RUN python -c "import aqours_code.eval_container_entry"
 
 WORKDIR /workspace
 USER 10001:10001
-CMD ["python", "-m", "codepilot_s20.eval_container_entry"]
+CMD ["python", "-m", "aqours_code.eval_container_entry"]

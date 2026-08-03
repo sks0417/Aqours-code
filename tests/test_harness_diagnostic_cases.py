@@ -11,11 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from codepilot_s20 import agent_loop as agent_loop_function
-import codepilot_s20.agent_loop as agent_loop_module
+from aqours_code import agent_loop as agent_loop_function
+import aqours_code.agent_loop as agent_loop_module
 from evals import run_eval
 from evals.grader_common import run_pytest
-from codepilot_s20.trace import TraceRun
+from aqours_code.trace import TraceRun
 
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -5,23 +5,23 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-from codepilot_s20 import bootstrap
+from aqours_code import bootstrap
 
 bootstrap()
 
-from codepilot_s20 import (
+from aqours_code import (
     agent_loop,
     autonomous,
     subagent,
     task_system,
     worktree_system,
 )
-from codepilot_s20.agent_profiles import (
+from aqours_code.agent_profiles import (
     assess_task_complexity,
     classify_delegation_intent,
 )
-from codepilot_s20.command_executor import LocalCommandExecutor
-from codepilot_s20.runtime import AgentRuntime
+from aqours_code.command_executor import LocalCommandExecutor
+from aqours_code.runtime import AgentRuntime
 from evals import run_eval
 
 
@@ -656,7 +656,7 @@ def test_invalid_reviewer_json_preserves_an_actionable_finding():
 
 
 def test_reviewer_findings_become_locked_acceptance_work():
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     basic_tools.CURRENT_TODOS.clear()
     try:
@@ -1009,7 +1009,7 @@ def test_reviewer_finding_reopens_matching_acceptance_instead_of_duplicating(
 
 
 def test_clean_reviewer_pass_completes_only_explicit_acceptance_ids():
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     basic_tools.CURRENT_TODOS.clear()
     try:
@@ -1110,7 +1110,7 @@ def test_readme_keywords_do_not_inject_hidden_acceptance_todos(tmp_path):
 
 
 def test_reviewer_gaps_never_auto_complete_acceptance():
-    from codepilot_s20 import basic_tools
+    from aqours_code import basic_tools
 
     basic_tools.CURRENT_TODOS.clear()
     try:

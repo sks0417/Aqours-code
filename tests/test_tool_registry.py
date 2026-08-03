@@ -5,22 +5,22 @@ from types import SimpleNamespace
 
 import pytest
 
-from codepilot_s20 import bootstrap
+from aqours_code import bootstrap
 
 bootstrap()
 
-from codepilot_s20 import background, hooks, mcp, prompts, subagent, teammate
-from codepilot_s20.agent_profiles import get_agent_profile
-from codepilot_s20.command_executor import LocalCommandExecutor
-from codepilot_s20.runtime import AgentRuntime
-from codepilot_s20.tool_defs import (
+from aqours_code import background, hooks, mcp, prompts, subagent, teammate
+from aqours_code.agent_profiles import get_agent_profile
+from aqours_code.command_executor import LocalCommandExecutor
+from aqours_code.runtime import AgentRuntime
+from aqours_code.tool_defs import (
     BUILTIN_HANDLERS,
     BUILTIN_TOOLS,
     TOOL_REGISTRY,
     builtin_handlers,
     tool_schemas_for_names,
 )
-from codepilot_s20.tool_registry import (
+from aqours_code.tool_registry import (
     effective_tool_names,
 )
 
