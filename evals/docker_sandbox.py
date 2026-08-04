@@ -53,6 +53,52 @@ def build_eval_image(
     return proc
 
 
+def eval_image_exists(
+    image: str,
+    *,
+    timeout: float = 30,
+    runner=subprocess.run,
+) -> bool:
+    """Return whether the eval image exists, while preserving real Docker errors."""
+    args = ["docker", "image", "inspect", image]
+    try:
+        proc = _run_docker_text(runner, args, timeout=timeout)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        raise SandboxError(
+            f"Docker image inspection failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    if proc.returncode == 0:
+        return True
+    detail = (proc.stderr or proc.stdout or "docker image inspect failed").strip()
+    normalized = detail.lower()
+    if "no such image" in normalized or "not found" in normalized:
+        return False
+    raise SandboxError(f"Docker image inspection failed: {detail}")
+
+
+def ensure_eval_image(
+    *,
+    project_root: Path,
+    image: str,
+    force_build: bool = False,
+    inspect_timeout: float = 30,
+    build_timeout: float = 600,
+    runner=subprocess.run,
+) -> bool:
+    """Ensure the eval image is available; return True when it was built."""
+    if not force_build and eval_image_exists(
+        image, timeout=inspect_timeout, runner=runner
+    ):
+        return False
+    build_eval_image(
+        project_root=project_root,
+        image=image,
+        timeout=build_timeout,
+        runner=runner,
+    )
+    return True
+
+
 class DockerAgentRunner:
     """Run one complete, one-shot Agent Runtime inside the eval image."""
 

@@ -21,6 +21,7 @@ from evals.docker_sandbox import (
     DockerGraderRunner,
     bind_mount,
     build_eval_image,
+    ensure_eval_image,
 )
 
 
@@ -176,6 +177,56 @@ def test_eval_image_build_uses_project_root_and_installs_runtime_and_git(tmp_pat
     runtime_import_check = dockerfile.index(
         'python -c "import aqours_code.eval_container_entry"')
     assert dependency_copy < dependency_install < source_copy < runtime_import_check
+
+
+def test_ensure_eval_image_reuses_existing_image():
+    runner = RecordingRunner()
+
+    built = ensure_eval_image(
+        project_root=run_eval.PROJECT_ROOT,
+        image="eval:test",
+        runner=runner,
+    )
+
+    assert built is False
+    assert runner.calls[0][0] == ["docker", "image", "inspect", "eval:test"]
+    assert len(runner.calls) == 1
+
+
+def test_ensure_eval_image_builds_missing_image():
+    def behavior(args, _kwargs):
+        if args[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(
+                args, 1, "", "Error response from daemon: No such image: eval:test"
+            )
+        return None
+
+    runner = RecordingRunner(behavior)
+
+    built = ensure_eval_image(
+        project_root=run_eval.PROJECT_ROOT,
+        image="eval:test",
+        runner=runner,
+    )
+
+    assert built is True
+    assert runner.calls[0][0] == ["docker", "image", "inspect", "eval:test"]
+    assert runner.calls[1][0][:2] == ["docker", "build"]
+
+
+def test_ensure_eval_image_force_build_skips_inspection():
+    runner = RecordingRunner()
+
+    built = ensure_eval_image(
+        project_root=run_eval.PROJECT_ROOT,
+        image="eval:test",
+        force_build=True,
+        runner=runner,
+    )
+
+    assert built is True
+    assert runner.calls[0][0][:2] == ["docker", "build"]
+    assert len(runner.calls) == 1
 
 
 def test_windows_mount_is_one_argument_not_colon_delimited():

@@ -56,7 +56,7 @@ from aqours_code.command_executor import (  # noqa: E402
 from evals.docker_sandbox import (  # noqa: E402
     DockerAgentRunner,
     DockerGraderRunner,
-    build_eval_image,
+    ensure_eval_image,
 )
 from aqours_code.docker_utils import prepare_disposable_tree  # noqa: E402
 from aqours_code.config import (  # noqa: E402
@@ -2378,7 +2378,8 @@ def main() -> int:
     parser.add_argument("--docker-image", default="aqours-code-eval:py311",
                         help="Eval sandbox image name.")
     parser.add_argument("--docker-build", action="store_true",
-                        help="Build the pinned eval image before running cases.")
+                        help=("Force rebuilding the pinned eval image before running cases. "
+                              "A missing image is built automatically."))
     parser.add_argument("--docker-memory", default="1g",
                         help="Container memory and memory-swap limit.")
     parser.add_argument("--docker-cpus", default="1",
@@ -2439,12 +2440,18 @@ def main() -> int:
         f"provider={MODEL_PROVIDER} model={MODEL}",
         flush=True,
     )
-    if args.execution == "docker" and args.docker_build:
+    if args.execution == "docker":
         try:
-            print(f"[eval] building Docker image {args.docker_image}", flush=True)
-            build_eval_image(project_root=PROJECT_ROOT, image=args.docker_image)
+            print(f"[eval] ensuring Docker image {args.docker_image}", flush=True)
+            built = ensure_eval_image(
+                project_root=PROJECT_ROOT,
+                image=args.docker_image,
+                force_build=args.docker_build,
+            )
+            if built:
+                print(f"[eval] Docker image ready {args.docker_image}", flush=True)
         except SandboxError as exc:
-            print(f"[eval] Docker build failed: {exc}", flush=True)
+            print(f"[eval] Docker image preparation failed: {exc}", flush=True)
             results = [case_exception_result(case, run_root, exc, execution_config) for case in cases]
             summary = build_summary(
                 started=started, cases_dir=cases_dir, run_root=run_root,

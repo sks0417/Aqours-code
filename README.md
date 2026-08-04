@@ -132,8 +132,10 @@ Aqours_code --help
 最小 Docker Eval smoke 使用确定性的 scripted model，但仍运行真实 Agent 容器和 Grader 容器：
 
 ```bash
-python evals/run_eval.py --scripted --execution docker --docker-build --case read_file_basic
+python evals/run_eval.py --scripted --execution docker --case read_file_basic
 ```
+
+Docker Eval 会在镜像缺失时自动构建；传入 `--docker-build` 可强制重建镜像。
 
 真实模型 Eval 去掉 `--scripted`，并使用 `.env` 中的同一组 API 配置。Docker 启动或构建失败是硬失败，不会悄悄回退到本地执行。只有开发调试时才显式使用 `--execution local`。
 
