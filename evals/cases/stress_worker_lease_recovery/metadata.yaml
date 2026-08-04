@@ -1,0 +1,16 @@
+id: stress_worker_lease_recovery
+suite: stress
+difficulty: 5
+category: state_machine_idempotency_and_recovery
+max_model_calls: 45
+score_runtime_target_sec: 210
+score_runtime_hard_limit_sec: 750
+score_llm_call_target: 15
+score_llm_call_hard_limit: 45
+score_tool_call_target: 38
+score_tool_call_hard_limit: 120
+score_token_target: 375000
+score_token_hard_limit: 1800000
+forbidden_paths: [README.md, pyproject.toml, tests/**]
+expected_artifacts: [src/worker_queue/__init__.py, src/worker_queue/api.py, src/worker_queue/bootstrap.py, src/worker_queue/errors.py, src/worker_queue/models.py, src/worker_queue/validation.py, src/worker_queue/fingerprint.py, src/worker_queue/serialization.py, src/worker_queue/repositories.py, src/worker_queue/leases.py, src/worker_queue/recovery.py, src/worker_queue/service.py]
+allowed_changes: [src/worker_queue/*.py]
