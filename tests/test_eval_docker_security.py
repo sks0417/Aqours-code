@@ -393,6 +393,15 @@ def test_eval_trace_storage_is_separate_and_exposes_normal_process_metrics(
         "exact_repeated_test_commands", "targeted_test_commands",
         "context_integrity_events", "context_integrity_failures",
         "context_configuration", "team_event_counts",
+        "tool_results", "tool_result_status_counts",
+        "explicit_tool_result_failures", "bash_exit_codes_available",
+        "bash_exit_code_results", "bash_nonzero_exit_codes",
+        "llm_responses", "model_trace_usage_responses",
+        "model_trace_usage_missing_responses",
+        "model_trace_actual_input_tokens",
+        "model_trace_actual_output_tokens",
+        "model_trace_actual_cache_creation_input_tokens",
+        "model_trace_actual_cache_read_input_tokens",
         "model_trace_actual_total_tokens", "event_count",
     }
     assert metrics["event_count"] > 0

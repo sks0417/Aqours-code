@@ -15,7 +15,6 @@ import uuid
 import fnmatch
 import hashlib
 import statistics
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -76,8 +75,11 @@ from aqours_code.model_broker import (  # noqa: E402
     ModelBroker,
     broker_ipc_wait_timeout,
 )
-from aqours_code.trace_analysis import (  # noqa: E402
-    post_compact_redundant_reads,
+from evals.metrics import (  # noqa: E402
+    read_trace_events,
+    trace_metrics,
+    write_metrics_artifacts,
+    write_trial_metrics,
 )
 from evals.scoring import (  # noqa: E402
     BREAKDOWN_WEIGHTS,
@@ -480,118 +482,6 @@ def load_metadata(case_dir: Path) -> dict:
         else:
             metadata[key] = str(parse_scalar(value, ""))
     return metadata
-
-
-def read_trace_events(trace_path: Path) -> list[dict]:
-    events = []
-    if not trace_path.exists():
-        return events
-    for line in trace_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            events.append(event)
-    return events
-
-
-def trace_metrics(trace_path: Path) -> dict:
-    events = read_trace_events(trace_path)
-    duplicate_tool_calls = 0
-    previous_tool_signature = None
-    tool_counts = Counter()
-    test_commands = []
-    for event in events:
-        if event.get("type") != "tool_use":
-            continue
-        tool_name = str(event.get("tool") or event.get("name") or "")
-        tool_counts[tool_name] += 1
-        tool_input = event.get("input") if isinstance(event.get("input"), dict) else {}
-        signature = (
-            tool_name,
-            json.dumps(tool_input, sort_keys=True, ensure_ascii=False),
-        )
-        if signature == previous_tool_signature:
-            duplicate_tool_calls += 1
-        previous_tool_signature = signature
-        if tool_name == "bash":
-            command = str(tool_input.get("command") or "").strip()
-            if any(marker in command for marker in (
-                    "pytest", "unittest", "python -m test")):
-                test_commands.append(command)
-    redundant_reads = post_compact_redundant_reads(events)
-    test_command_counts = Counter(test_commands)
-    integrity_events = [
-        event for event in events
-        if event.get("type") == "context_integrity"
-    ]
-    context_configuration = next((
-        event for event in events
-        if event.get("type") == "context_configuration"
-    ), {})
-    return {
-        "tool_calls": sum(
-            1 for event in events if event.get("type") == "tool_use"),
-        "llm_requests": sum(
-            1 for event in events if event.get("type") == "llm_request"),
-        "permission_blocks": sum(
-            1 for event in events
-            if event.get("type") == "hook"
-            and event.get("name") == "PreToolUse"
-            and event.get("decision") == "blocked"
-        ),
-        "duplicate_tool_calls": duplicate_tool_calls,
-        "tool_counts": dict(sorted(tool_counts.items())),
-        "read_file_calls": tool_counts.get("read_file", 0),
-        "post_compact_redundant_reads": redundant_reads["count"],
-        "post_compact_redundant_read_details": redundant_reads["details"],
-        "automatic_compactions": sum(
-            1 for event in events
-            if event.get("type") == "compact"
-            and event.get("kind") == "automatic"
-            and event.get("success") is True
-        ),
-        "oversized_tool_results_omitted": sum(
-            int(event.get("omitted_tool_result_count") or 0)
-            for event in events
-            if event.get("type") == "context_compact"
-            and event.get("stage") == "tool_result_limit"
-        ),
-        "exact_repeated_test_commands": sum(
-            count - 1 for count in test_command_counts.values() if count > 1),
-        "targeted_test_commands": sum(
-            1 for command in test_commands
-            if "::" in command or " -k " in f" {command} "
-            or "test_" in command
-        ),
-        "context_integrity_events": len(integrity_events),
-        "context_integrity_failures": sum(
-            1 for event in integrity_events
-            if (not event.get("checkpoint_present")
-                or not event.get("latest_user_preserved")
-                or bool(event.get("orphan_tool_result_ids")))
-        ),
-        "context_configuration": {
-            "context_limit_chars": context_configuration.get(
-                "context_limit_chars"),
-            "compact_trigger_ratio": context_configuration.get(
-                "compact_trigger_ratio"),
-            "eval_override": bool(context_configuration.get("eval_override")),
-        },
-        "team_event_counts": dict(sorted(Counter(
-            str(event.get("type")) for event in events
-            if str(event.get("type", "")).startswith((
-                "shared_task_", "message_bus_", "worktree_", "teammate_"))
-        ).items())),
-        "model_trace_actual_total_tokens": sum(
-            int(event.get("usage", {}).get("total_tokens") or 0)
-            for event in events
-            if event.get("type") == "llm_response"
-            and isinstance(event.get("usage"), dict)
-        ),
-        "event_count": len(events),
-    }
 
 
 def model_budgets_for_case(metadata: dict) -> tuple[int, int]:
@@ -1723,6 +1613,13 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
     if not stderr_path.exists():
         write_text(stderr_path, "")
 
+    source_run_dir_value = run_info.get("run_dir")
+    source_run_dir = Path(source_run_dir_value) if source_run_dir_value else None
+    source_metadata = source_run_dir / "metadata.json" if source_run_dir else None
+    if (source_metadata is not None and source_metadata.is_file()
+            and not run_metadata_path.exists()):
+        shutil.copy2(source_metadata, run_metadata_path)
+
     source_final_value = run_info.get("final_path")
     source_final = Path(source_final_value) if source_final_value else None
     if source_final and source_final.is_file():
@@ -1984,7 +1881,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             "lifecycle_complete": True,
         }
 
-    return {
+    result = {
         "case": case_name,
         "metadata": metadata,
         "passed": grader_result["passed"],
@@ -2026,6 +1923,8 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
         **lifecycle,
         "container_cleanup_succeeded": lifecycle["all_container_cleanup_succeeded"],
     }
+    result["metrics_artifact"] = str(write_trial_metrics(result))
+    return result
 
 
 def discover_cases(cases_dir: Path) -> list[Path]:
@@ -2283,7 +2182,7 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
                 else "test_timeout" if isinstance(exc, CaseTimeoutError)
                 else "grader_error")
     result = failure_result(reason=reason, failure_category=category)
-    return {
+    case_result = {
         "case": case.name,
         "metadata": metadata,
         "passed": False,
@@ -2351,9 +2250,24 @@ def case_exception_result(case: Path, run_root: Path, exc: Exception,
             "container_exit_code": None,
         },
     }
+    case_result["metrics_artifact"] = str(write_trial_metrics(case_result))
+    return case_result
 
 
 def write_summary(results_dir: Path, summary: dict):
+    run_root = Path(summary["run_root"])
+    metric_artifacts = write_metrics_artifacts(
+        run_root,
+        summary.get("results", []),
+        experiment={
+            "started_at": summary.get("started_at"),
+            "finished_at": summary.get("finished_at"),
+            "mode": summary.get("mode"),
+            "execution_backend": summary.get("execution_backend"),
+            "docker_image": summary.get("docker_image"),
+        },
+    )
+    summary["metrics_summary"] = str(metric_artifacts["summary"])
     summary_path = results_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary_path
