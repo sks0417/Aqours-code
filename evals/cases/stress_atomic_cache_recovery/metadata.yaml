@@ -1,0 +1,17 @@
+id: stress_atomic_cache_recovery
+suite: stress
+difficulty: 5
+category: filesystem_atomicity_fencing_and_recovery
+max_model_calls: 45
+# Provisional until at least three real-model trials are available.
+score_runtime_target_sec: 360
+score_runtime_hard_limit_sec: 900
+score_llm_call_target: 28
+score_llm_call_hard_limit: 45
+score_tool_call_target: 60
+score_tool_call_hard_limit: 140
+score_token_target: 650000
+score_token_hard_limit: 1800000
+forbidden_paths: [README.md, pyproject.toml, tests/**, src/artifact_cache/__init__.py, src/artifact_cache/models.py]
+expected_artifacts: [src/artifact_cache/__init__.py, src/artifact_cache/models.py, src/artifact_cache/key.py, src/artifact_cache/lock.py, src/artifact_cache/manifest.py, src/artifact_cache/store.py, src/artifact_cache/recovery.py, src/artifact_cache/service.py]
+allowed_changes: [src/artifact_cache/key.py, src/artifact_cache/lock.py, src/artifact_cache/manifest.py, src/artifact_cache/store.py, src/artifact_cache/recovery.py, src/artifact_cache/service.py]

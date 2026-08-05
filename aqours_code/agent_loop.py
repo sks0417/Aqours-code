@@ -1018,8 +1018,13 @@ def agent_loop(
             return
 
         if response.stop_reason == "max_tokens":
+            replayable_response = bool(
+                extract_text(response.content)
+                or has_tool_use(response.content)
+            )
             if force_final_response:
-                messages.append(assistant_message_from_response(response))
+                if replayable_response:
+                    messages.append(assistant_message_from_response(response))
                 record_hook("Stop")
                 trigger_hooks("Stop", messages)
                 finish_run(extract_text(response.content))
@@ -1029,7 +1034,12 @@ def agent_loop(
                 state.has_escalated = True
                 print(f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m")
                 continue
-            messages.append(assistant_message_from_response(response))
+            # Some thinking models can spend the entire response budget on
+            # hidden reasoning and return no text or tool call. Replaying that
+            # as an empty assistant message is invalid for OpenAI-compatible
+            # APIs and needlessly consumes the context budget.
+            if replayable_response:
+                messages.append(assistant_message_from_response(response))
             if state.recovery_count < MAX_RECOVERY_RETRIES:
                 messages.append({"role": "user", "content": CONTINUATION_PROMPT})
                 state.recovery_count += 1

@@ -107,6 +107,28 @@ def test_deepseek_v4_flash_uses_max_thinking_and_replays_reasoning(
     assert replayed[0]["tool_calls"][0]["function"]["name"] == "read_file"
 
 
+def test_openai_conversion_drops_empty_assistant_reasoning_turn():
+    replayed = _messages_to_openai([
+        {"role": "user", "content": "inspect the repository"},
+        {
+            "role": "assistant",
+            "content": [],
+            "reasoning_content": "unfinished hidden reasoning",
+        },
+        {"role": "user", "content": "continue"},
+    ])
+
+    assert replayed == [
+        {"role": "user", "content": "inspect the repository"},
+        {"role": "user", "content": "continue"},
+    ]
+    assert all(
+        message.get("content") or message.get("tool_calls")
+        for message in replayed
+        if message["role"] == "assistant"
+    )
+
+
 def test_non_deepseek_provider_retains_existing_tool_choice(monkeypatch):
     captured = {}
 

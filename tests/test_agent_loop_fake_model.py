@@ -399,6 +399,39 @@ def test_max_tokens_triggers_continuation_path(monkeypatch):
     assert messages[-1]["content"][0].text == "complete"
 
 
+def test_empty_max_tokens_response_is_not_replayed(monkeypatch):
+    install_common_agent_mocks(monkeypatch)
+    first_truncation = response([], stop_reason="max_tokens")
+    first_truncation.reasoning_content = "unfinished reasoning"
+    second_truncation = response([], stop_reason="max_tokens")
+    second_truncation.reasoning_content = "still unfinished reasoning"
+    fake_client = FakeClient([
+        first_truncation,
+        second_truncation,
+        response([text_block("complete")]),
+    ])
+    monkeypatch.setattr(agent_loop, "client", fake_client)
+
+    messages = [{"role": "user", "content": "long answer"}]
+    agent_loop.agent_loop(messages, {})
+
+    assert [
+        call["max_tokens"] for call in fake_client.messages.calls
+    ] == [
+        agent_loop.DEFAULT_MAX_TOKENS,
+        agent_loop.ESCALATED_MAX_TOKENS,
+        agent_loop.ESCALATED_MAX_TOKENS,
+    ]
+    assert not any(
+        message.get("role") == "assistant"
+        and not agent_loop.extract_text(message.get("content"))
+        and not agent_loop.has_tool_use(message.get("content"))
+        for message in messages
+    )
+    assert not any("reasoning_content" in message for message in messages)
+    assert messages[-1]["content"][0].text == "complete"
+
+
 def test_run_agent_task_uses_injected_fake_model_client(tmp_path):
     fake_client = FakeClient([response([text_block("task complete")])])
     trace_path = tmp_path / "trace.jsonl"

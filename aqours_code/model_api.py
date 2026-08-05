@@ -98,6 +98,12 @@ def _messages_to_openai(messages: list[dict]) -> list[dict]:
             reasoning_content = message.get("reasoning_content")
             if reasoning_content is not None:
                 msg["reasoning_content"] = str(reasoning_content)
+            # OpenAI-compatible providers reject assistant messages that have
+            # neither visible content nor tool calls. This can happen when a
+            # thinking model exhausts max_tokens before producing an answer.
+            # Incomplete reasoning alone is not a replayable assistant turn.
+            if msg["content"] is None and not tool_calls:
+                continue
             converted.append(msg)
             continue
         if role == "user" and isinstance(content, list):
