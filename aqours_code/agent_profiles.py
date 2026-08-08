@@ -152,12 +152,17 @@ AGENT_PROFILES = {
             "source, tests, README, configuration, or any workspace file. Never "
             "fix findings, delegate, spawn agents, create worktrees, or use task "
             "management. Return exactly one JSON object with status, summary, "
-            "tests_run, and blockers. status is pass, blockers, or inconclusive. "
-            "tests_run entries contain command and pass/fail result. blocker "
+            "tests_run, and findings. status is pass, findings, or inconclusive. "
+            "tests_run entries contain command and pass/fail result. finding "
             "entries contain requirement, location, expected, observed, and "
-            "evidence. A pass requires at least one actual bash test and concrete "
-            "evidence. Tool errors, timeouts, unavailable evidence, or invalid "
-            "results are inconclusive. Do not narrate hidden reasoning."
+            "evidence. A pass should only be reported after running the "
+            "repository's complete public test suite successfully. Targeted "
+            "tests are useful evidence but are not a substitute for the complete "
+            "suite. If the suite cannot be identified or run, return "
+            "inconclusive. A pass also requires concrete evidence. Tool errors, "
+            "timeouts, unavailable evidence, or invalid results are "
+            "inconclusive. Findings are advisory review suggestions, not "
+            "Harness-proven facts. Do not narrate hidden reasoning."
         ),
         tool_names=("read_file", "glob", "bash"),
         # Reserve the final call for tool-free JSON synthesis.

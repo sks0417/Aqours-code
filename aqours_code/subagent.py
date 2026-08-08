@@ -1,6 +1,6 @@
 from .runtime_state import *
 from .agent_profiles import get_agent_profile, normalize_agent_role
-from .model_budget import can_spend_optional_calls
+from .model_budget import allocate_verifier_calls, can_spend_optional_calls
 from .runtime import AgentRuntime
 from .model_api import assistant_message_from_response
 from .tool_registry import (
@@ -176,7 +176,7 @@ def _parse_role_result(text: str, role: str) -> dict:
             "status": "inconclusive",
             "summary": _short_text(raw, 700),
             "tests_run": [],
-            "blockers": [],
+            "findings": [],
             "invalid_json": True,
             "failure_reason": "invalid_verifier_json",
         }
@@ -189,41 +189,33 @@ def _short_text(value, limit: int) -> str:
 
 def _normalize_verifier_result(value: dict) -> dict:
     status = _short_text(value.get("status", "inconclusive"), 20).lower()
-    if status not in {"pass", "blockers", "inconclusive"}:
+    if status == "blockers":
+        status = "findings"
+    if status not in {"pass", "findings", "inconclusive"}:
         status = "inconclusive"
-    raw_tests = value.get("tests_run", [])
-    if not isinstance(raw_tests, list):
-        raw_tests = []
-    tests_run = []
-    for raw in raw_tests[:VERIFIER_MAX_TESTS]:
+    raw_findings = value.get("findings", value.get("blockers", []))
+    if not isinstance(raw_findings, list):
+        raw_findings = []
+    findings = []
+    for raw in raw_findings[:8]:
         if not isinstance(raw, dict):
             continue
-        result = _short_text(raw.get("result", "fail"), 10).lower()
-        tests_run.append({
-            "command": _short_text(raw.get("command", ""), 500),
-            "result": "pass" if result == "pass" else "fail",
-        })
-    raw_blockers = value.get("blockers", [])
-    if not isinstance(raw_blockers, list):
-        raw_blockers = []
-    blockers = []
-    for raw in raw_blockers[:8]:
-        if not isinstance(raw, dict):
-            continue
-        blockers.append({
+        findings.append({
             "requirement": _short_text(raw.get("requirement", ""), 300),
             "location": _short_text(raw.get("location", ""), 240),
             "expected": _short_text(raw.get("expected", ""), 500),
             "observed": _short_text(raw.get("observed", ""), 500),
             "evidence": _short_text(raw.get("evidence", ""), 700),
         })
-    if blockers and status == "pass":
-        status = "blockers"
+    if findings and status == "pass":
+        status = "findings"
     return {
         "status": status,
         "summary": _short_text(value.get("summary", ""), 700),
-        "tests_run": tests_run,
-        "blockers": blockers,
+        # Never trust model-supplied test claims. Finalization replaces this
+        # with facts captured from actual verifier Bash executions.
+        "tests_run": [],
+        "findings": findings,
     }
 
 
@@ -376,9 +368,9 @@ def _finalize_role_result(
         actual_tests = list(stats.get("tests_run", []))[:VERIFIER_MAX_TESTS]
         normalized["tests_run"] = actual_tests
         failure_reason = str(result.get("failure_reason", ""))
-        if normalized["status"] == "blockers" and not normalized["blockers"]:
+        if normalized["status"] == "findings" and not normalized["findings"]:
             normalized["status"] = "inconclusive"
-            failure_reason = "blockers_report_missing_findings"
+            failure_reason = "findings_report_missing_findings"
         elif normalized["status"] == "pass" and not actual_tests:
             normalized["status"] = "inconclusive"
             failure_reason = "no_actual_bash_test"
@@ -426,6 +418,8 @@ def run_role_agent(
     prompt: str,
     cwd: Path,
     runtime: AgentRuntime | None = None,
+    *,
+    max_model_calls: int | None = None,
 ) -> dict:
     profile = get_agent_profile(role)
     if profile is None:
@@ -505,7 +499,16 @@ def run_role_agent(
         "tests_run": [],
         "tool_failure": "",
     }
-    for _ in range(profile.max_tool_rounds):
+    configured_role_calls = profile.max_tool_rounds + 1
+    model_call_limit = (
+        configured_role_calls
+        if max_model_calls is None else max(0, int(max_model_calls))
+    )
+    tool_round_limit = min(
+        profile.max_tool_rounds,
+        max(0, model_call_limit - 1),
+    )
+    for _ in range(tool_round_limit):
         verifier_stats["model_calls"] += 1
         response = _request_with_deadline(
             system=system, messages=messages, tools=tools,
@@ -693,16 +696,27 @@ def run_role_agent(
     else:
         needs_synthesis = True
 
+    if (needs_synthesis
+            and verifier_stats["model_calls"] >= model_call_limit):
+        return _finalize_role_result(
+            _parse_role_result(final_text, profile.name),
+            profile,
+            successful_read_paths,
+            verifier_stats,
+        )
+
     if needs_synthesis:
         if profile.name == "verifier":
             synthesis_instruction = (
                 '<synthesis>Tool use is over. Return one compact JSON object and '
-                'nothing else: {"status":"pass|blockers|inconclusive",'
-                '"summary":"max 500 chars","tests_run":[],"blockers":'
+                'nothing else: {"status":"pass|findings|inconclusive",'
+                '"summary":"max 500 chars","tests_run":[],"findings":'
                 '[{"requirement":"","location":"","expected":"",'
-                '"observed":"","evidence":""}]}. Report only blockers backed '
-                'by observed code or test evidence. Do not request more tools, '
-                'edit files, use Markdown, or narrate reasoning.</synthesis>'
+                '"observed":"","evidence":""}]}. Treat findings as advisory '
+                'review suggestions. Report pass only after the repository\'s '
+                'complete public test suite succeeds; if it cannot be identified '
+                'or run, report inconclusive. Do not request more tools, edit '
+                'files, use Markdown, or narrate reasoning.</synthesis>'
             )
             synthesis_max_tokens = profile.max_response_tokens
         elif profile.name == "review":
@@ -806,17 +820,21 @@ def run_independent_verifier(
     model_client = (
         runtime.services.model_client if runtime is not None else client
     )
-    estimated_calls = profile.max_tool_rounds + 1
-    budget_allowed, budget = can_spend_optional_calls(
-        model_client, estimated_calls,
+    allocated_calls, budget = allocate_verifier_calls(
+        model_client,
+        VERIFIER_MAX_MODEL_CALLS,
+        resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
+        safety_margin=VERIFIER_SAFETY_MARGIN,
     )
-    if not budget_allowed:
+    if allocated_calls < 2:
         record_event(
             "verification_skipped",
             verification_skipped_reason="insufficient_model_budget",
             complexity_score=int(complexity_score),
             threshold=VERIFIER_COMPLEXITY_THRESHOLD,
-            estimated_model_calls=estimated_calls,
+            allocated_model_calls=allocated_calls,
+            resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
+            safety_margin=VERIFIER_SAFETY_MARGIN,
             **{key: value for key, value in budget.items()
                if key != "available"},
         )
@@ -832,7 +850,13 @@ def run_independent_verifier(
         "verification_start",
         complexity_score=int(complexity_score),
         threshold=VERIFIER_COMPLEXITY_THRESHOLD,
-        max_model_calls=estimated_calls,
+        remaining_model_calls=(
+            budget.get("remaining_calls") if budget.get("available") else None
+        ),
+        allocated_model_calls=allocated_calls,
+        resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
+        safety_margin=VERIFIER_SAFETY_MARGIN,
+        max_model_calls=allocated_calls,
         max_tool_calls=profile.max_tool_calls,
         max_tests=VERIFIER_MAX_TESTS,
     )
@@ -858,17 +882,23 @@ def run_independent_verifier(
         )
         + "Run no more than "
         f"{VERIFIER_MAX_TESTS} high-value tests. Do not modify the workspace.\n"
+        "A pass should only be reported after the repository's complete public "
+        "test suite succeeds. Targeted tests do not substitute for it; return "
+        "inconclusive when the complete suite cannot be identified or run.\n"
         "Observed public test commands and short results, if any:\n"
         f"{json.dumps(observed, ensure_ascii=False)}"
     )
     try:
-        raw_result = run_role_agent("verifier", assignment, workdir, runtime)
+        raw_result = run_role_agent(
+            "verifier", assignment, workdir, runtime,
+            max_model_calls=allocated_calls,
+        )
     except Exception as exc:
         raw_result = {
             "status": "inconclusive",
             "summary": "Independent verification could not complete.",
             "tests_run": [],
-            "blockers": [],
+            "findings": [],
             "failure_reason": (
                 "verifier_timeout" if isinstance(exc, _CaseTimeoutError)
                 else f"verifier_error:{type(exc).__name__}"
@@ -900,7 +930,9 @@ def run_independent_verifier(
         model_calls=model_calls,
         tool_calls=tool_calls,
         tests_run=len(result["tests_run"]),
-        blockers_found=len(result["blockers"]),
+        findings_found=len(result["findings"]),
+        blockers_found=len(result["findings"]),
+        allocated_model_calls=allocated_calls,
         workspace_modified=bool(changed_files),
         workspace_changed_files=changed_files[:20],
         failure_reason=failure_reason,
@@ -912,7 +944,9 @@ def run_independent_verifier(
         "model_calls": model_calls,
         "tool_calls": tool_calls,
         "tests_run": len(result["tests_run"]),
-        "blockers_found": len(result["blockers"]),
+        "findings_found": len(result["findings"]),
+        "blockers_found": len(result["findings"]),
+        "allocated_model_calls": allocated_calls,
         "workspace_modified": bool(changed_files),
         "failure_reason": failure_reason,
     }

@@ -37,14 +37,20 @@ class ScriptedClient:
 
 
 class BudgetedScriptedClient(ScriptedClient):
-    def __init__(self, responses, max_calls: int):
+    def __init__(self, responses, max_calls: int, used_calls: int = 0):
         super().__init__(responses)
         self.max_calls = max_calls
+        self.used_calls = used_calls
+
+    def create(self, **kwargs):
+        if self.used_calls + len(self.calls) >= self.max_calls:
+            raise RuntimeError("scripted broker hard limit exceeded")
+        return super().create(**kwargs)
 
     def budget_snapshot(self):
         return {
             "max_calls": self.max_calls,
-            "call_count": len(self.calls),
+            "call_count": self.used_calls + len(self.calls),
             "max_provider_retries": 0,
         }
 
@@ -98,18 +104,23 @@ def lead_test():
     ))
 
 
-def verifier_json(status: str, blockers=None):
-    return response(text_block(json.dumps({
+def verifier_json(
+    status: str, findings=None, *, legacy: bool = False, tests_run=None,
+):
+    payload = {
         "status": status,
         "summary": "independent evidence collected",
-        "tests_run": [],
-        "blockers": blockers or [],
-    })))
+        "tests_run": tests_run or [],
+        "blockers" if legacy else "findings": findings or [],
+    }
+    return response(text_block(json.dumps(payload)))
 
 
 def test_verifier_defaults_are_centralized():
     assert config.VERIFIER_COMPLEXITY_THRESHOLD == 6
     assert config.VERIFIER_MAX_MODEL_CALLS == 8
+    assert config.VERIFIER_RESOLUTION_RESERVE == 2
+    assert config.VERIFIER_SAFETY_MARGIN == 1
     assert config.VERIFIER_MAX_TOOL_CALLS == 12
     assert config.VERIFIER_MAX_TESTS == 5
     assert config.VERIFIER_MAX_RUNS_PER_TASK == 1
@@ -199,14 +210,17 @@ def test_verifier_pass_accepts_pending_lead_final_with_no_extra_lead_call(
     assert report["verifier_model_calls"] == 2
     assert report["verifier_tool_calls"] == 1
     assert report["verifier_tests_run"] == 1
+    assert report["verifier_findings_found"] == 0
     assert report["verifier_blockers_found"] == 0
+    assert report["verifier_allocated_model_calls"] == 8
     assert report["verifier_workspace_modified"] is False
 
 
-def test_blockers_discard_pending_final_and_return_json_to_lead_once(tmp_path):
+def test_findings_discard_pending_final_and_return_to_lead_once(tmp_path):
     prepare_workspace(tmp_path)
+    trace = tmp_path / "trace.jsonl"
     pending_final = "UNVERIFIED FINAL MUST DISAPPEAR"
-    blocker = {
+    finding = {
         "requirement": "Public VALUE is stable",
         "location": "service.py:1",
         "expected": "VALUE remains valid on retry",
@@ -215,17 +229,17 @@ def test_blockers_discard_pending_final_and_return_json_to_lead_once(tmp_path):
     }
     client = ScriptedClient([
         lead_edit(), response(text_block(pending_final)),
-        verifier_test(), verifier_json("blockers", [blocker]),
-        response(text_block("lead final after handling blocker")),
+        verifier_test(), verifier_json("findings", [finding]),
+        response(text_block("lead final after reviewing finding")),
     ])
 
     result = agent_loop.run_agent_task(
-        high_complexity_task(), str(tmp_path),
+        high_complexity_task(), str(tmp_path), str(trace),
         model_client=client, model_provider="scripted", model="scripted",
         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
     )
 
-    assert result["final_answer"] == "lead final after handling blocker"
+    assert result["final_answer"] == "lead final after reviewing finding"
     assert len([
         call for call in client.calls
         if "You are the verifier role" in call["system"]
@@ -233,9 +247,13 @@ def test_blockers_discard_pending_final_and_return_json_to_lead_once(tmp_path):
     final_lead_messages = json.dumps(
         client.calls[-1]["messages"], ensure_ascii=False, default=str,
     )
-    assert "Independent verification found potential blockers" in final_lead_messages
+    assert "Independent verification produced advisory findings" in final_lead_messages
     assert "Public VALUE is stable" in final_lead_messages
     assert pending_final not in final_lead_messages
+    report = metrics.trace_metrics(trace)
+    assert report["verifier_status"] == "findings"
+    assert report["verifier_findings_found"] == 1
+    assert report["verifier_blockers_found"] == 1
 
 
 def test_invalid_json_and_pass_without_bash_test_are_inconclusive(
@@ -245,7 +263,9 @@ def test_invalid_json_and_pass_without_bash_test_are_inconclusive(
     client = ScriptedClient([
         response(text_block("not json")),
         response(text_block("still not json")),
-        verifier_json("pass"),
+        verifier_json("pass", tests_run=[{
+            "command": "python -m pytest -q", "result": "pass",
+        }]),
     ])
     monkeypatch.setattr(subagent, "client", client)
     monkeypatch.setattr(subagent, "MODEL", "scripted")
@@ -262,6 +282,7 @@ def test_invalid_json_and_pass_without_bash_test_are_inconclusive(
     assert invalid["failure_reason"] == "invalid_verifier_json"
     assert no_test["status"] == "inconclusive"
     assert no_test["failure_reason"] == "no_actual_bash_test"
+    assert no_test["tests_run"] == []
 
 
 def test_verifier_workspace_mutation_invalidates_result_without_reset(
@@ -320,6 +341,77 @@ def test_verifier_budget_skip_is_explicit_and_does_not_call_model(
     assert events[-1][1]["verification_skipped_reason"] == (
         "insufficient_model_budget"
     )
+
+
+def test_legacy_blockers_format_maps_to_advisory_findings(
+    tmp_path, monkeypatch,
+):
+    prepare_workspace(tmp_path)
+    legacy_finding = {
+        "requirement": "Documented behavior remains stable",
+        "location": "implementation module",
+        "expected": "retry preserves the documented result",
+        "observed": "review suggests a possible mismatch",
+        "evidence": "source inspection",
+    }
+    client = ScriptedClient([
+        verifier_test(),
+        verifier_json("blockers", [legacy_finding], legacy=True),
+    ])
+    monkeypatch.setattr(subagent, "client", client)
+    monkeypatch.setattr(subagent, "MODEL", "scripted")
+    monkeypatch.setattr(subagent, "CURRENT_ROOT_TASK", high_complexity_task())
+
+    result = subagent.run_role_agent(
+        "verifier", "verify independently", tmp_path,
+    )
+
+    assert result["status"] == "findings"
+    assert result["findings"] == [legacy_finding]
+    assert "state" not in result["findings"][0]
+
+
+def test_verifier_dynamic_budget_45_used_36_allocates_six_calls(
+    tmp_path, monkeypatch,
+):
+    prepare_workspace(tmp_path)
+    tool_rounds = [
+        response(tool_block(
+            "read_file",
+            {"path": "README.md", "offset": index, "limit": 1},
+            f"read-{index}",
+        ))
+        for index in range(5)
+    ]
+    client = BudgetedScriptedClient(
+        [*tool_rounds, verifier_json("pass")],
+        max_calls=45,
+        used_calls=36,
+    )
+    monkeypatch.setattr(subagent, "client", client)
+    monkeypatch.setattr(subagent, "MODEL", "scripted")
+    monkeypatch.setattr(subagent, "CURRENT_ROOT_TASK", high_complexity_task())
+    events = []
+    monkeypatch.setattr(
+        subagent, "record_event",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+
+    outcome = subagent.run_independent_verifier(
+        tmp_path, None, complexity_score=8,
+    )
+
+    start = next(payload for kind, payload in events
+                 if kind == "verification_start")
+    assert outcome["invoked"] is True
+    assert outcome["allocated_model_calls"] == 6
+    assert start["remaining_model_calls"] == 9
+    assert start["allocated_model_calls"] == 6
+    assert start["resolution_reserve"] == 2
+    assert start["safety_margin"] == 1
+    assert len(client.calls) == 6
+    assert client.calls[-1]["tools"] == []
+    assert client.used_calls + len(client.calls) <= client.max_calls
 
 
 def test_last_model_call_records_verifier_budget_skip_and_tells_lead(tmp_path):

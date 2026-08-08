@@ -167,15 +167,14 @@ def _observed_lead_tests(messages: list, limit: int = 5) -> list[dict]:
 def _verification_feedback(outcome: dict) -> str:
     report = outcome.get("report", {})
     rendered = json.dumps(report, ensure_ascii=False, sort_keys=True)
-    if outcome.get("status") == "blockers":
+    if outcome.get("status") == "findings":
         return (
-            "Independent verification found potential blockers.\n\n"
-            "Review each finding against the original task and README.\n"
-            "Reproduce valid findings, fix the implementation, and rerun the "
-            "public test suite.\n"
-            "If a finding is a false positive, demonstrate that with a concrete "
-            "test.\n"
-            "Do not finish until all valid blockers are addressed.\n\n"
+            "Independent verification produced advisory findings.\n\n"
+            "Review them once against the original task, README, current code, "
+            "and tests. Reproduce and fix valid issues, or explain why a finding "
+            "does not apply. Rerun appropriate tests, then provide a new final "
+            "answer. These findings are review suggestions rather than "
+            "Harness-proven correctness facts; the verifier will not run again.\n\n"
             f"{rendered}"
         )
     reason = str(outcome.get("failure_reason") or "verifier_inconclusive")
