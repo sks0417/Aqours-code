@@ -152,11 +152,13 @@ AGENT_PROFILES = {
             "source, tests, README, configuration, or any workspace file. Never "
             "fix findings, delegate, spawn agents, create worktrees, or use task "
             "management. Return exactly one JSON object with status, summary, "
-            "tests_run, and blockers. status is pass, blockers, or inconclusive. "
-            "tests_run entries contain command and pass/fail result. blocker "
-            "entries contain requirement, location, expected, observed, and "
-            "evidence. A pass requires at least one actual bash test and concrete "
-            "evidence. Tool errors, timeouts, unavailable evidence, or invalid "
+            "tests_run, and findings. status is pass, findings, or inconclusive. "
+            "Every finding is only a candidate for the Harness to validate and "
+            "contains requirement, location, expected, observed, evidence, and "
+            "evidence_test_ids. Never claim a finding is confirmed. A pass "
+            "requires the complete public test suite to run successfully, not "
+            "only a targeted or temporary test. Tool errors, timeouts, "
+            "unavailable evidence, or invalid "
             "results are inconclusive. Do not narrate hidden reasoning."
         ),
         tool_names=("read_file", "glob", "bash"),

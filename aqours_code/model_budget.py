@@ -76,3 +76,29 @@ def can_spend_optional_calls(
         >= snapshot["reserve_calls"]
     )
     return allowed, snapshot
+
+
+def allocate_verifier_calls(
+    model_client,
+    configured_max_calls: int,
+    *,
+    resolution_reserve: int = 2,
+    safety_margin: int = 1,
+) -> tuple[int, dict]:
+    """Allocate a one-shot verifier without the generic tail reserve.
+
+    The Lead already has a pending final when this runs. Keep only the calls
+    needed to resolve findings plus a small hard-limit margin; ordinary
+    delegations continue to use ``can_spend_optional_calls`` unchanged.
+    """
+    snapshot = model_budget_snapshot(model_client)
+    configured = max(0, int(configured_max_calls))
+    reserve = max(0, int(resolution_reserve))
+    margin = max(0, int(safety_margin))
+    if not snapshot.get("available"):
+        return configured, snapshot
+    available = max(
+        0,
+        int(snapshot["remaining_calls"]) - reserve - margin,
+    )
+    return min(configured, available), snapshot

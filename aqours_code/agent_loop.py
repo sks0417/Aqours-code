@@ -167,15 +167,16 @@ def _observed_lead_tests(messages: list, limit: int = 5) -> list[dict]:
 def _verification_feedback(outcome: dict) -> str:
     report = outcome.get("report", {})
     rendered = json.dumps(report, ensure_ascii=False, sort_keys=True)
-    if outcome.get("status") == "blockers":
+    if outcome.get("status") == "findings":
         return (
-            "Independent verification found potential blockers.\n\n"
-            "Review each finding against the original task and README.\n"
-            "Reproduce valid findings, fix the implementation, and rerun the "
-            "public test suite.\n"
-            "If a finding is a false positive, demonstrate that with a concrete "
-            "test.\n"
-            "Do not finish until all valid blockers are addressed.\n\n"
+            "Independent verification produced candidate findings.\n\n"
+            "A candidate may be a real defect or a false positive; model-written "
+            "evidence is not proof. Check each finding against the original task "
+            "and README and reproduce it first. Fix real defects. A false "
+            "positive does not require a code change, but it must be disproved "
+            "with a new targeted test. Before finishing, run the complete public "
+            "test suite. Confirmed findings additionally require their captured "
+            "replayable failing commands to pass after a workspace change.\n\n"
             f"{rendered}"
         )
     reason = str(outcome.get("failure_reason") or "verifier_inconclusive")
@@ -185,6 +186,189 @@ def _verification_feedback(outcome: dict) -> str:
         "task and README, run the public test suite, and address any concrete "
         "issues before finishing. The independent verifier will not run again.\n\n"
         f"{rendered}"
+    )
+
+
+def _finding_state_counts(findings: list[dict]) -> dict[str, int]:
+    counts = {
+        "candidate": 0,
+        "confirmed": 0,
+        "dismissed": 0,
+        "resolved": 0,
+        "unresolved": 0,
+    }
+    for finding in findings:
+        state = str(finding.get("state", "candidate"))
+        if state in counts:
+            counts[state] += 1
+    return counts
+
+
+def _test_command_signature(command: object) -> str:
+    return " ".join(str(command or "").strip().split()).lower()
+
+
+def _evaluate_verification_resolution(
+    resolution: dict,
+    current_snapshot: dict[str, str],
+) -> dict:
+    """Evaluate candidate findings from observable post-feedback facts."""
+    findings = resolution.get("findings", [])
+    verifier_tests = {
+        str(test.get("id")): test
+        for test in resolution.get("verifier_tests", [])
+        if isinstance(test, dict) and test.get("id")
+    }
+    leader_tests = [
+        test for test in resolution.get("leader_tests", [])
+        if isinstance(test, dict)
+    ]
+    public_passed = any(
+        test.get("scope") == "public_suite" and test.get("exit_code") == 0
+        for test in leader_tests
+    )
+    targeted_passes = [
+        test for test in leader_tests
+        if test.get("scope") == "targeted" and test.get("exit_code") == 0
+    ]
+    feedback_snapshot = resolution.get("feedback_snapshot", {})
+    code_changed = any(
+        feedback_snapshot.get(path) != current_snapshot.get(path)
+        for path in set(feedback_snapshot) | set(current_snapshot)
+    )
+    candidate_total = sum(
+        finding.get("state") == "candidate" for finding in findings
+    )
+    targets = []
+    for finding in findings:
+        origin = str(finding.get("state", "candidate"))
+        if origin == "confirmed":
+            required = [
+                verifier_tests[test_id]
+                for test_id in finding.get("evidence_test_ids", [])
+                if test_id in verifier_tests
+                and verifier_tests[test_id].get("replayable") is True
+                and verifier_tests[test_id].get("result") == "fail"
+            ]
+            replay_passed = bool(required) and all(
+                any(
+                    _test_command_signature(test.get("command", ""))
+                    == _test_command_signature(required_test.get("command", ""))
+                    and test.get("exit_code") == 0
+                    for test in leader_tests
+                )
+                for required_test in required
+            )
+            state = (
+                "resolved"
+                if code_changed and public_passed and replay_passed
+                else "unresolved"
+            )
+            reason = (
+                "replay_passed_after_workspace_change"
+                if state == "resolved"
+                else "confirmed_failure_not_resolved"
+            )
+        elif code_changed:
+            enough_targeted = len(targeted_passes) >= max(1, candidate_total)
+            state = (
+                "resolved" if public_passed and enough_targeted
+                else "unresolved"
+            )
+            reason = (
+                "targeted_and_public_passed_after_workspace_change"
+                if state == "resolved"
+                else "candidate_resolution_evidence_incomplete"
+            )
+        else:
+            enough_targeted = len(targeted_passes) >= max(1, candidate_total)
+            state = (
+                "dismissed" if public_passed and enough_targeted
+                else "candidate"
+            )
+            reason = (
+                "targeted_counterevidence_and_public_suite_passed"
+                if state == "dismissed"
+                else "candidate_not_addressed"
+            )
+        targets.append({
+            "finding": finding,
+            "to": state,
+            "reason": reason,
+        })
+    success = bool(targets) and all(
+        item["to"] in {"resolved", "dismissed"} for item in targets
+    )
+    return {
+        "success": success,
+        "targets": targets,
+        "code_changed": code_changed,
+        "public_suite_run": any(
+            test.get("scope") == "public_suite" for test in leader_tests
+        ),
+        "public_suite_passed": public_passed,
+        "targeted_tests_passed": len(targeted_passes),
+    }
+
+
+def _apply_resolution_transitions(
+    resolution: dict,
+    evaluation: dict,
+    *,
+    incomplete: bool = False,
+) -> str:
+    findings = resolution.get("findings", [])
+    for item in evaluation.get("targets", []):
+        finding = item["finding"]
+        old_state = str(finding.get("state", "candidate"))
+        new_state = str(item["to"])
+        if incomplete and new_state == "candidate":
+            new_state = "candidate"
+        if old_state == new_state:
+            continue
+        finding["state"] = new_state
+        record_event(
+            "verification_finding_transition",
+            finding_id=finding.get("id", ""),
+            **{"from": old_state, "to": new_state},
+            reason=item.get("reason", ""),
+        )
+    counts = _finding_state_counts(findings)
+    if incomplete:
+        resolution_status = (
+            "unresolved" if counts["unresolved"] else "incomplete"
+        )
+    elif counts["resolved"]:
+        resolution_status = "resolved"
+    else:
+        resolution_status = "dismissed"
+    record_event(
+        "verification_resolution",
+        resolution_status=resolution_status,
+        candidate_findings=counts["candidate"],
+        confirmed_findings=counts["confirmed"],
+        dismissed_findings=counts["dismissed"],
+        resolved_findings=counts["resolved"],
+        unresolved_findings=counts["unresolved"],
+        public_suite_run=bool(evaluation.get("public_suite_run")),
+        public_suite_passed=bool(evaluation.get("public_suite_passed")),
+        workspace_modified_after_findings=bool(evaluation.get("code_changed")),
+    )
+    return resolution_status
+
+
+def _resolution_reminder(evaluation: dict) -> str:
+    return (
+        "<verification_resolution_reminder>Independent verification findings "
+        "remain unresolved. A normal success final cannot be accepted yet. "
+        "For a real defect, update the workspace, rerun every captured "
+        "confirmed/replayable failure, and run the complete public suite. For "
+        "a false-positive candidate, run new targeted counterevidence and the "
+        "complete public suite; no code change is required. "
+        f"Observed after feedback: workspace_changed={bool(evaluation.get('code_changed'))}, "
+        f"targeted_passes={int(evaluation.get('targeted_tests_passed', 0))}, "
+        f"public_suite_passed={bool(evaluation.get('public_suite_passed'))}."
+        "</verification_resolution_reminder>"
     )
 
 
@@ -941,13 +1125,20 @@ def agent_loop(
     if not root_task:
         root_task = _latest_user_instruction(messages)
     complexity = assess_task_complexity(root_task)
-    from .subagent import snapshot_workspace, workspace_changes
+    from .subagent import (
+        _bash_exit_code,
+        captured_test_fact,
+        is_test_command,
+        snapshot_workspace,
+        workspace_changes,
+    )
     verification_workdir = (
         runtime.paths.workdir if runtime is not None else _Path(WORKDIR)
     )
     task_start_snapshot = snapshot_workspace(verification_workdir)
     verifier_runs = 0
     verifier_run_limit = min(max(int(VERIFIER_MAX_RUNS_PER_TASK), 0), 1)
+    verification_resolution = None
     multiagent_enabled = "delegate_agent" in handlers
     multiagent_required = (
         multiagent_enabled
@@ -1173,6 +1364,34 @@ def agent_loop(
         state.has_escalated = False
         messages.append(assistant_message_from_response(response))
         if force_final_response:
+            if verification_resolution is not None:
+                evaluation = _evaluate_verification_resolution(
+                    verification_resolution,
+                    snapshot_workspace(verification_workdir),
+                )
+                if evaluation["success"]:
+                    _apply_resolution_transitions(
+                        verification_resolution, evaluation,
+                    )
+                else:
+                    _apply_resolution_transitions(
+                        verification_resolution, evaluation, incomplete=True,
+                    )
+                    if messages and messages[-1].get("role") == "assistant":
+                        messages.pop()
+                    incomplete_text = (
+                        "verification_incomplete: Independent verification "
+                        "findings were not resolved before the model-call "
+                        "budget was exhausted."
+                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": incomplete_text}],
+                    })
+                    record_hook("Stop")
+                    trigger_hooks("Stop", messages)
+                    finish_run(incomplete_text, status="blocked")
+                    return
             unresolved = _incomplete_todos(runtime)
             if unresolved:
                 _append_todo_warning(response.content, unresolved)
@@ -1228,6 +1447,52 @@ def agent_loop(
                     "todo_completion_reminder", decision="incomplete_final",
                     unresolved_count=len(unresolved_todos),
                 )
+            if verification_resolution is not None:
+                evaluation = _evaluate_verification_resolution(
+                    verification_resolution,
+                    snapshot_workspace(verification_workdir),
+                )
+                if evaluation["success"]:
+                    _apply_resolution_transitions(
+                        verification_resolution, evaluation,
+                    )
+                    record_hook("Stop")
+                    trigger_hooks("Stop", messages)
+                    finish_run(extract_text(response.content))
+                    return
+                if messages and messages[-1].get("role") == "assistant":
+                    messages.pop()
+                if not verification_resolution.get("reminder_sent"):
+                    verification_resolution["reminder_sent"] = True
+                    messages.append({
+                        "role": "user",
+                        "content": _resolution_reminder(evaluation),
+                    })
+                    record_event(
+                        "verification_resolution_reminder",
+                        decision="resolution_reminder_sent",
+                        workspace_modified=bool(evaluation["code_changed"]),
+                        public_suite_passed=bool(
+                            evaluation["public_suite_passed"]),
+                        targeted_tests_passed=int(
+                            evaluation["targeted_tests_passed"]),
+                    )
+                    continue
+                _apply_resolution_transitions(
+                    verification_resolution, evaluation, incomplete=True,
+                )
+                incomplete_text = (
+                    "verification_incomplete: Independent verification "
+                    "findings remain unresolved after the resolution reminder."
+                )
+                messages.append({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": incomplete_text}],
+                })
+                record_hook("Stop")
+                trigger_hooks("Stop", messages)
+                finish_run(incomplete_text, status="blocked")
+                return
             verification_skip_reason = ""
             if not complexity.get("implementation_task", False):
                 verification_skip_reason = "not_implementation_task"
@@ -1265,6 +1530,26 @@ def agent_loop(
                     if messages and messages[-1].get("role") == "assistant":
                         messages.pop()
                     if outcome.get("invoked"):
+                        if outcome.get("status") == "findings":
+                            verification_resolution = {
+                                "findings": [
+                                    dict(item) for item in outcome.get(
+                                        "report", {},
+                                    ).get("findings", [])
+                                    if isinstance(item, dict)
+                                ],
+                                "verifier_tests": [
+                                    dict(item) for item in outcome.get(
+                                        "report", {},
+                                    ).get("tests_run", [])
+                                    if isinstance(item, dict)
+                                ],
+                                "leader_tests": [],
+                                "feedback_snapshot": snapshot_workspace(
+                                    verification_workdir,
+                                ),
+                                "reminder_sent": False,
+                            }
                         messages.append({
                             "role": "user",
                             "content": _verification_feedback(outcome),
@@ -1402,7 +1687,13 @@ def agent_loop(
                 continue
             record_hook("PreToolUse", tool=block.name, decision="allowed")
 
-            if should_run_background(block.name, block.input):
+            resolution_test_command = bool(
+                verification_resolution is not None
+                and block.name == "bash"
+                and is_test_command(str(block.input.get("command", "")))
+            )
+            if (should_run_background(block.name, block.input)
+                    and not resolution_test_command):
                 routing_reason = (
                     "explicit" if block.input.get("run_in_background")
                     else "slow_command"
@@ -1428,12 +1719,28 @@ def agent_loop(
                 continue
 
             handler = handlers.get(block.name)
+            handler_input = dict(block.input)
+            if resolution_test_command:
+                handler_input["_report_exit_code"] = True
             output = call_tool_handler(
                 handler,
-                block.input,
+                handler_input,
                 block.name,
                 tool_use_id=block.id,
             )
+            if resolution_test_command:
+                fact = captured_test_fact(
+                    str(block.input.get("command", "")),
+                    _bash_exit_code(str(output)),
+                    len(verification_resolution["leader_tests"]) + 1,
+                    id_prefix="leader_test",
+                )
+                verification_resolution["leader_tests"].append(fact)
+                output = (
+                    f"{output}\n<harness_test_fact>"
+                    f"{json.dumps(fact, ensure_ascii=False)}"
+                    "</harness_test_fact>"
+                )
             trigger_hooks("PostToolUse", block, output)
             record_hook("PostToolUse", tool=block.name)
             print(str(output)[:300])

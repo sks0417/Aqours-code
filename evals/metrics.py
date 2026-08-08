@@ -124,6 +124,16 @@ def trace_metrics(trace_path: Path) -> dict:
     verification_skip = (
         verification_skips[-1] if verification_skips else {}
     )
+    verification_resolutions = [
+        event for event in events
+        if event.get("type") == "verification_resolution"
+    ]
+    verification_resolution = (
+        verification_resolutions[-1] if verification_resolutions else {}
+    )
+    verification_state = (
+        verification_resolution or verification_result
+    )
 
     return {
         "tool_calls": sum(tool_counts.values()),
@@ -217,6 +227,32 @@ def trace_metrics(trace_path: Path) -> dict:
             verification_result.get("tests_run") or 0),
         "verifier_blockers_found": int(
             verification_result.get("blockers_found") or 0),
+        "verifier_candidate_findings": int(
+            verification_state.get("candidate_findings") or 0),
+        "verifier_confirmed_findings": int(
+            verification_state.get("confirmed_findings") or 0),
+        "verifier_dismissed_findings": int(
+            verification_state.get("dismissed_findings") or 0),
+        "verifier_resolved_findings": int(
+            verification_state.get("resolved_findings") or 0),
+        "verifier_unresolved_findings": int(
+            verification_state.get("unresolved_findings") or 0),
+        "verifier_public_suite_run": (
+            verification_state.get("public_suite_run")
+            if "public_suite_run" in verification_state else None
+        ),
+        "verifier_public_suite_passed": (
+            verification_state.get("public_suite_passed")
+            if "public_suite_passed" in verification_state else None
+        ),
+        "verifier_allocated_model_calls": (
+            int(verification_result.get("allocated_model_calls"))
+            if verification_result.get("allocated_model_calls") is not None
+            else None
+        ),
+        "verifier_resolution_status": (
+            verification_state.get("resolution_status") or "unknown"
+        ),
         "verifier_workspace_modified": bool(
             verification_result.get("workspace_modified")),
         "verifier_skipped_reason": (
