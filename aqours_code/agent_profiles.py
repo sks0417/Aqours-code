@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import re
 
 from .config import (
+    VERIFIER_MAX_MODEL_CALLS,
     VERIFIER_MAX_RESPONSE_TOKENS,
     VERIFIER_MAX_TOOL_CALLS,
 )
@@ -164,9 +165,8 @@ AGENT_PROFILES = {
             "Harness-proven facts. Do not narrate hidden reasoning."
         ),
         tool_names=("read_file", "glob", "bash"),
-        # The Verifier loop does not use this generic role-round field. It is
-        # bounded by its tool/test policies and the global emergency fuse.
-        max_tool_rounds=0,
+        # Reserve the final call for tool-free JSON synthesis.
+        max_tool_rounds=max(0, VERIFIER_MAX_MODEL_CALLS - 1),
         max_read_paths=20,
         max_tool_calls=VERIFIER_MAX_TOOL_CALLS,
         max_response_tokens=VERIFIER_MAX_RESPONSE_TOKENS,

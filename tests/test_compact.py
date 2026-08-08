@@ -865,11 +865,20 @@ def test_large_reasoning_tool_exchange_uses_256k_summary_input_window(
 
 
 def test_each_compact_uses_at_most_one_summary_model_call(monkeypatch):
+    budget_requests = []
     calls = install_summary(monkeypatch, "s" * 30_000)
+    monkeypatch.setattr(
+        compact,
+        "can_spend_optional_calls",
+        lambda _client, count: (
+            budget_requests.append(count) or (True, {"available": True})
+        ),
+    )
 
     force_compact(long_history(15, width=400))
 
     assert len(calls) == 1
+    assert budget_requests == [1]
 
 
 def test_unchanged_failed_automatic_compact_is_not_retried(

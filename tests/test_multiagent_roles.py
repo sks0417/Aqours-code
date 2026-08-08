@@ -52,6 +52,19 @@ class ScriptedClient:
         return self.responses.pop(0)
 
 
+class BudgetedScriptedClient(ScriptedClient):
+    def __init__(self, responses, max_calls: int):
+        super().__init__(responses)
+        self.max_calls = max_calls
+
+    def budget_snapshot(self):
+        return {
+            "max_calls": self.max_calls,
+            "call_count": len(self.calls),
+            "max_provider_retries": 0,
+        }
+
+
 def test_persistent_teammate_idle_waits_for_explicit_shutdown(monkeypatch):
     class DelayedShutdown:
         def __init__(self):
@@ -169,24 +182,18 @@ def test_legacy_task_uses_bounded_traced_role_runtime(tmp_path, monkeypatch):
     )
 
 
-def test_legacy_task_is_not_blocked_by_shared_model_budget(tmp_path, monkeypatch):
-    client = ScriptedClient([response(text_block(json.dumps({
-        "verdict": "complete",
-        "summary": "request handler located",
-        "changed_files": [],
-        "tests": [],
-        "remaining_risks": [],
-    })))])
+def test_legacy_task_respects_finalization_reserve(tmp_path, monkeypatch):
+    client = BudgetedScriptedClient([], max_calls=4)
     monkeypatch.setattr(subagent, "client", client)
     monkeypatch.setattr(subagent, "WORKDIR", tmp_path)
 
     result = json.loads(subagent.spawn_subagent(
         "Inspect the repository and locate the request handler"))
 
-    assert result["status"] == "completed"
+    assert result["status"] == "budget_reserved"
     assert result["role"] == "general-purpose"
     assert result["routed_from"] == "task"
-    assert len(client.calls) == 1
+    assert client.calls == []
 
 
 def test_explore_role_enforces_unique_read_path_budget(tmp_path, monkeypatch):
@@ -874,35 +881,49 @@ def test_readme_keywords_do_not_inject_hidden_todos(tmp_path):
     )
 
 
-def test_runtime_role_signal_requires_repeat_and_cross_scope():
+def test_runtime_role_signal_requires_repeat_cross_scope_and_tail_budget():
+    class Budget:
+        def __init__(self, used):
+            self.used = used
+
+        def budget_snapshot(self):
+            return {
+                "source": "test", "max_calls": 40,
+                "call_count": self.used, "max_provider_retries": 1,
+            }
+
     broad_once = {
         "README.md": 1,
         **{f"src/module_{index}.py": 1 for index in range(6)},
         "tests/test_contract.py": 1,
     }
-    no_repeat = agent_loop._runtime_role_benefit(broad_once)
+    no_repeat = agent_loop._runtime_role_benefit(broad_once, Budget(10))
     assert no_repeat["evidence_ready"] is False
 
     repeated = dict(broad_once)
     repeated["src/module_1.py"] = 2
     repeated["tests/test_contract.py"] = 2
-    eligible = agent_loop._runtime_role_benefit(repeated)
+    eligible = agent_loop._runtime_role_benefit(repeated, Budget(10))
     assert eligible["eligible"] is True
     assert eligible["repeated_reads"] == 2
     assert eligible["scope_count"] == 3
+
+    tail = agent_loop._runtime_role_benefit(repeated, Budget(28))
+    assert tail["evidence_ready"] is True
+    assert tail["eligible"] is False
+    assert tail["budget_allowed"] is False
 
     absolute = {
         "/workspace/README.md": 1,
         **{f"/workspace/src/module_{index}.py": 1 for index in range(6)},
         "/workspace/tests/test_contract.py": 3,
     }
-    docker_paths = agent_loop._runtime_role_benefit(absolute)
+    docker_paths = agent_loop._runtime_role_benefit(absolute, Budget(10))
     assert docker_paths["eligible"] is True
     assert docker_paths["scope_count"] == 3
 
 
-def test_complex_task_has_no_model_budget_fallback(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_loop, "VERIFIER_MAX_RUNS_PER_TASK", 0)
+def test_complex_task_degrades_to_lead_verification_when_budget_is_low(tmp_path):
     (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
     task = (
         "Implement an end-to-end atomic transaction rollback and idempotency "
@@ -912,14 +933,15 @@ def test_complex_task_has_no_model_budget_fallback(tmp_path, monkeypatch):
         + "Keep each cross-file change focused and maintainable. " * 8
     )
     assert assess_task_complexity(task)["level"] == "complex"
-    client = ScriptedClient([
+    client = BudgetedScriptedClient([
         response(tool_block(
             "edit_file",
             {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
             "edit",
         )),
         response(text_block("ready for final")),
-    ])
+        response(text_block("finished with reserved calls")),
+    ], max_calls=4)
 
     result = agent_loop.run_agent_task(
         task, str(tmp_path), model_client=client,
@@ -927,24 +949,29 @@ def test_complex_task_has_no_model_budget_fallback(tmp_path, monkeypatch):
         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
     )
 
-    assert result["final_answer"] == "ready for final"
-    assert len(client.calls) == 2
+    assert result["final_answer"] == "finished with reserved calls"
+    assert len(client.calls) == 3
     assert all(
         any(tool["name"] == "delegate_agent" for tool in call["tools"])
         for call in client.calls[:2]
     )
-    assert "insufficient_model_budget" not in json.dumps(
-        client.calls[-1]["messages"], default=str,
+    assert not any(
+        "You are the verifier role" in call["system"]
+        for call in client.calls
+    )
+    assert any(
+        "insufficient_model_budget" in str(message.get("content"))
+        for message in client.calls[-1]["messages"]
     )
 
 
-def test_second_call_keeps_tools_and_has_no_forced_final_message(tmp_path):
+def test_last_budget_call_is_forced_to_be_a_tool_free_final(tmp_path):
     (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    client = ScriptedClient([
+    client = BudgetedScriptedClient([
         response(tool_block(
             "read_file", {"path": "service.py"}, "read-once")),
         response(text_block("final from retained evidence")),
-    ])
+    ], max_calls=2)
 
     result = agent_loop.run_agent_task(
         "Inspect service.py and report its current value.",
@@ -955,8 +982,8 @@ def test_second_call_keeps_tools_and_has_no_forced_final_message(tmp_path):
 
     assert result["final_answer"] == "final from retained evidence"
     assert len(client.calls) == 2
-    assert client.calls[1]["tools"]
-    assert not any(
+    assert client.calls[1]["tools"] == []
+    assert any(
         "<finalization_deadline>" in str(message.get("content"))
         for message in client.calls[1]["messages"]
     )

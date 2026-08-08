@@ -81,14 +81,12 @@ def test_grader_receives_only_remaining_case_budget(tmp_path, monkeypatch):
     assert result["all_container_cleanup_succeeded"] is True
 
 
-def test_emergency_fuse_failure_preserves_broker_usage_metadata(
-    tmp_path, monkeypatch,
-):
+def test_budget_failure_preserves_broker_usage_metadata(tmp_path, monkeypatch):
     usage = {
-        "model_broker_calls": 100,
-        "model_broker_emergency_request_limit": 100,
-        "model_broker_emergency_stop_count": 1,
-        "model_broker_requested_tokens": 800000,
+        "model_broker_calls": 32,
+        "model_broker_call_budget": 32,
+        "model_broker_requested_tokens": 264000,
+        "model_broker_token_budget": 264000,
         "model_broker_rejected_calls": 1,
     }
 
@@ -96,7 +94,7 @@ def test_emergency_fuse_failure_preserves_broker_usage_metadata(
         run_eval, "_run_docker_agent_phase",
         lambda **_kwargs: (
             {},
-            "ProviderRequestSafetyLimitError: provider_request_safety_limit",
+            "BrokerProtocolError: model broker token budget exceeded",
             agent_metadata(**usage),
         ),
     )
@@ -511,10 +509,9 @@ def test_eval_runtime_configuration_records_experiment_values():
         docker_timeout_seconds=1500,
     ) == {
         "default_max_tokens": 8000,
-            "escalated_max_tokens": 64000,
-            "max_recovery_retries": 0,
-            "emergency_max_provider_requests": 100,
-            "request_timeout_seconds": 720.0,
+        "escalated_max_tokens": 64000,
+        "max_recovery_retries": 0,
+        "request_timeout_seconds": 720.0,
         "docker_timeout_seconds": 1500.0,
     }
 

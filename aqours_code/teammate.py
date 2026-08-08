@@ -1,9 +1,6 @@
 from .runtime_state import *
 from .runtime import AgentRuntime
-from .model_api import (
-    ProviderRequestSafetyLimitError,
-    assistant_message_from_response,
-)
+from .model_api import assistant_message_from_response
 from .tool_registry import (
     delegated_policy_for_role,
     effective_tool_names,
@@ -210,26 +207,15 @@ def spawn_teammate_thread(
                         messages.append({"role": "user",
                             "content": "<inbox>" + json.dumps(non_protocol) + "</inbox>"})
                 try:
-                    model_client = (
-                        teammate_runtime.services.model_client
-                        if teammate_runtime is not None else client
-                    )
-                    provider_metadata = (
-                        {"_aqours_purpose": "teammate"}
-                        if getattr(
-                            model_client, "emergency_fuse_managed", False
-                        ) else {}
-                    )
                     record_llm_request(
                         model=MODEL, max_tokens=8000,
                         message_count=len(messages[-20:]),
                         tool_count=len(sub_tools), purpose="teammate",
                         agent_role=name,
                     )
-                    response = model_client.messages.create(
+                    response = client.messages.create(
                         model=MODEL, system=system, messages=messages[-20:],
-                        tools=sub_tools, max_tokens=8000,
-                        **provider_metadata)
+                        tools=sub_tools, max_tokens=8000)
                     record_llm_response(response, purpose="teammate",
                                         agent_role=name)
                     record_event(
@@ -239,8 +225,6 @@ def spawn_teammate_thread(
                             if getattr(item, "type", None) == "tool_use"),
                     )
                 except Exception as exc:
-                    if isinstance(exc, ProviderRequestSafetyLimitError):
-                        record_error(exc)
                     record_event("teammate_model_error", teammate=name,
                                  error_type=type(exc).__name__, message=str(exc))
                     break
