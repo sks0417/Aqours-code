@@ -1053,7 +1053,7 @@ def agent_loop(
                 )
                 record_event(
                     "verification_skipped",
-                    verification_skipped_reason="insufficient_model_budget",
+                    verification_skipped_reason="global_model_call_limit_reached",
                     complexity_score=int(complexity.get("score", 0)),
                     threshold=VERIFIER_COMPLEXITY_THRESHOLD,
                 )

@@ -76,24 +76,3 @@ def can_spend_optional_calls(
         >= snapshot["reserve_calls"]
     )
     return allowed, snapshot
-
-
-def allocate_verifier_calls(
-    model_client,
-    configured_max_calls: int,
-    *,
-    resolution_reserve: int = 2,
-    safety_margin: int = 1,
-) -> tuple[int, dict]:
-    """Allocate only the calls an Independent Verifier can safely spend."""
-    snapshot = model_budget_snapshot(model_client)
-    configured = max(0, int(configured_max_calls))
-    if not snapshot.get("available"):
-        return configured, snapshot
-    available = max(
-        0,
-        int(snapshot["remaining_calls"])
-        - max(0, int(resolution_reserve))
-        - max(0, int(safety_margin)),
-    )
-    return min(configured, available), snapshot

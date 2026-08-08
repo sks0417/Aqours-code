@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace
 
 from aqours_code import agent_loop, config, subagent
+from aqours_code.agent_profiles import get_agent_profile
 from evals import metrics, run_eval
 
 
@@ -117,13 +118,15 @@ def verifier_json(
 
 
 def test_verifier_defaults_are_centralized():
+    profile = get_agent_profile("verifier")
+
     assert config.VERIFIER_COMPLEXITY_THRESHOLD == 6
-    assert config.VERIFIER_MAX_MODEL_CALLS == 8
-    assert config.VERIFIER_RESOLUTION_RESERVE == 2
-    assert config.VERIFIER_SAFETY_MARGIN == 1
-    assert config.VERIFIER_MAX_TOOL_CALLS == 12
     assert config.VERIFIER_MAX_TESTS == 5
     assert config.VERIFIER_MAX_RUNS_PER_TASK == 1
+    assert profile is not None
+    assert profile.max_tool_rounds is None
+    assert profile.max_read_paths is None
+    assert profile.max_tool_calls is None
 
 
 def test_low_complexity_change_does_not_invoke_verifier(tmp_path):
@@ -212,7 +215,11 @@ def test_verifier_pass_accepts_pending_lead_final_with_no_extra_lead_call(
     assert report["verifier_tests_run"] == 1
     assert report["verifier_findings_found"] == 0
     assert report["verifier_blockers_found"] == 0
-    assert report["verifier_allocated_model_calls"] == 8
+    assert report["verifier_allocated_model_calls"] is None
+    assert report["verifier_budget_mode"] == "shared_global"
+    assert report["verifier_global_calls_remaining_at_start"] is None
+    assert report["verifier_local_model_call_limit"] is None
+    assert report["verifier_local_tool_call_limit"] is None
     assert report["verifier_workspace_modified"] is False
 
 
@@ -318,11 +325,11 @@ def test_verifier_workspace_mutation_invalidates_result_without_reset(
     assert events[-1][1]["workspace_modified"] is True
 
 
-def test_verifier_budget_skip_is_explicit_and_does_not_call_model(
+def test_exhausted_global_budget_skips_verifier_without_calling_model(
     tmp_path, monkeypatch,
 ):
     prepare_workspace(tmp_path)
-    client = BudgetedScriptedClient([], max_calls=4)
+    client = BudgetedScriptedClient([], max_calls=4, used_calls=4)
     monkeypatch.setattr(subagent, "client", client)
     events = []
     monkeypatch.setattr(
@@ -335,11 +342,15 @@ def test_verifier_budget_skip_is_explicit_and_does_not_call_model(
     )
 
     assert outcome["invoked"] is False
-    assert outcome["failure_reason"] == "insufficient_model_budget"
+    assert outcome["failure_reason"] == "global_model_call_limit_reached"
+    assert outcome["budget_mode"] == "shared_global"
+    assert outcome["global_calls_remaining_at_start"] == 0
+    assert outcome["local_model_call_limit"] is None
+    assert outcome["local_tool_call_limit"] is None
     assert client.calls == []
     assert events[-1][0] == "verification_skipped"
     assert events[-1][1]["verification_skipped_reason"] == (
-        "insufficient_model_budget"
+        "global_model_call_limit_reached"
     )
 
 
@@ -371,22 +382,26 @@ def test_legacy_blockers_format_maps_to_advisory_findings(
     assert "state" not in result["findings"][0]
 
 
-def test_verifier_dynamic_budget_45_used_36_allocates_six_calls(
+def test_verifier_uses_more_than_legacy_model_and_tool_limits(
     tmp_path, monkeypatch,
 ):
     prepare_workspace(tmp_path)
+    for index in range(13):
+        (tmp_path / f"part_{index}.py").write_text(
+            f"VALUE = {index}\n", encoding="utf-8",
+        )
     tool_rounds = [
         response(tool_block(
             "read_file",
-            {"path": "README.md", "offset": index, "limit": 1},
+            {"path": f"part_{index}.py"},
             f"read-{index}",
         ))
-        for index in range(5)
+        for index in range(13)
     ]
     client = BudgetedScriptedClient(
-        [*tool_rounds, verifier_json("pass")],
-        max_calls=45,
-        used_calls=36,
+        [*tool_rounds, verifier_json("inconclusive")],
+        max_calls=64,
+        used_calls=27,
     )
     monkeypatch.setattr(subagent, "client", client)
     monkeypatch.setattr(subagent, "MODEL", "scripted")
@@ -404,17 +419,69 @@ def test_verifier_dynamic_budget_45_used_36_allocates_six_calls(
     start = next(payload for kind, payload in events
                  if kind == "verification_start")
     assert outcome["invoked"] is True
-    assert outcome["allocated_model_calls"] == 6
-    assert start["remaining_model_calls"] == 9
-    assert start["allocated_model_calls"] == 6
-    assert start["resolution_reserve"] == 2
-    assert start["safety_margin"] == 1
-    assert len(client.calls) == 6
-    assert client.calls[-1]["tools"] == []
-    assert client.used_calls + len(client.calls) <= client.max_calls
+    assert outcome["model_calls"] == 14
+    assert outcome["tool_calls"] == 13
+    assert outcome["allocated_model_calls"] is None
+    assert start["budget_mode"] == "shared_global"
+    assert start["global_calls_remaining_at_start"] == 37
+    assert start["local_model_call_limit"] is None
+    assert start["local_tool_call_limit"] is None
+    assert "allocated_model_calls" not in start
+    assert "max_model_calls" not in start
+    assert "max_tool_calls" not in start
+    assert len(client.calls) == 14
+    assert client.used_calls + len(client.calls) == 41
+    assert not any(
+        kind == "delegated_tool_budget" for kind, _payload in events
+    )
+    assert not any(
+        payload.get("failure_reason") == "verifier_tool_limit_reached"
+        for _kind, payload in events
+    )
 
 
-def test_last_model_call_records_verifier_budget_skip_and_tells_lead(tmp_path):
+def test_verifier_stops_when_shared_global_budget_is_exhausted(
+    tmp_path, monkeypatch,
+):
+    prepare_workspace(tmp_path)
+    client = BudgetedScriptedClient([
+        response(tool_block(
+            "read_file", {"path": "README.md"}, "read-readme",
+        )),
+        response(tool_block(
+            "read_file", {"path": "service.py"}, "read-service",
+        )),
+    ], max_calls=10, used_calls=8)
+    monkeypatch.setattr(subagent, "client", client)
+    monkeypatch.setattr(subagent, "MODEL", "scripted")
+    monkeypatch.setattr(subagent, "CURRENT_ROOT_TASK", high_complexity_task())
+    events = []
+    monkeypatch.setattr(
+        subagent, "record_event",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+
+    outcome = subagent.run_independent_verifier(
+        tmp_path, None, complexity_score=8,
+    )
+
+    result = next(payload for kind, payload in events
+                  if kind == "verification_result")
+    assert outcome["invoked"] is True
+    assert outcome["status"] == "inconclusive"
+    assert outcome["failure_reason"] == "global_model_call_limit_reached"
+    assert outcome["model_calls"] == 2
+    assert outcome["tool_calls"] == 2
+    assert len(client.calls) == 2
+    assert client.used_calls + len(client.calls) == client.max_calls
+    assert result["failure_reason"] == "global_model_call_limit_reached"
+    assert result["budget_mode"] == "shared_global"
+    assert result["local_model_call_limit"] is None
+    assert result["local_tool_call_limit"] is None
+    assert result["failure_reason"] != "verifier_tool_limit_reached"
+
+
+def test_last_model_call_records_global_budget_skip_and_tells_lead(tmp_path):
     prepare_workspace(tmp_path)
     trace = tmp_path / "trace.jsonl"
     client = BudgetedScriptedClient([
@@ -434,4 +501,6 @@ def test_last_model_call_records_verifier_budget_skip_and_tells_lead(tmp_path):
     )
     report = metrics.trace_metrics(trace)
     assert report["verifier_invoked"] is False
-    assert report["verifier_skipped_reason"] == "insufficient_model_budget"
+    assert report["verifier_skipped_reason"] == (
+        "global_model_call_limit_reached"
+    )

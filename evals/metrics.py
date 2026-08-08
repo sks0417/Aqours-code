@@ -124,6 +124,10 @@ def trace_metrics(trace_path: Path) -> dict:
     verification_skip = (
         verification_skips[-1] if verification_skips else {}
     )
+    verification_budget = (
+        verification_starts[-1]
+        if verification_starts else verification_skip
+    )
 
     return {
         "tool_calls": sum(tool_counts.values()),
@@ -222,6 +226,22 @@ def trace_metrics(trace_path: Path) -> dict:
         "verifier_allocated_model_calls": (
             int(verification_result.get("allocated_model_calls"))
             if verification_result.get("allocated_model_calls") is not None
+            else None
+        ),
+        "verifier_budget_mode": verification_budget.get("budget_mode"),
+        "verifier_global_calls_remaining_at_start": (
+            int(verification_budget.get("global_calls_remaining_at_start"))
+            if verification_budget.get("global_calls_remaining_at_start")
+            is not None else None
+        ),
+        "verifier_local_model_call_limit": (
+            int(verification_budget.get("local_model_call_limit"))
+            if verification_budget.get("local_model_call_limit") is not None
+            else None
+        ),
+        "verifier_local_tool_call_limit": (
+            int(verification_budget.get("local_tool_call_limit"))
+            if verification_budget.get("local_tool_call_limit") is not None
             else None
         ),
         "verifier_workspace_modified": bool(

@@ -406,7 +406,10 @@ def test_eval_trace_storage_is_separate_and_exposes_normal_process_metrics(
         "verifier_invoked", "verifier_status", "verifier_model_calls",
         "verifier_tool_calls", "verifier_tests_run",
         "verifier_findings_found", "verifier_blockers_found",
-        "verifier_allocated_model_calls", "verifier_workspace_modified",
+        "verifier_allocated_model_calls", "verifier_budget_mode",
+        "verifier_global_calls_remaining_at_start",
+        "verifier_local_model_call_limit", "verifier_local_tool_call_limit",
+        "verifier_workspace_modified",
         "verifier_skipped_reason", "event_count",
     }
     assert metrics["event_count"] > 0

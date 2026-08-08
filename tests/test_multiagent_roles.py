@@ -923,7 +923,7 @@ def test_runtime_role_signal_requires_repeat_cross_scope_and_tail_budget():
     assert docker_paths["scope_count"] == 3
 
 
-def test_complex_task_degrades_to_lead_verification_when_budget_is_low(tmp_path):
+def test_complex_task_shares_remaining_budget_with_verifier_and_lead(tmp_path):
     (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
     task = (
         "Implement an end-to-end atomic transaction rollback and idempotency "
@@ -940,6 +940,18 @@ def test_complex_task_degrades_to_lead_verification_when_budget_is_low(tmp_path)
             "edit",
         )),
         response(text_block("ready for final")),
+        response(text_block(json.dumps({
+            "status": "findings",
+            "summary": "one focused issue remains",
+            "tests_run": [],
+            "findings": [{
+                "requirement": "VALUE remains stable",
+                "location": "service.py:1",
+                "expected": "VALUE is validated",
+                "observed": "validation needs confirmation",
+                "evidence": "independent source inspection",
+            }],
+        }))),
         response(text_block("finished with reserved calls")),
     ], max_calls=4)
 
@@ -950,18 +962,17 @@ def test_complex_task_degrades_to_lead_verification_when_budget_is_low(tmp_path)
     )
 
     assert result["final_answer"] == "finished with reserved calls"
-    assert len(client.calls) == 3
+    assert len(client.calls) == 4
     assert all(
         any(tool["name"] == "delegate_agent" for tool in call["tools"])
         for call in client.calls[:2]
     )
-    assert not any(
-        "You are the verifier role" in call["system"]
-        for call in client.calls
-    )
+    assert "You are the verifier role" in client.calls[2]["system"]
+    assert client.calls[3]["tools"] == []
     assert any(
-        "insufficient_model_budget" in str(message.get("content"))
-        for message in client.calls[-1]["messages"]
+        "Independent verification produced advisory findings"
+        in str(message.get("content"))
+        for message in client.calls[3]["messages"]
     )
 
 

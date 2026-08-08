@@ -1,6 +1,6 @@
 from .runtime_state import *
 from .agent_profiles import get_agent_profile, normalize_agent_role
-from .model_budget import allocate_verifier_calls, can_spend_optional_calls
+from .model_budget import can_spend_optional_calls, model_budget_snapshot
 from .runtime import AgentRuntime
 from .model_api import assistant_message_from_response
 from .tool_registry import (
@@ -424,6 +424,9 @@ def run_role_agent(
     profile = get_agent_profile(role)
     if profile is None:
         return {"verdict": "blocked", "summary": f"unknown role: {role}"}
+    role_model_client = (
+        runtime.services.model_client if runtime is not None else client
+    )
     role_runtime = (
         runtime.child(workdir=cwd, root_task=runtime.state.root_task)
         if runtime is not None else None
@@ -499,16 +502,61 @@ def run_role_agent(
         "tests_run": [],
         "tool_failure": "",
     }
-    configured_role_calls = profile.max_tool_rounds + 1
+    configured_role_calls = (
+        profile.max_tool_rounds + 1
+        if profile.max_tool_rounds is not None else None
+    )
     model_call_limit = (
-        configured_role_calls
-        if max_model_calls is None else max(0, int(max_model_calls))
+        None
+        if profile.name == "verifier"
+        else configured_role_calls
+        if max_model_calls is None
+        else max(0, int(max_model_calls))
     )
-    tool_round_limit = min(
-        profile.max_tool_rounds,
-        max(0, model_call_limit - 1),
+    tool_round_limit = (
+        None
+        if model_call_limit is None
+        else min(
+            int(profile.max_tool_rounds or 0),
+            max(0, model_call_limit - 1),
+        )
     )
-    for _ in range(tool_round_limit):
+
+    def shared_global_budget_stop() -> dict | None:
+        if profile.name != "verifier" or model_call_limit is not None:
+            return None
+        budget = model_budget_snapshot(role_model_client)
+        if (not budget.get("available")
+                or int(budget.get("remaining_calls", 0)) > 0):
+            return None
+        verifier_stats["tool_failure"] = "global_model_call_limit_reached"
+        record_event(
+            "delegated_model_budget",
+            agent_role="verifier",
+            decision="global_model_call_limit_reached",
+            budget_mode="shared_global",
+            global_calls_remaining=0,
+        )
+        return _finalize_role_result(
+            {
+                "status": "inconclusive",
+                "summary": (
+                    "Verifier stopped because the global model-call budget "
+                    "was exhausted."
+                ),
+                "tests_run": [],
+                "findings": [],
+                "failure_reason": "global_model_call_limit_reached",
+            },
+            profile,
+            successful_read_paths,
+            verifier_stats,
+        )
+
+    while tool_round_limit is None or tool_rounds < tool_round_limit:
+        budget_stop = shared_global_budget_stop()
+        if budget_stop is not None:
+            return budget_stop
         verifier_stats["model_calls"] += 1
         response = _request_with_deadline(
             system=system, messages=messages, tools=tools,
@@ -540,7 +588,8 @@ def run_role_agent(
             if blocked:
                 output = (tool_rejection_text(blocked)
                           if "tool_rejection_text" in globals() else str(blocked))
-            elif executed_tool_calls >= profile.max_tool_calls:
+            elif (profile.max_tool_calls is not None
+                  and executed_tool_calls >= profile.max_tool_calls):
                 output = (
                     "Tool not run: this delegation reached its "
                     f"{profile.max_tool_calls}-call execution budget. Synthesize "
@@ -551,10 +600,6 @@ def run_role_agent(
                     decision="tool_limit_reached",
                     tool_limit=profile.max_tool_calls,
                 )
-                if profile.name == "verifier":
-                    verifier_stats["tool_failure"] = (
-                        "verifier_tool_limit_reached"
-                    )
             elif (profile.name == "verifier" and block_name == "bash"
                   and _verifier_bash_rejection(
                       str(block_input.get("command", "")))):
@@ -592,7 +637,8 @@ def run_role_agent(
                         "delegated_read_reused", agent_role=profile.name,
                         path=read_path,
                     )
-                elif (read_path not in read_paths
+                elif (profile.max_read_paths is not None
+                      and read_path not in read_paths
                       and len(read_paths) >= profile.max_read_paths):
                     output = (
                         "Tool not run: this delegation reached its "
@@ -697,6 +743,7 @@ def run_role_agent(
         needs_synthesis = True
 
     if (needs_synthesis
+            and model_call_limit is not None
             and verifier_stats["model_calls"] >= model_call_limit):
         return _finalize_role_result(
             _parse_role_result(final_text, profile.name),
@@ -706,6 +753,9 @@ def run_role_agent(
         )
 
     if needs_synthesis:
+        budget_stop = shared_global_budget_stop()
+        if budget_stop is not None:
+            return budget_stop
         if profile.name == "verifier":
             synthesis_instruction = (
                 '<synthesis>Tool use is over. Return one compact JSON object and '
@@ -820,28 +870,33 @@ def run_independent_verifier(
     model_client = (
         runtime.services.model_client if runtime is not None else client
     )
-    allocated_calls, budget = allocate_verifier_calls(
-        model_client,
-        VERIFIER_MAX_MODEL_CALLS,
-        resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
-        safety_margin=VERIFIER_SAFETY_MARGIN,
+    budget = model_budget_snapshot(model_client)
+    global_calls_remaining_at_start = (
+        int(budget["remaining_calls"])
+        if budget.get("available") else None
     )
-    if allocated_calls < 2:
+    if (global_calls_remaining_at_start is not None
+            and global_calls_remaining_at_start <= 0):
         record_event(
             "verification_skipped",
-            verification_skipped_reason="insufficient_model_budget",
+            verification_skipped_reason="global_model_call_limit_reached",
             complexity_score=int(complexity_score),
             threshold=VERIFIER_COMPLEXITY_THRESHOLD,
-            allocated_model_calls=allocated_calls,
-            resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
-            safety_margin=VERIFIER_SAFETY_MARGIN,
+            budget_mode="shared_global",
+            global_calls_remaining_at_start=global_calls_remaining_at_start,
+            local_model_call_limit=None,
+            local_tool_call_limit=None,
             **{key: value for key, value in budget.items()
                if key != "available"},
         )
         return {
             "invoked": False,
             "status": "inconclusive",
-            "failure_reason": "insufficient_model_budget",
+            "failure_reason": "global_model_call_limit_reached",
+            "budget_mode": "shared_global",
+            "global_calls_remaining_at_start": global_calls_remaining_at_start,
+            "local_model_call_limit": None,
+            "local_tool_call_limit": None,
         }
 
     workdir = Path(cwd).resolve()
@@ -850,14 +905,10 @@ def run_independent_verifier(
         "verification_start",
         complexity_score=int(complexity_score),
         threshold=VERIFIER_COMPLEXITY_THRESHOLD,
-        remaining_model_calls=(
-            budget.get("remaining_calls") if budget.get("available") else None
-        ),
-        allocated_model_calls=allocated_calls,
-        resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
-        safety_margin=VERIFIER_SAFETY_MARGIN,
-        max_model_calls=allocated_calls,
-        max_tool_calls=profile.max_tool_calls,
+        budget_mode="shared_global",
+        global_calls_remaining_at_start=global_calls_remaining_at_start,
+        local_model_call_limit=None,
+        local_tool_call_limit=None,
         max_tests=VERIFIER_MAX_TESTS,
     )
     observed = []
@@ -891,16 +942,22 @@ def run_independent_verifier(
     try:
         raw_result = run_role_agent(
             "verifier", assignment, workdir, runtime,
-            max_model_calls=allocated_calls,
         )
     except Exception as exc:
+        budget_after_error = model_budget_snapshot(model_client)
+        global_budget_exhausted = bool(
+            budget_after_error.get("available")
+            and int(budget_after_error.get("remaining_calls", 0)) <= 0
+        )
         raw_result = {
             "status": "inconclusive",
             "summary": "Independent verification could not complete.",
             "tests_run": [],
             "findings": [],
             "failure_reason": (
-                "verifier_timeout" if isinstance(exc, _CaseTimeoutError)
+                "global_model_call_limit_reached"
+                if global_budget_exhausted
+                else "verifier_timeout" if isinstance(exc, _CaseTimeoutError)
                 else f"verifier_error:{type(exc).__name__}"
             ),
             "_verification_stats": {
@@ -932,7 +989,10 @@ def run_independent_verifier(
         tests_run=len(result["tests_run"]),
         findings_found=len(result["findings"]),
         blockers_found=len(result["findings"]),
-        allocated_model_calls=allocated_calls,
+        budget_mode="shared_global",
+        global_calls_remaining_at_start=global_calls_remaining_at_start,
+        local_model_call_limit=None,
+        local_tool_call_limit=None,
         workspace_modified=bool(changed_files),
         workspace_changed_files=changed_files[:20],
         failure_reason=failure_reason,
@@ -946,7 +1006,11 @@ def run_independent_verifier(
         "tests_run": len(result["tests_run"]),
         "findings_found": len(result["findings"]),
         "blockers_found": len(result["findings"]),
-        "allocated_model_calls": allocated_calls,
+        "budget_mode": "shared_global",
+        "global_calls_remaining_at_start": global_calls_remaining_at_start,
+        "local_model_call_limit": None,
+        "local_tool_call_limit": None,
+        "allocated_model_calls": None,
         "workspace_modified": bool(changed_files),
         "failure_reason": failure_reason,
     }

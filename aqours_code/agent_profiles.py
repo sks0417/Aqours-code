@@ -4,9 +4,7 @@ from dataclasses import dataclass
 import re
 
 from .config import (
-    VERIFIER_MAX_MODEL_CALLS,
     VERIFIER_MAX_RESPONSE_TOKENS,
-    VERIFIER_MAX_TOOL_CALLS,
 )
 
 
@@ -16,9 +14,9 @@ class AgentProfile:
     description: str
     instructions: str
     tool_names: tuple[str, ...]
-    max_tool_rounds: int
-    max_read_paths: int
-    max_tool_calls: int
+    max_tool_rounds: int | None
+    max_read_paths: int | None
+    max_tool_calls: int | None
     max_response_tokens: int
     read_only: bool = True
 
@@ -165,10 +163,9 @@ AGENT_PROFILES = {
             "Harness-proven facts. Do not narrate hidden reasoning."
         ),
         tool_names=("read_file", "glob", "bash"),
-        # Reserve the final call for tool-free JSON synthesis.
-        max_tool_rounds=max(0, VERIFIER_MAX_MODEL_CALLS - 1),
-        max_read_paths=20,
-        max_tool_calls=VERIFIER_MAX_TOOL_CALLS,
+        max_tool_rounds=None,
+        max_read_paths=None,
+        max_tool_calls=None,
         max_response_tokens=VERIFIER_MAX_RESPONSE_TOKENS,
     ),
 }
