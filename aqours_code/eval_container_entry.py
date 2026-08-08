@@ -112,7 +112,6 @@ def main(argv: list[str] | None = None) -> int:
         config["broker_nonce"],
         request_timeout=broker_request_timeout,
         case_deadline=case_deadline,
-        max_calls=config.get("model_call_budget"),
         max_provider_retries=config.get("broker_max_provider_retries", 0),
     )
     result_path = runtime_root / "result.json"

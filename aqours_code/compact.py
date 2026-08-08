@@ -6,7 +6,7 @@ import time
 from copy import copy as shallow_copy
 from pathlib import Path
 
-from .model_budget import can_spend_optional_calls
+from .model_api import ProviderRequestSafetyLimitError
 from .runtime import AgentRuntime
 from .runtime_state import *
 
@@ -467,10 +467,16 @@ def _call_compact_model(
         purpose=purpose,
         agent_role="",
     )
+    provider_metadata = (
+        {"_aqours_purpose": purpose}
+        if getattr(model_client, "emergency_fuse_managed", False)
+        else {}
+    )
     response = model_client.messages.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=SUMMARY_MAX_TOKENS,
+        **provider_metadata,
     )
     record_llm_response(response, purpose=purpose, agent_role="")
     return extract_text(response.content)
@@ -499,6 +505,8 @@ def _summarize_once(
             else summarize_history(summary_input)
         )
     except Exception as exc:
+        if isinstance(exc, ProviderRequestSafetyLimitError):
+            raise
         record_event(
             "compact_summary_error",
             attempt=1,
@@ -809,20 +817,7 @@ def _compact(
         )
         return active_messages
 
-    model_client = runtime.services.model_client if runtime is not None else client
-    budget_allowed, budget = can_spend_optional_calls(model_client, 1)
-    if allow_model_summary is False or not budget_allowed:
-        record_event(
-            "model_budget_guard",
-            decision="compact_skipped",
-            reason="finalization_reserve",
-            estimated_calls=1,
-            **{
-                key: value
-                for key, value in budget.items()
-                if key != "available"
-            },
-        )
+    if allow_model_summary is False:
         _record_compact(
             reason=reason,
             transcript=transcript,
@@ -834,7 +829,7 @@ def _compact(
             tail=active_messages,
             summary="",
             success=False,
-            failure_reason="model summary call unavailable",
+            failure_reason="model summary disabled",
             omitted_tool_results=omitted_count,
         )
         return active_messages

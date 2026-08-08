@@ -1,8 +1,10 @@
 from .runtime_state import *
 from .agent_profiles import get_agent_profile, normalize_agent_role
-from .model_budget import allocate_verifier_calls, can_spend_optional_calls
 from .runtime import AgentRuntime
-from .model_api import assistant_message_from_response
+from .model_api import (
+    ProviderRequestSafetyLimitError,
+    assistant_message_from_response,
+)
 from .tool_registry import (
     delegated_policy_for_role,
     effective_tool_names,
@@ -113,9 +115,19 @@ def _request_with_deadline(*, system: str, messages: list, tools: list,
         tool_count=len(tools), purpose=purpose, agent_role=role,
     )
     try:
+        provider_metadata = (
+            {
+                "_aqours_purpose": (
+                    "verifier" if role == "verifier" else purpose
+                )
+            }
+            if getattr(model_client, "emergency_fuse_managed", False)
+            else {}
+        )
         response = model_client.messages.create(
             model=model, system=system, messages=messages,
             tools=tools, max_tokens=max_tokens,
+            **provider_metadata,
         )
         record_llm_response(response, purpose=purpose, agent_role=role)
         return response
@@ -418,8 +430,6 @@ def run_role_agent(
     prompt: str,
     cwd: Path,
     runtime: AgentRuntime | None = None,
-    *,
-    max_model_calls: int | None = None,
 ) -> dict:
     profile = get_agent_profile(role)
     if profile is None:
@@ -499,16 +509,13 @@ def run_role_agent(
         "tests_run": [],
         "tool_failure": "",
     }
-    configured_role_calls = profile.max_tool_rounds + 1
-    model_call_limit = (
-        configured_role_calls
-        if max_model_calls is None else max(0, int(max_model_calls))
+    # Ordinary delegated roles retain their established bounded shape. The
+    # independent Verifier is instead governed by its existing tool/test
+    # limits and the one global emergency Provider fuse, never by Lead usage.
+    tool_round_limit = (
+        None if profile.name == "verifier" else profile.max_tool_rounds
     )
-    tool_round_limit = min(
-        profile.max_tool_rounds,
-        max(0, model_call_limit - 1),
-    )
-    for _ in range(tool_round_limit):
+    while tool_round_limit is None or tool_rounds < tool_round_limit:
         verifier_stats["model_calls"] += 1
         response = _request_with_deadline(
             system=system, messages=messages, tools=tools,
@@ -529,6 +536,7 @@ def run_role_agent(
             break
         tool_rounds += 1
         results = []
+        force_synthesis_after_round = False
         for block in response.content:
             if _block_value(block, "type") != "tool_use":
                 continue
@@ -555,6 +563,7 @@ def run_role_agent(
                     verifier_stats["tool_failure"] = (
                         "verifier_tool_limit_reached"
                     )
+                    force_synthesis_after_round = True
             elif (profile.name == "verifier" and block_name == "bash"
                   and _verifier_bash_rejection(
                       str(block_input.get("command", "")))):
@@ -574,6 +583,7 @@ def run_role_agent(
                     f"{VERIFIER_MAX_TESTS}-test budget."
                 )
                 verifier_stats["tool_failure"] = "verifier_test_limit_reached"
+                force_synthesis_after_round = True
             elif block_name == "read_file":
                 read_path = _os.path.normpath(
                     str(block_input.get("path", "")).strip()
@@ -693,17 +703,12 @@ def run_role_agent(
                 "content": str(output),
             })
         messages.append({"role": "user", "content": results})
-    else:
-        needs_synthesis = True
+        if force_synthesis_after_round:
+            needs_synthesis = True
+            break
 
-    if (needs_synthesis
-            and verifier_stats["model_calls"] >= model_call_limit):
-        return _finalize_role_result(
-            _parse_role_result(final_text, profile.name),
-            profile,
-            successful_read_paths,
-            verifier_stats,
-        )
+    if not needs_synthesis:
+        needs_synthesis = True
 
     if needs_synthesis:
         if profile.name == "verifier":
@@ -817,46 +822,12 @@ def run_independent_verifier(
             "status": "inconclusive",
             "failure_reason": "verifier_profile_unavailable",
         }
-    model_client = (
-        runtime.services.model_client if runtime is not None else client
-    )
-    allocated_calls, budget = allocate_verifier_calls(
-        model_client,
-        VERIFIER_MAX_MODEL_CALLS,
-        resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
-        safety_margin=VERIFIER_SAFETY_MARGIN,
-    )
-    if allocated_calls < 2:
-        record_event(
-            "verification_skipped",
-            verification_skipped_reason="insufficient_model_budget",
-            complexity_score=int(complexity_score),
-            threshold=VERIFIER_COMPLEXITY_THRESHOLD,
-            allocated_model_calls=allocated_calls,
-            resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
-            safety_margin=VERIFIER_SAFETY_MARGIN,
-            **{key: value for key, value in budget.items()
-               if key != "available"},
-        )
-        return {
-            "invoked": False,
-            "status": "inconclusive",
-            "failure_reason": "insufficient_model_budget",
-        }
-
     workdir = Path(cwd).resolve()
     before = snapshot_workspace(workdir)
     record_event(
         "verification_start",
         complexity_score=int(complexity_score),
         threshold=VERIFIER_COMPLEXITY_THRESHOLD,
-        remaining_model_calls=(
-            budget.get("remaining_calls") if budget.get("available") else None
-        ),
-        allocated_model_calls=allocated_calls,
-        resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
-        safety_margin=VERIFIER_SAFETY_MARGIN,
-        max_model_calls=allocated_calls,
         max_tool_calls=profile.max_tool_calls,
         max_tests=VERIFIER_MAX_TESTS,
     )
@@ -889,11 +860,10 @@ def run_independent_verifier(
         f"{json.dumps(observed, ensure_ascii=False)}"
     )
     try:
-        raw_result = run_role_agent(
-            "verifier", assignment, workdir, runtime,
-            max_model_calls=allocated_calls,
-        )
+        raw_result = run_role_agent("verifier", assignment, workdir, runtime)
     except Exception as exc:
+        if isinstance(exc, ProviderRequestSafetyLimitError):
+            raise
         raw_result = {
             "status": "inconclusive",
             "summary": "Independent verification could not complete.",
@@ -932,7 +902,6 @@ def run_independent_verifier(
         tests_run=len(result["tests_run"]),
         findings_found=len(result["findings"]),
         blockers_found=len(result["findings"]),
-        allocated_model_calls=allocated_calls,
         workspace_modified=bool(changed_files),
         workspace_changed_files=changed_files[:20],
         failure_reason=failure_reason,
@@ -946,7 +915,6 @@ def run_independent_verifier(
         "tests_run": len(result["tests_run"]),
         "findings_found": len(result["findings"]),
         "blockers_found": len(result["findings"]),
-        "allocated_model_calls": allocated_calls,
         "workspace_modified": bool(changed_files),
         "failure_reason": failure_reason,
     }
@@ -976,32 +944,6 @@ def delegate_agent(
     if not str(prompt or "").strip():
         return json.dumps({"status": "error", "error": "prompt cannot be empty"})
 
-    estimated_calls = profile.max_tool_rounds + 1
-    model_client = (
-        runtime.services.model_client if runtime is not None else client
-    )
-    budget_allowed, budget = can_spend_optional_calls(
-        model_client, estimated_calls)
-    if not budget_allowed:
-        record_event(
-            "model_budget_guard", decision="delegation_skipped",
-            agent_role=normalized_role, estimated_calls=estimated_calls,
-            **{key: value for key, value in budget.items()
-               if key != "available"},
-        )
-        return json.dumps({
-            "status": "budget_reserved",
-            "role": normalized_role,
-            "verdict": "blocked",
-            "error": (
-                "Finalization model-call reserve is active; do not start a new "
-                "delegation. Continue directly from retained evidence and use "
-                "remaining calls for fixes, targeted verification, and final."
-            ),
-            "budget": {key: value for key, value in budget.items()
-                       if key != "available"},
-        })
-
     record_event(
         "subagent_start", agent_role=normalized_role, name=name,
     )
@@ -1015,6 +957,8 @@ def delegate_agent(
         result = run_role_agent(
             normalized_role, prompt, role_workdir, runtime)
     except Exception as exc:
+        if isinstance(exc, ProviderRequestSafetyLimitError):
+            raise
         record_event(
             "subagent_finish", agent_role=normalized_role,
             verdict="blocked", status="error",

@@ -403,10 +403,11 @@ def test_eval_trace_storage_is_separate_and_exposes_normal_process_metrics(
         "model_trace_actual_cache_creation_input_tokens",
         "model_trace_actual_cache_read_input_tokens",
         "model_trace_actual_total_tokens",
+        "emergency_stop_count", "emergency_stop_reason",
         "verifier_invoked", "verifier_status", "verifier_model_calls",
         "verifier_tool_calls", "verifier_tests_run",
         "verifier_findings_found", "verifier_blockers_found",
-        "verifier_allocated_model_calls", "verifier_workspace_modified",
+        "verifier_workspace_modified",
         "verifier_skipped_reason", "event_count",
     }
     assert metrics["event_count"] > 0

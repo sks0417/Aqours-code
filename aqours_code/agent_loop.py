@@ -12,13 +12,10 @@ from .agent_profiles import (
     complex_delegation_briefing,
     normalize_agent_role,
 )
-from .model_budget import (
-    can_spend_optional_calls,
-    finalization_reserve_active,
-)
 from .runtime import AgentRuntime
 from .model_api import (
     assistant_message_from_response,
+    ensure_emergency_limited_client,
     effective_escalated_max_tokens,
 )
 
@@ -505,19 +502,6 @@ def _screened_reviewer_output(
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _finalization_budget_message(snapshot: dict) -> str:
-    return (
-        "<finalization_budget>This task has entered its reserved finalization "
-        f"budget ({snapshot.get('remaining_calls')} model calls remain; "
-        f"{snapshot.get('reserve_calls')} are reserved). Do not start a new "
-        "Explore, Plan, Review, persistent Teammate, broad repository scan, or "
-        "model-generated "
-        "compact summary. Continue directly from retained evidence. Use the "
-        "remaining calls only for unresolved fixes, targeted verification, and "
-        "one final answer.</finalization_budget>"
-    )
-
-
 def _context_stats(
     messages: list,
     *,
@@ -797,7 +781,7 @@ def tool_rejection_text(output) -> str:
     return text
 
 
-def _runtime_role_benefit(read_counts: dict[str, int], model_client) -> dict:
+def _runtime_role_benefit(read_counts: dict[str, int]) -> dict:
     """Describe a conservative, evidence-based opportunity for one Explorer."""
     unique_paths = len(read_counts)
     repeated_reads = sum(max(0, count - 1) for count in read_counts.values())
@@ -811,21 +795,13 @@ def _runtime_role_benefit(read_counts: dict[str, int], model_client) -> dict:
         path for path, count in read_counts.items() if count > 1)
     evidence_ready = (
         unique_paths >= 8 and repeated_reads >= 2 and len(scopes) >= 2)
-    budget_allowed = False
-    budget = {"available": False}
-    if evidence_ready:
-        # Two focused Explorer calls plus a three-call Reviewer allowance must
-        # fit before the existing finalization reserve.
-        budget_allowed, budget = can_spend_optional_calls(model_client, 5)
     return {
-        "eligible": evidence_ready and budget_allowed,
+        "eligible": evidence_ready,
         "evidence_ready": evidence_ready,
-        "budget_allowed": budget_allowed,
         "unique_read_paths": unique_paths,
         "repeated_reads": repeated_reads,
         "scope_count": len(scopes),
         "repeated_paths": repeated_paths[:4],
-        "budget": budget,
     }
 
 
@@ -868,13 +844,19 @@ def call_llm(messages: list, context: dict, tools: list,
             configured = 30.0
         _os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = str(max(0.1, min(configured, remaining)))
     try:
+        provider_metadata = (
+            {"_aqours_purpose": "lead"}
+            if getattr(model_client, "emergency_fuse_managed", False)
+            else {}
+        )
         return with_retry(
             lambda: model_client.messages.create(
                 model=state.current_model,
                 system=system,
                 messages=messages,
                 tools=tools,
-                max_tokens=max_tokens),
+                max_tokens=max_tokens,
+                **provider_metadata),
             state)
     finally:
         if remaining is not None:
@@ -909,6 +891,12 @@ def agent_loop(
 ):
     from . import bootstrap
     bootstrap()
+    if runtime is not None:
+        runtime.services.model_client = ensure_emergency_limited_client(
+            runtime.services.model_client,
+            EMERGENCY_MAX_PROVIDER_REQUESTS,
+            reset=True,
+        )
     tools, handlers = (
         assemble_tool_pool(runtime)
         if runtime is not None else assemble_tool_pool()
@@ -959,8 +947,6 @@ def agent_loop(
     mutation_revision = 0
     reviewer_attempted_revision = -1
     reviewer_cached_result = ""
-    finalization_budget_notice_sent = False
-    budget_snapshot_observed = False
     if multiagent_required:
         messages.append({
             "role": "user", "content": complex_delegation_briefing(complexity),
@@ -984,103 +970,6 @@ def agent_loop(
         model_client = (
             runtime.services.model_client if runtime is not None else client
         )
-        reserve_active, budget_snapshot = finalization_reserve_active(
-            model_client)
-        if budget_snapshot.get("available") and not budget_snapshot_observed:
-            budget_snapshot_observed = True
-            record_event(
-                "model_budget_guard", decision="budget_snapshot_available",
-                **{key: value for key, value in budget_snapshot.items()
-                   if key != "available"},
-            )
-        if (budget_snapshot.get("available")
-                and budget_snapshot["remaining_calls"] <= 0):
-            unresolved = _incomplete_todos(runtime)
-            fallback = (
-                "Harness stopped before issuing an over-budget model request. "
-                "The implementation changes made so far remain in the workspace."
-            )
-            if unresolved:
-                fallback += " Unresolved Todo work: " + "; ".join(
-                    str(item.get("content", ""))[:180]
-                    for item in unresolved[:5]
-                )
-            record_event(
-                "model_budget_guard", decision="over_budget_request_prevented",
-                unresolved_count=len(unresolved),
-                **{key: value for key, value in budget_snapshot.items()
-                   if key != "available"},
-            )
-            record_hook("Stop")
-            trigger_hooks("Stop", messages)
-            finish_run(fallback)
-            return
-
-        force_final_response = bool(
-            budget_snapshot.get("available")
-            and budget_snapshot["remaining_calls"] == 1
-        )
-        if reserve_active and not finalization_budget_notice_sent:
-            messages.append({
-                "role": "user",
-                "content": _finalization_budget_message(budget_snapshot),
-            })
-            finalization_budget_notice_sent = True
-            record_event(
-                "model_budget_guard", decision="finalization_reserve_entered",
-                **{key: value for key, value in budget_snapshot.items()
-                   if key != "available"},
-            )
-        if force_final_response:
-            unresolved = _incomplete_todos(runtime)
-            verifier_deadline_note = ""
-            if (
-                complexity.get("implementation_task", False)
-                and int(complexity.get("score", 0))
-                >= VERIFIER_COMPLEXITY_THRESHOLD
-                and verifier_run_limit > 0
-                and verifier_runs < verifier_run_limit
-                and workspace_changes(
-                    task_start_snapshot,
-                    snapshot_workspace(verification_workdir),
-                )
-            ):
-                verifier_runs += 1
-                verifier_deadline_note = (
-                    " The independent verifier cannot run because the model-call "
-                    "budget is exhausted. Self-check the implementation against "
-                    "the original task and report any unverified risk honestly."
-                )
-                record_event(
-                    "verification_skipped",
-                    verification_skipped_reason="insufficient_model_budget",
-                    complexity_score=int(complexity.get("score", 0)),
-                    threshold=VERIFIER_COMPLEXITY_THRESHOLD,
-                )
-            messages.append({
-                "role": "user",
-                "content": (
-                    "<finalization_deadline>Exactly one model call remains. "
-                    "Tools are disabled for this call. Return the best accurate "
-                    "final answer now from retained context; state any unfinished "
-                    "Todo work honestly and do not request another action."
-                    + (
-                        " Unresolved Todo work: " + "; ".join(
-                            str(item.get("content", ""))[:180]
-                            for item in unresolved[:5]
-                        )
-                        if unresolved else ""
-                    )
-                    + verifier_deadline_note
-                    + "</finalization_deadline>"
-                ),
-            })
-            record_event(
-                "model_budget_guard", decision="last_call_forced_final",
-                unresolved_count=len(unresolved),
-                **{key: value for key, value in budget_snapshot.items()
-                   if key != "available"},
-            )
 
         if runtime is not None:
             context = update_context(context, messages, runtime)
@@ -1095,9 +984,6 @@ def agent_loop(
             # the same context/tool request components for budgeting.
             prepare_context(messages)
             context = update_context(context, messages)
-        if force_final_response:
-            tools = []
-
         try:
             response = (
                 call_llm(messages, context, tools, state, max_tokens, runtime)
@@ -1135,13 +1021,6 @@ def agent_loop(
                 extract_text(response.content)
                 or has_tool_use(response.content)
             )
-            if force_final_response:
-                if replayable_response:
-                    messages.append(assistant_message_from_response(response))
-                record_hook("Stop")
-                trigger_hooks("Stop", messages)
-                finish_run(extract_text(response.content))
-                return
             if not state.has_escalated:
                 provider_name = (
                     runtime.config.model_provider
@@ -1171,14 +1050,6 @@ def agent_loop(
         max_tokens = DEFAULT_MAX_TOKENS
         state.has_escalated = False
         messages.append(assistant_message_from_response(response))
-        if force_final_response:
-            unresolved = _incomplete_todos(runtime)
-            if unresolved:
-                _append_todo_warning(response.content, unresolved)
-            record_hook("Stop")
-            trigger_hooks("Stop", messages)
-            finish_run(extract_text(response.content))
-            return
         if not has_tool_use(response.content):
             if background_workers_alive() and CASE_DEADLINE is not None:
                 remaining = _remaining_case_time(runtime)
@@ -1513,33 +1384,17 @@ def agent_loop(
                 if (multiagent_enabled and not runtime_benefit_signal_sent
                         and not explorer_attempted
                         and complexity.get("implementation_task", False)):
-                    benefit = _runtime_role_benefit(
-                        lead_read_counts, model_client)
+                    benefit = _runtime_role_benefit(lead_read_counts)
                     if benefit["evidence_ready"]:
                         runtime_benefit_signal_sent = True
-                        event_budget = {
-                            key: value for key, value in benefit["budget"].items()
-                            if key != "available"
-                        }
-                        if benefit["eligible"]:
-                            record_event(
-                                "multiagent_policy",
-                                decision="runtime_benefit_observed",
-                                unique_read_paths=benefit["unique_read_paths"],
-                                repeated_reads=benefit["repeated_reads"],
-                                scope_count=benefit["scope_count"],
-                                repeated_paths=benefit["repeated_paths"],
-                                **event_budget,
-                            )
-                        else:
-                            record_event(
-                                "multiagent_policy",
-                                decision="runtime_benefit_observed_no_budget",
-                                unique_read_paths=benefit["unique_read_paths"],
-                                repeated_reads=benefit["repeated_reads"],
-                                scope_count=benefit["scope_count"],
-                                **event_budget,
-                            )
+                        record_event(
+                            "multiagent_policy",
+                            decision="runtime_benefit_observed",
+                            unique_read_paths=benefit["unique_read_paths"],
+                            repeated_reads=benefit["repeated_reads"],
+                            scope_count=benefit["scope_count"],
+                            repeated_paths=benefit["repeated_paths"],
+                        )
 
             results.append({"type": "tool_result",
                             "tool_use_id": block.id, "content": output})
@@ -1820,6 +1675,8 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
             summary_input_limit_tokens=int(
                 _runtime_value("SUMMARY_INPUT_LIMIT_TOKENS")),
             summary_max_tokens=int(_runtime_value("SUMMARY_MAX_TOKENS")),
+            emergency_max_provider_requests=int(
+                _runtime_value("EMERGENCY_MAX_PROVIDER_REQUESTS")),
             eval_override=bool(
                 context_limit_chars is not None
                 or compact_trigger_ratio is not None),

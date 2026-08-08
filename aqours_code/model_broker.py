@@ -11,6 +11,11 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
+from .model_api import (
+    ProviderRequestSafetyLimitError,
+    _record_emergency_stop,
+)
+
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
@@ -328,6 +333,8 @@ def _validate_request(
 class BrokerModelClient:
     """Container-side model client exposing only messages.create over file IPC."""
 
+    emergency_fuse_managed = True
+
     def __init__(
         self,
         ipc_root: str | Path,
@@ -336,7 +343,6 @@ class BrokerModelClient:
         request_timeout: float = 30,
         case_deadline: float | None = None,
         poll_interval: float = 0.02,
-        max_calls: int | None = None,
         max_provider_retries: int = 0,
     ):
         self.ipc_root = Path(ipc_root).resolve()
@@ -344,13 +350,13 @@ class BrokerModelClient:
         self.request_timeout = float(request_timeout)
         self.case_deadline = case_deadline
         self.poll_interval = float(poll_interval)
-        self.max_calls = int(max_calls) if max_calls is not None else 0
         self.max_provider_retries = max(0, int(max_provider_retries))
         self._logical_request_count = 0
+        self._emergency_stop_recorded = False
         self.messages = self
 
-    def budget_snapshot(self) -> dict:
-        """Read the Broker's live, non-secret budget counters."""
+    def provider_request_snapshot(self) -> dict:
+        """Read the Broker's live, non-secret observational counters."""
         payload = None
         # The nested location is mounted read-only into Docker. Keep the root
         # fallback for older local callers and previously created fixtures.
@@ -366,19 +372,17 @@ class BrokerModelClient:
         if (not isinstance(payload, dict)
                 or payload.get("version") != PROTOCOL_VERSION
                 or payload.get("nonce") != self.nonce):
-            if self.max_calls > 0:
-                return {
-                    "source": "configured_fallback",
-                    "request_count": self._logical_request_count,
-                    "call_count": self._logical_request_count,
-                    "max_calls": self.max_calls,
-                    "max_provider_retries": self.max_provider_retries,
-                }
-            return {}
+            return {
+                "source": "client_fallback",
+                "request_count": self._logical_request_count,
+                "provider_request_count": self._logical_request_count,
+                "max_provider_retries": self.max_provider_retries,
+            }
         allowed = {
             "request_count", "call_count", "rejected_count", "retry_count",
-            "requested_token_count", "max_calls", "max_tokens_per_call",
-            "max_total_tokens", "max_provider_retries",
+            "provider_request_count", "requested_token_count",
+            "emergency_max_provider_requests", "emergency_stop_count",
+            "max_tokens_per_call", "max_provider_retries",
             "actual_input_token_count", "actual_output_token_count",
             "actual_cache_creation_input_token_count",
             "actual_cache_read_input_token_count", "actual_total_token_count",
@@ -389,7 +393,7 @@ class BrokerModelClient:
         return snapshot
 
     def create(self, *, model: str, messages: list, system=None, tools=None,
-               max_tokens: int = 8000, **kwargs):
+               max_tokens: int = 8000, _aqours_purpose: str = "lead", **kwargs):
         if kwargs:
             raise BrokerProtocolError(
                 "messages.create received unsupported arguments: "
@@ -415,6 +419,7 @@ class BrokerModelClient:
             "nonce": self.nonce,
             "request_id": request_id,
             "method": "messages.create",
+            "purpose": str(_aqours_purpose or "unknown"),
             "params": params,
         }
         # This is a conservative fallback when the live stats mount is briefly
@@ -436,10 +441,38 @@ class BrokerModelClient:
                         raise BrokerProtocolError("broker response identity mismatch")
                     if not payload.get("ok"):
                         error = str(payload.get("error") or "model broker failed")
+                        error_kind = str(
+                            payload.get("error_kind") or "broker_remote_error"
+                        )
+                        if error_kind == "provider_request_safety_limit":
+                            limit = int(payload.get(
+                                "limit",
+                                payload.get(
+                                    "emergency_max_provider_requests", 100,
+                                ),
+                            ))
+                            used_requests = int(payload.get(
+                                "used_requests", limit,
+                            ))
+                            next_purpose = str(payload.get(
+                                "next_purpose", _aqours_purpose,
+                            ))
+                            if not self._emergency_stop_recorded:
+                                self._emergency_stop_recorded = True
+                                _record_emergency_stop(
+                                    limit=limit,
+                                    used_requests=used_requests,
+                                    purpose=next_purpose,
+                                )
+                            raise ProviderRequestSafetyLimitError(
+                                limit=limit,
+                                used_requests=used_requests,
+                                next_purpose=next_purpose,
+                            )
                         if error.startswith("BrokerProtocolError:"):
                             raise BrokerProtocolError(error)
                         raise BrokerRemoteError(
-                            str(payload.get("error_kind") or "broker_remote_error"),
+                            error_kind,
                             error,
                             request_id,
                         )
@@ -461,9 +494,8 @@ class ModelBroker:
     def __init__(self, ipc_root: str | Path, nonce: str, model_client, *,
                  allowed_model: str,
                  case_deadline: float | None = None, poll_interval: float = 0.02,
-                 max_calls: int = 32,
+                 emergency_max_provider_requests: int = 100,
                  max_tokens_per_call: int = MAX_TOKENS_PER_CALL,
-                 max_total_tokens: int | None = None,
                  provider_timeout: float | None = None,
                  max_provider_retries: int = DEFAULT_PROVIDER_RETRIES,
                  provider_retry_delay: float = DEFAULT_PROVIDER_RETRY_DELAY,
@@ -476,18 +508,16 @@ class ModelBroker:
             raise ValueError("allowed_model must be non-empty")
         self.case_deadline = case_deadline
         self.poll_interval = float(poll_interval)
-        self.max_calls = int(max_calls)
+        self.emergency_max_provider_requests = int(
+            emergency_max_provider_requests
+        )
         self.max_tokens_per_call = int(max_tokens_per_call)
-        if self.max_calls <= 0:
-            raise ValueError("max_calls must be greater than zero")
+        if self.emergency_max_provider_requests <= 0:
+            raise ValueError(
+                "emergency_max_provider_requests must be greater than zero"
+            )
         if self.max_tokens_per_call <= 0:
             raise ValueError("max_tokens_per_call must be greater than zero")
-        self.max_total_tokens = int(
-            max_total_tokens
-            if max_total_tokens is not None
-            else self.max_calls * self.max_tokens_per_call)
-        if self.max_total_tokens <= 0:
-            raise ValueError("max_total_tokens must be greater than zero")
         if provider_timeout is None:
             try:
                 provider_timeout = float(os.getenv("AQOURS_CODE_REQUEST_TIMEOUT", "30"))
@@ -522,6 +552,7 @@ class ModelBroker:
         self.retry_skipped_reason = ""
         self.last_request_id = ""
         self.last_request_attempts = 0
+        self.emergency_stop_count = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._handled: set[str] = set()
@@ -573,6 +604,7 @@ class ModelBroker:
                 "allowed_model": self.allowed_model,
                 "request_count": self.request_count,
                 "call_count": self.call_count,
+                "provider_request_count": self.call_count,
                 "rejected_count": self.rejected_count,
                 "requested_token_count": self.requested_token_count,
                 "actual_input_token_count": self.actual_input_token_count,
@@ -586,9 +618,10 @@ class ModelBroker:
                 "usage_missing_response_count": self.usage_missing_response_count,
                 "retry_count": self.retry_count,
                 "provider_error_count": self.provider_error_count,
-                "max_calls": self.max_calls,
+                "emergency_max_provider_requests": (
+                    self.emergency_max_provider_requests),
+                "emergency_stop_count": self.emergency_stop_count,
                 "max_tokens_per_call": self.max_tokens_per_call,
-                "max_total_tokens": self.max_total_tokens,
                 "provider_timeout": self.provider_timeout,
                 "max_provider_retries": self.max_provider_retries,
                 "provider_retry_delay": self.provider_retry_delay,
@@ -603,13 +636,18 @@ class ModelBroker:
         except OSError:
             pass
 
-    def _reserve_provider_attempt(self, requested_tokens: int):
+    def _reserve_provider_attempt(self, requested_tokens: int, purpose: str):
         if self.case_deadline is not None and time.monotonic() >= self.case_deadline:
             raise TimeoutError("eval case deadline exceeded before model request")
-        if self.call_count >= self.max_calls:
-            raise BrokerProtocolError("model broker call limit exceeded")
-        if self.requested_token_count + requested_tokens > self.max_total_tokens:
-            raise BrokerProtocolError("model broker token budget exceeded")
+        if self.call_count >= self.emergency_max_provider_requests:
+            if self.emergency_stop_count == 0:
+                self.emergency_stop_count = 1
+                self._write_stats()
+            raise ProviderRequestSafetyLimitError(
+                limit=self.emergency_max_provider_requests,
+                used_requests=self.call_count,
+                next_purpose=purpose,
+            )
         self.call_count += 1
         self.requested_token_count += requested_tokens
         self.last_request_attempts += 1
@@ -618,10 +656,8 @@ class ModelBroker:
     def _retry_block_reason(self, requested_tokens: int) -> str:
         if self._stop.is_set():
             return "broker_stopping"
-        if self.call_count >= self.max_calls:
-            return "call_budget"
-        if self.requested_token_count + requested_tokens > self.max_total_tokens:
-            return "token_budget"
+        if self.call_count >= self.emergency_max_provider_requests:
+            return "provider_request_safety_limit"
         if self.case_deadline is not None:
             remaining = self.case_deadline - time.monotonic()
             required = (
@@ -650,11 +686,11 @@ class ModelBroker:
             else:
                 os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = old_timeout
 
-    def _call_provider_with_retry(self, params: dict):
+    def _call_provider_with_retry(self, params: dict, purpose: str):
         retries_used = 0
         requested_tokens = params["max_tokens"]
         while True:
-            self._reserve_provider_attempt(requested_tokens)
+            self._reserve_provider_attempt(requested_tokens, purpose)
             try:
                 response = self._call_provider_once(params)
                 usage = _response_usage(response)
@@ -685,6 +721,15 @@ class ModelBroker:
                 blocked = self._retry_block_reason(requested_tokens)
                 if blocked:
                     self.retry_skipped_reason = blocked
+                    if blocked == "provider_request_safety_limit":
+                        if self.emergency_stop_count == 0:
+                            self.emergency_stop_count = 1
+                            self._write_stats()
+                        raise ProviderRequestSafetyLimitError(
+                            limit=self.emergency_max_provider_requests,
+                            used_requests=self.call_count,
+                            next_purpose=purpose,
+                        ) from exc
                     raise _ProviderCallError(error_kind, exc) from exc
                 retries_used += 1
                 self.retry_count += 1
@@ -721,13 +766,14 @@ class ModelBroker:
                 allowed_model=self.allowed_model,
                 max_tokens_per_call=self.max_tokens_per_call,
             )
+            purpose = str(payload.get("purpose") or "unknown")[:80]
             self.request_count += 1
             self.last_request_id = request_id
             self.last_request_attempts = 0
             self.last_error = ""
             self.last_error_kind = ""
             self.retry_skipped_reason = ""
-            response = self._call_provider_with_retry(params)
+            response = self._call_provider_with_retry(params, purpose)
             result = {
                 "version": PROTOCOL_VERSION,
                 "nonce": self.nonce,
@@ -737,7 +783,10 @@ class ModelBroker:
             }
         except BaseException as exc:
             self.rejected_count += 1
-            if isinstance(exc, _ProviderCallError):
+            if isinstance(exc, ProviderRequestSafetyLimitError):
+                self.last_error_kind = exc.error_kind
+                self.last_error = str(exc)
+            elif isinstance(exc, _ProviderCallError):
                 self.last_error_kind = exc.error_kind
                 self.last_error = (
                     f"{type(exc.original).__name__}: {exc.original}")
@@ -759,6 +808,12 @@ class ModelBroker:
                 "error": self.last_error,
                 "error_kind": self.last_error_kind,
             }
+            if isinstance(exc, ProviderRequestSafetyLimitError):
+                result.update({
+                    "limit": exc.limit,
+                    "used_requests": exc.used_requests,
+                    "next_purpose": exc.next_purpose,
+                })
         response_path = _protocol_path(
             self.ipc_root, "responses", self.nonce, request_id)
         _atomic_write_json(response_path, result)

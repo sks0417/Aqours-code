@@ -138,11 +138,11 @@ class AgentRuntime:
         root_task: str | None = None,
         tool_policy: dict | None = None,
     ) -> "AgentRuntime":
-        """Create an isolated child state while sharing bounded services.
+        """Create an isolated child state while sharing external services.
 
-        Role-specific limits are still enforced by the current role runtime;
-        this method only establishes the ownership semantics needed for their
-        later migration.
+        Role-specific tool policies are still enforced by the current role
+        runtime; this method only establishes the ownership semantics needed
+        for their later migration.
         """
         child_workdir = Path(workdir).resolve() if workdir else self.paths.workdir
         return AgentRuntime.create(

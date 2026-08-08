@@ -21,8 +21,12 @@ def _clean_env() -> dict[str, str]:
         "AQOURS_CODE_COMPACT_TRIGGER_TOKENS",
         "AQOURS_CODE_SUMMARY_INPUT_LIMIT_TOKENS",
         "AQOURS_CODE_SUMMARY_MAX_TOKENS",
+        "AQOURS_CODE_EMERGENCY_MAX_PROVIDER_REQUESTS",
     ):
-        env.pop(name, None)
+        # Empty values also prevent python-dotenv (override=False) from
+        # repopulating credentials from a developer's repository .env file.
+        env[name] = ""
+    env["AQOURS_CODE_PROVIDER"] = "openai_compatible"
     env["PYTHONPATH"] = str(PROJECT_ROOT)
     return env
 

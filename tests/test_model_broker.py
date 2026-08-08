@@ -18,6 +18,7 @@ from aqours_code.model_broker import (
     ModelBroker,
     broker_ipc_wait_timeout,
 )
+from aqours_code.model_api import ProviderRequestSafetyLimitError
 from aqours_code import recovery
 from aqours_code.eval_container_entry import main as container_entry_main
 from evals import run_eval
@@ -69,7 +70,7 @@ def test_broker_records_actual_provider_usage_and_forwards_it(tmp_path):
     try:
         response = client.messages.create(
             model="scripted", messages=[], max_tokens=8000)
-        snapshot = client.budget_snapshot()
+        snapshot = client.provider_request_snapshot()
     finally:
         broker.stop()
 
@@ -181,7 +182,7 @@ def test_broker_retries_one_transient_provider_error_without_overlap(
     messages = FlakyMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=16000,
+        allowed_model="case-model",
         provider_timeout=0.1, max_provider_retries=1,
         provider_retry_delay=0, delivery_grace=0.1,
     ).start()
@@ -204,13 +205,7 @@ def test_broker_retries_one_transient_provider_error_without_overlap(
     assert broker.last_provider_error
 
 
-@pytest.mark.parametrize(("max_calls", "max_total_tokens", "blocked_reason"), [
-    (1, 16000, "call_budget"),
-    (2, 8000, "token_budget"),
-])
-def test_broker_does_not_retry_when_attempt_budget_is_exhausted(
-    tmp_path, max_calls, max_total_tokens, blocked_reason,
-):
+def test_broker_retry_is_stopped_by_same_emergency_request_fuse(tmp_path):
     class TimeoutMessages:
         def __init__(self):
             self.calls = 0
@@ -223,24 +218,25 @@ def test_broker_does_not_retry_when_attempt_budget_is_exhausted(
     messages = TimeoutMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=max_calls,
-        max_total_tokens=max_total_tokens,
+        allowed_model="case-model", emergency_max_provider_requests=1,
         provider_timeout=0.1, max_provider_retries=1,
         provider_retry_delay=0, delivery_grace=0.1,
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
-        with pytest.raises(BrokerRemoteError) as caught:
+        with pytest.raises(ProviderRequestSafetyLimitError) as caught:
             client.messages.create(
-                model="case-model", messages=[], max_tokens=8000)
+                model="case-model", messages=[], max_tokens=8000,
+                _aqours_purpose="lead")
     finally:
         broker.stop()
 
-    assert caught.value.error_kind == "provider_timeout"
+    assert caught.value.error_kind == "provider_request_safety_limit"
     assert messages.calls == 1
     assert broker.call_count == 1
     assert broker.retry_count == 0
-    assert broker.retry_skipped_reason == blocked_reason
+    assert broker.retry_skipped_reason == "provider_request_safety_limit"
+    assert broker.emergency_stop_count == 1
 
 
 def test_broker_does_not_retry_without_full_case_time_window(tmp_path):
@@ -257,7 +253,6 @@ def test_broker_does_not_retry_without_full_case_time_window(tmp_path):
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
         allowed_model="case-model", case_deadline=time.monotonic() + 0.5,
-        max_calls=2, max_total_tokens=16000,
         provider_timeout=0.4, max_provider_retries=1,
         provider_retry_delay=0, delivery_grace=0.2,
     ).start()
@@ -289,7 +284,7 @@ def test_broker_does_not_retry_permanent_provider_error(tmp_path):
     messages = UnauthorizedMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=16000,
+        allowed_model="case-model",
         provider_timeout=0.1, max_provider_retries=1,
         provider_retry_delay=0, delivery_grace=0.1,
     ).start()
@@ -357,7 +352,7 @@ def test_broker_rejects_wrong_model_without_calling_host_client(tmp_path):
     messages = RecordingMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=24000,
+        allowed_model="case-model",
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
@@ -381,7 +376,7 @@ def test_broker_rejects_invalid_token_limits_without_host_call(
     messages = RecordingMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=24000,
+        allowed_model="case-model",
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
@@ -400,7 +395,7 @@ def test_broker_accepts_normal_8000_and_16000_recovery_requests(tmp_path):
     messages = RecordingMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=24000,
+        allowed_model="case-model",
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
@@ -423,8 +418,8 @@ def test_broker_accepts_deepseek_64000_recovery_when_configured(tmp_path):
     messages = RecordingMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="deepseek-v4-flash", max_calls=2,
-        max_tokens_per_call=64000, max_total_tokens=72000,
+        allowed_model="deepseek-v4-flash",
+        max_tokens_per_call=64000,
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
@@ -439,61 +434,66 @@ def test_broker_accepts_deepseek_64000_recovery_when_configured(tmp_path):
     assert broker.requested_token_count == 72000
 
 
-def test_broker_rejects_calls_beyond_case_budget_without_host_call(tmp_path):
+def test_broker_allows_100_and_stops_101_before_host_call(tmp_path):
     nonce = uuid.uuid4().hex
     messages = RecordingMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=1, max_total_tokens=16000,
+        allowed_model="case-model", emergency_max_provider_requests=100,
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
-        client.messages.create(
-            model="case-model", messages=[], max_tokens=8000)
-        with pytest.raises(BrokerProtocolError, match="call limit"):
+        for _ in range(100):
+            client.messages.create(
+                model="case-model", messages=[], max_tokens=8000,
+                _aqours_purpose="lead")
+        with pytest.raises(
+            ProviderRequestSafetyLimitError,
+            match="provider_request_safety_limit",
+        ):
+            client.messages.create(
+                model="case-model", messages=[], max_tokens=8000,
+                _aqours_purpose="verifier")
+    finally:
+        broker.stop()
+
+    assert len(messages.calls) == 100
+    assert broker.call_count == 100
+    assert broker.emergency_stop_count == 1
+    assert broker.last_error_kind == "provider_request_safety_limit"
+
+
+def test_broker_does_not_stop_at_old_45_call_boundary(tmp_path):
+    nonce = uuid.uuid4().hex
+    messages = RecordingMessages()
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="case-model", emergency_max_provider_requests=100,
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        for _ in range(60):
             client.messages.create(
                 model="case-model", messages=[], max_tokens=8000)
     finally:
         broker.stop()
 
-    assert len(messages.calls) == 1
-    assert broker.call_count == 1
+    assert len(messages.calls) == 60
+    assert broker.requested_token_count == 60 * 8000
 
 
-def test_broker_rejects_request_beyond_case_token_budget(tmp_path):
-    nonce = uuid.uuid4().hex
-    messages = RecordingMessages()
-    broker = ModelBroker(
-        tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=8000,
-    ).start()
-    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
-    try:
-        client.messages.create(
-            model="case-model", messages=[], max_tokens=8000)
-        with pytest.raises(BrokerProtocolError, match="token budget"):
-            client.messages.create(
-                model="case-model", messages=[], max_tokens=8000)
-    finally:
-        broker.stop()
+def test_eval_runtime_fuse_is_independent_of_scoring_metadata():
+    runtime = run_eval.eval_runtime_configuration(
+        escalated_max_tokens=64000,
+        request_timeout_seconds=720,
+        docker_timeout_seconds=1500,
+    )
 
-    assert len(messages.calls) == 1
-    assert broker.requested_token_count == 8000
-
-
-def test_eval_broker_budget_is_derived_from_trusted_case_metadata():
-    assert run_eval.model_budgets_for_case({}) == (32, 264000)
-    assert run_eval.model_budgets_for_case({"max_turns": 3}) == (32, 264000)
-    assert run_eval.model_budgets_for_case({
-        "max_model_calls": 2,
-        "max_model_tokens": 24000,
-    }) == (2, 24000)
-    assert run_eval.model_budgets_for_case(
-        {}, escalated_max_tokens=64000,
-    ) == (32, 312000)
+    assert runtime["emergency_max_provider_requests"] == 100
 
 
 @pytest.mark.parametrize("message", [
+    "ProviderRequestSafetyLimitError: provider_request_safety_limit",
     "BrokerProtocolError: model broker call limit exceeded",
     "BrokerProtocolError: model broker token budget exceeded",
 ])

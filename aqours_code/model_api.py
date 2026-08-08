@@ -5,12 +5,122 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from types import SimpleNamespace
 
 
 DEEPSEEK_V4_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
 DEEPSEEK_REASONING_EFFORT = "high"
 DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS = 64_000
+
+
+class ProviderRequestSafetyLimitError(RuntimeError):
+    """The per-run emergency fuse stopped a Provider request before sending."""
+
+    retry_managed = True
+
+    def __init__(
+        self,
+        *,
+        limit: int,
+        used_requests: int,
+        next_purpose: str,
+    ):
+        self.error_kind = "provider_request_safety_limit"
+        self.limit = int(limit)
+        self.used_requests = int(used_requests)
+        self.next_purpose = str(next_purpose or "unknown")
+        super().__init__(
+            "provider_request_safety_limit: emergency Provider request "
+            f"limit {self.limit} reached before {self.next_purpose} request"
+        )
+
+
+def _record_emergency_stop(*, limit: int, used_requests: int, purpose: str):
+    # Keep the Provider layer independent from Trace initialization. A run is
+    # active by the time a request can trip the fuse, so the lazy import is
+    # sufficient for both direct and Broker-backed clients.
+    try:
+        from .trace import record_event
+
+        record_event(
+            "emergency_stop",
+            reason="provider_request_safety_limit",
+            limit=int(limit),
+            used_requests=int(used_requests),
+            next_purpose=str(purpose or "unknown"),
+        )
+    except Exception:
+        pass
+
+
+class EmergencyLimitedModelClient:
+    """Count real direct Provider calls and enforce one high safety fuse."""
+
+    emergency_fuse_managed = True
+
+    def __init__(self, model_client, limit: int):
+        self._model_client = model_client
+        self._messages = getattr(model_client, "messages", model_client)
+        self.emergency_max_provider_requests = int(limit)
+        if self.emergency_max_provider_requests <= 0:
+            raise ValueError(
+                "emergency_max_provider_requests must be greater than zero"
+            )
+        self.provider_request_count = 0
+        self.purpose_request_counts = Counter()
+        self._emergency_stop_recorded = False
+        self.messages = self
+
+    def create(self, *args, **kwargs):
+        purpose = str(kwargs.pop("_aqours_purpose", "lead") or "unknown")
+        if self.provider_request_count >= self.emergency_max_provider_requests:
+            if not self._emergency_stop_recorded:
+                self._emergency_stop_recorded = True
+                _record_emergency_stop(
+                    limit=self.emergency_max_provider_requests,
+                    used_requests=self.provider_request_count,
+                    purpose=purpose,
+                )
+            raise ProviderRequestSafetyLimitError(
+                limit=self.emergency_max_provider_requests,
+                used_requests=self.provider_request_count,
+                next_purpose=purpose,
+            )
+        # Increment immediately before handing control to the concrete client:
+        # failed network attempts and harness retries are real requests too.
+        self.provider_request_count += 1
+        self.purpose_request_counts[purpose] += 1
+        return self._messages.create(*args, **kwargs)
+
+    def provider_request_snapshot(self) -> dict:
+        return {
+            "provider_request_count": self.provider_request_count,
+            "emergency_max_provider_requests": (
+                self.emergency_max_provider_requests
+            ),
+            "purpose_request_counts": dict(self.purpose_request_counts),
+            "emergency_stopped": self._emergency_stop_recorded,
+        }
+
+
+def ensure_emergency_limited_client(
+    model_client,
+    limit: int,
+    *,
+    reset: bool = False,
+):
+    """Install a fresh per-run fuse unless the client owns one remotely."""
+    if isinstance(model_client, EmergencyLimitedModelClient):
+        if reset:
+            return EmergencyLimitedModelClient(
+                model_client._model_client,
+                limit,
+            )
+        return model_client
+    if getattr(model_client, "emergency_fuse_managed", False):
+        return model_client
+    return EmergencyLimitedModelClient(model_client, limit)
 
 
 def uses_deepseek_thinking(provider_name: str, model: str) -> bool:
@@ -247,6 +357,9 @@ class AnthropicClient:
         self._client = Anthropic(
             api_key=_validate_api_key(_clean_env(api_key), "Anthropic"),
             base_url=base_url or None,
+            # Aqours_code owns retries so every real attempt is visible to the
+            # per-run emergency request fuse.
+            max_retries=0,
         )
         self.messages = self._client.messages
 
