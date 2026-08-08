@@ -49,7 +49,8 @@ def safe_path(
 
 def run_bash(command: str, cwd: Path = None,
              run_in_background: bool = False, timeout: float = 120,
-             executor=None, runtime: AgentRuntime | None = None) -> str:
+             executor=None, runtime: AgentRuntime | None = None,
+             _report_exit_code: bool = False) -> str:
     # run_in_background is consumed by the dispatcher; direct execution ignores it.
     if looks_like_delete_command(command):
         return "Permission denied: delete commands are disabled for bash"
@@ -74,7 +75,10 @@ def run_bash(command: str, cwd: Path = None,
         out = (result["stdout"] + result["stderr"]).strip()
         if result["timed_out"]:
             return f"Error: Timeout ({timeout:g}s)" + (f"\n{out[:50000]}" if out else "")
-        return out[:50000] if out else "(no output)"
+        rendered = out[:50000] if out else "(no output)"
+        if _report_exit_code:
+            return f"[exit_code={int(result['exit_code'])}]\n{rendered}"
+        return rendered
     except CaseTimeoutError:
         raise
     except Exception as exc:

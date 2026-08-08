@@ -109,6 +109,85 @@ def _tool_json(output) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _observed_lead_tests(messages: list, limit: int = 5) -> list[dict]:
+    """Extract commands/results only, never Lead prose or reasoning."""
+    pending: dict[str, str] = {}
+    observed = []
+    test_markers = (
+        "pytest", "unittest", "python -m test", "python3 -m test", "tox",
+        "nox", "npm test", "npm run test", "pnpm test", "yarn test",
+        "cargo test", "go test", "dotnet test", "mvn test", "gradle test",
+        "./gradlew test",
+    )
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        if message.get("role") == "assistant":
+            for block in content:
+                kind = (block.get("type") if isinstance(block, dict)
+                        else getattr(block, "type", ""))
+                name = (block.get("name") if isinstance(block, dict)
+                        else getattr(block, "name", ""))
+                if kind != "tool_use" or name != "bash":
+                    continue
+                data = (block.get("input", {}) if isinstance(block, dict)
+                        else getattr(block, "input", {}) or {})
+                command = str(data.get("command", "")).strip()
+                normalized_command = " ".join(command.lower().split())
+                if not (any(
+                    marker in normalized_command
+                    for marker in test_markers
+                ) or ("assert " in normalized_command
+                      and "python" in normalized_command)):
+                    continue
+                block_id = (block.get("id", "") if isinstance(block, dict)
+                            else getattr(block, "id", ""))
+                pending[str(block_id)] = command[:500]
+        elif message.get("role") == "user":
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                command = pending.pop(str(block.get("tool_use_id", "")), "")
+                if not command:
+                    continue
+                output = " ".join(str(block.get("content", "")).split())
+                failed = output.lower().startswith((
+                    "error:", "permission denied", "tool not run:",
+                )) or bool(re.search(r"\b(?:failed|failure|error)s?\b", output.lower()))
+                observed.append({
+                    "command": command,
+                    "result": ("fail: " if failed else "pass: ") + output[:160],
+                })
+                if len(observed) >= limit:
+                    return observed
+    return observed
+
+
+def _verification_feedback(outcome: dict) -> str:
+    report = outcome.get("report", {})
+    rendered = json.dumps(report, ensure_ascii=False, sort_keys=True)
+    if outcome.get("status") == "blockers":
+        return (
+            "Independent verification found potential blockers.\n\n"
+            "Review each finding against the original task and README.\n"
+            "Reproduce valid findings, fix the implementation, and rerun the "
+            "public test suite.\n"
+            "If a finding is a false positive, demonstrate that with a concrete "
+            "test.\n"
+            "Do not finish until all valid blockers are addressed.\n\n"
+            f"{rendered}"
+        )
+    reason = str(outcome.get("failure_reason") or "verifier_inconclusive")
+    return (
+        "Independent verification was inconclusive "
+        f"({reason}). Perform focused self-verification against the original "
+        "task and README, run the public test suite, and address any concrete "
+        "issues before finishing. The independent verifier will not run again.\n\n"
+        f"{rendered}"
+    )
+
+
 _REVIEW_FINDING_STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "both", "by", "does",
     "for", "from", "in", "is", "it", "must", "not", "of", "on", "or",
@@ -862,6 +941,13 @@ def agent_loop(
     if not root_task:
         root_task = _latest_user_instruction(messages)
     complexity = assess_task_complexity(root_task)
+    from .subagent import snapshot_workspace, workspace_changes
+    verification_workdir = (
+        runtime.paths.workdir if runtime is not None else _Path(WORKDIR)
+    )
+    task_start_snapshot = snapshot_workspace(verification_workdir)
+    verifier_runs = 0
+    verifier_run_limit = min(max(int(VERIFIER_MAX_RUNS_PER_TASK), 0), 1)
     multiagent_enabled = "delegate_agent" in handlers
     multiagent_required = (
         multiagent_enabled
@@ -948,6 +1034,30 @@ def agent_loop(
             )
         if force_final_response:
             unresolved = _incomplete_todos(runtime)
+            verifier_deadline_note = ""
+            if (
+                complexity.get("implementation_task", False)
+                and int(complexity.get("score", 0))
+                >= VERIFIER_COMPLEXITY_THRESHOLD
+                and verifier_run_limit > 0
+                and verifier_runs < verifier_run_limit
+                and workspace_changes(
+                    task_start_snapshot,
+                    snapshot_workspace(verification_workdir),
+                )
+            ):
+                verifier_runs += 1
+                verifier_deadline_note = (
+                    " The independent verifier cannot run because the model-call "
+                    "budget is exhausted. Self-check the implementation against "
+                    "the original task and report any unverified risk honestly."
+                )
+                record_event(
+                    "verification_skipped",
+                    verification_skipped_reason="insufficient_model_budget",
+                    complexity_score=int(complexity.get("score", 0)),
+                    threshold=VERIFIER_COMPLEXITY_THRESHOLD,
+                )
             messages.append({
                 "role": "user",
                 "content": (
@@ -962,6 +1072,7 @@ def agent_loop(
                         )
                         if unresolved else ""
                     )
+                    + verifier_deadline_note
                     + "</finalization_deadline>"
                 ),
             })
@@ -1116,6 +1227,69 @@ def agent_loop(
                 record_event(
                     "todo_completion_reminder", decision="incomplete_final",
                     unresolved_count=len(unresolved_todos),
+                )
+            verification_skip_reason = ""
+            if not complexity.get("implementation_task", False):
+                verification_skip_reason = "not_implementation_task"
+            elif int(complexity.get("score", 0)) < VERIFIER_COMPLEXITY_THRESHOLD:
+                verification_skip_reason = "below_complexity_threshold"
+            elif verifier_run_limit <= 0:
+                verification_skip_reason = "verification_disabled"
+            elif verifier_runs >= verifier_run_limit:
+                verification_skip_reason = "max_runs_reached"
+            else:
+                from .subagent import run_independent_verifier
+                current_snapshot = snapshot_workspace(verification_workdir)
+                task_changed_files = workspace_changes(
+                    task_start_snapshot, current_snapshot,
+                )
+                if not task_changed_files:
+                    verification_skip_reason = "workspace_unchanged"
+                else:
+                    verifier_runs += 1
+                    outcome = run_independent_verifier(
+                        verification_workdir,
+                        runtime,
+                        complexity_score=int(complexity.get("score", 0)),
+                        observed_tests=_observed_lead_tests(
+                            messages, VERIFIER_MAX_TESTS,
+                        ),
+                        changed_files=task_changed_files,
+                    )
+                    if outcome.get("invoked") and outcome.get("status") == "pass":
+                        record_hook("Stop")
+                        trigger_hooks("Stop", messages)
+                        finish_run(extract_text(response.content))
+                        return
+                    # The pending Lead final must not survive a failed gate.
+                    if messages and messages[-1].get("role") == "assistant":
+                        messages.pop()
+                    if outcome.get("invoked"):
+                        messages.append({
+                            "role": "user",
+                            "content": _verification_feedback(outcome),
+                        })
+                    else:
+                        reason = str(outcome.get(
+                            "failure_reason", "verification_unavailable",
+                        ))
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "Independent verification was skipped "
+                                f"({reason}). Perform focused self-verification "
+                                "against the original task and README, rerun the "
+                                "public tests, then provide a final answer. The "
+                                "verifier will not be retried."
+                            ),
+                        })
+                    continue
+            if verification_skip_reason:
+                record_event(
+                    "verification_skipped",
+                    verification_skipped_reason=verification_skip_reason,
+                    complexity_score=int(complexity.get("score", 0)),
+                    threshold=VERIFIER_COMPLEXITY_THRESHOLD,
                 )
             record_hook("Stop")
             trigger_hooks("Stop", messages)

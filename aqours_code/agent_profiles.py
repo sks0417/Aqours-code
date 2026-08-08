@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from .config import (
+    VERIFIER_MAX_MODEL_CALLS,
+    VERIFIER_MAX_RESPONSE_TOKENS,
+    VERIFIER_MAX_TOOL_CALLS,
+)
+
 
 @dataclass(frozen=True)
 class AgentProfile:
@@ -119,6 +125,46 @@ AGENT_PROFILES = {
         max_read_paths=16,
         max_tool_calls=20,
         max_response_tokens=8000,
+    ),
+    "verifier": AgentProfile(
+        name="verifier",
+        description=(
+            "Fresh-context, read-only verifier that tests the final workspace "
+            "against the original task before the lead answer is accepted."
+        ),
+        instructions=(
+            "Act as an independent verifier, not as the implementing agent. "
+            "Re-read the original task, repository guidance and README files, "
+            "then inspect the final git diff when git metadata is available; "
+            "otherwise inspect the harness-supplied changed paths and current "
+            "files. Distrust implementation summaries "
+            "and seek the smallest concrete counterexamples. Audit numeric and "
+            "time boundaries; state convergence after success and errors; faults "
+            "before, during, and after persistence; first attempts and retries "
+            "with changed arguments; current, expired, replaced, forged, and "
+            "cross-resource identities; same-resource and different-resource "
+            "concurrency; effects on return values, disk, locks, temporary data, "
+            "and old data; every must, only, never, at-or-after, and if-raises "
+            "clause; public APIs, exceptions, allowed scope, and regressions. "
+            "Use only read_file, glob, and bash. Bash is for read-only repository "
+            "inspection, existing tests, and at most a few high-value temporary "
+            "counterexample tests under /tmp or via a here-document. Never edit "
+            "source, tests, README, configuration, or any workspace file. Never "
+            "fix findings, delegate, spawn agents, create worktrees, or use task "
+            "management. Return exactly one JSON object with status, summary, "
+            "tests_run, and blockers. status is pass, blockers, or inconclusive. "
+            "tests_run entries contain command and pass/fail result. blocker "
+            "entries contain requirement, location, expected, observed, and "
+            "evidence. A pass requires at least one actual bash test and concrete "
+            "evidence. Tool errors, timeouts, unavailable evidence, or invalid "
+            "results are inconclusive. Do not narrate hidden reasoning."
+        ),
+        tool_names=("read_file", "glob", "bash"),
+        # Reserve the final call for tool-free JSON synthesis.
+        max_tool_rounds=max(0, VERIFIER_MAX_MODEL_CALLS - 1),
+        max_read_paths=20,
+        max_tool_calls=VERIFIER_MAX_TOOL_CALLS,
+        max_response_tokens=VERIFIER_MAX_RESPONSE_TOKENS,
     ),
 }
 
@@ -306,8 +352,8 @@ def complex_delegation_briefing(assessment: dict) -> str:
         "persistent teammates. Every teammate keeps the common Task and mailbox "
         "protocol, may claim further unblocked Tasks, and remains alive until the "
         "Lead requests shutdown. After the final code change, the harness may run "
-        "one temporary Review subagent automatically. Do not duplicate that "
-        "review. The Lead owns decomposition, teammate lifecycle, integration, "
+        "one fresh-context Verifier automatically. Do not duplicate that "
+        "verification. The Lead owns decomposition, teammate lifecycle, integration, "
         "tests, and the final answer."
         "</multiagent_policy>"
     )

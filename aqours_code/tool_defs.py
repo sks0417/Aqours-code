@@ -286,13 +286,13 @@ _TOOL_HANDLERS = {
 
 _LEAD = frozenset({"lead"})
 _ROLE_ACCESS = {
-    "bash": frozenset({"lead", "general-purpose", "teammate"}),
+    "bash": frozenset({"lead", "general-purpose", "verifier", "teammate"}),
     "read_file": frozenset({
-        "lead", "general-purpose", "explore", "plan", "review", "teammate",
+        "lead", "general-purpose", "explore", "plan", "review", "verifier", "teammate",
     }),
     "write_file": frozenset({"lead", "general-purpose", "teammate"}),
     "edit_file": frozenset({"lead", "general-purpose", "teammate"}),
-    "glob": frozenset({"lead", "general-purpose", "plan", "teammate"}),
+    "glob": frozenset({"lead", "general-purpose", "plan", "verifier", "teammate"}),
     "send_message": frozenset({"lead", "teammate"}),
     "list_tasks": frozenset({"lead", "teammate"}),
     "claim_task": frozenset({"lead", "teammate"}),

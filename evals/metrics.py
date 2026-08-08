@@ -106,6 +106,24 @@ def trace_metrics(trace_path: Path) -> dict:
     llm_responses = sum(
         1 for event in events if event.get("type") == "llm_response"
     )
+    verification_starts = [
+        event for event in events
+        if event.get("type") == "verification_start"
+    ]
+    verification_results = [
+        event for event in events
+        if event.get("type") == "verification_result"
+    ]
+    verification_skips = [
+        event for event in events
+        if event.get("type") == "verification_skipped"
+    ]
+    verification_result = (
+        verification_results[-1] if verification_results else {}
+    )
+    verification_skip = (
+        verification_skips[-1] if verification_skips else {}
+    )
 
     return {
         "tool_calls": sum(tool_counts.values()),
@@ -189,6 +207,22 @@ def trace_metrics(trace_path: Path) -> dict:
             events, "cache_read_input_tokens",
         ),
         "model_trace_actual_total_tokens": _usage_total(events, "total_tokens"),
+        "verifier_invoked": bool(verification_starts),
+        "verifier_status": verification_result.get("status"),
+        "verifier_model_calls": int(
+            verification_result.get("model_calls") or 0),
+        "verifier_tool_calls": int(
+            verification_result.get("tool_calls") or 0),
+        "verifier_tests_run": int(
+            verification_result.get("tests_run") or 0),
+        "verifier_blockers_found": int(
+            verification_result.get("blockers_found") or 0),
+        "verifier_workspace_modified": bool(
+            verification_result.get("workspace_modified")),
+        "verifier_skipped_reason": (
+            None if verification_starts else verification_skip.get(
+                "verification_skipped_reason")
+        ),
         "event_count": len(events),
     }
 

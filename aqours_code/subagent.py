@@ -15,35 +15,53 @@ from .command_executor import CaseTimeoutError as _CaseTimeoutError
 
 _SNAPSHOT_EXCLUDED_DIRS = frozenset({
     ".git", ".aqours_code", ".transcripts", ".task_outputs", ".tasks",
-    ".mailboxes", ".worktrees",
+    ".mailboxes", ".worktrees", ".pytest_cache", "__pycache__",
+    ".mypy_cache", ".ruff_cache", "node_modules",
 })
+_SNAPSHOT_EXCLUDED_FILES = frozenset({".coverage"})
 
 
-def _snapshot_workspace(workdir: str | Path) -> dict[str, str]:
-    """Fingerprint files only for a mutating delegated agent's change list."""
+def snapshot_workspace(workdir: str | Path) -> dict[str, str]:
+    """Fingerprint material workspace files for mutation detection."""
     root = Path(workdir).resolve()
     fingerprints: dict[str, str] = {}
     if not root.is_dir():
         return fingerprints
-    for candidate in root.rglob("*"):
-        try:
-            relative = candidate.relative_to(root)
-            if any(
-                part in _SNAPSHOT_EXCLUDED_DIRS
-                for part in relative.parts[:-1]
-            ):
+    for directory, dirnames, filenames in _os.walk(root, followlinks=False):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in _SNAPSHOT_EXCLUDED_DIRS
+            and not (Path(directory) / name).is_symlink()
+        ]
+        for filename in filenames:
+            candidate = Path(directory) / filename
+            try:
+                if (filename in _SNAPSHOT_EXCLUDED_FILES
+                        or filename.startswith(".coverage.")):
+                    continue
+                resolved = candidate.resolve()
+                if not candidate.is_file() or not resolved.is_relative_to(root):
+                    continue
+                relative = resolved.relative_to(root)
+                fingerprints[relative.as_posix()] = _hashlib.sha256(
+                    candidate.read_bytes(),
+                ).hexdigest()
+            except (OSError, ValueError):
                 continue
-            if not candidate.is_file():
-                continue
-            resolved = candidate.resolve()
-            if not resolved.is_relative_to(root):
-                continue
-            fingerprints[relative.as_posix()] = _hashlib.sha256(
-                candidate.read_bytes(),
-            ).hexdigest()
-        except (OSError, ValueError):
-            continue
     return fingerprints
+
+
+# Compatibility for callers that used the previous private helper.
+_snapshot_workspace = snapshot_workspace
+
+
+def workspace_changes(
+    before: dict[str, str], after: dict[str, str],
+) -> list[str]:
+    return sorted(
+        path for path in set(before) | set(after)
+        if before.get(path) != after.get(path)
+    )
 
 # ── Subagent Tool ──
 
@@ -144,6 +162,8 @@ def _parse_role_result(text: str, role: str) -> dict:
         except (TypeError, json.JSONDecodeError):
             continue
         if isinstance(value, dict):
+            if role == "verifier":
+                return _normalize_verifier_result(value)
             value.setdefault("verdict", "blocked")
             value.setdefault("summary", "")
             return (_normalize_reviewer_result(value)
@@ -151,11 +171,104 @@ def _parse_role_result(text: str, role: str) -> dict:
     fallback = "blocked"
     if role == "review":
         return _fallback_reviewer_result(raw)
+    if role == "verifier":
+        return {
+            "status": "inconclusive",
+            "summary": _short_text(raw, 700),
+            "tests_run": [],
+            "blockers": [],
+            "invalid_json": True,
+            "failure_reason": "invalid_verifier_json",
+        }
     return {"verdict": fallback, "summary": raw[:4000], "invalid_json": True}
 
 
 def _short_text(value, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
+
+
+def _normalize_verifier_result(value: dict) -> dict:
+    status = _short_text(value.get("status", "inconclusive"), 20).lower()
+    if status not in {"pass", "blockers", "inconclusive"}:
+        status = "inconclusive"
+    raw_tests = value.get("tests_run", [])
+    if not isinstance(raw_tests, list):
+        raw_tests = []
+    tests_run = []
+    for raw in raw_tests[:VERIFIER_MAX_TESTS]:
+        if not isinstance(raw, dict):
+            continue
+        result = _short_text(raw.get("result", "fail"), 10).lower()
+        tests_run.append({
+            "command": _short_text(raw.get("command", ""), 500),
+            "result": "pass" if result == "pass" else "fail",
+        })
+    raw_blockers = value.get("blockers", [])
+    if not isinstance(raw_blockers, list):
+        raw_blockers = []
+    blockers = []
+    for raw in raw_blockers[:8]:
+        if not isinstance(raw, dict):
+            continue
+        blockers.append({
+            "requirement": _short_text(raw.get("requirement", ""), 300),
+            "location": _short_text(raw.get("location", ""), 240),
+            "expected": _short_text(raw.get("expected", ""), 500),
+            "observed": _short_text(raw.get("observed", ""), 500),
+            "evidence": _short_text(raw.get("evidence", ""), 700),
+        })
+    if blockers and status == "pass":
+        status = "blockers"
+    return {
+        "status": status,
+        "summary": _short_text(value.get("summary", ""), 700),
+        "tests_run": tests_run,
+        "blockers": blockers,
+    }
+
+
+_VERIFIER_TEST_MARKERS = (
+    "pytest", "unittest", "python -m test", "python3 -m test", "tox",
+    "nox", "npm test", "npm run test", "pnpm test", "yarn test",
+    "cargo test", "go test", "dotnet test", "mvn test", "gradle test",
+    "./gradlew test",
+)
+_VERIFIER_MUTATION_PATTERN = re.compile(
+    r"(?i)(?:^|[;&|]\s*)(?:rm|mv|cp|touch|mkdir|rmdir|truncate|tee)\b|"
+    r"\bsed\s+-[^\n;]*i\b|\bperl\s+-[^\n;]*i\b|"
+    r"\bgit\s+(?:add|commit|checkout|switch|restore|reset|clean|apply)\b|"
+    r"\b(?:pip|pip3)\s+install\b|\b(?:npm|pnpm|yarn)\s+install\b"
+)
+
+
+def _is_verifier_test_command(command: str) -> bool:
+    normalized = " ".join(str(command or "").lower().split())
+    return (
+        any(marker in normalized for marker in _VERIFIER_TEST_MARKERS)
+        or ("assert " in normalized and (
+            "python" in normalized or "<<" in normalized or "/tmp/" in normalized
+        ))
+    )
+
+
+def _verifier_bash_rejection(command: str) -> str:
+    value = str(command or "").strip()
+    if not value:
+        return "empty_command"
+    if _VERIFIER_MUTATION_PATTERN.search(value):
+        return "workspace_mutation_command"
+    # Output redirection is permitted only for disposable /tmp artifacts or
+    # here-doc counterexamples. File-descriptor redirects such as 2>&1 are safe.
+    stripped_fds = re.sub(r"\d*>&\d+", "", value)
+    if re.search(r"(?:^|\s)(?:>|>>)(?![&])", stripped_fds):
+        if "/tmp/" not in value.replace("\\", "/") and "<<" not in value:
+            return "workspace_redirection"
+    return ""
+
+
+def _bash_exit_code(output: str) -> int | None:
+    match = re.match(r"\[exit_code=(-?\d+)\]", str(output or ""))
+    return int(match.group(1)) if match else None
 
 
 def _normalize_reviewer_result(value: dict) -> dict:
@@ -255,7 +368,36 @@ def _successful_tool_output(output: str) -> bool:
 
 def _finalize_role_result(
     result: dict, profile, successful_read_paths: set[str],
+    verifier_stats: dict | None = None,
 ) -> dict:
+    if profile.name == "verifier":
+        normalized = _normalize_verifier_result(result)
+        stats = verifier_stats or {}
+        actual_tests = list(stats.get("tests_run", []))[:VERIFIER_MAX_TESTS]
+        normalized["tests_run"] = actual_tests
+        failure_reason = str(result.get("failure_reason", ""))
+        if normalized["status"] == "blockers" and not normalized["blockers"]:
+            normalized["status"] = "inconclusive"
+            failure_reason = "blockers_report_missing_findings"
+        elif normalized["status"] == "pass" and not actual_tests:
+            normalized["status"] = "inconclusive"
+            failure_reason = "no_actual_bash_test"
+        elif (normalized["status"] == "pass"
+              and any(test.get("result") != "pass" for test in actual_tests)):
+            normalized["status"] = "inconclusive"
+            failure_reason = "bash_test_failed"
+        if stats.get("tool_failure"):
+            if normalized["status"] == "pass":
+                normalized["status"] = "inconclusive"
+            failure_reason = failure_reason or str(stats["tool_failure"])
+        if failure_reason:
+            normalized["failure_reason"] = failure_reason
+        normalized["_verification_stats"] = {
+            "model_calls": int(stats.get("model_calls", 0)),
+            "tool_calls": int(stats.get("tool_calls", 0)),
+            "tests_run": actual_tests,
+        }
+        return normalized
     if profile.name not in {"explore", "plan", "review"}:
         return result
     normalized = dict(result)
@@ -357,7 +499,14 @@ def run_role_agent(
     successful_read_paths: set[str] = set()
     read_cache: set[tuple[str, object, object]] = set()
     executed_tool_calls = 0
+    verifier_stats = {
+        "model_calls": 0,
+        "tool_calls": 0,
+        "tests_run": [],
+        "tool_failure": "",
+    }
     for _ in range(profile.max_tool_rounds):
+        verifier_stats["model_calls"] += 1
         response = _request_with_deadline(
             system=system, messages=messages, tools=tools,
             purpose="subagent", role=profile.name,
@@ -372,7 +521,7 @@ def run_role_agent(
             parsed = _parse_role_result(final_text, profile.name)
             if not parsed.get("invalid_json"):
                 return _finalize_role_result(
-                    parsed, profile, successful_read_paths)
+                    parsed, profile, successful_read_paths, verifier_stats)
             needs_synthesis = True
             break
         tool_rounds += 1
@@ -399,6 +548,29 @@ def run_role_agent(
                     decision="tool_limit_reached",
                     tool_limit=profile.max_tool_calls,
                 )
+                if profile.name == "verifier":
+                    verifier_stats["tool_failure"] = (
+                        "verifier_tool_limit_reached"
+                    )
+            elif (profile.name == "verifier" and block_name == "bash"
+                  and _verifier_bash_rejection(
+                      str(block_input.get("command", "")))):
+                reason = _verifier_bash_rejection(
+                    str(block_input.get("command", "")))
+                output = (
+                    "Tool not run: verifier bash is read-only; rejected "
+                    f"command ({reason})."
+                )
+                verifier_stats["tool_failure"] = reason
+            elif (profile.name == "verifier" and block_name == "bash"
+                  and _is_verifier_test_command(
+                      str(block_input.get("command", "")))
+                  and len(verifier_stats["tests_run"]) >= VERIFIER_MAX_TESTS):
+                output = (
+                    "Tool not run: verifier reached its "
+                    f"{VERIFIER_MAX_TESTS}-test budget."
+                )
+                verifier_stats["tool_failure"] = "verifier_test_limit_reached"
             elif block_name == "read_file":
                 read_path = _os.path.normpath(
                     str(block_input.get("path", "")).strip()
@@ -435,6 +607,8 @@ def run_role_agent(
                         tool_use_id=block_id,
                     )
                     executed_tool_calls += 1
+                    if profile.name == "verifier":
+                        verifier_stats["tool_calls"] += 1
                     read_paths.add(read_path)
                     read_cache.add(read_key)
                     if _successful_tool_output(str(output)):
@@ -442,15 +616,56 @@ def run_role_agent(
                             str(block_input.get("path", "")).strip())
                     trigger_hooks("PostToolUse", block, output)
             else:
+                handler_input = dict(block_input)
+                if profile.name == "verifier" and block_name == "bash":
+                    handler_input["_report_exit_code"] = True
+                    try:
+                        handler_input["timeout"] = min(
+                            max(float(handler_input.get("timeout", 120)), 0.1),
+                            120.0,
+                        )
+                    except (TypeError, ValueError):
+                        handler_input["timeout"] = 120.0
                 output = call_tool_handler(
-                    handler, block_input, block_name,
+                    handler, handler_input, block_name,
                     tool_use_id=block_id,
                 )
                 executed_tool_calls += 1
+                if profile.name == "verifier":
+                    verifier_stats["tool_calls"] += 1
+                    exit_code = (
+                        _bash_exit_code(str(output))
+                        if block_name == "bash" else None
+                    )
+                    if block_name == "bash" and exit_code not in {None, 0}:
+                        verifier_stats["tool_failure"] = (
+                            "verifier_bash_nonzero_exit"
+                        )
+                    if block_name == "bash" and _is_verifier_test_command(
+                        str(block_input.get("command", "")),
+                    ):
+                        verifier_stats["tests_run"].append({
+                            "command": _short_text(
+                                block_input.get("command", ""), 500),
+                            "result": "pass" if exit_code == 0 else "fail",
+                        })
+                        if exit_code is None:
+                            verifier_stats["tool_failure"] = (
+                                "verifier_test_result_unavailable"
+                            )
+                    if not _successful_tool_output(str(output)):
+                        verifier_stats["tool_failure"] = (
+                            "verifier_tool_failure"
+                        )
                 trigger_hooks("PostToolUse", block, output)
             output_text = str(output)
-            if profile.name in {"explore", "plan", "review"} \
-                    and block_name == "read_file" \
+            if (profile.name == "verifier"
+                    and not _successful_tool_output(output_text)):
+                verifier_stats["tool_failure"] = (
+                    verifier_stats["tool_failure"] or "verifier_tool_failure"
+                )
+            if profile.name in {"explore", "plan", "review", "verifier"} \
+                    and (block_name == "read_file" or profile.name == "verifier") \
                     and _successful_tool_output(output_text):
                 evidence_path = str(block_input.get("path", ""))
                 role_evidence.append(
@@ -479,7 +694,18 @@ def run_role_agent(
         needs_synthesis = True
 
     if needs_synthesis:
-        if profile.name == "review":
+        if profile.name == "verifier":
+            synthesis_instruction = (
+                '<synthesis>Tool use is over. Return one compact JSON object and '
+                'nothing else: {"status":"pass|blockers|inconclusive",'
+                '"summary":"max 500 chars","tests_run":[],"blockers":'
+                '[{"requirement":"","location":"","expected":"",'
+                '"observed":"","evidence":""}]}. Report only blockers backed '
+                'by observed code or test evidence. Do not request more tools, '
+                'edit files, use Markdown, or narrate reasoning.</synthesis>'
+            )
+            synthesis_max_tokens = profile.max_response_tokens
+        elif profile.name == "review":
             synthesis_instruction = (
                 '<synthesis>Tool use is over. Return one compact JSON object and '
                 'nothing else: {"verdict":"pass|gaps|blocked","summary":"max '
@@ -531,7 +757,7 @@ def run_role_agent(
             tool_rounds=tool_rounds,
         )
         synthesis_messages = messages
-        if profile.name in {"explore", "plan", "review"}:
+        if profile.name in {"explore", "plan", "review", "verifier"}:
             # A fresh turn prevents the synthesis model from continuing the
             # role's last unfinished intent (for example, "now run tests")
             # instead of analyzing evidence and returning the required JSON.
@@ -544,6 +770,7 @@ def run_role_agent(
                     f"<role_evidence>{evidence}</role_evidence>"
                 ),
             }]
+        verifier_stats["model_calls"] += 1
         response = _request_with_deadline(
             system=system, messages=synthesis_messages, tools=[],
             purpose="subagent", role=profile.name,
@@ -556,7 +783,139 @@ def run_role_agent(
         _parse_role_result(final_text, profile.name),
         profile,
         successful_read_paths,
+        verifier_stats,
     )
+
+
+def run_independent_verifier(
+    cwd: Path,
+    runtime: AgentRuntime | None,
+    *,
+    complexity_score: int,
+    observed_tests: list[dict] | None = None,
+    changed_files: list[str] | None = None,
+) -> dict:
+    """Run the one-shot harness verifier with fresh role context."""
+    profile = get_agent_profile("verifier")
+    if profile is None:
+        return {
+            "invoked": False,
+            "status": "inconclusive",
+            "failure_reason": "verifier_profile_unavailable",
+        }
+    model_client = (
+        runtime.services.model_client if runtime is not None else client
+    )
+    estimated_calls = profile.max_tool_rounds + 1
+    budget_allowed, budget = can_spend_optional_calls(
+        model_client, estimated_calls,
+    )
+    if not budget_allowed:
+        record_event(
+            "verification_skipped",
+            verification_skipped_reason="insufficient_model_budget",
+            complexity_score=int(complexity_score),
+            threshold=VERIFIER_COMPLEXITY_THRESHOLD,
+            estimated_model_calls=estimated_calls,
+            **{key: value for key, value in budget.items()
+               if key != "available"},
+        )
+        return {
+            "invoked": False,
+            "status": "inconclusive",
+            "failure_reason": "insufficient_model_budget",
+        }
+
+    workdir = Path(cwd).resolve()
+    before = snapshot_workspace(workdir)
+    record_event(
+        "verification_start",
+        complexity_score=int(complexity_score),
+        threshold=VERIFIER_COMPLEXITY_THRESHOLD,
+        max_model_calls=estimated_calls,
+        max_tool_calls=profile.max_tool_calls,
+        max_tests=VERIFIER_MAX_TESTS,
+    )
+    observed = []
+    for item in (observed_tests or [])[:VERIFIER_MAX_TESTS]:
+        if not isinstance(item, dict):
+            continue
+        observed.append({
+            "command": _short_text(item.get("command", ""), 500),
+            "result": _short_text(item.get("result", "unknown"), 120),
+        })
+    assignment = (
+        "Independently verify the current final workspace against the original "
+        "task. Re-read repository guidance and README files. "
+        + (
+            "Inspect git status and the complete final diff. "
+            if (workdir / ".git").exists()
+            else (
+                "Git metadata is unavailable in this isolated workspace; do not "
+                "run git commands. Inspect these harness-observed changed paths "
+                f"and their current dependencies: {json.dumps((changed_files or [])[:50])}. "
+            )
+        )
+        + "Run no more than "
+        f"{VERIFIER_MAX_TESTS} high-value tests. Do not modify the workspace.\n"
+        "Observed public test commands and short results, if any:\n"
+        f"{json.dumps(observed, ensure_ascii=False)}"
+    )
+    try:
+        raw_result = run_role_agent("verifier", assignment, workdir, runtime)
+    except Exception as exc:
+        raw_result = {
+            "status": "inconclusive",
+            "summary": "Independent verification could not complete.",
+            "tests_run": [],
+            "blockers": [],
+            "failure_reason": (
+                "verifier_timeout" if isinstance(exc, _CaseTimeoutError)
+                else f"verifier_error:{type(exc).__name__}"
+            ),
+            "_verification_stats": {
+                "model_calls": 0, "tool_calls": 0, "tests_run": [],
+            },
+        }
+    after = snapshot_workspace(workdir)
+    changed_files = workspace_changes(before, after)
+    stats = raw_result.pop("_verification_stats", {})
+    result = _normalize_verifier_result(raw_result)
+    failure_reason = str(raw_result.get("failure_reason", ""))
+    if changed_files:
+        result["status"] = "inconclusive"
+        result["summary"] = (
+            "Verifier changed the workspace; its result is invalid."
+        )
+        failure_reason = "verifier_modified_workspace"
+    if result["status"] == "inconclusive" and not failure_reason:
+        failure_reason = "verifier_inconclusive"
+    model_calls = int(stats.get("model_calls", 0))
+    tool_calls = int(stats.get("tool_calls", 0))
+    tests_run = list(stats.get("tests_run", result.get("tests_run", [])))
+    result["tests_run"] = tests_run[:VERIFIER_MAX_TESTS]
+    record_event(
+        "verification_result",
+        status=result["status"],
+        model_calls=model_calls,
+        tool_calls=tool_calls,
+        tests_run=len(result["tests_run"]),
+        blockers_found=len(result["blockers"]),
+        workspace_modified=bool(changed_files),
+        workspace_changed_files=changed_files[:20],
+        failure_reason=failure_reason,
+    )
+    return {
+        "invoked": True,
+        "status": result["status"],
+        "report": result,
+        "model_calls": model_calls,
+        "tool_calls": tool_calls,
+        "tests_run": len(result["tests_run"]),
+        "blockers_found": len(result["blockers"]),
+        "workspace_modified": bool(changed_files),
+        "failure_reason": failure_reason,
+    }
 
 
 def delegate_agent(
@@ -573,7 +932,7 @@ def delegate_agent(
     """
     normalized_role = normalize_agent_role(role)
     profile = get_agent_profile(normalized_role)
-    if profile is None:
+    if profile is None or normalized_role == "verifier":
         return json.dumps({
             "status": "error",
             "error": (

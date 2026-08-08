@@ -395,7 +395,8 @@ def test_general_purpose_subagent_edits_without_team_task_or_worktree(
     assert {"task_id", "worktree", "commit"}.isdisjoint(delegated)
 
 
-def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
+def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_loop, "VERIFIER_MAX_RUNS_PER_TASK", 0)
     (tmp_path / "README.md").write_text(
         "Contract: preserve the API and keep state atomic.\n", encoding="utf-8")
     (tmp_path / "service.py").write_text("BROKEN = True\n", encoding="utf-8")
@@ -470,7 +471,10 @@ def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
     assert len(reviewer_calls) == 1
 
 
-def test_inconclusive_explorer_is_reused_and_does_not_lock_lead(tmp_path):
+def test_inconclusive_explorer_is_reused_and_does_not_lock_lead(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(agent_loop, "VERIFIER_MAX_RUNS_PER_TASK", 0)
     (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
     task = (
         "Implement an end-to-end repository update for atomic concurrent "
@@ -919,7 +923,7 @@ def test_runtime_role_signal_requires_repeat_cross_scope_and_tail_budget():
     assert docker_paths["scope_count"] == 3
 
 
-def test_complex_task_does_not_start_an_automatic_reviewer(tmp_path):
+def test_complex_task_degrades_to_lead_verification_when_budget_is_low(tmp_path):
     (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
     task = (
         "Implement an end-to-end atomic transaction rollback and idempotency "
@@ -945,15 +949,19 @@ def test_complex_task_does_not_start_an_automatic_reviewer(tmp_path):
         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
     )
 
-    assert result["final_answer"] == "ready for final"
-    assert len(client.calls) == 2
+    assert result["final_answer"] == "finished with reserved calls"
+    assert len(client.calls) == 3
     assert all(
         any(tool["name"] == "delegate_agent" for tool in call["tools"])
-        for call in client.calls
+        for call in client.calls[:2]
     )
     assert not any(
-        "You are the review role" in call["system"]
+        "You are the verifier role" in call["system"]
         for call in client.calls
+    )
+    assert any(
+        "insufficient_model_budget" in str(message.get("content"))
+        for message in client.calls[-1]["messages"]
     )
 
 
@@ -981,7 +989,10 @@ def test_last_budget_call_is_forced_to_be_a_tool_free_final(tmp_path):
     )
 
 
-def test_reviewer_gap_stays_in_tool_output_without_hidden_todo(tmp_path):
+def test_reviewer_gap_stays_in_tool_output_without_hidden_todo(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(agent_loop, "VERIFIER_MAX_RUNS_PER_TASK", 0)
     (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
     task = (
         "Implement an end-to-end atomic transaction rollback and idempotency "
