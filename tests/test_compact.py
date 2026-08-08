@@ -107,17 +107,22 @@ def force_compact(messages, **kwargs):
     )
 
 
-def test_default_window_is_64k_with_normal_response_headroom():
-    trigger_chars = int(
-        compact.CONTEXT_LIMIT * compact.COMPACT_TRIGGER_RATIO
+def test_default_context_and_summary_budgets_are_independent():
+    trigger_chars = (
+        compact.COMPACT_TRIGGER_TOKENS
+        * compact.ESTIMATED_CHARS_PER_TOKEN
     )
 
-    assert compact.CONTEXT_LIMIT == 192_000
-    assert compact.CONTEXT_LIMIT_TOKENS == 64_000
-    assert compact.COMPACT_TRIGGER_RATIO == 0.85
-    assert compact.estimate_context_tokens(compact.CONTEXT_LIMIT) == 64_000
-    assert compact.estimate_context_tokens(trigger_chars) == 54_400
-    assert 64_000 - 54_400 >= agent_loop.DEFAULT_MAX_TOKENS
+    assert compact.AGENT_CONTEXT_LIMIT_TOKENS == 128_000
+    assert compact.CONTEXT_LIMIT_TOKENS == 128_000
+    assert compact.CONTEXT_LIMIT == 384_000
+    assert compact.COMPACT_TRIGGER_TOKENS == 100_000
+    assert compact.COMPACT_TRIGGER_RATIO == 100_000 / 128_000
+    assert compact.SUMMARY_INPUT_LIMIT_TOKENS == 256_000
+    assert compact.SUMMARY_MAX_TOKENS == 6_000
+    assert compact.estimate_context_tokens(compact.CONTEXT_LIMIT) == 128_000
+    assert compact.estimate_context_tokens(trigger_chars) == 100_000
+    assert 128_000 - 100_000 >= agent_loop.DEFAULT_MAX_TOKENS
     assert compact.RECENT_TAIL_MAX_TOKENS == 20_000
 
 
@@ -142,14 +147,38 @@ def test_automatic_trigger_uses_complete_request_size(monkeypatch):
     result = compact.compact_history(
         messages,
         allow_model_summary=True,
-        target_context_budget=190_000,
+        target_context_budget=350_000,
         request_size_fn=lambda candidate: (
-            compact.estimate_size(candidate) + 160_000
+            compact.estimate_size(candidate) + 310_000
         ),
     )
 
     assert calls
     assert checkpoint_count(result) == 1
+
+
+@pytest.mark.parametrize(
+    ("estimated_tokens", "should_compact"),
+    [(99_999, False), (100_000, True), (100_001, True)],
+)
+def test_automatic_compact_uses_token_threshold(
+    monkeypatch,
+    estimated_tokens,
+    should_compact,
+):
+    calls = install_summary(monkeypatch)
+    messages = long_history()
+
+    compact.compact_history(
+        messages,
+        allow_model_summary=True,
+        target_context_budget=350_000,
+        request_size_fn=lambda _candidate: (
+            estimated_tokens * compact.ESTIMATED_CHARS_PER_TOKEN
+        ),
+    )
+
+    assert bool(calls) is should_compact
 
 
 def test_successful_compact_has_checkpoint_and_recent_raw_tail(monkeypatch):
@@ -206,6 +235,15 @@ def test_compaction_prompt_requires_concrete_self_contained_markdown(
     assert "Return concise Markdown only" in captured["prompt"]
     assert "archive IDs" in captured["prompt"]
     assert "recovery tool" not in captured["prompt"]
+
+
+def test_summary_model_receives_configured_6000_output_tokens(tmp_path):
+    runtime = make_runtime(tmp_path, responses=["## Checkpoint\nDone."])
+
+    summary = compact.summarize_history(exchange(1, "useful result"), runtime)
+
+    assert summary.startswith("## Checkpoint")
+    assert runtime.services.model_client.messages.calls[0]["max_tokens"] == 6_000
 
 
 def test_prior_checkpoint_is_folded_into_replacement_without_stacking(
@@ -509,7 +547,7 @@ def test_prepare_context_trace_changed_matches_compact_result(
     monkeypatch.setattr(
         agent_loop,
         "assemble_system_prompt",
-        lambda *args: "s" * 170_000,
+        lambda *args: "s" * 310_000,
     )
     monkeypatch.setattr(agent_loop, "update_context", lambda *args: {})
     monkeypatch.setattr(
@@ -539,6 +577,9 @@ def test_prepare_context_trace_changed_matches_compact_result(
         and item["stage"] == "compact_history"
     )
     assert event["changed"] is changes_history
+    assert any(
+        item["type"] == "context_integrity" for item in events
+    ) is changes_history
 
 
 def test_prepare_context_below_trigger_does_not_report_compact(monkeypatch):
@@ -691,7 +732,7 @@ def test_candidate_budget_expands_prefix_before_summary(monkeypatch):
 
     result = force_compact(
         messages,
-        target_context_budget=42_500,
+        target_context_budget=52_000,
         request_size_fn=assembled_size,
     )
 
@@ -733,22 +774,94 @@ def test_compaction_failure_keeps_original_history(
     assert messages == original
 
 
-def test_unsafe_summary_input_fails_before_model_call(monkeypatch):
+def test_summary_input_over_256k_fails_before_model_call_and_is_not_retried(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = make_runtime(tmp_path)
+    events = []
     monkeypatch.setattr(
         compact,
         "summarize_history",
         lambda *_args, **_kwargs: pytest.fail("unsafe request must not be sent"),
     )
+    monkeypatch.setattr(
+        compact,
+        "record_event",
+        lambda event_type, **payload: events.append({
+            "type": event_type,
+            **payload,
+        }),
+    )
+    oversized_reasoning = "r" * (
+        260_000 * compact.ESTIMATED_CHARS_PER_TOKEN
+    )
+    oversized_exchange = exchange(0, "result")
+    oversized_exchange[0]["reasoning_content"] = oversized_reasoning
     messages = [
-        {"role": "user", "content": "LATEST-" + "p" * 120_000},
-        *long_history(6)[1:],
+        {"role": "user", "content": "Keep this latest request exact."},
+        *oversized_exchange,
     ]
+    for index in range(1, 6):
+        messages.extend(exchange(index, "recent"))
     original = json.loads(json.dumps(messages))
 
-    result = force_compact(messages)
+    first = compact.compact_history(
+        messages,
+        runtime=runtime,
+        allow_model_summary=True,
+        request_size_fn=compact.estimate_size,
+    )
+    second = compact.compact_history(
+        first,
+        runtime=runtime,
+        allow_model_summary=True,
+        request_size_fn=compact.estimate_size,
+    )
 
-    assert result is messages
+    assert first is second is messages
     assert messages == original
+    failures = [
+        event["failure_reason"]
+        for event in events
+        if event["type"] == "compact" and not event["success"]
+    ]
+    assert "SUMMARY_INPUT_LIMIT_TOKENS=256000" in failures[0]
+    assert failures[1] == "unchanged history matches the last failed compact"
+
+
+def test_large_reasoning_tool_exchange_uses_256k_summary_input_window(
+    monkeypatch,
+):
+    calls = install_summary(monkeypatch, "large exchange retained")
+    latest = {
+        "role": "user",
+        "content": "Keep this latest instruction outside the summary.",
+    }
+    large_reasoning = "r" * (
+        140_000 * compact.ESTIMATED_CHARS_PER_TOKEN
+    )
+    large_exchange = exchange(0, "tool result remains paired")
+    large_exchange[0]["reasoning_content"] = large_reasoning
+    messages = [latest, *large_exchange]
+    for index in range(1, 6):
+        messages.extend(exchange(index, "recent"))
+
+    result = compact.compact_history(
+        messages,
+        allow_model_summary=True,
+        request_size_fn=compact.estimate_size,
+        system="SYSTEM_PROMPT_MUST_NOT_BE_SUMMARIZED",
+    )
+
+    assert len(calls) == 1
+    summary_input = calls[0]
+    assert large_reasoning in render(summary_input)
+    assert latest not in summary_input
+    assert "SYSTEM_PROMPT_MUST_NOT_BE_SUMMARIZED" not in render(summary_input)
+    assert_tool_pairs(summary_input)
+    assert result[1] == latest
+    assert checkpoint_count(result) == 1
 
 
 def test_each_compact_uses_at_most_one_summary_model_call(monkeypatch):
@@ -781,20 +894,20 @@ def test_unchanged_failed_automatic_compact_is_not_retried(
 
     monkeypatch.setattr(compact, "summarize_history", fail)
     messages = long_history(10)
-    sizer = lambda candidate: compact.estimate_size(candidate) + 160_000
+    sizer = lambda candidate: compact.estimate_size(candidate) + 310_000
 
     first = compact.compact_history(
         messages,
         runtime=runtime,
         allow_model_summary=True,
-        target_context_budget=190_000,
+        target_context_budget=350_000,
         request_size_fn=sizer,
     )
     second = compact.compact_history(
         first,
         runtime=runtime,
         allow_model_summary=True,
-        target_context_budget=190_000,
+        target_context_budget=350_000,
         request_size_fn=sizer,
     )
     changed = [*second, {"role": "assistant", "content": "new history"}]
@@ -802,7 +915,7 @@ def test_unchanged_failed_automatic_compact_is_not_retried(
         changed,
         runtime=runtime,
         allow_model_summary=True,
-        target_context_budget=190_000,
+        target_context_budget=350_000,
         request_size_fn=sizer,
     )
 
@@ -836,7 +949,7 @@ def test_reactive_compact_forces_compaction_below_automatic_trigger(
 
     result = compact.reactive_compact(
         messages,
-        target_context_budget=10_000,
+        target_context_budget=30_000,
         request_size_fn=compact.estimate_size,
     )
 

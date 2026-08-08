@@ -62,12 +62,16 @@ from aqours_code.config import (  # noqa: E402
     BASE_URL,
     DEFAULT_MAX_TOKENS,
     ESCALATED_MAX_TOKENS,
+    MAX_RECOVERY_RETRIES,
     MODEL,
     MODEL_PROVIDER,
     get_model_client,
     validate_runtime_configuration,
 )
-from aqours_code.model_api import sanitize_base_url  # noqa: E402
+from aqours_code.model_api import (  # noqa: E402
+    effective_escalated_max_tokens,
+    sanitize_base_url,
+)
 from aqours_code.model_broker import (  # noqa: E402
     DEFAULT_IPC_DELIVERY_GRACE,
     DEFAULT_PROVIDER_RETRIES,
@@ -208,6 +212,21 @@ def configured_resource_limits(config: EvalExecutionConfig) -> dict:
         "nofile": "256:256",
         "tmpfs": "/tmp:rw,noexec,nosuid,size=64m",
         "overall_timeout_seconds": config.docker_timeout,
+    }
+
+
+def eval_runtime_configuration(
+    *,
+    escalated_max_tokens: int,
+    request_timeout_seconds: float,
+    docker_timeout_seconds: float,
+) -> dict:
+    return {
+        "default_max_tokens": DEFAULT_MAX_TOKENS,
+        "escalated_max_tokens": int(escalated_max_tokens),
+        "max_recovery_retries": MAX_RECOVERY_RETRIES,
+        "request_timeout_seconds": float(request_timeout_seconds),
+        "docker_timeout_seconds": float(docker_timeout_seconds),
     }
 
 
@@ -484,8 +503,15 @@ def load_metadata(case_dir: Path) -> dict:
     return metadata
 
 
-def model_budgets_for_case(metadata: dict) -> tuple[int, int]:
+def model_budgets_for_case(
+    metadata: dict,
+    *,
+    escalated_max_tokens: int = ESCALATED_MAX_TOKENS,
+) -> tuple[int, int]:
     """Bind broker spend to trusted case metadata, not container requests."""
+    escalated_max_tokens = max(
+        DEFAULT_MAX_TOKENS, int(escalated_max_tokens),
+    )
     raw_calls = metadata.get("max_model_calls")
     if raw_calls is None:
         raw_calls = DEFAULT_MODEL_CALLS_PER_CASE
@@ -496,15 +522,15 @@ def model_budgets_for_case(metadata: dict) -> tuple[int, int]:
 
     raw_tokens = metadata.get("max_model_tokens")
     if raw_tokens is None:
-        # Normal calls request 8k; one 16k recovery is allowed within the same
-        # explicit call budget.
+        # Normal calls request 8k; one provider-specific recovery is allowed
+        # within the same explicit call budget.
         raw_tokens = calls * DEFAULT_MAX_TOKENS + (
-            ESCALATED_MAX_TOKENS - DEFAULT_MAX_TOKENS)
+            escalated_max_tokens - DEFAULT_MAX_TOKENS)
     tokens = int(raw_tokens)
-    if tokens <= 0 or tokens > calls * ESCALATED_MAX_TOKENS:
+    if tokens <= 0 or tokens > calls * escalated_max_tokens:
         raise ValueError(
             "max_model_tokens must be positive and no greater than "
-            "max_model_calls * 16000")
+            f"max_model_calls * {escalated_max_tokens}")
     return calls, tokens
 
 
@@ -989,7 +1015,7 @@ def _model_broker_process(payload: dict):
         allowed_model=payload["allowed_model"],
         case_deadline=payload["case_deadline"],
         max_calls=payload["max_calls"],
-        max_tokens_per_call=ESCALATED_MAX_TOKENS,
+        max_tokens_per_call=payload["max_tokens_per_call"],
         max_total_tokens=payload["max_total_tokens"],
         provider_timeout=payload["provider_timeout"],
         max_provider_retries=DEFAULT_PROVIDER_RETRIES,
@@ -1017,6 +1043,7 @@ def _run_docker_agent_phase(
     scripted: bool,
     model_call_budget: int,
     model_token_budget: int,
+    escalated_max_tokens: int,
     context_limit_chars: int | None,
     compact_trigger_ratio: float | None,
     config: EvalExecutionConfig,
@@ -1032,6 +1059,11 @@ def _run_docker_agent_phase(
     remaining = remaining_timeout(case_deadline)
     provider_timeout, broker_request_timeout = model_broker_timeouts(
         float(os.getenv("AQOURS_CODE_REQUEST_TIMEOUT", "30")), remaining)
+    runtime_configuration = eval_runtime_configuration(
+        escalated_max_tokens=escalated_max_tokens,
+        request_timeout_seconds=provider_timeout,
+        docker_timeout_seconds=config.docker_timeout,
+    )
     input_payload = {
         "task": task,
         "workspace": "/workspace",
@@ -1044,6 +1076,7 @@ def _run_docker_agent_phase(
         "model": "scripted-eval" if scripted else MODEL,
         "model_provider": "scripted" if scripted else MODEL_PROVIDER,
         "base_url": "" if scripted else sanitize_base_url(BASE_URL),
+        **runtime_configuration,
         # request_timeout remains the Provider timeout for backward-compatible
         # runtime configuration. The container waits through one Broker-owned
         # retry plus the final response delivery grace.
@@ -1078,6 +1111,7 @@ def _run_docker_agent_phase(
             "model_provider": MODEL_PROVIDER,
             "allowed_model": input_payload["model"],
             "max_calls": model_call_budget,
+            "max_tokens_per_call": escalated_max_tokens,
             "max_total_tokens": model_token_budget,
             "case_deadline": case_deadline,
             "provider_timeout": provider_timeout,
@@ -1218,7 +1252,7 @@ def _run_docker_agent_phase(
         "model_broker_token_budget": broker_stats.get(
             "max_total_tokens", model_token_budget),
         "model_broker_max_tokens_per_call": broker_stats.get(
-            "max_tokens_per_call", ESCALATED_MAX_TOKENS),
+            "max_tokens_per_call", escalated_max_tokens),
         "model_broker_error": broker_stats.get("last_error", ""),
         "model_broker_error_kind": broker_stats.get("last_error_kind", ""),
         "model_broker_last_provider_error": broker_stats.get(
@@ -1228,6 +1262,7 @@ def _run_docker_agent_phase(
         "model_broker_provider_timeout": broker_stats.get(
             "provider_timeout", provider_timeout),
         "model_broker_ipc_timeout": broker_request_timeout,
+        **runtime_configuration,
         "model_broker_stopped": broker_stopped,
         "model_broker_exit_code": broker_process.exitcode,
         "model_broker_ipc_cleaned": False,
@@ -1534,7 +1569,18 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
     trusted_before = trusted_input_snapshot(case_dir)
     trusted_case_dir = copy_trusted_case(case_dir, trusted_eval_root, case_name)
     metadata = load_metadata(trusted_case_dir)
-    model_call_budget, model_token_budget = model_budgets_for_case(metadata)
+    active_provider = "scripted" if scripted else MODEL_PROVIDER
+    active_model = "scripted-eval" if scripted else MODEL
+    escalated_max_tokens = effective_escalated_max_tokens(
+        active_provider,
+        active_model,
+        current_max_tokens=DEFAULT_MAX_TOKENS,
+        configured_escalated_max_tokens=ESCALATED_MAX_TOKENS,
+    )
+    model_call_budget, model_token_budget = model_budgets_for_case(
+        metadata,
+        escalated_max_tokens=escalated_max_tokens,
+    )
     original_snapshot = workspace_snapshot(trusted_case_dir / "workspace")
     copy_case_workspace(trusted_case_dir, agent_workspace)
     if execution_config.backend == "docker":
@@ -1576,6 +1622,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             scripted=scripted,
             model_call_budget=model_call_budget,
             model_token_budget=model_token_budget,
+            escalated_max_tokens=escalated_max_tokens,
             context_limit_chars=metadata.get("context_limit_chars"),
             compact_trigger_ratio=metadata.get("compact_trigger_ratio"),
             config=execution_config,

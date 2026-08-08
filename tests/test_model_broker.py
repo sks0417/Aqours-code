@@ -340,6 +340,7 @@ def test_ipc_wait_window_covers_retry_backoff_and_delivery_grace():
     ) == 126
     assert run_eval.model_broker_timeouts(60, 600) == (60, 126)
     assert run_eval.model_broker_timeouts(60, 100) == (60, 100)
+    assert run_eval.model_broker_timeouts(720, 1500) == (720, 1446)
 
 
 @pytest.mark.parametrize(("message", "category"), [
@@ -417,6 +418,27 @@ def test_broker_accepts_normal_8000_and_16000_recovery_requests(tmp_path):
     assert broker.requested_token_count == 24000
 
 
+def test_broker_accepts_deepseek_64000_recovery_when_configured(tmp_path):
+    nonce = uuid.uuid4().hex
+    messages = RecordingMessages()
+    broker = ModelBroker(
+        tmp_path, nonce, SimpleNamespace(messages=messages),
+        allowed_model="deepseek-v4-flash", max_calls=2,
+        max_tokens_per_call=64000, max_total_tokens=72000,
+    ).start()
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
+    try:
+        client.messages.create(
+            model="deepseek-v4-flash", messages=[], max_tokens=8000)
+        client.messages.create(
+            model="deepseek-v4-flash", messages=[], max_tokens=64000)
+    finally:
+        broker.stop()
+
+    assert [call["max_tokens"] for call in messages.calls] == [8000, 64000]
+    assert broker.requested_token_count == 72000
+
+
 def test_broker_rejects_calls_beyond_case_budget_without_host_call(tmp_path):
     nonce = uuid.uuid4().hex
     messages = RecordingMessages()
@@ -466,6 +488,9 @@ def test_eval_broker_budget_is_derived_from_trusted_case_metadata():
         "max_model_calls": 2,
         "max_model_tokens": 24000,
     }) == (2, 24000)
+    assert run_eval.model_budgets_for_case(
+        {}, escalated_max_tokens=64000,
+    ) == (32, 312000)
 
 
 @pytest.mark.parametrize("message", [

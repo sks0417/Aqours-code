@@ -114,9 +114,25 @@ def validate_runtime_configuration() -> None:
             + ", ".join(missing)
             + ". Copy .env.example to .env and fill in your provider settings."
         )
-    if not 16_000 <= CONTEXT_LIMIT_TOKENS <= 1_000_000:
+    if not 16_000 <= AGENT_CONTEXT_LIMIT_TOKENS <= 1_000_000:
         raise RuntimeError(
-            "AQOURS_CODE_CONTEXT_LIMIT_TOKENS must be between 16000 and 1000000"
+            "AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS (or legacy "
+            "AQOURS_CODE_CONTEXT_LIMIT_TOKENS) must be between 16000 and "
+            "1000000"
+        )
+    if not 1_000 <= COMPACT_TRIGGER_TOKENS <= AGENT_CONTEXT_LIMIT_TOKENS:
+        raise RuntimeError(
+            "AQOURS_CODE_COMPACT_TRIGGER_TOKENS must be between 1000 and "
+            "AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS"
+        )
+    if not 16_000 <= SUMMARY_INPUT_LIMIT_TOKENS <= 1_000_000:
+        raise RuntimeError(
+            "AQOURS_CODE_SUMMARY_INPUT_LIMIT_TOKENS must be between 16000 "
+            "and 1000000"
+        )
+    if not 1_000 <= SUMMARY_MAX_TOKENS <= 64_000:
+        raise RuntimeError(
+            "AQOURS_CODE_SUMMARY_MAX_TOKENS must be between 1000 and 64000"
         )
 
 
@@ -135,17 +151,31 @@ DEFAULT_MAX_TOKENS = 8000
 ESCALATED_MAX_TOKENS = 16000
 MAX_RETRIES = _env_int("AQOURS_CODE_MODEL_MAX_RETRIES", 3)
 MAX_CONSECUTIVE_529 = 2
-MAX_RECOVERY_RETRIES = 2
+MAX_RECOVERY_RETRIES = 0
 BASE_DELAY_MS = 500
-# The harness budgets serialized request characters, not provider-native tokens.
-# At the shared conservative estimate of 3 chars/token, the default is a
-# 64K-token request ceiling. The internal 85% trigger leaves room for a normal
-# 8K response while keeping the public configuration to one understandable knob.
+# The harness estimates serialized request characters because Providers do not
+# share one tokenizer. Public context and compact settings remain token-based;
+# each distinct budget is converted independently at its point of use.
 CONTEXT_CHARS_PER_TOKEN = 3
-CONTEXT_LIMIT_TOKENS = _env_int(
-    "AQOURS_CODE_CONTEXT_LIMIT_TOKENS", 64_000,
+AGENT_CONTEXT_LIMIT_TOKENS = _env_int(
+    "AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS",
+    _env_int("AQOURS_CODE_CONTEXT_LIMIT_TOKENS", 128_000),
 )
-CONTEXT_LIMIT = CONTEXT_LIMIT_TOKENS * CONTEXT_CHARS_PER_TOKEN
+# Compatibility aliases for embedders that still import the old names.
+CONTEXT_LIMIT_TOKENS = AGENT_CONTEXT_LIMIT_TOKENS
+CONTEXT_LIMIT = AGENT_CONTEXT_LIMIT_TOKENS * CONTEXT_CHARS_PER_TOKEN
+COMPACT_TRIGGER_TOKENS = _env_int(
+    "AQOURS_CODE_COMPACT_TRIGGER_TOKENS", 100_000,
+)
+COMPACT_TRIGGER_RATIO = (
+    COMPACT_TRIGGER_TOKENS / AGENT_CONTEXT_LIMIT_TOKENS
+)
+SUMMARY_INPUT_LIMIT_TOKENS = _env_int(
+    "AQOURS_CODE_SUMMARY_INPUT_LIMIT_TOKENS", 256_000,
+)
+SUMMARY_MAX_TOKENS = _env_int(
+    "AQOURS_CODE_SUMMARY_MAX_TOKENS", 6_000,
+)
 CONTINUATION_PROMPT = "Continue from the previous response. Do not repeat completed work."
 TRACE_CLEANUP_ENABLED = _env_bool("AQOURS_CODE_TRACE_CLEANUP_ENABLED", True)
 TRACE_RETENTION_MAX_DAYS = _env_float("AQOURS_CODE_TRACE_RETENTION_MAX_DAYS", 7)

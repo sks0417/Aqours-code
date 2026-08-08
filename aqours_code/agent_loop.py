@@ -17,7 +17,10 @@ from .model_budget import (
     finalization_reserve_active,
 )
 from .runtime import AgentRuntime
-from .model_api import assistant_message_from_response
+from .model_api import (
+    assistant_message_from_response,
+    effective_escalated_max_tokens,
+)
 
 # ── Agent Loop ──
 
@@ -457,6 +460,10 @@ def _context_stats(
     }
 
 
+def _compact_target_chars() -> int:
+    return COMPACT_TRIGGER_TOKENS * CONTEXT_CHARS_PER_TOKEN
+
+
 def _latest_genuine_user_signature(messages: list) -> str:
     for message in reversed(messages):
         if message.get("role") != "user" or is_tool_result_message(message):
@@ -609,8 +616,7 @@ def prepare_context(
         system_size=len(system),
         tool_schema_size=estimate_size(budget_tools),
     )
-    compact_trigger = int(CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO)
-    if before["estimated_size"] > compact_trigger:
+    if before["estimated_tokens"] >= COMPACT_TRIGGER_TOKENS:
         latest_user_before = _latest_genuine_user_signature(messages)
         sizer = _request_sizer(budget_context, budget_tools, runtime)
         compacted = (
@@ -618,13 +624,13 @@ def prepare_context(
                 messages,
                 runtime=runtime,
                 reason="automatic",
-                target_context_budget=compact_trigger,
+                target_context_budget=_compact_target_chars(),
                 request_size_fn=sizer,
             )
             if runtime is not None else compact_history(
                 messages,
                 reason="automatic",
-                target_context_budget=compact_trigger,
+                target_context_budget=_compact_target_chars(),
                 request_size_fn=sizer,
             )
         )
@@ -654,7 +660,8 @@ def prepare_context(
             before_tokens=before["estimated_tokens"],
             after_tokens=after["estimated_tokens"],
         )
-        _record_context_integrity(messages, latest_user_before)
+        if changed:
+            _record_context_integrity(messages, latest_user_before)
     return messages
 
 
@@ -998,16 +1005,12 @@ def agent_loop(
                     reactive_compact(
                         messages,
                         runtime,
-                        target_context_budget=int(
-                            CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO
-                        ),
+                        target_context_budget=_compact_target_chars(),
                         request_size_fn=reactive_sizer,
                     )
                     if runtime is not None else reactive_compact(
                         messages,
-                        target_context_budget=int(
-                            CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO
-                        ),
+                        target_context_budget=_compact_target_chars(),
                         request_size_fn=reactive_sizer,
                     )
                 )
@@ -1030,7 +1033,16 @@ def agent_loop(
                 finish_run(extract_text(response.content))
                 return
             if not state.has_escalated:
-                max_tokens = ESCALATED_MAX_TOKENS
+                provider_name = (
+                    runtime.config.model_provider
+                    if runtime is not None else MODEL_PROVIDER
+                )
+                max_tokens = effective_escalated_max_tokens(
+                    provider_name,
+                    state.current_model,
+                    current_max_tokens=max_tokens,
+                    configured_escalated_max_tokens=ESCALATED_MAX_TOKENS,
+                )
                 state.has_escalated = True
                 print(f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m")
                 continue
@@ -1164,17 +1176,13 @@ def agent_loop(
                         messages,
                         runtime=runtime,
                         reason="manual",
-                        target_context_budget=int(
-                            CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO
-                        ),
+                        target_context_budget=_compact_target_chars(),
                         request_size_fn=compact_sizer,
                     )
                     if runtime is not None else compact_history(
                         messages,
                         reason="manual",
-                        target_context_budget=int(
-                            CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO
-                        ),
+                        target_context_budget=_compact_target_chars(),
                         request_size_fn=compact_sizer,
                     )
                 )
@@ -1531,7 +1539,9 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         "WORKDIR", "client", "MODEL_PROVIDER", "MODEL", "PRIMARY_MODEL",
         "COMMAND_EXECUTOR", "TOOL_POLICY", "CASE_DEADLINE",
         "CURRENT_ROOT_TASK", "BACKGROUND_TASKS_ENABLED", "APPROVAL_MODE",
-        "CONTEXT_LIMIT", "COMPACT_TRIGGER_RATIO",
+        "AGENT_CONTEXT_LIMIT_TOKENS", "CONTEXT_LIMIT_TOKENS",
+        "CONTEXT_LIMIT", "COMPACT_TRIGGER_TOKENS",
+        "COMPACT_TRIGGER_RATIO",
         *_WORKDIR_DERIVED_PATHS,
     ]
     old_state = {name: _runtime_value(name) for name in state_names}
@@ -1550,18 +1560,41 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         _set_runtime_value("TOOL_POLICY", tool_policy)
         _set_runtime_value("CASE_DEADLINE", case_deadline)
         _set_runtime_value("CURRENT_ROOT_TASK", task)
+        effective_context_chars = int(_runtime_value("CONTEXT_LIMIT"))
+        effective_trigger_ratio = float(
+            _runtime_value("COMPACT_TRIGGER_RATIO")
+        )
         if context_limit_chars is not None:
-            context_limit_chars = int(context_limit_chars)
-            if not 16_000 <= context_limit_chars <= 2_000_000:
+            effective_context_chars = int(context_limit_chars)
+            if not 16_000 <= effective_context_chars <= 2_000_000:
                 raise ValueError(
                     "context_limit_chars must be between 16000 and 2000000")
-            _set_runtime_value("CONTEXT_LIMIT", context_limit_chars)
         if compact_trigger_ratio is not None:
-            compact_trigger_ratio = float(compact_trigger_ratio)
-            if not 0.25 <= compact_trigger_ratio <= 0.95:
+            effective_trigger_ratio = float(compact_trigger_ratio)
+            if not 0.25 <= effective_trigger_ratio <= 0.95:
                 raise ValueError(
                     "compact_trigger_ratio must be between 0.25 and 0.95")
-            _set_runtime_value("COMPACT_TRIGGER_RATIO", compact_trigger_ratio)
+        if context_limit_chars is not None or compact_trigger_ratio is not None:
+            effective_context_tokens = estimate_context_tokens(
+                effective_context_chars
+            )
+            effective_trigger_tokens = max(
+                1,
+                int(effective_context_tokens * effective_trigger_ratio),
+            )
+            _set_runtime_value(
+                "AGENT_CONTEXT_LIMIT_TOKENS", effective_context_tokens,
+            )
+            _set_runtime_value(
+                "CONTEXT_LIMIT_TOKENS", effective_context_tokens,
+            )
+            _set_runtime_value("CONTEXT_LIMIT", effective_context_chars)
+            _set_runtime_value(
+                "COMPACT_TRIGGER_TOKENS", effective_trigger_tokens,
+            )
+            _set_runtime_value(
+                "COMPACT_TRIGGER_RATIO", effective_trigger_ratio,
+            )
         if approval_mode is not None:
             if approval_mode not in {"interactive", "non_interactive"}:
                 raise ValueError(f"unsupported approval mode: {approval_mode}")
@@ -1603,11 +1636,17 @@ def run_agent_task(task: str, workdir: str, trace_path: str | None = None,
         record_event(
             "context_configuration",
             context_limit_chars=int(_runtime_value("CONTEXT_LIMIT")),
-            context_limit_tokens=estimate_context_tokens(
-                int(_runtime_value("CONTEXT_LIMIT")),
-            ),
+            context_limit_tokens=int(
+                _runtime_value("AGENT_CONTEXT_LIMIT_TOKENS")),
+            agent_context_limit_tokens=int(
+                _runtime_value("AGENT_CONTEXT_LIMIT_TOKENS")),
+            compact_trigger_tokens=int(
+                _runtime_value("COMPACT_TRIGGER_TOKENS")),
             compact_trigger_ratio=float(
                 _runtime_value("COMPACT_TRIGGER_RATIO")),
+            summary_input_limit_tokens=int(
+                _runtime_value("SUMMARY_INPUT_LIMIT_TOKENS")),
+            summary_max_tokens=int(_runtime_value("SUMMARY_MAX_TOKENS")),
             eval_override=bool(
                 context_limit_chars is not None
                 or compact_trigger_ratio is not None),

@@ -110,13 +110,14 @@ The checkpoint is an ordinary internal user message marked
 older prefix and replaces it with one new cumulative checkpoint; summaries do
 not stack. The summary is free-form Markdown. There is no JSON schema, semantic
 merge, file-card state, Tool-result acknowledgement protocol, or deterministic
-semantic fallback. The public context setting is
-`AQOURS_CODE_CONTEXT_LIMIT_TOKENS`, defaulting to 64,000 estimated tokens.
-Internally this is converted with the conservative three-characters-per-token
-estimate. Compact triggers at the fixed 85% ratio, around 54,400 estimated
-input tokens at the default, leaving about 9,600 tokens of headroom for a
-normal 8,000-token response and estimation error. It reserves up to 3,000
-estimated tokens for the summary.
+semantic fallback. The public budgets are token based: the active Agent
+context defaults to 128,000 tokens, automatic Compact triggers at 100,000
+tokens, a single summary request may read up to 256,000 input tokens, and the
+summary may output up to 6,000 tokens. Internally each budget is converted
+independently with the conservative three-characters-per-token estimate. The
+legacy `AQOURS_CODE_CONTEXT_LIMIT_TOKENS` setting remains an alias for
+`AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS`; the summary input preflight does not
+reuse the active Agent context ceiling.
 
 Assistant Tool-use and matching user Tool-result messages are one atomic unit
 and cannot be cut apart; a parallel Tool batch is one unit as well. The recent

@@ -385,6 +385,7 @@ def test_unfinished_todo_gets_one_final_reminder(monkeypatch):
 
 def test_max_tokens_triggers_continuation_path(monkeypatch):
     install_common_agent_mocks(monkeypatch)
+    monkeypatch.setattr(agent_loop, "MODEL_PROVIDER", "openai")
     fake_client = FakeClient([
         response([text_block("partial")], stop_reason="max_tokens"),
         response([text_block("complete")]),
@@ -399,8 +400,33 @@ def test_max_tokens_triggers_continuation_path(monkeypatch):
     assert messages[-1]["content"][0].text == "complete"
 
 
-def test_empty_max_tokens_response_is_not_replayed(monkeypatch):
+def test_deepseek_thinking_max_tokens_escalates_to_64000(monkeypatch):
+    from aqours_code import recovery
+
     install_common_agent_mocks(monkeypatch)
+    monkeypatch.setattr(agent_loop, "MODEL_PROVIDER", "deepseek")
+    monkeypatch.setattr(recovery, "PRIMARY_MODEL", "deepseek-v4-flash")
+    fake_client = FakeClient([
+        response([], stop_reason="max_tokens"),
+        response([text_block("complete")]),
+    ])
+    monkeypatch.setattr(agent_loop, "client", fake_client)
+
+    messages = [{"role": "user", "content": "long answer"}]
+    agent_loop.agent_loop(messages, {})
+
+    assert [
+        call["max_tokens"] for call in fake_client.messages.calls
+    ] == [8000, 64000]
+    assert messages[-1]["content"][0].text == "complete"
+
+
+def test_empty_max_tokens_response_is_not_replayed(monkeypatch):
+    from aqours_code import recovery
+
+    install_common_agent_mocks(monkeypatch)
+    monkeypatch.setattr(agent_loop, "MODEL_PROVIDER", "deepseek")
+    monkeypatch.setattr(recovery, "PRIMARY_MODEL", "deepseek-v4-flash")
     first_truncation = response([], stop_reason="max_tokens")
     first_truncation.reasoning_content = "unfinished reasoning"
     second_truncation = response([], stop_reason="max_tokens")
@@ -419,8 +445,7 @@ def test_empty_max_tokens_response_is_not_replayed(monkeypatch):
         call["max_tokens"] for call in fake_client.messages.calls
     ] == [
         agent_loop.DEFAULT_MAX_TOKENS,
-        agent_loop.ESCALATED_MAX_TOKENS,
-        agent_loop.ESCALATED_MAX_TOKENS,
+        64000,
     ]
     assert not any(
         message.get("role") == "assistant"
@@ -429,7 +454,34 @@ def test_empty_max_tokens_response_is_not_replayed(monkeypatch):
         for message in messages
     )
     assert not any("reasoning_content" in message for message in messages)
-    assert messages[-1]["content"][0].text == "complete"
+    assert sum(
+        message.get("content") == agent_loop.CONTINUATION_PROMPT
+        for message in messages
+    ) == 0
+
+
+def test_max_tokens_recovery_retries_can_be_disabled(monkeypatch):
+    from aqours_code import recovery
+
+    install_common_agent_mocks(monkeypatch)
+    monkeypatch.setattr(agent_loop, "MODEL_PROVIDER", "deepseek")
+    monkeypatch.setattr(recovery, "PRIMARY_MODEL", "deepseek-v4-flash")
+    fake_client = FakeClient([
+        response([], stop_reason="max_tokens")
+        for _index in range(4)
+    ])
+    monkeypatch.setattr(agent_loop, "client", fake_client)
+
+    messages = [{"role": "user", "content": "long answer"}]
+    agent_loop.agent_loop(messages, {})
+
+    assert [
+        call["max_tokens"] for call in fake_client.messages.calls
+    ] == [8000, 64000]
+    assert sum(
+        message.get("content") == agent_loop.CONTINUATION_PROMPT
+        for message in messages
+    ) == agent_loop.MAX_RECOVERY_RETRIES == 0
 
 
 def test_run_agent_task_uses_injected_fake_model_client(tmp_path):

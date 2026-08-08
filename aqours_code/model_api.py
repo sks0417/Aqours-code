@@ -9,7 +9,34 @@ from types import SimpleNamespace
 
 
 DEEPSEEK_V4_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
-DEEPSEEK_REASONING_EFFORT = "max"
+DEEPSEEK_REASONING_EFFORT = "high"
+DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS = 64_000
+
+
+def uses_deepseek_thinking(provider_name: str, model: str) -> bool:
+    return (
+        str(provider_name).casefold() == "deepseek"
+        and str(model).casefold() in DEEPSEEK_V4_MODELS
+    )
+
+
+def effective_escalated_max_tokens(
+    provider_name: str,
+    model: str,
+    *,
+    current_max_tokens: int,
+    configured_escalated_max_tokens: int,
+) -> int:
+    provider_escalation = (
+        DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS
+        if uses_deepseek_thinking(provider_name, model)
+        else configured_escalated_max_tokens
+    )
+    return max(
+        int(current_max_tokens),
+        int(configured_escalated_max_tokens),
+        int(provider_escalation),
+    )
 
 
 def _clean_env(value: str | None) -> str | None:
@@ -179,9 +206,8 @@ class OpenAICompatibleMessages:
             payload_messages.append({"role": "system", "content": system})
         payload_messages.extend(_messages_to_openai(messages))
         payload = {"model": model, "messages": payload_messages, "max_tokens": max_tokens}
-        deepseek_thinking = (
-            self.provider_name.casefold() == "deepseek"
-            and model.casefold() in DEEPSEEK_V4_MODELS
+        deepseek_thinking = uses_deepseek_thinking(
+            self.provider_name, model,
         )
         if deepseek_thinking:
             payload["thinking"] = {"type": "enabled"}

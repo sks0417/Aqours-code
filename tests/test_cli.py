@@ -16,7 +16,11 @@ def _clean_env() -> dict[str, str]:
         "AQOURS_CODE_BASE_URL",
         "AQOURS_CODE_MODEL",
         "AQOURS_CODE_PROVIDER",
+        "AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS",
         "AQOURS_CODE_CONTEXT_LIMIT_TOKENS",
+        "AQOURS_CODE_COMPACT_TRIGGER_TOKENS",
+        "AQOURS_CODE_SUMMARY_INPUT_LIMIT_TOKENS",
+        "AQOURS_CODE_SUMMARY_MAX_TOKENS",
     ):
         env.pop(name, None)
     env["PYTHONPATH"] = str(PROJECT_ROOT)
@@ -95,6 +99,40 @@ def test_context_window_environment_setting_is_token_based(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "288000"
+
+
+def test_new_context_and_summary_environment_settings_are_token_based(tmp_path):
+    env = _clean_env()
+    env.update({
+        "AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS": "160000",
+        "AQOURS_CODE_CONTEXT_LIMIT_TOKENS": "96000",
+        "AQOURS_CODE_COMPACT_TRIGGER_TOKENS": "120000",
+        "AQOURS_CODE_SUMMARY_INPUT_LIMIT_TOKENS": "300000",
+        "AQOURS_CODE_SUMMARY_MAX_TOKENS": "7000",
+    })
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from aqours_code.config import "
+                "AGENT_CONTEXT_LIMIT_TOKENS, CONTEXT_LIMIT, "
+                "COMPACT_TRIGGER_TOKENS, SUMMARY_INPUT_LIMIT_TOKENS, "
+                "SUMMARY_MAX_TOKENS; "
+                "print(AGENT_CONTEXT_LIMIT_TOKENS, CONTEXT_LIMIT, "
+                "COMPACT_TRIGGER_TOKENS, SUMMARY_INPUT_LIMIT_TOKENS, "
+                "SUMMARY_MAX_TOKENS)"
+            ),
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "160000 480000 120000 300000 7000"
 
 
 def test_configured_cli_starts_without_printing_api_key(tmp_path):

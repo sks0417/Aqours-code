@@ -15,12 +15,13 @@ from .runtime_state import *
 # Markdown checkpoint, the latest genuine user message, and a recent verbatim
 # suffix. Token counts are estimates because providers do not share a tokenizer.
 CONTEXT_CHECKPOINT_MARKER = "[Context checkpoint]"
-COMPACT_TRIGGER_RATIO = 0.85
 RECENT_TOOL_RESULT_COUNT = 4
 RECENT_TAIL_MAX_TOKENS = 20_000
 MAX_TOOL_RESULT_TOKENS = 8_000
-SUMMARY_MAX_TOKENS = 3_000
 ESTIMATED_CHARS_PER_TOKEN = CONTEXT_CHARS_PER_TOKEN
+# Leave room for estimation error and Provider-side message framing without
+# coupling the summary input window to either the Agent window or output size.
+SUMMARY_INPUT_SAFETY_MARGIN_TOKENS = 1_000
 SUMMARY_OUTPUT_RESERVE_CHARS = (
     SUMMARY_MAX_TOKENS * ESTIMATED_CHARS_PER_TOKEN
 )
@@ -361,13 +362,19 @@ def _select_prefix_and_recent_tail(
 
     prefix_units = units[:boundary]
     tail_units = units[boundary:]
+    prefix = [
+        _copy_messages([message])[0]
+        for unit in prefix_units
+        for message in unit
+        if id(message) != latest_message_id
+    ]
     tail = [
         _copy_messages([message])[0]
         for unit in tail_units
         for message in unit
         if id(message) != latest_message_id
     ]
-    return _copy_messages(_flatten(prefix_units)), tail, latest
+    return prefix, tail, latest
 
 
 def sanitize_context_tool_results(
@@ -426,6 +433,19 @@ def _compact_prompt(prefix: list) -> str:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+    )
+
+
+def summary_prefix_budget_tokens() -> int:
+    """Return the safe prefix budget for one summary-model input."""
+    instruction_overhead = estimate_context_tokens(
+        len(_compact_prompt([]))
+    )
+    return max(
+        0,
+        SUMMARY_INPUT_LIMIT_TOKENS
+        - instruction_overhead
+        - SUMMARY_INPUT_SAFETY_MARGIN_TOKENS,
     )
 
 
@@ -627,17 +647,19 @@ def _compact(
         int(
             target_context_budget
             if target_context_budget is not None
-            else CONTEXT_LIMIT - COMPACT_OUTPUT_RESERVE_CHARS
+            else COMPACT_TRIGGER_TOKENS * ESTIMATED_CHARS_PER_TOKEN
         ),
     )
-    trigger = int(CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO)
     signature = _compact_signature(
         active_messages,
         target=target,
         fixed_size=sizer([]),
     )
 
-    if not force and active_size <= trigger:
+    if (
+        not force
+        and estimate_context_tokens(active_size) < COMPACT_TRIGGER_TOKENS
+    ):
         if omitted_count:
             _clear_failed_compact(runtime)
         _record_compact(
@@ -745,12 +767,26 @@ def _compact(
         prefix.extend(_copy_messages(tail_units[0]))
         tail = _copy_messages(_flatten(tail_units[1:]))
 
-    summary_prompt_budget = max(
-        1_000,
-        CONTEXT_LIMIT - SUMMARY_OUTPUT_RESERVE_CHARS,
+    prefix_tokens = estimate_context_tokens(estimate_size(prefix))
+    prefix_budget_tokens = summary_prefix_budget_tokens()
+    prompt_tokens = estimate_context_tokens(len(_compact_prompt(prefix)))
+    safe_prompt_tokens = max(
+        0,
+        SUMMARY_INPUT_LIMIT_TOKENS - SUMMARY_INPUT_SAFETY_MARGIN_TOKENS,
     )
-    if len(_compact_prompt(prefix)) > summary_prompt_budget:
-        failure = "selected prefix cannot fit one safe summary request"
+    if (
+        prefix_tokens > prefix_budget_tokens
+        or prompt_tokens > safe_prompt_tokens
+    ):
+        failure = (
+            "summary request input exceeds safe limit: "
+            f"prefix={prefix_tokens} estimated tokens, "
+            f"prefix_budget={prefix_budget_tokens}, "
+            f"prompt={prompt_tokens}, "
+            "SUMMARY_INPUT_LIMIT_TOKENS="
+            f"{SUMMARY_INPUT_LIMIT_TOKENS}, "
+            f"safety_margin={SUMMARY_INPUT_SAFETY_MARGIN_TOKENS}"
+        )
         _remember_failed_compact(
             runtime,
             reason=reason,

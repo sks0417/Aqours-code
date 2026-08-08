@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 
 from aqours_code.model_api import (
+    DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS,
     OpenAICompatibleMessages,
     _messages_to_openai,
     _openai_message_to_response,
     assistant_message_from_response,
+    effective_escalated_max_tokens,
     sanitize_base_url,
 )
 
@@ -33,10 +35,11 @@ def test_base_url_metadata_removes_credentials_and_auth_query_values():
     ) == "https://example.invalid/v1?api-version=1"
 
 
-def test_deepseek_v4_flash_uses_max_thinking_and_replays_reasoning(
+def test_deepseek_v4_flash_uses_high_thinking_and_replays_reasoning(
     monkeypatch,
 ):
     captured = {}
+    monkeypatch.setenv("AQOURS_CODE_REQUEST_TIMEOUT", "720")
 
     class FakeHttpResponse:
         def __enter__(self):
@@ -95,9 +98,11 @@ def test_deepseek_v4_flash_uses_max_thinking_and_replays_reasoning(
     )
 
     payload = captured["payload"]
+    assert payload["max_tokens"] == 8000
     assert payload["thinking"] == {"type": "enabled"}
-    assert payload["reasoning_effort"] == "max"
+    assert payload["reasoning_effort"] == "high"
     assert "tool_choice" not in payload
+    assert captured["timeout"] == 720
     assert response.reasoning_content == "checked the tool arguments"
 
     replayed = _messages_to_openai([
@@ -105,6 +110,27 @@ def test_deepseek_v4_flash_uses_max_thinking_and_replays_reasoning(
     ])
     assert replayed[0]["reasoning_content"] == "checked the tool arguments"
     assert replayed[0]["tool_calls"][0]["function"]["name"] == "read_file"
+
+
+def test_escalated_tokens_are_provider_specific_and_monotonic():
+    assert effective_escalated_max_tokens(
+        "deepseek",
+        "deepseek-v4-flash",
+        current_max_tokens=8000,
+        configured_escalated_max_tokens=16000,
+    ) == DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS == 64000
+    assert effective_escalated_max_tokens(
+        "openai",
+        "gpt-test",
+        current_max_tokens=8000,
+        configured_escalated_max_tokens=16000,
+    ) == 16000
+    assert effective_escalated_max_tokens(
+        "deepseek",
+        "deepseek-v4-flash",
+        current_max_tokens=128000,
+        configured_escalated_max_tokens=16000,
+    ) == 128000
 
 
 def test_openai_conversion_drops_empty_assistant_reasoning_turn():

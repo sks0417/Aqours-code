@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -453,6 +454,66 @@ def test_default_scripted_mode_selects_only_supported_smoke_cases(
         "edit_file_basic", "permission_denied_basic", "read_file_basic",
         "run_tests_basic", "trace_record_basic",
     ]
+
+
+def test_eval_cli_forwards_request_and_overall_docker_timeouts(
+    tmp_path, monkeypatch,
+):
+    observed = {}
+
+    def fake_run_case(case, _run_root, _scripted, config):
+        observed["request_timeout"] = os.environ[
+            "AQOURS_CODE_REQUEST_TIMEOUT"
+        ]
+        observed["docker_timeout"] = config.docker_timeout
+        return {
+            "case": case.name,
+            "passed": True,
+            "score": 100,
+            "breakdown": dict(run_eval.DEFAULT_BREAKDOWN_WEIGHTS),
+            "metrics": {},
+            "metadata": run_eval.load_metadata(case),
+            "failure_category": None,
+            "reason": "",
+            "diagnostic_score": None,
+            "command_execution_count": 0,
+            "all_container_cleanup_succeeded": True,
+        }
+
+    monkeypatch.setattr(run_eval, "run_case", fake_run_case)
+    monkeypatch.setattr(run_eval, "ensure_eval_image", lambda **_kwargs: False)
+    monkeypatch.setattr(sys, "argv", [
+        "run_eval",
+        "--scripted",
+        "--case", "read_file_basic",
+        "--execution", "docker",
+        "--request-timeout", "720",
+        "--docker-timeout", "1500",
+        "--results-dir", str(tmp_path / "results"),
+    ])
+
+    assert run_eval.main() == 0
+    assert observed == {
+        "request_timeout": "720.0",
+        "docker_timeout": 1500.0,
+    }
+    assert run_eval.configured_resource_limits(
+        run_eval.EvalExecutionConfig(docker_timeout=1500),
+    )["overall_timeout_seconds"] == 1500
+
+
+def test_eval_runtime_configuration_records_experiment_values():
+    assert run_eval.eval_runtime_configuration(
+        escalated_max_tokens=64000,
+        request_timeout_seconds=720,
+        docker_timeout_seconds=1500,
+    ) == {
+        "default_max_tokens": 8000,
+        "escalated_max_tokens": 64000,
+        "max_recovery_retries": 0,
+        "request_timeout_seconds": 720.0,
+        "docker_timeout_seconds": 1500.0,
+    }
 
 
 def test_explicit_unsupported_scripted_case_returns_clear_error(

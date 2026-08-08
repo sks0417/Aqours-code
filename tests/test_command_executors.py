@@ -140,6 +140,32 @@ def test_full_agent_container_is_one_shot_entrypoint_with_isolated_mounts(tmp_pa
     assert "GIT_CONFIG_VALUE_0=*" not in args
 
 
+def test_full_agent_container_uses_configured_overall_timeout(tmp_path):
+    paths = {}
+    for name in ("workspace", "state", "runtime", "ipc"):
+        paths[name] = tmp_path / name
+        paths[name].mkdir()
+    runner = RecordingRunner()
+    agent = DockerAgentRunner(
+        image="eval:test",
+        case_name="overall-budget",
+        timeout=1500,
+        runner=runner,
+    )
+
+    proc, metadata = agent.run(
+        agent_workspace=paths["workspace"],
+        agent_state=paths["state"],
+        runtime_root=paths["runtime"],
+        ipc_root=paths["ipc"],
+    )
+
+    assert proc.returncode == 0
+    assert runner.calls[0][1]["timeout"] == 1500
+    assert runner.calls[0][0][:3] == ["docker", "run", "--name"]
+    assert metadata["container_timed_out"] is False
+
+
 def test_eval_image_build_uses_project_root_and_installs_runtime_and_git(tmp_path):
     calls = []
 
