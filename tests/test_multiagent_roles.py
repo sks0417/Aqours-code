@@ -941,7 +941,7 @@ def test_complex_task_degrades_to_lead_verification_when_budget_is_low(tmp_path)
         )),
         response(text_block("ready for final")),
         response(text_block("finished with reserved calls")),
-    ], max_calls=4)
+    ], max_calls=7)
 
     result = agent_loop.run_agent_task(
         task, str(tmp_path), model_client=client,

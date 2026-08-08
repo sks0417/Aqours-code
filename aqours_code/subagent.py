@@ -1,6 +1,6 @@
 from .runtime_state import *
 from .agent_profiles import get_agent_profile, normalize_agent_role
-from .model_budget import allocate_verifier_calls, can_spend_optional_calls
+from .model_budget import can_spend_optional_calls
 from .runtime import AgentRuntime
 from .model_api import assistant_message_from_response
 from .tool_registry import (
@@ -176,7 +176,7 @@ def _parse_role_result(text: str, role: str) -> dict:
             "status": "inconclusive",
             "summary": _short_text(raw, 700),
             "tests_run": [],
-            "findings": [],
+            "blockers": [],
             "invalid_json": True,
             "failure_reason": "invalid_verifier_json",
         }
@@ -189,42 +189,41 @@ def _short_text(value, limit: int) -> str:
 
 def _normalize_verifier_result(value: dict) -> dict:
     status = _short_text(value.get("status", "inconclusive"), 20).lower()
-    if status == "blockers":
-        status = "findings"
-    if status not in {"pass", "findings", "inconclusive"}:
+    if status not in {"pass", "blockers", "inconclusive"}:
         status = "inconclusive"
-    raw_findings = value.get("findings", value.get("blockers", []))
-    if not isinstance(raw_findings, list):
-        raw_findings = []
-    findings = []
-    for index, raw in enumerate(raw_findings[:8], 1):
+    raw_tests = value.get("tests_run", [])
+    if not isinstance(raw_tests, list):
+        raw_tests = []
+    tests_run = []
+    for raw in raw_tests[:VERIFIER_MAX_TESTS]:
         if not isinstance(raw, dict):
             continue
-        evidence_ids = raw.get("evidence_test_ids", [])
-        if not isinstance(evidence_ids, list):
-            evidence_ids = []
-        findings.append({
-            "id": f"finding_{index}",
-            "state": "candidate",
+        result = _short_text(raw.get("result", "fail"), 10).lower()
+        tests_run.append({
+            "command": _short_text(raw.get("command", ""), 500),
+            "result": "pass" if result == "pass" else "fail",
+        })
+    raw_blockers = value.get("blockers", [])
+    if not isinstance(raw_blockers, list):
+        raw_blockers = []
+    blockers = []
+    for raw in raw_blockers[:8]:
+        if not isinstance(raw, dict):
+            continue
+        blockers.append({
             "requirement": _short_text(raw.get("requirement", ""), 300),
             "location": _short_text(raw.get("location", ""), 240),
             "expected": _short_text(raw.get("expected", ""), 500),
             "observed": _short_text(raw.get("observed", ""), 500),
             "evidence": _short_text(raw.get("evidence", ""), 700),
-            "evidence_test_ids": [
-                _short_text(item, 80) for item in evidence_ids[:8]
-                if _short_text(item, 80)
-            ],
         })
-    if findings and status == "pass":
-        status = "findings"
+    if blockers and status == "pass":
+        status = "blockers"
     return {
         "status": status,
         "summary": _short_text(value.get("summary", ""), 700),
-        # Model-supplied test claims are deliberately discarded. The Harness
-        # replaces them with captured Bash execution facts during finalization.
-        "tests_run": [],
-        "findings": findings,
+        "tests_run": tests_run,
+        "blockers": blockers,
     }
 
 
@@ -242,97 +241,14 @@ _VERIFIER_MUTATION_PATTERN = re.compile(
 )
 
 
-def test_command_key(command: str) -> str:
-    return " ".join(str(command or "").strip().split()).lower()
-
-
-def classify_test_command(command: str) -> tuple[str, bool]:
-    """Classify a captured command without trusting model-provided claims."""
-    normalized = test_command_key(command)
-    if not normalized:
-        return "unknown", False
-    has_python_assert = (
-        "assert " in normalized
-        and re.search(r"(?:^|[\\/\s])python(?:\d+(?:\.\d+)*)?(?:\.exe)?\b",
-                      normalized) is not None
-    )
-    looks_like_runner = any(
-        marker in normalized for marker in _VERIFIER_TEST_MARKERS
-    )
-    if not looks_like_runner and not has_python_assert:
-        return "unknown", False
-
-    is_temporary = (
-        "/tmp/" in normalized.replace("\\", "/")
-        or "<<" in normalized
-        or (" -c " in normalized and any(
-            runtime_name in normalized
-            for runtime_name in ("python", "pypy")
-        ))
-        or bool(re.search(
-            r"\bpython(?:\d+(?:\.\d+)*)?(?:\.exe)?\s+-c\b",
-            normalized,
+def _is_verifier_test_command(command: str) -> bool:
+    normalized = " ".join(str(command or "").lower().split())
+    return (
+        any(marker in normalized for marker in _VERIFIER_TEST_MARKERS)
+        or ("assert " in normalized and (
+            "python" in normalized or "<<" in normalized or "/tmp/" in normalized
         ))
     )
-    has_unsafe_pipeline = bool(
-        re.search(r"(?<!\|)\|(?!\|)", normalized)
-        and "pipefail" not in normalized
-    )
-    if has_unsafe_pipeline:
-        return "unknown", False
-    if is_temporary:
-        return "targeted", False
-
-    targeted_filter = any(marker in normalized for marker in (
-        " -k ", "::", " --filter ", " --tests ", "-dtest=",
-    ))
-    pytest_runner = bool(re.search(
-        r"(?:^|\s)(?:pytest|py\.test)(?:\s|$)|"
-        r"\bpython(?:\d+(?:\.\d+)*)?(?:\.exe)?\s+-m\s+pytest\b",
-        normalized,
-    ))
-    if pytest_runner and re.search(r"(?:^|\s)[^\s]+\.py(?:\s|$)", normalized):
-        targeted_filter = True
-    if "unittest" in normalized and not any(
-        marker in normalized for marker in (" discover", "unittest -q", "unittest -v")
-    ):
-        tail = normalized.split("unittest", 1)[1].strip()
-        if tail and not all(token.startswith("-") for token in tail.split()):
-            targeted_filter = True
-    if "go test" in normalized and "./..." not in normalized:
-        targeted_filter = True
-    if targeted_filter:
-        return "targeted", True
-    return "public_suite", True
-
-
-def is_test_command(command: str) -> bool:
-    scope, _replayable = classify_test_command(command)
-    return scope != "unknown" or any(
-        marker in test_command_key(command) for marker in _VERIFIER_TEST_MARKERS
-    )
-
-
-def captured_test_fact(
-    command: str,
-    exit_code: int | None,
-    index: int,
-    *,
-    id_prefix: str = "verifier_test",
-) -> dict:
-    scope, replayable = classify_test_command(command)
-    return {
-        "id": f"{id_prefix}_{index}",
-        "command": _short_text(command, 500),
-        "exit_code": exit_code,
-        "result": (
-            "pass" if exit_code == 0
-            else "fail" if isinstance(exit_code, int)
-            else "unknown"
-        ),
-        "scope": scope,
-        "replayable": bool(replayable),
-    }
 
 
 def _verifier_bash_rejection(command: str) -> str:
@@ -457,132 +373,29 @@ def _finalize_role_result(
     if profile.name == "verifier":
         normalized = _normalize_verifier_result(result)
         stats = verifier_stats or {}
-        actual_tests = [
-            dict(item) for item in stats.get("tests_run", [])[:VERIFIER_MAX_TESTS]
-            if isinstance(item, dict)
-        ]
+        actual_tests = list(stats.get("tests_run", []))[:VERIFIER_MAX_TESTS]
         normalized["tests_run"] = actual_tests
         failure_reason = str(result.get("failure_reason", ""))
-        valid_test_ids = {
-            str(test.get("id")) for test in actual_tests if test.get("id")
-        }
-        failed_public = [
-            test for test in actual_tests
-            if test.get("scope") == "public_suite"
-            and isinstance(test.get("exit_code"), int)
-            and test.get("exit_code") != 0
-        ]
-        failure_groups: dict[str, list[dict]] = {}
-        for test in actual_tests:
-            if (test.get("scope") == "targeted"
-                    and test.get("replayable") is True
-                    and isinstance(test.get("exit_code"), int)
-                    and test.get("exit_code") != 0):
-                failure_groups.setdefault(
-                    test_command_key(test.get("command", "")), [],
-                ).append(test)
-        strong_test_ids = {
-            str(test["id"]) for test in failed_public
-        }
-        for repeated in failure_groups.values():
-            if len(repeated) >= 2:
-                strong_test_ids.update(str(test["id"]) for test in repeated)
-
-        transitions = []
-        referenced_test_ids = set()
-        for finding in normalized["findings"]:
-            evidence_ids = [
-                str(item) for item in finding.get("evidence_test_ids", [])
-                if str(item) in valid_test_ids
-            ]
-            finding["evidence_test_ids"] = evidence_ids
-            referenced_test_ids.update(evidence_ids)
-            if strong_test_ids.intersection(evidence_ids):
-                finding["state"] = "confirmed"
-                transitions.append({
-                    "finding_id": finding["id"],
-                    "from": "candidate",
-                    "to": "confirmed",
-                    "reason": "authoritative_replayable_test_failure",
-                })
-
-        for test in actual_tests:
-            test_id = str(test.get("id", ""))
-            if (not isinstance(test.get("exit_code"), int)
-                    or test.get("exit_code") == 0
-                    or test_id in referenced_test_ids
-                    or len(normalized["findings"]) >= 8):
-                continue
-            confirmed = test_id in strong_test_ids
-            finding = {
-                "id": f"finding_{len(normalized['findings']) + 1}",
-                "state": "confirmed" if confirmed else "candidate",
-                "requirement": (
-                    "The existing public test suite must pass"
-                    if test.get("scope") == "public_suite"
-                    else "Review the failing targeted verifier check"
-                ),
-                "location": "",
-                "expected": "The captured test command exits successfully",
-                "observed": (
-                    f"Harness captured exit code {test.get('exit_code')}"
-                ),
-                "evidence": "Harness-captured Bash execution result",
-                "evidence_test_ids": [test_id],
-            }
-            normalized["findings"].append(finding)
-            if confirmed:
-                transitions.append({
-                    "finding_id": finding["id"],
-                    "from": "candidate",
-                    "to": "confirmed",
-                    "reason": "authoritative_replayable_test_failure",
-                })
-
-        public_tests = [
-            test for test in actual_tests
-            if test.get("scope") == "public_suite"
-        ]
-        public_suite_passed = any(
-            test.get("exit_code") == 0 for test in public_tests
-        )
-        if normalized["findings"] and normalized["status"] == "pass":
-            normalized["status"] = "findings"
-        if failed_public:
-            normalized["status"] = "findings"
-            failure_reason = "public_suite_failed"
-        elif normalized["status"] == "pass" and not public_tests:
+        if normalized["status"] == "blockers" and not normalized["blockers"]:
             normalized["status"] = "inconclusive"
-            failure_reason = "public_suite_not_run"
-        elif normalized["status"] == "pass" and not public_suite_passed:
+            failure_reason = "blockers_report_missing_findings"
+        elif normalized["status"] == "pass" and not actual_tests:
             normalized["status"] = "inconclusive"
-            failure_reason = "public_suite_exit_code_unavailable"
-        elif normalized["status"] == "findings" and not normalized["findings"]:
+            failure_reason = "no_actual_bash_test"
+        elif (normalized["status"] == "pass"
+              and any(test.get("result") != "pass" for test in actual_tests)):
             normalized["status"] = "inconclusive"
-            failure_reason = "findings_report_missing_findings"
+            failure_reason = "bash_test_failed"
         if stats.get("tool_failure"):
             if normalized["status"] == "pass":
                 normalized["status"] = "inconclusive"
             failure_reason = failure_reason or str(stats["tool_failure"])
         if failure_reason:
             normalized["failure_reason"] = failure_reason
-        candidate_count = sum(
-            finding["state"] == "candidate"
-            for finding in normalized["findings"]
-        )
-        confirmed_count = sum(
-            finding["state"] == "confirmed"
-            for finding in normalized["findings"]
-        )
         normalized["_verification_stats"] = {
             "model_calls": int(stats.get("model_calls", 0)),
             "tool_calls": int(stats.get("tool_calls", 0)),
             "tests_run": actual_tests,
-            "public_suite_run": bool(public_tests),
-            "public_suite_passed": public_suite_passed,
-            "candidate_findings": candidate_count,
-            "confirmed_findings": confirmed_count,
-            "finding_transitions": transitions,
         }
         return normalized
     if profile.name not in {"explore", "plan", "review"}:
@@ -613,8 +426,6 @@ def run_role_agent(
     prompt: str,
     cwd: Path,
     runtime: AgentRuntime | None = None,
-    *,
-    max_model_calls: int | None = None,
 ) -> dict:
     profile = get_agent_profile(role)
     if profile is None:
@@ -694,16 +505,7 @@ def run_role_agent(
         "tests_run": [],
         "tool_failure": "",
     }
-    configured_role_calls = profile.max_tool_rounds + 1
-    model_call_limit = (
-        configured_role_calls
-        if max_model_calls is None else max(0, int(max_model_calls))
-    )
-    tool_round_limit = min(
-        profile.max_tool_rounds,
-        max(0, model_call_limit - 1),
-    )
-    for _ in range(tool_round_limit):
+    for _ in range(profile.max_tool_rounds):
         verifier_stats["model_calls"] += 1
         response = _request_with_deadline(
             system=system, messages=messages, tools=tools,
@@ -761,7 +563,7 @@ def run_role_agent(
                 )
                 verifier_stats["tool_failure"] = reason
             elif (profile.name == "verifier" and block_name == "bash"
-                  and is_test_command(
+                  and _is_verifier_test_command(
                       str(block_input.get("command", "")))
                   and len(verifier_stats["tests_run"]) >= VERIFIER_MAX_TESTS):
                 output = (
@@ -835,28 +637,18 @@ def run_role_agent(
                         _bash_exit_code(str(output))
                         if block_name == "bash" else None
                     )
-                    captured_test = (
-                        block_name == "bash" and is_test_command(
-                            str(block_input.get("command", "")),
-                        )
-                    )
-                    if (block_name == "bash" and not captured_test
-                            and exit_code not in {None, 0}):
+                    if block_name == "bash" and exit_code not in {None, 0}:
                         verifier_stats["tool_failure"] = (
                             "verifier_bash_nonzero_exit"
                         )
-                    if captured_test:
-                        fact = captured_test_fact(
-                            str(block_input.get("command", "")),
-                            exit_code,
-                            len(verifier_stats["tests_run"]) + 1,
-                        )
-                        verifier_stats["tests_run"].append(fact)
-                        output = (
-                            f"{output}\n<harness_test_fact>"
-                            f"{json.dumps(fact, ensure_ascii=False)}"
-                            "</harness_test_fact>"
-                        )
+                    if block_name == "bash" and _is_verifier_test_command(
+                        str(block_input.get("command", "")),
+                    ):
+                        verifier_stats["tests_run"].append({
+                            "command": _short_text(
+                                block_input.get("command", ""), 500),
+                            "result": "pass" if exit_code == 0 else "fail",
+                        })
                         if exit_code is None:
                             verifier_stats["tool_failure"] = (
                                 "verifier_test_result_unavailable"
@@ -905,13 +697,11 @@ def run_role_agent(
         if profile.name == "verifier":
             synthesis_instruction = (
                 '<synthesis>Tool use is over. Return one compact JSON object and '
-                'nothing else: {"status":"pass|findings|inconclusive",'
-                '"summary":"max 500 chars","tests_run":[],"findings":'
+                'nothing else: {"status":"pass|blockers|inconclusive",'
+                '"summary":"max 500 chars","tests_run":[],"blockers":'
                 '[{"requirement":"","location":"","expected":"",'
-                '"observed":"","evidence":"","evidence_test_ids":[]}]}. '
-                'Findings are candidates, not proven blockers; cite Harness test '
-                'IDs when relevant. Use pass only after a complete public test '
-                'suite succeeded. Do not request more tools, '
+                '"observed":"","evidence":""}]}. Report only blockers backed '
+                'by observed code or test evidence. Do not request more tools, '
                 'edit files, use Markdown, or narrate reasoning.</synthesis>'
             )
             synthesis_max_tokens = profile.max_response_tokens
@@ -1016,21 +806,17 @@ def run_independent_verifier(
     model_client = (
         runtime.services.model_client if runtime is not None else client
     )
-    allocated_calls, budget = allocate_verifier_calls(
-        model_client,
-        VERIFIER_MAX_MODEL_CALLS,
-        resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
-        safety_margin=VERIFIER_SAFETY_MARGIN,
+    estimated_calls = profile.max_tool_rounds + 1
+    budget_allowed, budget = can_spend_optional_calls(
+        model_client, estimated_calls,
     )
-    if allocated_calls < 2:
+    if not budget_allowed:
         record_event(
             "verification_skipped",
             verification_skipped_reason="insufficient_model_budget",
             complexity_score=int(complexity_score),
             threshold=VERIFIER_COMPLEXITY_THRESHOLD,
-            allocated_model_calls=allocated_calls,
-            resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
-            safety_margin=VERIFIER_SAFETY_MARGIN,
+            estimated_model_calls=estimated_calls,
             **{key: value for key, value in budget.items()
                if key != "available"},
         )
@@ -1046,13 +832,7 @@ def run_independent_verifier(
         "verification_start",
         complexity_score=int(complexity_score),
         threshold=VERIFIER_COMPLEXITY_THRESHOLD,
-        remaining_model_calls=(
-            budget.get("remaining_calls") if budget.get("available") else None
-        ),
-        allocated_model_calls=allocated_calls,
-        resolution_reserve=VERIFIER_RESOLUTION_RESERVE,
-        safety_margin=VERIFIER_SAFETY_MARGIN,
-        max_model_calls=allocated_calls,
+        max_model_calls=estimated_calls,
         max_tool_calls=profile.max_tool_calls,
         max_tests=VERIFIER_MAX_TESTS,
     )
@@ -1082,16 +862,13 @@ def run_independent_verifier(
         f"{json.dumps(observed, ensure_ascii=False)}"
     )
     try:
-        raw_result = run_role_agent(
-            "verifier", assignment, workdir, runtime,
-            max_model_calls=allocated_calls,
-        )
+        raw_result = run_role_agent("verifier", assignment, workdir, runtime)
     except Exception as exc:
         raw_result = {
             "status": "inconclusive",
             "summary": "Independent verification could not complete.",
             "tests_run": [],
-            "findings": [],
+            "blockers": [],
             "failure_reason": (
                 "verifier_timeout" if isinstance(exc, _CaseTimeoutError)
                 else f"verifier_error:{type(exc).__name__}"
@@ -1101,22 +878,11 @@ def run_independent_verifier(
             },
         }
     after = snapshot_workspace(workdir)
-    verifier_changed_files = workspace_changes(before, after)
+    changed_files = workspace_changes(before, after)
     stats = raw_result.pop("_verification_stats", {})
-    result = {
-        "status": str(raw_result.get("status", "inconclusive")),
-        "summary": _short_text(raw_result.get("summary", ""), 700),
-        "tests_run": [
-            dict(item) for item in raw_result.get("tests_run", [])
-            if isinstance(item, dict)
-        ][:VERIFIER_MAX_TESTS],
-        "findings": [
-            dict(item) for item in raw_result.get("findings", [])
-            if isinstance(item, dict)
-        ][:8],
-    }
+    result = _normalize_verifier_result(raw_result)
     failure_reason = str(raw_result.get("failure_reason", ""))
-    if verifier_changed_files:
+    if changed_files:
         result["status"] = "inconclusive"
         result["summary"] = (
             "Verifier changed the workspace; its result is invalid."
@@ -1128,34 +894,15 @@ def run_independent_verifier(
     tool_calls = int(stats.get("tool_calls", 0))
     tests_run = list(stats.get("tests_run", result.get("tests_run", [])))
     result["tests_run"] = tests_run[:VERIFIER_MAX_TESTS]
-    for transition in stats.get("finding_transitions", []):
-        if not isinstance(transition, dict):
-            continue
-        record_event("verification_finding_transition", **transition)
-    candidate_findings = int(stats.get("candidate_findings", 0))
-    confirmed_findings = int(stats.get("confirmed_findings", 0))
-    resolution_status = (
-        "incomplete" if result["status"] == "findings" else "not_needed"
-    )
     record_event(
         "verification_result",
         status=result["status"],
         model_calls=model_calls,
         tool_calls=tool_calls,
         tests_run=len(result["tests_run"]),
-        blockers_found=len(result["findings"]),
-        findings_found=len(result["findings"]),
-        candidate_findings=candidate_findings,
-        confirmed_findings=confirmed_findings,
-        dismissed_findings=0,
-        resolved_findings=0,
-        unresolved_findings=0,
-        public_suite_run=bool(stats.get("public_suite_run")),
-        public_suite_passed=bool(stats.get("public_suite_passed")),
-        allocated_model_calls=allocated_calls,
-        resolution_status=resolution_status,
-        workspace_modified=bool(verifier_changed_files),
-        workspace_changed_files=verifier_changed_files[:20],
+        blockers_found=len(result["blockers"]),
+        workspace_modified=bool(changed_files),
+        workspace_changed_files=changed_files[:20],
         failure_reason=failure_reason,
     )
     return {
@@ -1165,15 +912,8 @@ def run_independent_verifier(
         "model_calls": model_calls,
         "tool_calls": tool_calls,
         "tests_run": len(result["tests_run"]),
-        "blockers_found": len(result["findings"]),
-        "findings_found": len(result["findings"]),
-        "candidate_findings": candidate_findings,
-        "confirmed_findings": confirmed_findings,
-        "public_suite_run": bool(stats.get("public_suite_run")),
-        "public_suite_passed": bool(stats.get("public_suite_passed")),
-        "allocated_model_calls": allocated_calls,
-        "resolution_status": resolution_status,
-        "workspace_modified": bool(verifier_changed_files),
+        "blockers_found": len(result["blockers"]),
+        "workspace_modified": bool(changed_files),
         "failure_reason": failure_reason,
     }
 

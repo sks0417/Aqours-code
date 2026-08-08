@@ -37,20 +37,14 @@ class ScriptedClient:
 
 
 class BudgetedScriptedClient(ScriptedClient):
-    def __init__(self, responses, max_calls: int, used_calls: int = 0):
+    def __init__(self, responses, max_calls: int):
         super().__init__(responses)
         self.max_calls = max_calls
-        self.used_calls = used_calls
-
-    def create(self, **kwargs):
-        if self.used_calls + len(self.calls) >= self.max_calls:
-            raise RuntimeError("scripted broker hard limit exceeded")
-        return super().create(**kwargs)
 
     def budget_snapshot(self):
         return {
             "max_calls": self.max_calls,
-            "call_count": self.used_calls + len(self.calls),
+            "call_count": len(self.calls),
             "max_provider_retries": 0,
         }
 
@@ -104,14 +98,13 @@ def lead_test():
     ))
 
 
-def verifier_json(status: str, findings=None, *, legacy: bool = False):
-    payload = {
+def verifier_json(status: str, blockers=None):
+    return response(text_block(json.dumps({
         "status": status,
         "summary": "independent evidence collected",
         "tests_run": [],
-        "findings" if not legacy else "blockers": findings or [],
-    }
-    return response(text_block(json.dumps(payload)))
+        "blockers": blockers or [],
+    })))
 
 
 def test_verifier_defaults_are_centralized():
@@ -120,8 +113,6 @@ def test_verifier_defaults_are_centralized():
     assert config.VERIFIER_MAX_TOOL_CALLS == 12
     assert config.VERIFIER_MAX_TESTS == 5
     assert config.VERIFIER_MAX_RUNS_PER_TASK == 1
-    assert config.VERIFIER_RESOLUTION_RESERVE == 2
-    assert config.VERIFIER_SAFETY_MARGIN == 1
 
 
 def test_low_complexity_change_does_not_invoke_verifier(tmp_path):
@@ -212,11 +203,8 @@ def test_verifier_pass_accepts_pending_lead_final_with_no_extra_lead_call(
     assert report["verifier_workspace_modified"] is False
 
 
-def test_candidate_finding_ignored_twice_finishes_verification_incomplete(
-    tmp_path,
-):
+def test_blockers_discard_pending_final_and_return_json_to_lead_once(tmp_path):
     prepare_workspace(tmp_path)
-    trace = tmp_path / "trace.jsonl"
     pending_final = "UNVERIFIED FINAL MUST DISAPPEAR"
     blocker = {
         "requirement": "Public VALUE is stable",
@@ -227,32 +215,27 @@ def test_candidate_finding_ignored_twice_finishes_verification_incomplete(
     }
     client = ScriptedClient([
         lead_edit(), response(text_block(pending_final)),
-        verifier_test(), verifier_json("findings", [blocker]),
-        response(text_block("first ignored final")),
-        response(text_block("second ignored final")),
+        verifier_test(), verifier_json("blockers", [blocker]),
+        response(text_block("lead final after handling blocker")),
     ])
 
     result = agent_loop.run_agent_task(
-        high_complexity_task(), str(tmp_path), str(trace),
+        high_complexity_task(), str(tmp_path),
         model_client=client, model_provider="scripted", model="scripted",
         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
     )
 
-    assert result["final_answer"].startswith("verification_incomplete:")
+    assert result["final_answer"] == "lead final after handling blocker"
     assert len([
         call for call in client.calls
         if "You are the verifier role" in call["system"]
     ]) == 2
-    resolution_messages = json.dumps(
+    final_lead_messages = json.dumps(
         client.calls[-1]["messages"], ensure_ascii=False, default=str,
     )
-    assert "candidate findings" in resolution_messages
-    assert "verification_resolution_reminder" in resolution_messages
-    assert "Public VALUE is stable" in resolution_messages
-    assert pending_final not in resolution_messages
-    report = metrics.trace_metrics(trace)
-    assert report["verifier_candidate_findings"] == 1
-    assert report["verifier_resolution_status"] == "incomplete"
+    assert "Independent verification found potential blockers" in final_lead_messages
+    assert "Public VALUE is stable" in final_lead_messages
+    assert pending_final not in final_lead_messages
 
 
 def test_invalid_json_and_pass_without_bash_test_are_inconclusive(
@@ -278,7 +261,7 @@ def test_invalid_json_and_pass_without_bash_test_are_inconclusive(
     assert invalid["status"] == "inconclusive"
     assert invalid["failure_reason"] == "invalid_verifier_json"
     assert no_test["status"] == "inconclusive"
-    assert no_test["failure_reason"] == "public_suite_not_run"
+    assert no_test["failure_reason"] == "no_actual_bash_test"
 
 
 def test_verifier_workspace_mutation_invalidates_result_without_reset(
@@ -360,251 +343,3 @@ def test_last_model_call_records_verifier_budget_skip_and_tells_lead(tmp_path):
     report = metrics.trace_metrics(trace)
     assert report["verifier_invoked"] is False
     assert report["verifier_skipped_reason"] == "insufficient_model_budget"
-
-
-def candidate_finding(*, evidence_test_ids=None) -> dict:
-    return {
-        "requirement": "Public VALUE follows the documented contract",
-        "location": "service.py:1",
-        "expected": "VALUE has the documented value",
-        "observed": "Verifier suspects a mismatched value",
-        "evidence": "Candidate observation requiring Harness validation",
-        "evidence_test_ids": evidence_test_ids or [],
-    }
-
-
-def targeted_assert_command(expected: int = 2) -> str:
-    return (
-        f'"{sys.executable}" -c "import service; '
-        f'assert service.VALUE == {expected}"'
-    )
-
-
-def test_false_positive_candidate_is_dismissed_by_new_tests(tmp_path):
-    prepare_workspace(tmp_path)
-    trace = tmp_path / "trace.jsonl"
-    public = f'"{sys.executable}" -m pytest -q'
-    client = ScriptedClient([
-        lead_edit(), response(text_block("pending candidate final")),
-        verifier_test(public), verifier_json("findings", [candidate_finding()]),
-        response(
-            tool_block("bash", {"command": targeted_assert_command(2)}, "counter"),
-            tool_block("bash", {"command": public}, "public"),
-        ),
-        response(text_block("accepted after counterevidence")),
-    ])
-
-    result = agent_loop.run_agent_task(
-        high_complexity_task(), str(tmp_path), str(trace),
-        model_client=client, model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "accepted after counterevidence"
-    report = metrics.trace_metrics(trace)
-    assert report["verifier_status"] == "findings"
-    assert report["verifier_candidate_findings"] == 0
-    assert report["verifier_dismissed_findings"] == 1
-    assert report["verifier_resolution_status"] == "dismissed"
-    assert report["verifier_public_suite_run"] is True
-    assert report["verifier_public_suite_passed"] is True
-
-
-def _prepare_confirmed_workspace(tmp_path: Path) -> str:
-    prepare_workspace(tmp_path)
-    (tmp_path / "test_service.py").write_text(
-        "import service\n\ndef test_value():\n    assert service.VALUE == 3\n",
-        encoding="utf-8",
-    )
-    return f'"{sys.executable}" -m pytest -q'
-
-
-def test_confirmed_finding_is_resolved_after_fix_and_replay(tmp_path):
-    public = _prepare_confirmed_workspace(tmp_path)
-    trace = tmp_path / "trace.jsonl"
-    client = ScriptedClient([
-        lead_edit(), response(text_block("pending wrong-value final")),
-        verifier_test(public),
-        verifier_json("findings", [candidate_finding(
-            evidence_test_ids=["verifier_test_1"],
-        )]),
-        response(
-            tool_block(
-                "edit_file",
-                {"path": "service.py", "old_text": "VALUE = 2", "new_text": "VALUE = 3"},
-                "fix",
-            ),
-            tool_block("bash", {"command": public}, "replay"),
-        ),
-        response(text_block("accepted after confirmed fix")),
-    ])
-
-    result = agent_loop.run_agent_task(
-        high_complexity_task(), str(tmp_path), str(trace),
-        model_client=client, model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "accepted after confirmed fix"
-    assert "VALUE = 3" in (tmp_path / "service.py").read_text(encoding="utf-8")
-    report = metrics.trace_metrics(trace)
-    assert report["verifier_confirmed_findings"] == 0
-    assert report["verifier_resolved_findings"] == 1
-    assert report["verifier_resolution_status"] == "resolved"
-
-
-def test_confirmed_finding_still_reproduces_and_is_unresolved(tmp_path):
-    public = _prepare_confirmed_workspace(tmp_path)
-    trace = tmp_path / "trace.jsonl"
-    client = ScriptedClient([
-        lead_edit(), response(text_block("pending wrong-value final")),
-        verifier_test(public),
-        verifier_json("findings", [candidate_finding(
-            evidence_test_ids=["verifier_test_1"],
-        )]),
-        response(
-            tool_block(
-                "edit_file",
-                {"path": "service.py", "old_text": "VALUE = 2", "new_text": "VALUE = 4"},
-                "bad-fix",
-            ),
-            tool_block("bash", {"command": public}, "failed-replay"),
-        ),
-        response(text_block("first unresolved final")),
-        response(text_block("second unresolved final")),
-    ])
-
-    result = agent_loop.run_agent_task(
-        high_complexity_task(), str(tmp_path), str(trace),
-        model_client=client, model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"].startswith("verification_incomplete:")
-    report = metrics.trace_metrics(trace)
-    assert report["verifier_unresolved_findings"] == 1
-    assert report["verifier_resolution_status"] == "unresolved"
-
-
-def _direct_verifier(tmp_path: Path, monkeypatch, responses) -> dict:
-    client = ScriptedClient(responses)
-    monkeypatch.setattr(subagent, "client", client)
-    monkeypatch.setattr(subagent, "MODEL", "scripted")
-    monkeypatch.setattr(subagent, "CURRENT_ROOT_TASK", high_complexity_task())
-    return subagent.run_role_agent(
-        "verifier", "verify independently", tmp_path,
-    )
-
-
-def test_targeted_python_assert_cannot_satisfy_pass_gate(tmp_path, monkeypatch):
-    prepare_workspace(tmp_path)
-    result = _direct_verifier(tmp_path, monkeypatch, [
-        verifier_test(targeted_assert_command(1)), verifier_json("pass"),
-    ])
-
-    assert result["status"] == "inconclusive"
-    assert result["failure_reason"] == "public_suite_not_run"
-    assert result["tests_run"][0]["scope"] == "targeted"
-
-
-def test_single_targeted_pytest_cannot_satisfy_pass_gate(tmp_path, monkeypatch):
-    prepare_workspace(tmp_path)
-    (tmp_path / "service.py").write_text("VALUE = 2\n", encoding="utf-8")
-    targeted = f'"{sys.executable}" -m pytest test_service.py -q'
-    result = _direct_verifier(tmp_path, monkeypatch, [
-        verifier_test(targeted), verifier_json("pass"),
-    ])
-
-    assert result["status"] == "inconclusive"
-    assert result["failure_reason"] == "public_suite_not_run"
-    assert result["tests_run"][0]["scope"] == "targeted"
-
-
-def test_complete_public_pytest_allows_pass(tmp_path, monkeypatch):
-    prepare_workspace(tmp_path)
-    (tmp_path / "service.py").write_text("VALUE = 2\n", encoding="utf-8")
-    result = _direct_verifier(tmp_path, monkeypatch, [
-        verifier_test(), verifier_json("pass"),
-    ])
-
-    assert result["status"] == "pass"
-    assert result["tests_run"][0]["scope"] == "public_suite"
-    assert result["tests_run"][0]["exit_code"] == 0
-
-
-def test_failed_public_suite_creates_confirmed_finding(tmp_path, monkeypatch):
-    prepare_workspace(tmp_path)
-    result = _direct_verifier(tmp_path, monkeypatch, [
-        verifier_test(), verifier_json("pass"),
-    ])
-
-    assert result["status"] == "findings"
-    assert result["failure_reason"] == "public_suite_failed"
-    assert result["findings"][0]["state"] == "confirmed"
-    assert result["findings"][0]["evidence_test_ids"] == ["verifier_test_1"]
-
-
-def test_legacy_blockers_are_candidate_findings(tmp_path, monkeypatch):
-    prepare_workspace(tmp_path)
-    result = _direct_verifier(tmp_path, monkeypatch, [
-        verifier_json("blockers", [candidate_finding()], legacy=True),
-    ])
-
-    assert result["status"] == "findings"
-    assert result["findings"][0]["id"] == "finding_1"
-    assert result["findings"][0]["state"] == "candidate"
-    assert result["findings"][0]["evidence_test_ids"] == []
-
-
-def test_nonexistent_model_evidence_ids_are_discarded(tmp_path, monkeypatch):
-    prepare_workspace(tmp_path)
-    (tmp_path / "service.py").write_text("VALUE = 2\n", encoding="utf-8")
-    finding = candidate_finding(
-        evidence_test_ids=["verifier_test_1", "invented_test_99"],
-    )
-    client = ScriptedClient([
-        verifier_test(), verifier_json("findings", [finding]),
-    ])
-    monkeypatch.setattr(subagent, "client", client)
-    monkeypatch.setattr(subagent, "MODEL", "scripted")
-    monkeypatch.setattr(subagent, "CURRENT_ROOT_TASK", high_complexity_task())
-
-    result = subagent.run_role_agent(
-        "verifier", "verify independently", tmp_path,
-    )
-
-    assert result["status"] == "findings"
-    assert result["findings"][0]["state"] == "candidate"
-    assert result["findings"][0]["evidence_test_ids"] == ["verifier_test_1"]
-
-
-def test_verifier_dynamic_budget_allocates_six_of_nine_remaining(
-    tmp_path, monkeypatch,
-):
-    prepare_workspace(tmp_path)
-    (tmp_path / "service.py").write_text("VALUE = 2\n", encoding="utf-8")
-    client = BudgetedScriptedClient([
-        verifier_test(), verifier_json("pass"),
-    ], max_calls=45, used_calls=36)
-    monkeypatch.setattr(subagent, "client", client)
-    monkeypatch.setattr(subagent, "MODEL", "scripted")
-    monkeypatch.setattr(subagent, "CURRENT_ROOT_TASK", high_complexity_task())
-    events = []
-    monkeypatch.setattr(
-        subagent, "record_event",
-        lambda event_type, **payload: events.append((event_type, payload)),
-    )
-
-    outcome = subagent.run_independent_verifier(
-        tmp_path, None, complexity_score=8,
-    )
-
-    assert outcome["invoked"] is True
-    assert outcome["allocated_model_calls"] == 6
-    assert len(client.calls) == 2
-    assert client.used_calls + len(client.calls) <= client.max_calls
-    start = next(payload for event, payload in events if event == "verification_start")
-    assert start["remaining_model_calls"] == 9
-    assert start["allocated_model_calls"] == 6
-    assert start["resolution_reserve"] == 2
-    assert start["safety_margin"] == 1
