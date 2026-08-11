@@ -80,6 +80,7 @@ def test_broker_records_actual_provider_usage_and_forwards_it(tmp_path):
     assert snapshot["actual_cache_creation_input_token_count"] == 10
     assert snapshot["actual_cache_read_input_token_count"] == 40
     assert snapshot["actual_total_token_count"] == 200
+    assert snapshot["requested_token_count"] == 8000
     assert snapshot["usage_response_count"] == 1
     assert snapshot["usage_missing_response_count"] == 0
 
@@ -181,7 +182,7 @@ def test_broker_retries_one_transient_provider_error_without_overlap(
     messages = FlakyMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=16000,
+        allowed_model="case-model", max_calls=2,
         provider_timeout=0.1, max_provider_retries=1,
         provider_retry_delay=0, delivery_grace=0.1,
     ).start()
@@ -204,13 +205,7 @@ def test_broker_retries_one_transient_provider_error_without_overlap(
     assert broker.last_provider_error
 
 
-@pytest.mark.parametrize(("max_calls", "max_total_tokens", "blocked_reason"), [
-    (1, 16000, "call_budget"),
-    (2, 8000, "token_budget"),
-])
-def test_broker_does_not_retry_when_attempt_budget_is_exhausted(
-    tmp_path, max_calls, max_total_tokens, blocked_reason,
-):
+def test_broker_does_not_retry_when_call_budget_is_exhausted(tmp_path):
     class TimeoutMessages:
         def __init__(self):
             self.calls = 0
@@ -223,8 +218,7 @@ def test_broker_does_not_retry_when_attempt_budget_is_exhausted(
     messages = TimeoutMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=max_calls,
-        max_total_tokens=max_total_tokens,
+        allowed_model="case-model", max_calls=1,
         provider_timeout=0.1, max_provider_retries=1,
         provider_retry_delay=0, delivery_grace=0.1,
     ).start()
@@ -240,7 +234,7 @@ def test_broker_does_not_retry_when_attempt_budget_is_exhausted(
     assert messages.calls == 1
     assert broker.call_count == 1
     assert broker.retry_count == 0
-    assert broker.retry_skipped_reason == blocked_reason
+    assert broker.retry_skipped_reason == "call_budget"
 
 
 def test_broker_does_not_retry_without_full_case_time_window(tmp_path):
@@ -257,7 +251,7 @@ def test_broker_does_not_retry_without_full_case_time_window(tmp_path):
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
         allowed_model="case-model", case_deadline=time.monotonic() + 0.5,
-        max_calls=2, max_total_tokens=16000,
+        max_calls=2,
         provider_timeout=0.4, max_provider_retries=1,
         provider_retry_delay=0, delivery_grace=0.2,
     ).start()
@@ -289,7 +283,7 @@ def test_broker_does_not_retry_permanent_provider_error(tmp_path):
     messages = UnauthorizedMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=16000,
+        allowed_model="case-model", max_calls=2,
         provider_timeout=0.1, max_provider_retries=1,
         provider_retry_delay=0, delivery_grace=0.1,
     ).start()
@@ -357,7 +351,7 @@ def test_broker_rejects_wrong_model_without_calling_host_client(tmp_path):
     messages = RecordingMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=24000,
+        allowed_model="case-model", max_calls=2,
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
@@ -381,7 +375,7 @@ def test_broker_rejects_invalid_token_limits_without_host_call(
     messages = RecordingMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=24000,
+        allowed_model="case-model", max_calls=2,
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
@@ -400,7 +394,7 @@ def test_broker_accepts_normal_8000_and_16000_recovery_requests(tmp_path):
     messages = RecordingMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=24000,
+        allowed_model="case-model", max_calls=2,
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
@@ -424,7 +418,7 @@ def test_broker_accepts_deepseek_64000_recovery_when_configured(tmp_path):
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
         allowed_model="deepseek-v4-flash", max_calls=2,
-        max_tokens_per_call=64000, max_total_tokens=72000,
+        max_tokens_per_call=64000,
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
@@ -444,7 +438,7 @@ def test_broker_rejects_calls_beyond_case_budget_without_host_call(tmp_path):
     messages = RecordingMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=1, max_total_tokens=16000,
+        allowed_model="case-model", max_calls=1,
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
@@ -460,45 +454,49 @@ def test_broker_rejects_calls_beyond_case_budget_without_host_call(tmp_path):
     assert broker.call_count == 1
 
 
-def test_broker_rejects_request_beyond_case_token_budget(tmp_path):
+def test_broker_allows_high_cumulative_requested_tokens_before_call_limit(
+    tmp_path,
+):
     nonce = uuid.uuid4().hex
     messages = RecordingMessages()
     broker = ModelBroker(
         tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=2, max_total_tokens=8000,
+        allowed_model="case-model", max_calls=4, max_tokens_per_call=64000,
     ).start()
     client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
     try:
-        client.messages.create(
-            model="case-model", messages=[], max_tokens=8000)
-        with pytest.raises(BrokerProtocolError, match="token budget"):
+        for _ in range(3):
             client.messages.create(
-                model="case-model", messages=[], max_tokens=8000)
+                model="case-model", messages=[], max_tokens=64000)
     finally:
         broker.stop()
 
-    assert len(messages.calls) == 1
-    assert broker.requested_token_count == 8000
+    assert len(messages.calls) == 3
+    assert broker.call_count == 3
+    assert broker.requested_token_count == 192000
 
 
-def test_eval_broker_budget_is_derived_from_trusted_case_metadata():
-    assert run_eval.model_budgets_for_case({}) == (32, 264000)
-    assert run_eval.model_budgets_for_case({"max_turns": 3}) == (32, 264000)
-    assert run_eval.model_budgets_for_case({
-        "max_model_calls": 2,
-        "max_model_tokens": 24000,
-    }) == (2, 24000)
-    assert run_eval.model_budgets_for_case(
-        {}, escalated_max_tokens=64000,
-    ) == (32, 312000)
+def test_eval_call_budget_is_derived_from_trusted_case_metadata():
+    assert run_eval.model_call_budget_for_case({}) == 32
+    assert run_eval.model_call_budget_for_case({"max_turns": 3}) == 32
+    assert run_eval.model_call_budget_for_case({"max_model_calls": 2}) == 2
 
 
-@pytest.mark.parametrize("message", [
-    "BrokerProtocolError: model broker call limit exceeded",
-    "BrokerProtocolError: model broker token budget exceeded",
-])
-def test_broker_budget_exhaustion_has_one_clear_failure_category(message):
-    assert run_eval.agent_failure_category(message) == "budget_exhausted"
+def test_atomic_cache_recovery_has_64_model_calls():
+    metadata = run_eval.load_metadata(
+        run_eval.PROJECT_ROOT
+        / "evals"
+        / "cases"
+        / "stress_atomic_cache_recovery"
+    )
+
+    assert metadata["max_model_calls"] == 64
+
+
+def test_broker_call_budget_exhaustion_has_one_clear_failure_category():
+    assert run_eval.agent_failure_category(
+        "BrokerProtocolError: model broker call limit exceeded"
+    ) == "budget_exhausted"
 
 
 def test_noninteractive_container_entry_runs_normal_agent_through_broker(

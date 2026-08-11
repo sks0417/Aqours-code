@@ -3,7 +3,6 @@ suite: stress
 difficulty: 4
 category: multi_agent_dependency_handoff
 max_model_calls: 48
-max_model_tokens: 1100000
 score_runtime_target_sec: 240
 score_runtime_hard_limit_sec: 700
 score_llm_call_target: 18

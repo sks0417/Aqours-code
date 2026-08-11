@@ -3,7 +3,6 @@ suite: stress
 difficulty: 4
 category: context_compaction_verbose_diagnostics
 max_model_calls: 40
-max_model_tokens: 900000
 context_limit_chars: 60000
 compact_trigger_ratio: 0.70
 score_runtime_target_sec: 180

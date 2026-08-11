@@ -470,7 +470,6 @@ def load_metadata(case_dir: Path) -> dict:
         "difficulty": 1,
         "category": "uncategorized",
         "max_model_calls": None,
-        "max_model_tokens": None,
         "context_limit_chars": None,
         "compact_trigger_ratio": None,
         "forbidden_paths": [],
@@ -493,7 +492,7 @@ def load_metadata(case_dir: Path) -> dict:
             metadata[key] = parse_list(value)
         elif key in {
             "difficulty", "max_model_calls",
-            "max_model_tokens", "scripted_supported",
+            "scripted_supported",
             "context_limit_chars", "compact_trigger_ratio",
             *PROFILE_METADATA_KEYS.values(),
         }:
@@ -503,15 +502,8 @@ def load_metadata(case_dir: Path) -> dict:
     return metadata
 
 
-def model_budgets_for_case(
-    metadata: dict,
-    *,
-    escalated_max_tokens: int = ESCALATED_MAX_TOKENS,
-) -> tuple[int, int]:
-    """Bind broker spend to trusted case metadata, not container requests."""
-    escalated_max_tokens = max(
-        DEFAULT_MAX_TOKENS, int(escalated_max_tokens),
-    )
+def model_call_budget_for_case(metadata: dict) -> int:
+    """Bind the broker call budget to trusted case metadata."""
     raw_calls = metadata.get("max_model_calls")
     if raw_calls is None:
         raw_calls = DEFAULT_MODEL_CALLS_PER_CASE
@@ -519,19 +511,7 @@ def model_budgets_for_case(
     if calls <= 0 or calls > MAX_MODEL_CALLS_PER_CASE:
         raise ValueError(
             f"max_model_calls must be between 1 and {MAX_MODEL_CALLS_PER_CASE}")
-
-    raw_tokens = metadata.get("max_model_tokens")
-    if raw_tokens is None:
-        # Normal calls request 8k; one provider-specific recovery is allowed
-        # within the same explicit call budget.
-        raw_tokens = calls * DEFAULT_MAX_TOKENS + (
-            escalated_max_tokens - DEFAULT_MAX_TOKENS)
-    tokens = int(raw_tokens)
-    if tokens <= 0 or tokens > calls * escalated_max_tokens:
-        raise ValueError(
-            "max_model_tokens must be positive and no greater than "
-            f"max_model_calls * {escalated_max_tokens}")
-    return calls, tokens
+    return calls
 
 
 def posix_relative(root: Path, path: Path) -> str:
@@ -1016,7 +996,6 @@ def _model_broker_process(payload: dict):
         case_deadline=payload["case_deadline"],
         max_calls=payload["max_calls"],
         max_tokens_per_call=payload["max_tokens_per_call"],
-        max_total_tokens=payload["max_total_tokens"],
         provider_timeout=payload["provider_timeout"],
         max_provider_retries=DEFAULT_PROVIDER_RETRIES,
         provider_retry_delay=DEFAULT_PROVIDER_RETRY_DELAY,
@@ -1042,7 +1021,6 @@ def _run_docker_agent_phase(
     stderr_path: Path,
     scripted: bool,
     model_call_budget: int,
-    model_token_budget: int,
     escalated_max_tokens: int,
     context_limit_chars: int | None,
     compact_trigger_ratio: float | None,
@@ -1112,7 +1090,6 @@ def _run_docker_agent_phase(
             "allowed_model": input_payload["model"],
             "max_calls": model_call_budget,
             "max_tokens_per_call": escalated_max_tokens,
-            "max_total_tokens": model_token_budget,
             "case_deadline": case_deadline,
             "provider_timeout": provider_timeout,
         },),
@@ -1249,8 +1226,6 @@ def _run_docker_agent_phase(
             "usage_missing_response_count", 0),
         "model_broker_call_budget": broker_stats.get(
             "max_calls", model_call_budget),
-        "model_broker_token_budget": broker_stats.get(
-            "max_total_tokens", model_token_budget),
         "model_broker_max_tokens_per_call": broker_stats.get(
             "max_tokens_per_call", escalated_max_tokens),
         "model_broker_error": broker_stats.get("last_error", ""),
@@ -1577,10 +1552,7 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
         current_max_tokens=DEFAULT_MAX_TOKENS,
         configured_escalated_max_tokens=ESCALATED_MAX_TOKENS,
     )
-    model_call_budget, model_token_budget = model_budgets_for_case(
-        metadata,
-        escalated_max_tokens=escalated_max_tokens,
-    )
+    model_call_budget = model_call_budget_for_case(metadata)
     original_snapshot = workspace_snapshot(trusted_case_dir / "workspace")
     copy_case_workspace(trusted_case_dir, agent_workspace)
     if execution_config.backend == "docker":
@@ -1621,7 +1593,6 @@ def run_case(case_dir: Path, run_root: Path, scripted: bool,
             stderr_path=stderr_path,
             scripted=scripted,
             model_call_budget=model_call_budget,
-            model_token_budget=model_token_budget,
             escalated_max_tokens=escalated_max_tokens,
             context_limit_chars=metadata.get("context_limit_chars"),
             compact_trigger_ratio=metadata.get("compact_trigger_ratio"),
@@ -2039,9 +2010,7 @@ def failure_category_counts(results: list[dict]) -> dict:
 def agent_failure_category(agent_error: str) -> str:
     lowered = agent_error.lower()
     if ("model broker call limit exceeded" in lowered
-            or "broker model call limit exceeded" in lowered
-            or "model broker token budget exceeded" in lowered
-            or "broker token budget exceeded" in lowered):
+            or "broker model call limit exceeded" in lowered):
         return "budget_exhausted"
     if ("casetimeouterror" in lowered or "agent case exceeded" in lowered
             or "case_timeout" in lowered or "case deadline" in lowered):

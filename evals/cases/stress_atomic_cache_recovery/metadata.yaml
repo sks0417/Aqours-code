@@ -2,7 +2,7 @@ id: stress_atomic_cache_recovery
 suite: stress
 difficulty: 5
 category: filesystem_atomicity_fencing_and_recovery
-max_model_calls: 45
+max_model_calls: 64
 # Provisional until at least three real-model trials are available.
 score_runtime_target_sec: 360
 score_runtime_hard_limit_sec: 900

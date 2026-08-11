@@ -81,12 +81,13 @@ def test_grader_receives_only_remaining_case_budget(tmp_path, monkeypatch):
     assert result["all_container_cleanup_succeeded"] is True
 
 
-def test_budget_failure_preserves_broker_usage_metadata(tmp_path, monkeypatch):
+def test_call_budget_failure_preserves_broker_usage_metadata(
+    tmp_path, monkeypatch,
+):
     usage = {
         "model_broker_calls": 32,
         "model_broker_call_budget": 32,
         "model_broker_requested_tokens": 264000,
-        "model_broker_token_budget": 264000,
         "model_broker_rejected_calls": 1,
     }
 
@@ -94,7 +95,7 @@ def test_budget_failure_preserves_broker_usage_metadata(tmp_path, monkeypatch):
         run_eval, "_run_docker_agent_phase",
         lambda **_kwargs: (
             {},
-            "BrokerProtocolError: model broker token budget exceeded",
+            "BrokerProtocolError: model broker call limit exceeded",
             agent_metadata(**usage),
         ),
     )

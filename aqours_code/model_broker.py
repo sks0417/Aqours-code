@@ -378,7 +378,7 @@ class BrokerModelClient:
         allowed = {
             "request_count", "call_count", "rejected_count", "retry_count",
             "requested_token_count", "max_calls", "max_tokens_per_call",
-            "max_total_tokens", "max_provider_retries",
+            "max_provider_retries",
             "actual_input_token_count", "actual_output_token_count",
             "actual_cache_creation_input_token_count",
             "actual_cache_read_input_token_count", "actual_total_token_count",
@@ -463,7 +463,6 @@ class ModelBroker:
                  case_deadline: float | None = None, poll_interval: float = 0.02,
                  max_calls: int = 32,
                  max_tokens_per_call: int = MAX_TOKENS_PER_CALL,
-                 max_total_tokens: int | None = None,
                  provider_timeout: float | None = None,
                  max_provider_retries: int = DEFAULT_PROVIDER_RETRIES,
                  provider_retry_delay: float = DEFAULT_PROVIDER_RETRY_DELAY,
@@ -482,12 +481,6 @@ class ModelBroker:
             raise ValueError("max_calls must be greater than zero")
         if self.max_tokens_per_call <= 0:
             raise ValueError("max_tokens_per_call must be greater than zero")
-        self.max_total_tokens = int(
-            max_total_tokens
-            if max_total_tokens is not None
-            else self.max_calls * self.max_tokens_per_call)
-        if self.max_total_tokens <= 0:
-            raise ValueError("max_total_tokens must be greater than zero")
         if provider_timeout is None:
             try:
                 provider_timeout = float(os.getenv("AQOURS_CODE_REQUEST_TIMEOUT", "30"))
@@ -588,7 +581,6 @@ class ModelBroker:
                 "provider_error_count": self.provider_error_count,
                 "max_calls": self.max_calls,
                 "max_tokens_per_call": self.max_tokens_per_call,
-                "max_total_tokens": self.max_total_tokens,
                 "provider_timeout": self.provider_timeout,
                 "max_provider_retries": self.max_provider_retries,
                 "provider_retry_delay": self.provider_retry_delay,
@@ -608,20 +600,16 @@ class ModelBroker:
             raise TimeoutError("eval case deadline exceeded before model request")
         if self.call_count >= self.max_calls:
             raise BrokerProtocolError("model broker call limit exceeded")
-        if self.requested_token_count + requested_tokens > self.max_total_tokens:
-            raise BrokerProtocolError("model broker token budget exceeded")
         self.call_count += 1
         self.requested_token_count += requested_tokens
         self.last_request_attempts += 1
         self._write_stats()
 
-    def _retry_block_reason(self, requested_tokens: int) -> str:
+    def _retry_block_reason(self) -> str:
         if self._stop.is_set():
             return "broker_stopping"
         if self.call_count >= self.max_calls:
             return "call_budget"
-        if self.requested_token_count + requested_tokens > self.max_total_tokens:
-            return "token_budget"
         if self.case_deadline is not None:
             remaining = self.case_deadline - time.monotonic()
             required = (
@@ -682,7 +670,7 @@ class ModelBroker:
                 if (not _is_transient_provider_error(error_kind)
                         or retries_used >= self.max_provider_retries):
                     raise _ProviderCallError(error_kind, exc) from exc
-                blocked = self._retry_block_reason(requested_tokens)
+                blocked = self._retry_block_reason()
                 if blocked:
                     self.retry_skipped_reason = blocked
                     raise _ProviderCallError(error_kind, exc) from exc
