@@ -1,10 +1,8 @@
 from .runtime_state import *
 from .agent_profiles import get_agent_profile, normalize_agent_role
+from .model_budget import can_spend_optional_calls
 from .runtime import AgentRuntime
-from .model_api import (
-    assistant_message_from_response,
-    effective_escalated_max_tokens,
-)
+from .model_api import assistant_message_from_response
 from .tool_registry import (
     delegated_policy_for_role,
     effective_tool_names,
@@ -77,58 +75,38 @@ def _block_value(block, name: str, default=None):
 def _request_with_deadline(*, system: str, messages: list, tools: list,
                            purpose: str, role: str, max_tokens: int = 8000,
                            runtime: AgentRuntime | None = None):
+    deadline = runtime.state.deadline if runtime is not None else CASE_DEADLINE
+    remaining = None if deadline is None else deadline - _time.monotonic()
+    if remaining is not None and remaining <= 0:
+        raise _CaseTimeoutError("eval case deadline exceeded")
+    old_timeout = _os.environ.get("AQOURS_CODE_REQUEST_TIMEOUT")
+    if remaining is not None:
+        try:
+            configured = float(old_timeout or "30")
+        except (TypeError, ValueError):
+            configured = 30.0
+        _os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = str(max(0.1, min(configured, remaining)))
     model = runtime.config.model if runtime is not None else MODEL
     model_client = (
         runtime.services.model_client if runtime is not None else client
     )
-    provider = (
-        runtime.config.model_provider if runtime is not None else MODEL_PROVIDER
+    record_llm_request(
+        model=model, max_tokens=max_tokens, message_count=len(messages),
+        tool_count=len(tools), purpose=purpose, agent_role=role,
     )
-
-    def request_once(request_max_tokens: int):
-        deadline = (
-            runtime.state.deadline if runtime is not None else CASE_DEADLINE
+    try:
+        response = model_client.messages.create(
+            model=model, system=system, messages=messages,
+            tools=tools, max_tokens=max_tokens,
         )
-        remaining = None if deadline is None else deadline - _time.monotonic()
-        if remaining is not None and remaining <= 0:
-            raise _CaseTimeoutError("eval case deadline exceeded")
-        old_timeout = _os.environ.get("AQOURS_CODE_REQUEST_TIMEOUT")
-        if remaining is not None:
-            try:
-                configured = float(old_timeout or "30")
-            except (TypeError, ValueError):
-                configured = 30.0
-            _os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = str(
-                max(0.1, min(configured, remaining)))
-        record_llm_request(
-            model=model, max_tokens=request_max_tokens,
-            message_count=len(messages), tool_count=len(tools),
-            purpose=purpose, agent_role=role,
-        )
-        try:
-            response = model_client.messages.create(
-                model=model, system=system, messages=messages,
-                tools=tools, max_tokens=request_max_tokens,
-            )
-            record_llm_response(response, purpose=purpose, agent_role=role)
-            return response
-        finally:
-            if remaining is not None:
-                if old_timeout is None:
-                    _os.environ.pop("AQOURS_CODE_REQUEST_TIMEOUT", None)
-                else:
-                    _os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = old_timeout
-
-    response = request_once(max_tokens)
-    if getattr(response, "stop_reason", None) != "max_tokens":
+        record_llm_response(response, purpose=purpose, agent_role=role)
         return response
-    escalated_max_tokens = effective_escalated_max_tokens(
-        provider,
-        model,
-        current_max_tokens=max_tokens,
-        configured_escalated_max_tokens=ESCALATED_MAX_TOKENS,
-    )
-    return request_once(escalated_max_tokens)
+    finally:
+        if remaining is not None:
+            if old_timeout is None:
+                _os.environ.pop("AQOURS_CODE_REQUEST_TIMEOUT", None)
+            else:
+                _os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = old_timeout
 
 
 def _role_handlers(
@@ -604,6 +582,32 @@ def delegate_agent(
         })
     if not str(prompt or "").strip():
         return json.dumps({"status": "error", "error": "prompt cannot be empty"})
+
+    estimated_calls = profile.max_tool_rounds + 1
+    model_client = (
+        runtime.services.model_client if runtime is not None else client
+    )
+    budget_allowed, budget = can_spend_optional_calls(
+        model_client, estimated_calls)
+    if not budget_allowed:
+        record_event(
+            "model_budget_guard", decision="delegation_skipped",
+            agent_role=normalized_role, estimated_calls=estimated_calls,
+            **{key: value for key, value in budget.items()
+               if key != "available"},
+        )
+        return json.dumps({
+            "status": "budget_reserved",
+            "role": normalized_role,
+            "verdict": "blocked",
+            "error": (
+                "Finalization model-call reserve is active; do not start a new "
+                "delegation. Continue directly from retained evidence and use "
+                "remaining calls for fixes, targeted verification, and final."
+            ),
+            "budget": {key: value for key, value in budget.items()
+                       if key != "available"},
+        })
 
     record_event(
         "subagent_start", agent_role=normalized_role, name=name,

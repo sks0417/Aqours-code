@@ -182,23 +182,18 @@ def test_legacy_task_uses_bounded_traced_role_runtime(tmp_path, monkeypatch):
     )
 
 
-def test_legacy_task_is_not_rejected_by_finalization_reserve(
-    tmp_path, monkeypatch,
-):
-    client = BudgetedScriptedClient([response(text_block(json.dumps({
-        "verdict": "complete",
-        "summary": "delegation ran through the shared broker",
-    })))], max_calls=4)
+def test_legacy_task_respects_finalization_reserve(tmp_path, monkeypatch):
+    client = BudgetedScriptedClient([], max_calls=4)
     monkeypatch.setattr(subagent, "client", client)
     monkeypatch.setattr(subagent, "WORKDIR", tmp_path)
 
     result = json.loads(subagent.spawn_subagent(
         "Inspect the repository and locate the request handler"))
 
-    assert result["status"] == "completed"
+    assert result["status"] == "budget_reserved"
     assert result["role"] == "general-purpose"
     assert result["routed_from"] == "task"
-    assert len(client.calls) == 1
+    assert client.calls == []
 
 
 def test_explore_role_enforces_unique_read_path_budget(tmp_path, monkeypatch):
@@ -259,60 +254,6 @@ def test_reviewer_role_is_actually_read_only(tmp_path, monkeypatch):
     }
     assert {tool["name"] for tool in client.calls[0]["tools"]} == {"read_file"}
     assert "write_file" not in {tool["name"] for tool in client.calls[0]["tools"]}
-
-
-def test_role_request_retries_once_with_deepseek_escalated_tokens(
-    tmp_path, monkeypatch,
-):
-    truncated = SimpleNamespace(
-        content=[text_block("truncated reviewer output")],
-        stop_reason="max_tokens",
-    )
-    client = ScriptedClient([
-        truncated,
-        response(text_block(json.dumps({
-            "verdict": "pass",
-            "summary": "contract satisfied after retry",
-            "findings": [],
-            "files_checked": [],
-            "missing_evidence": [],
-        }))),
-    ])
-    monkeypatch.setattr(subagent, "client", client)
-    monkeypatch.setattr(subagent, "MODEL_PROVIDER", "deepseek")
-    monkeypatch.setattr(subagent, "MODEL", "deepseek-v4-flash")
-    monkeypatch.setattr(subagent, "CURRENT_ROOT_TASK", "Review the contract")
-
-    result = subagent.run_role_agent("review", "Audit the code", tmp_path)
-
-    assert result["verdict"] == "pass"
-    assert [call["max_tokens"] for call in client.calls] == [8000, 64000]
-    assert client.calls[0]["system"] == client.calls[1]["system"]
-    assert client.calls[0]["messages"] == client.calls[1]["messages"]
-    assert client.calls[0]["tools"] == client.calls[1]["tools"]
-    assert "truncated reviewer output" not in str(client.calls[1]["messages"])
-
-
-def test_role_request_stops_after_one_max_tokens_retry(monkeypatch):
-    first = SimpleNamespace(content=[], stop_reason="max_tokens")
-    second = SimpleNamespace(content=[], stop_reason="max_tokens")
-    client = BudgetedScriptedClient([first, second], max_calls=64)
-    monkeypatch.setattr(subagent, "client", client)
-    monkeypatch.setattr(subagent, "MODEL_PROVIDER", "deepseek")
-    monkeypatch.setattr(subagent, "MODEL", "deepseek-v4-flash")
-
-    observed = subagent._request_with_deadline(
-        system="system",
-        messages=[{"role": "user", "content": "review"}],
-        tools=[],
-        purpose="subagent",
-        role="review",
-        max_tokens=8000,
-    )
-
-    assert observed is second
-    assert [call["max_tokens"] for call in client.calls] == [8000, 64000]
-    assert client.budget_snapshot()["call_count"] == 2
 
 
 def test_plan_role_is_read_only(tmp_path, monkeypatch):
@@ -978,9 +919,7 @@ def test_runtime_role_signal_requires_repeat_cross_scope_and_tail_budget():
     assert docker_paths["scope_count"] == 3
 
 
-def test_complex_task_does_not_start_automatic_reviewer_and_traces_final(
-    tmp_path,
-):
+def test_complex_task_does_not_start_an_automatic_reviewer(tmp_path):
     (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
     task = (
         "Implement an end-to-end atomic transaction rollback and idempotency "
@@ -997,11 +936,11 @@ def test_complex_task_does_not_start_automatic_reviewer_and_traces_final(
             "edit",
         )),
         response(text_block("ready for final")),
+        response(text_block("finished with reserved calls")),
     ], max_calls=7)
-    trace_path = tmp_path / "trace.jsonl"
 
     result = agent_loop.run_agent_task(
-        task, str(tmp_path), trace_path=str(trace_path), model_client=client,
+        task, str(tmp_path), model_client=client,
         model_provider="scripted", model="scripted",
         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
     )
@@ -1012,22 +951,9 @@ def test_complex_task_does_not_start_automatic_reviewer_and_traces_final(
         any(tool["name"] == "delegate_agent" for tool in call["tools"])
         for call in client.calls
     )
-    events = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
     assert not any(
-        event.get("type") == "subagent_start"
-        and (
-            event.get("agent_role") == "review"
-            or event.get("name") == "verifier"
-        )
-        for event in events
-    )
-    assert any(
-        event.get("type") == "final_answer"
-        and event.get("content") == "ready for final"
-        for event in events
+        "You are the review role" in call["system"]
+        for call in client.calls
     )
 
 

@@ -698,6 +698,10 @@ def inject_background_notifications(messages: list):
             {"type": "text", "text": note} for note in notes]})
 
 
+def is_permission_denied_output(output) -> bool:
+    return str(output).lower().startswith("permission denied")
+
+
 def is_recoverable_tool_rejection(output) -> bool:
     return (isinstance(output, dict)
             and output.get("kind") == "tool_policy_rejection"
@@ -745,6 +749,17 @@ def _runtime_role_benefit(read_counts: dict[str, int], model_client) -> dict:
         "repeated_paths": repeated_paths[:4],
         "budget": budget,
     }
+
+
+def stop_after_permission_denied(messages: list, reason: str):
+    if messages and messages[-1].get("role") == "assistant":
+        messages[-1]["content"] = [{"type": "text", "text": reason}]
+    else:
+        messages.append({"role": "assistant", "content": [
+            {"type": "text", "text": reason}
+        ]})
+    record_hook("Stop")
+    trigger_hooks("Stop", messages)
 
 
 def scheduled_prompt_text(job) -> str:
@@ -1204,6 +1219,12 @@ def agent_loop(
                                 "tool_use_id": block.id,
                                 "content": blocked_text})
                 record_tool_result(block.id, block.name, blocked_text)
+                if is_recoverable_tool_rejection(blocked):
+                    continue
+                if is_permission_denied_output(blocked_text):
+                    stop_after_permission_denied(messages, blocked_text)
+                    finish_run(blocked_text)
+                    return
                 continue
             record_hook("PreToolUse", tool=block.name, decision="allowed")
 
@@ -1350,6 +1371,10 @@ def agent_loop(
             results.append({"type": "tool_result",
                             "tool_use_id": block.id, "content": output})
             record_tool_result(block.id, block.name, output)
+            if is_permission_denied_output(output):
+                stop_after_permission_denied(messages, str(output))
+                finish_run(str(output))
+                return
 
         if compacted_now:
             continue

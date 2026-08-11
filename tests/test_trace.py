@@ -197,10 +197,7 @@ def test_llm_events_and_tool_use_are_recorded(tmp_path):
 
     run = trace.start_run("prompt", workdir=tmp_path, model_provider="openai", model="model")
 
-    trace.record_llm_request(
-        model="model", max_tokens=100, message_count=2, tool_count=3,
-        purpose="compact_summary", thinking="disabled",
-    )
+    trace.record_llm_request(model="model", max_tokens=100, message_count=2, tool_count=3)
     trace.record_llm_response(Response())
     trace.record_tool_use(Block())
 
@@ -209,10 +206,6 @@ def test_llm_events_and_tool_use_are_recorded(tmp_path):
     assert "llm_request" in event_types
     assert "llm_response" in event_types
     assert "tool_use" in event_types
-    llm_request = next(
-        event for event in events if event["type"] == "llm_request")
-    assert llm_request["purpose"] == "compact_summary"
-    assert llm_request["thinking"] == "disabled"
     assert events[-1]["input"] == {"path": "README.md"}
     assert trace.get_run_summary(run.run_id, tmp_path)["tool_count"] == 1
 

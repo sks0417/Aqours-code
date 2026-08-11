@@ -11,13 +11,7 @@ from aqours_code.command_executor import LocalCommandExecutor
 from aqours_code.runtime import AgentRuntime
 
 
-def make_runtime(
-    tmp_path: Path,
-    responses=(),
-    *,
-    model_provider="test",
-    model="test",
-) -> AgentRuntime:
+def make_runtime(tmp_path: Path, responses=()) -> AgentRuntime:
     class Messages:
         def __init__(self, values):
             self.values = list(values)
@@ -38,8 +32,8 @@ def make_runtime(
         state_root=tmp_path / "state",
         model_client=SimpleNamespace(messages=Messages(responses)),
         command_executor=LocalCommandExecutor(),
-        model_provider=model_provider,
-        model=model,
+        model_provider="test",
+        model="test",
         root_task="compact test",
     )
 
@@ -243,37 +237,13 @@ def test_compaction_prompt_requires_concrete_self_contained_markdown(
     assert "recovery tool" not in captured["prompt"]
 
 
-def test_summary_model_disables_thinking_and_keeps_6000_output_tokens(
-    tmp_path, monkeypatch,
-):
-    runtime = make_runtime(
-        tmp_path,
-        responses=["## Checkpoint\nDone."],
-        model_provider="deepseek",
-        model="deepseek-v4-flash",
-    )
-    requests = []
-    monkeypatch.setattr(
-        compact,
-        "record_llm_request",
-        lambda **payload: requests.append(payload),
-    )
+def test_summary_model_receives_configured_6000_output_tokens(tmp_path):
+    runtime = make_runtime(tmp_path, responses=["## Checkpoint\nDone."])
 
     summary = compact.summarize_history(exchange(1, "useful result"), runtime)
 
     assert summary.startswith("## Checkpoint")
-    call = runtime.services.model_client.messages.calls[0]
-    assert call["max_tokens"] == 6_000
-    assert call["thinking"] == {"type": "disabled"}
-    assert requests == [{
-        "model": "deepseek-v4-flash",
-        "max_tokens": 6_000,
-        "message_count": 1,
-        "tool_count": 0,
-        "purpose": "compact_summary",
-        "agent_role": "",
-        "thinking": "disabled",
-    }]
+    assert runtime.services.model_client.messages.calls[0]["max_tokens"] == 6_000
 
 
 def test_prior_checkpoint_is_folded_into_replacement_without_stacking(

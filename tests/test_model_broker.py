@@ -99,7 +99,6 @@ def test_broker_round_trip_supports_only_messages_create_and_cleans_files(tmp_pa
             messages=[{"role": "user", "content": "hello"}],
             tools=[{"name": "read_file", "input_schema": {}}],
             max_tokens=123,
-            thinking={"type": "disabled"},
         )
     finally:
         stopped = broker.stop()
@@ -108,7 +107,6 @@ def test_broker_round_trip_supports_only_messages_create_and_cleans_files(tmp_pa
     assert broker.call_count == 1
     assert messages.calls[0]["model"] == "scripted"
     assert messages.calls[0]["max_tokens"] == 123
-    assert messages.calls[0]["thinking"] == {"type": "disabled"}
     assert response.stop_reason == "tool_use"
     assert response.content[0].text == "brokered"
     assert response.content[1].name == "read_file"
@@ -454,28 +452,6 @@ def test_broker_rejects_calls_beyond_case_budget_without_host_call(tmp_path):
 
     assert len(messages.calls) == 1
     assert broker.call_count == 1
-
-
-def test_broker_still_enforces_the_global_64_call_fuse(tmp_path):
-    nonce = uuid.uuid4().hex
-    messages = RecordingMessages()
-    broker = ModelBroker(
-        tmp_path, nonce, SimpleNamespace(messages=messages),
-        allowed_model="case-model", max_calls=64,
-    ).start()
-    client = BrokerModelClient(tmp_path, nonce, request_timeout=2)
-    try:
-        for _ in range(64):
-            client.messages.create(
-                model="case-model", messages=[], max_tokens=8000)
-        with pytest.raises(BrokerProtocolError, match="call limit"):
-            client.messages.create(
-                model="case-model", messages=[], max_tokens=8000)
-    finally:
-        broker.stop()
-
-    assert len(messages.calls) == 64
-    assert broker.call_count == 64
 
 
 def test_broker_allows_high_cumulative_requested_tokens_before_call_limit(

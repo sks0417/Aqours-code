@@ -7,7 +7,6 @@ from copy import copy as shallow_copy
 from pathlib import Path
 
 from .model_budget import can_spend_optional_calls
-from .model_api import uses_deepseek_thinking
 from .runtime import AgentRuntime
 from .runtime_state import *
 
@@ -460,13 +459,6 @@ def _call_compact_model(
     model_client = (
         runtime.services.model_client if runtime is not None else client
     )
-    provider = (
-        runtime.config.model_provider if runtime is not None else MODEL_PROVIDER
-    )
-    disable_thinking = (
-        purpose == "compact_summary"
-        and uses_deepseek_thinking(provider, model)
-    )
     record_llm_request(
         model=model,
         max_tokens=SUMMARY_MAX_TOKENS,
@@ -474,17 +466,11 @@ def _call_compact_model(
         tool_count=0,
         purpose=purpose,
         agent_role="",
-        thinking="disabled" if disable_thinking else None,
-    )
-    request_options = (
-        {"thinking": {"type": "disabled"}}
-        if disable_thinking else {}
     )
     response = model_client.messages.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=SUMMARY_MAX_TOKENS,
-        **request_options,
     )
     record_llm_response(response, purpose=purpose, agent_role="")
     return extract_text(response.content)
