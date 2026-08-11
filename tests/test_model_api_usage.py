@@ -112,6 +112,48 @@ def test_deepseek_v4_flash_uses_high_thinking_and_replays_reasoning(
     assert replayed[0]["tool_calls"][0]["function"]["name"] == "read_file"
 
 
+def test_deepseek_explicit_thinking_disable_omits_reasoning_effort(monkeypatch):
+    captured = {}
+
+    class FakeHttpResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "choices": [{
+                    "message": {"content": "summary"},
+                    "finish_reason": "stop",
+                }],
+            }).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeHttpResponse()
+
+    monkeypatch.setattr(
+        "aqours_code.model_api.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    messages = OpenAICompatibleMessages(
+        "sk-test",
+        "https://api.deepseek.com",
+        provider_name="DeepSeek",
+    )
+
+    messages.create(
+        model="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "summarize"}],
+        thinking={"type": "disabled"},
+    )
+
+    assert captured["payload"]["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in captured["payload"]
+
+
 def test_escalated_tokens_are_provider_specific_and_monotonic():
     assert effective_escalated_max_tokens(
         "deepseek",

@@ -79,6 +79,12 @@ mixed pair. A failed replacement must preserve an older valid entry. Repeating a
 already successful commit with the exact lease and bytes is idempotent; changed data
 for that consumed lease is stale and has no side effects.
 
+A fault raised at `after_publish` occurs after durable publication. The lease must
+be recorded as terminally `committed` rather than remaining `active` or becoming
+`aborted`. Retrying the exact lease and bytes returns the published entry without
+rebuilding, while retrying the consumed lease with different bytes is stale and has
+no side effects.
+
 Current manifests use schema version 2 and contain at least `schema_version`,
 `cache_key`, `digest`, `size`, `artifact_format`, `generation`, `writer_id`,
 `lease_token`, and `created_at`. `digest` is a lowercase SHA-256 hex digest. Every
@@ -148,4 +154,3 @@ Run the public tests with:
 ```bash
 python -m pytest -q
 ```
-

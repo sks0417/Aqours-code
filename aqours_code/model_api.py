@@ -209,7 +209,10 @@ class OpenAICompatibleMessages:
         deepseek_thinking = uses_deepseek_thinking(
             self.provider_name, model,
         )
-        if deepseek_thinking:
+        thinking_override = kwargs.pop("thinking", None)
+        if thinking_override is not None:
+            payload["thinking"] = thinking_override
+        elif deepseek_thinking:
             payload["thinking"] = {"type": "enabled"}
             payload["reasoning_effort"] = DEEPSEEK_REASONING_EFFORT
         if tools:

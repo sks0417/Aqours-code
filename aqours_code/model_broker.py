@@ -16,7 +16,9 @@ PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_TOKENS_PER_CALL = 16000
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
-_ALLOWED_CREATE_KEYS = {"model", "system", "messages", "tools", "max_tokens"}
+_ALLOWED_CREATE_KEYS = {
+    "model", "system", "messages", "tools", "max_tokens", "thinking",
+}
 DEFAULT_PROVIDER_RETRIES = 1
 DEFAULT_PROVIDER_RETRY_DELAY = 1.0
 DEFAULT_IPC_DELIVERY_GRACE = 5.0
@@ -313,6 +315,10 @@ def _validate_request(
             f"broker model is not allowed for this case: {params['model']}")
     if "tools" in params and not isinstance(params["tools"], list):
         raise BrokerProtocolError("broker tools must be a list")
+    if ("thinking" in params
+            and params["thinking"] != {"type": "disabled"}):
+        raise BrokerProtocolError(
+            "broker thinking override must explicitly disable thinking")
     if ("max_tokens" not in params
             or isinstance(params["max_tokens"], bool)
             or not isinstance(params["max_tokens"], int)):
@@ -389,7 +395,7 @@ class BrokerModelClient:
         return snapshot
 
     def create(self, *, model: str, messages: list, system=None, tools=None,
-               max_tokens: int = 8000, **kwargs):
+               max_tokens: int = 8000, thinking=None, **kwargs):
         if kwargs:
             raise BrokerProtocolError(
                 "messages.create received unsupported arguments: "
@@ -410,6 +416,8 @@ class BrokerModelClient:
             params["system"] = str(system)
         if tools is not None:
             params["tools"] = _message_value(tools)
+        if thinking is not None:
+            params["thinking"] = _message_value(thinking)
         request = {
             "version": PROTOCOL_VERSION,
             "nonce": self.nonce,

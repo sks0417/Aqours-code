@@ -1068,10 +1068,18 @@ def record_hook(name: str, **payload):
 
 def record_llm_request(*, model: str, max_tokens: int, message_count: int,
                        tool_count: int, purpose: str = "lead",
-                       agent_role: str = ""):
-    record_event("llm_request", model=model, max_tokens=max_tokens,
-                 message_count=message_count, tool_count=tool_count,
-                 purpose=purpose, agent_role=agent_role)
+                       agent_role: str = "", thinking: str | None = None):
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "message_count": message_count,
+        "tool_count": tool_count,
+        "purpose": purpose,
+        "agent_role": agent_role,
+    }
+    if thinking is not None:
+        payload["thinking"] = thinking
+    record_event("llm_request", **payload)
 
 
 def record_llm_response(response, *, purpose: str = "lead", agent_role: str = ""):
