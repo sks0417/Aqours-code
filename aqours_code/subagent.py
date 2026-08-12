@@ -284,6 +284,8 @@ def run_role_agent(
     prompt: str,
     cwd: Path,
     runtime: AgentRuntime | None = None,
+    *,
+    synthesize_invalid_json: bool = True,
 ) -> dict:
     profile = get_agent_profile(role)
     if profile is None:
@@ -478,7 +480,7 @@ def run_role_agent(
     else:
         needs_synthesis = True
 
-    if needs_synthesis:
+    if needs_synthesis and synthesize_invalid_json:
         if profile.name == "review":
             synthesis_instruction = (
                 '<synthesis>Tool use is over. Return one compact JSON object and '
@@ -552,11 +554,13 @@ def run_role_agent(
         )
         messages.append(assistant_message_from_response(response))
         final_text = extract_text(response.content)
-    return _finalize_role_result(
-        _parse_role_result(final_text, profile.name),
-        profile,
-        successful_read_paths,
-    )
+    result = _parse_role_result(final_text, profile.name)
+    if not synthesize_invalid_json and result.get("invalid_json"):
+        # The automatic test audit is evidence for the Lead, not a protocol
+        # consumed by the harness. Preserve arbitrary Markdown/DSML/plain text
+        # instead of truncating it or spending another model call on repair.
+        result["summary"] = str(final_text or "").strip()
+    return _finalize_role_result(result, profile, successful_read_paths)
 
 
 def delegate_agent(
@@ -620,7 +624,12 @@ def delegate_agent(
     )
     try:
         result = run_role_agent(
-            normalized_role, prompt, role_workdir, runtime)
+            normalized_role,
+            prompt,
+            role_workdir,
+            runtime,
+            synthesize_invalid_json=(name != "test-audit"),
+        )
     except Exception as exc:
         record_event(
             "subagent_finish", agent_role=normalized_role,
