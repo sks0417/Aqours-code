@@ -7,7 +7,9 @@ Fix the implementation while preserving the contracts below.
 ## Public API
 
 The package exports `ArtifactCache`, the immutable request/result models, the public
-exceptions, and the manifest constants listed in `artifact_cache.__all__`.
+exceptions, and the manifest constants listed in `artifact_cache.__all__`. Existing
+export names, constant values, public dataclass field order, and public method
+signatures are part of the API and must remain unchanged.
 
 ```python
 cache = ArtifactCache(
@@ -26,20 +28,26 @@ report = cache.recover()
 ```
 
 `root` is a path. `clock` is a zero-argument callable returning a finite numeric
-time; it defaults to a monotonic clock. `lease_seconds` must be finite and positive.
-Tests and callers may inject a clock, so the implementation must not sleep.
+time; it defaults to a monotonic clock. `lease_seconds` must be finite and positive;
+booleans are not accepted as numeric clock or duration values. Tests and callers may
+inject a clock, so the implementation must not sleep.
 `fault_hook`, when supplied, is called as `fault_hook(stage, path)` at documented
 publication boundaries (`artifact_staged`, `manifest_staged`, `before_publish`, and
 `after_publish`). It may raise to simulate a crash or I/O failure.
 
 `BuildRequest` contains:
 
-- `inputs`: a mapping of logical input names to `bytes` or `str` content;
+- `inputs`: a non-empty mapping whose logical input names are non-empty strings and
+  whose content values are `bytes` or `str`;
 - `options`: a nested value made from mappings with string keys, lists, tuples,
   sets/frozensets, JSON scalar values, and bytes;
 - `tool_version`, `namespace_version`, and `artifact_format`: non-empty strings;
 - optional `scratch_dir`, an execution-only location that never changes output
   identity and therefore must not affect a cache key.
+
+Unsupported request values, non-string option keys, empty required strings, and
+non-finite numbers are invalid and raise `InvalidRequest`. `writer_id` must likewise
+be a non-empty string.
 
 `get` returns `None` for a missing or invalid cache entry. A returned `CacheEntry`
 contains detached artifact bytes, a detached normalized manifest mapping, and a
@@ -52,6 +60,13 @@ acquire the next generation. Only the exact current key, writer, generation, and
 opaque token may publish. Expired, replaced, forged, or cross-key leases raise
 `StaleWriter` without changing cache data, lock state, or another writer's staging
 directory. `abort` is idempotent and may clean only its own staging data.
+
+Lease expiry uses a strict live interval: a lease is live only while the current time
+is less than `expires_at`; equality is already expired. A successful publication
+transitions the matching active record to terminal `committed`, and an ordinary
+pre-publication failure or explicit abort transitions it to terminal `aborted`.
+Terminal records are durable history: retries and recovery must not reactivate or
+rewrite them.
 
 `commit` accepts bytes-like data, a path inside the lease's staging directory, or
 `None` when the builder already wrote `artifact.bin` there. A path outside that
@@ -83,13 +98,23 @@ A fault raised at `after_publish` occurs after durable publication. The lease mu
 be recorded as terminally `committed` rather than remaining `active` or becoming
 `aborted`. Retrying the exact lease and bytes returns the published entry without
 rebuilding, while retrying the consumed lease with different bytes is stale and has
-no side effects.
+no side effects. Once the current pointer has been replaced, later hook behavior or
+clock advancement cannot turn that durable publication into an aborted transaction.
 
-Current manifests use schema version 2 and contain at least `schema_version`,
+Current manifests use schema version 2 and contain exactly `schema_version`,
 `cache_key`, `digest`, `size`, `artifact_format`, `generation`, `writer_id`,
-`lease_token`, and `created_at`. `digest` is a lowercase SHA-256 hex digest. Every
-cache read, including a legacy read, verifies digest and size before returning a hit.
-Corrupt, truncated, replaced, malformed, or mismatched entries are safe misses.
+`lease_token`, and `created_at`. The schema version is the integer `2`; `cache_key`
+and `digest` are lowercase SHA-256 hex strings; `size` and `generation` are
+non-negative integers; `artifact_format`, `writer_id`, and `lease_token` are
+non-empty strings; and `created_at` is finite. Booleans are not valid numeric field
+values. Every cache read, including a legacy read, verifies digest and size before
+returning a hit. Corrupt, truncated, replaced, malformed, or mismatched entries are
+safe misses.
+The current pointer has the JSON shape `{"version": "<version-directory>"}` and must
+name a safe version directory belonging to the same cache key. The pointed directory
+must contain both a readable artifact and a valid matching manifest. A malformed
+pointer, unsafe version name, missing file, incomplete version, cache-key mismatch,
+digest mismatch, or size mismatch must never become a cache hit.
 
 The durable layout is:
 
@@ -136,10 +161,32 @@ directories, and invalid current pointers/pointed entries. An expired active loc
 be marked abandoned, but committed/aborted records must not become active again.
 Keys are recovered independently.
 
+Recovery applies the following observable rules independently to each cache key:
+
+- A valid current pointer and complete matching version remain readable and increment
+  `kept_entries`.
+- A malformed or unsafe current pointer, a pointer to a missing version, or a pointed
+  version with a missing, malformed, corrupt, or mismatched artifact/manifest is one
+  invalid entry. Recovery removes the current pointer, removes the invalid pointed
+  version when it is a safe cache-owned directory, increments `invalid_entries`,
+  increments `removed_versions` when that directory is removed, and includes the key
+  in `removed_cache_keys`. The invalid data must remain a cache miss before and after
+  recovery; recovery must never promote a partial version into a hit.
+- A cache-owned version not named by a valid current pointer is unreachable and is
+  removed and counted in `removed_versions`, while the valid current version survives.
+- Staging belonging to an exact live active lease is preserved and reported through
+  `kept_active_builds` and `active_cache_keys`. Expired, abandoned, or orphaned
+  cache-owned staging is removed and counted in `removed_staging_dirs` and
+  `removed_cache_keys`.
+- Existing terminal `committed` and `aborted` lock records are left unchanged. Files
+  unrelated to the cache layout are left untouched.
+
 `RecoveryReport` reports `kept_entries`, `kept_active_builds`,
 `removed_staging_dirs`, `removed_versions`, `invalid_entries`, and sorted tuples of
-the affected cache keys. Running recovery again without external changes reports no
-new removals.
+the affected cache keys. Counts describe filesystem actions performed by that run;
+the key tuples are sorted and contain no duplicates. Running recovery again without
+external changes reports the still-kept valid/live state but no new removals or new
+invalidations.
 
 ## Failure behavior
 

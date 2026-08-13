@@ -5,8 +5,6 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from aqours_code import bootstrap
 
 bootstrap()
@@ -16,7 +14,6 @@ from aqours_code import (
     autonomous,
     subagent,
     task_system,
-    tool_handlers,
     worktree_system,
 )
 from aqours_code.agent_profiles import (
@@ -52,10 +49,7 @@ class ScriptedClient:
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        item = self.responses.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
+        return self.responses.pop(0)
 
 
 class BudgetedScriptedClient(ScriptedClient):
@@ -446,10 +440,6 @@ def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
         }))),
         response(tool_block("todo_write", {"todos": completed_todos}, "complete")),
         response(text_block("completed after independent review")),
-        response(text_block(
-            "NO_CONCRETE_FAILURE_REPRODUCED\nfocused checkpoint test passed"
-        )),
-        response(text_block("completed after independent test audit")),
     ])
     task = (
         "Implement an end-to-end repository change from the README contract. "
@@ -464,9 +454,9 @@ def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
     )
 
-    assert result["final_answer"] == "completed after independent test audit"
+    assert result["final_answer"] == "completed after independent review"
     assert (tmp_path / "service.py").read_text(encoding="utf-8") == "FIXED = True\n"
-    assert len(client.calls) == 10
+    assert len(client.calls) == 8
     explorer_calls = [
         call for call in client.calls
         if "You are the explore role" in call["system"]
@@ -478,12 +468,6 @@ def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
         if "You are the review role" in call["system"]
     ]
     assert len(reviewer_calls) == 1
-    audit_calls = [
-        call for call in client.calls
-        if "You are the general-purpose role" in call["system"]
-    ]
-    assert len(audit_calls) == 1
-    assert "independent test audit" in audit_calls[0]["messages"][0]["content"]
 
 
 def test_inconclusive_explorer_is_reused_and_does_not_lock_lead(tmp_path):
@@ -530,9 +514,9 @@ def test_inconclusive_explorer_is_reused_and_does_not_lock_lead(tmp_path):
         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
     )
 
-    assert result["final_answer"] == "finished from lead evidence"
+    assert result["final_answer"] == "final attempt"
     assert (tmp_path / "service.py").read_text(encoding="utf-8") == "VALUE = 2\n"
-    assert len(client.calls) == 8
+    assert len(client.calls) == 6
     assert client.calls[2]["tools"] == []
     assert len([
         call for call in client.calls
@@ -542,20 +526,6 @@ def test_inconclusive_explorer_is_reused_and_does_not_lock_lead(tmp_path):
         "You are the review role" in call["system"]
         for call in client.calls
     )
-
-
-def complex_implementation_task() -> str:
-    return (
-        "Implement an end-to-end atomic transaction rollback and idempotency "
-        "consistency change across multiple files with state and security risks.\n"
-        "- inspect the producer path\n- retain rollback semantics\n"
-        "- update the adapter\n- verify the final state transition\n"
-        + "Keep each cross-file change focused and maintainable. " * 8
-    )
-    assert len([
-        call for call in client.calls
-        if "You are the general-purpose role" in call["system"]
-    ]) == 1
 
 
 def test_invalid_reviewer_json_preserves_an_actionable_finding():
@@ -949,9 +919,8 @@ def test_runtime_role_signal_requires_repeat_cross_scope_and_tail_budget():
     assert docker_paths["scope_count"] == 3
 
 
-def test_complex_task_starts_one_general_purpose_test_audit(tmp_path):
+def test_complex_task_does_not_start_an_automatic_reviewer(tmp_path):
     (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    trace_path = tmp_path / "trace.jsonl"
     task = (
         "Implement an end-to-end atomic transaction rollback and idempotency "
         "consistency change across multiple files with state and security risks.\n"
@@ -967,271 +936,8 @@ def test_complex_task_starts_one_general_purpose_test_audit(tmp_path):
             "edit",
         )),
         response(text_block("ready for final")),
-        response(text_block(
-            "Contracts: atomic rollback.\n"
-            "Command: python /tmp/aqours_test_audit_1/test_service.py\n"
-            "PASS\nNO_CONCRETE_FAILURE_REPRODUCED"
-        )),
-        response(text_block("finished after audit")),
-    ], max_calls=20)
-
-    result = agent_loop.run_agent_task(
-        task, str(tmp_path), str(trace_path), model_client=client,
-        model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "finished after audit"
-    assert len(client.calls) == 4
-    assert all(
-        any(tool["name"] == "delegate_agent" for tool in call["tools"])
-        for call in (client.calls[0], client.calls[-1])
-    )
-    assert not any(
-        "You are the review role" in call["system"]
-        for call in client.calls
-    )
-    audit_calls = [
-        call for call in client.calls
-        if "You are the general-purpose role" in call["system"]
-    ]
-    assert len(audit_calls) == 1
-    assignment = audit_calls[0]["messages"][0]["content"]
-    assert task in assignment
-    assert "service.py" in assignment
-    assert "/tmp/aqours_test_audit_*" in assignment
-    assert "git diff --stat" not in assignment or "current_git_diff_stat" in assignment
-    assert any(
-        "python /tmp/aqours_test_audit_1/test_service.py" in str(
-            message.get("content")
-        )
-        for message in client.calls[-1]["messages"]
-    )
-    events = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert any(
-        event["type"] == "subagent_start"
-        and event["agent_role"] == "general-purpose"
-        and event["name"] == "test-audit"
-        for event in events
-    )
-    started = [event for event in events if event["type"] == "test_audit_started"]
-    completed = [
-        event for event in events if event["type"] == "test_audit_completed"
-    ]
-    assert len(started) == len(completed) == 1
-    assert started[0]["mutation_revision"] == 1
-    assert completed[0]["status"] == "completed"
-    assert completed[0]["model_calls"] == 1
-    assert completed[0]["changed_files"] == []
-
-
-def test_test_audit_uses_shared_global_budget_beyond_six_tool_rounds(tmp_path):
-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    for index in range(8):
-        (tmp_path / f"audit_{index}.py").write_text(
-            f"VALUE = {index}\n", encoding="utf-8",
-        )
-    trace_path = tmp_path / "trace.jsonl"
-    audit_tool_rounds = [
-        response(tool_block(
-            "read_file", {"path": f"audit_{index}.py"}, f"audit-read-{index}",
-        ))
-        for index in range(8)
-    ]
-    report = (
-        "Command: python /tmp/aqours_test_audit_long/test_service.py\n"
-        "PASS\nNO_CONCRETE_FAILURE_REPRODUCED"
-    )
-    client = BudgetedScriptedClient([
-        response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
-            "edit",
-        )),
-        response(text_block("ready for final")),
-        *audit_tool_rounds,
-        response(text_block(report)),
-        response(text_block("finished after long audit")),
-    ], max_calls=64)
-
-    result = agent_loop.run_agent_task(
-        complex_implementation_task(), str(tmp_path), str(trace_path),
-        model_client=client, model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "finished after long audit"
-    audit_calls = [
-        call for call in client.calls
-        if "You are the general-purpose role" in call["system"]
-    ]
-    assert len(audit_calls) == 9
-    assert len(client.calls) == 12
-    lead_audit_context = "\n".join(
-        str(message.get("content"))
-        for message in client.calls[-1]["messages"]
-    )
-    assert "aqours_test_audit_long/test_service.py" in lead_audit_context
-    assert "NO_CONCRETE_FAILURE_REPRODUCED" in lead_audit_context
-    events = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
-    completed = [
-        event for event in events if event["type"] == "test_audit_completed"
-    ]
-    assert completed[-1]["model_calls"] == 9
-    assert client.budget_snapshot() == {
-        "max_calls": 64,
-        "call_count": 12,
-        "max_provider_retries": 0,
-    }
-
-
-def test_test_audit_retries_empty_max_tokens_at_escalated_budget(tmp_path):
-    class MessageSnapshotClient(BudgetedScriptedClient):
-        def __init__(self, responses, max_calls):
-            super().__init__(responses, max_calls)
-            self.message_snapshots = []
-
-        def create(self, **kwargs):
-            self.message_snapshots.append(list(kwargs["messages"]))
-            return super().create(**kwargs)
-
-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    trace_path = tmp_path / "trace.jsonl"
-    truncated = SimpleNamespace(content=[], stop_reason="max_tokens")
-    report = (
-        "Command: python /tmp/aqours_test_audit_tokens/test_service.py\n"
-        "PASS\nNO_CONCRETE_FAILURE_REPRODUCED"
-    )
-    client = MessageSnapshotClient([
-        response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
-            "edit",
-        )),
-        response(text_block("ready for final")),
-        truncated,
-        response(tool_block(
-            "read_file", {"path": "service.py"}, "audit-read",
-        )),
-        response(text_block(report)),
-        response(text_block("finished after recovered audit")),
-    ], max_calls=64)
-
-    result = agent_loop.run_agent_task(
-        complex_implementation_task(), str(tmp_path), str(trace_path),
-        model_client=client, model_provider="deepseek",
-        model="deepseek-v4-flash",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "finished after recovered audit"
-    audit_call_indexes = [
-        index for index, call in enumerate(client.calls)
-        if "You are the general-purpose role" in call["system"]
-    ]
-    assert len(audit_call_indexes) == 3
-    first, retry, after_tool = audit_call_indexes
-    assert client.calls[first]["max_tokens"] == 8_000
-    assert client.calls[retry]["max_tokens"] == 64_000
-    assert client.calls[after_tool]["max_tokens"] == 8_000
-    assert len(client.message_snapshots[first]) == 1
-    assert client.message_snapshots[retry] == client.message_snapshots[first]
-    assert not any(
-        message.get("role") == "assistant"
-        for message in client.message_snapshots[retry]
-    )
-    lead_audit_context = "\n".join(
-        str(message.get("content"))
-        for message in client.calls[-1]["messages"]
-    )
-    assert "aqours_test_audit_tokens/test_service.py" in lead_audit_context
-    assert "NO_CONCRETE_FAILURE_REPRODUCED" in lead_audit_context
-    assert len(client.calls) == 6
-    assert client.budget_snapshot() == {
-        "max_calls": 64,
-        "call_count": 6,
-        "max_provider_retries": 0,
-    }
-    events = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
-    completed = [
-        event for event in events if event["type"] == "test_audit_completed"
-    ]
-    assert completed[-1]["model_calls"] == 3
-
-
-def test_regular_general_purpose_keeps_six_tool_round_limit(
-    tmp_path, monkeypatch,
-):
-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    client = ScriptedClient([
-        *[
-            response(tool_block(
-                "read_file", {"path": "service.py", "offset": index},
-                f"read-{index}",
-            ))
-            for index in range(6)
-        ],
-        response(text_block(json.dumps({
-            "verdict": "blocked",
-            "summary": "stopped after the ordinary six tool rounds",
-            "changed_files": [],
-            "tests": [],
-            "remaining_risks": ["more inspection was requested"],
-        }))),
-    ])
-    monkeypatch.setattr(subagent, "client", client)
-    monkeypatch.setattr(subagent, "MODEL", "scripted")
-    monkeypatch.setattr(subagent, "CURRENT_ROOT_TASK", "Inspect service.py")
-
-    result = json.loads(subagent.delegate_agent(
-        "general-purpose", "Inspect service.py", name="ordinary-agent",
-    ))
-
-    assert result["status"] == "completed"
-    assert len(client.calls) == 7
-    assert all(call["tools"] for call in client.calls[:6])
-    assert client.calls[6]["tools"] == []
-    assert any(
-        "<synthesis>" in str(message.get("content"))
-        for message in client.calls[6]["messages"]
-    )
-
-
-@pytest.mark.parametrize(
-    ("task", "edit_workspace"),
-    [
-        ("What does this function do?", True),
-        (complex_implementation_task(), False),
-        (
-            "Write a detailed non-code project retrospective with risks, "
-            "requirements, tests, atomic state, concurrency, and rollback. " * 8,
-            True,
-        ),
-    ],
-    ids=("simple_question", "no_workspace_change", "non_code_task"),
-)
-def test_test_audit_does_not_run_without_all_triggers(
-    tmp_path, task, edit_workspace,
-):
-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    responses = []
-    if edit_workspace:
-        responses.append(response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
-            "edit",
-        )))
-    responses.append(response(text_block("original final")))
-    client = ScriptedClient(responses)
+        response(text_block("finished with reserved calls")),
+    ], max_calls=7)
 
     result = agent_loop.run_agent_task(
         task, str(tmp_path), model_client=client,
@@ -1239,246 +945,15 @@ def test_test_audit_does_not_run_without_all_triggers(
         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
     )
 
-    assert result["final_answer"] == "original final"
-    assert not any(
-        "You are the general-purpose role" in call["system"]
+    assert result["final_answer"] == "ready for final"
+    assert len(client.calls) == 2
+    assert all(
+        any(tool["name"] == "delegate_agent" for tool in call["tools"])
         for call in client.calls
     )
-
-
-def test_test_audit_budget_skip_keeps_original_final_and_traces_reason(tmp_path):
-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    trace_path = tmp_path / "trace.jsonl"
-    client = BudgetedScriptedClient([
-        response(tool_block("todo_write", {"todos": [{
-            "content": "still pending",
-            "status": "pending",
-        }]}, "todo")),
-        response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
-            "edit",
-        )),
-        response(text_block("original final")),
-    ], max_calls=11)
-
-    result = agent_loop.run_agent_task(
-        complex_implementation_task(), str(tmp_path), str(trace_path),
-        model_client=client, model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "original final"
-    assert len(client.calls) == 3
     assert not any(
-        "todo_completion_reminder" in str(message.get("content"))
-        for call in client.calls for message in call["messages"]
-    )
-    events = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
-    skipped = [event for event in events if event["type"] == "test_audit_skipped"]
-    assert len(skipped) == 1
-    assert skipped[0]["reason"] == "budget_reserved"
-
-
-@pytest.mark.parametrize("failure", [TimeoutError("late"), RuntimeError("provider")])
-def test_test_audit_failure_keeps_original_final(tmp_path, failure):
-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    trace_path = tmp_path / "trace.jsonl"
-    client = ScriptedClient([
-        response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
-            "edit",
-        )),
-        response(text_block("original final")),
-        failure,
-    ])
-
-    result = agent_loop.run_agent_task(
-        complex_implementation_task(), str(tmp_path), str(trace_path),
-        model_client=client,
-        model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "original final"
-    assert len(client.calls) == 3
-    events = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
-    completed = [event for event in events if event["type"] == "test_audit_completed"]
-    assert completed[-1]["status"] == "inconclusive"
-
-
-def test_test_audit_invalid_json_raw_summary_reaches_lead_without_synthesis(tmp_path):
-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    raw_report = (
-        "<audit>command: python /tmp/aqours_test_audit_x/test_service.py\n"
-        "AssertionError: expected persisted state</audit>"
-    )
-    client = ScriptedClient([
-        response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
-            "edit",
-        )),
-        response(text_block("first final")),
-        response(text_block(raw_report)),
-        response(text_block("second final")),
-    ])
-
-    result = agent_loop.run_agent_task(
-        complex_implementation_task(), str(tmp_path), model_client=client,
-        model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "second final"
-    assert len(client.calls) == 4
-    audit_context = "\n".join(
-        str(message.get("content"))
-        for message in client.calls[-1]["messages"]
-    )
-    assert "python /tmp/aqours_test_audit_x/test_service.py" in audit_context
-    assert "AssertionError: expected persisted state" in audit_context
-
-
-def test_test_audit_error_with_raw_summary_still_reaches_lead(tmp_path, monkeypatch):
-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    client = ScriptedClient([
-        response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
-            "edit",
-        )),
-        response(text_block("first final")),
-        response(text_block("second final")),
-    ])
-    original_delegate = subagent.delegate_agent
-
-    def raw_error_delegate(role, prompt, name="", runtime=None):
-        if name == "test-audit":
-            return json.dumps({
-                "status": "error",
-                "role": "general-purpose",
-                "verdict": "blocked",
-                "error": "provider response was invalid",
-                "result": {
-                    "summary": (
-                        "command: python /tmp/aqours_test_audit_raw/test_service.py\n"
-                        "AssertionError: persisted state mismatch"
-                    ),
-                    "invalid_json": True,
-                },
-                "changed_files": [],
-            })
-        return original_delegate(role, prompt, name, runtime)
-
-    monkeypatch.setattr(subagent, "delegate_agent", raw_error_delegate)
-    monkeypatch.setattr(agent_loop, "delegate_agent", raw_error_delegate)
-    monkeypatch.setattr(tool_handlers, "delegate_agent", raw_error_delegate)
-
-    result = agent_loop.run_agent_task(
-        complex_implementation_task(), str(tmp_path), model_client=client,
-        model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "second final"
-    audit_context = "\n".join(
-        str(message.get("content"))
-        for message in client.calls[-1]["messages"]
-    )
-    assert "aqours_test_audit_raw/test_service.py" in audit_context
-    assert "persisted state mismatch" in audit_context
-
-
-def test_test_audit_runs_only_once_after_lead_edits_again(tmp_path):
-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    client = ScriptedClient([
-        response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
-            "edit-1",
-        )),
-        response(text_block("first final")),
-        response(text_block(
-            "python /tmp/aqours_test_audit_x/test_service.py failed: "
-            "AssertionError: expected 3"
-        )),
-        response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "VALUE = 2", "new_text": "VALUE = 3"},
-            "edit-2",
-        )),
-        response(text_block("final after fix")),
-    ])
-
-    result = agent_loop.run_agent_task(
-        complex_implementation_task(), str(tmp_path), model_client=client,
-        model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "final after fix"
-    assert (tmp_path / "service.py").read_text(encoding="utf-8") == "VALUE = 3\n"
-    assert len([
-        call for call in client.calls
-        if "You are the general-purpose role" in call["system"]
-    ]) == 1
-
-
-def test_test_audit_workspace_change_is_warned_without_restore(tmp_path, monkeypatch):
-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
-    client = ScriptedClient([
-        response(tool_block(
-            "edit_file",
-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
-            "edit",
-        )),
-        response(text_block("first final")),
-        response(text_block("final after warning")),
-    ])
-    original_delegate = subagent.delegate_agent
-
-    def changing_delegate(role, prompt, name="", runtime=None):
-        if name == "test-audit":
-            (tmp_path / "audit_wrote.txt").write_text("unexpected\n", encoding="utf-8")
-            return json.dumps({
-                "status": "completed",
-                "role": "general-purpose",
-                "verdict": "blocked",
-                "result": {
-                    "verdict": "blocked",
-                    "summary": "focused test was inconclusive",
-                    "invalid_json": True,
-                },
-                "changed_files": ["audit_wrote.txt"],
-            })
-        return original_delegate(role, prompt, name, runtime)
-
-    monkeypatch.setattr(subagent, "delegate_agent", changing_delegate)
-    monkeypatch.setattr(agent_loop, "delegate_agent", changing_delegate)
-    monkeypatch.setattr(tool_handlers, "delegate_agent", changing_delegate)
-
-    result = agent_loop.run_agent_task(
-        complex_implementation_task(), str(tmp_path), model_client=client,
-        model_provider="scripted", model="scripted",
-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
-    )
-
-    assert result["final_answer"] == "final after warning"
-    assert (tmp_path / "audit_wrote.txt").read_text(encoding="utf-8") == "unexpected\n"
-    assert any(
-        "WARNING: The test audit unexpectedly modified repository files" in str(
-            message.get("content")
-        )
-        and "audit_wrote.txt" in str(message.get("content"))
-        for message in client.calls[-1]["messages"]
+        "You are the review role" in call["system"]
+        for call in client.calls
     )
 
 
@@ -1543,10 +1018,6 @@ def test_reviewer_gap_stays_in_tool_output_without_hidden_todo(tmp_path):
             "missing_evidence": [],
         }))),
         response(text_block("finished with the reviewer concern reported")),
-        response(text_block(
-            "NO_CONCRETE_FAILURE_REPRODUCED\nfocused rollback test passed"
-        )),
-        response(text_block("finished after test audit")),
     ])
 
     result = agent_loop.run_agent_task(
@@ -1555,8 +1026,8 @@ def test_reviewer_gap_stays_in_tool_output_without_hidden_todo(tmp_path):
         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
     )
 
-    assert result["final_answer"] == "finished after test audit"
-    assert len(client.calls) == 6
+    assert result["final_answer"] == "finished with the reviewer concern reported"
+    assert len(client.calls) == 4
     assert any(
         "rollback is incomplete" in str(message.get("content"))
         for message in client.calls[-1]["messages"]

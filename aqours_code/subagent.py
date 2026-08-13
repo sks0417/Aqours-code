@@ -2,10 +2,7 @@ from .runtime_state import *
 from .agent_profiles import get_agent_profile, normalize_agent_role
 from .model_budget import can_spend_optional_calls
 from .runtime import AgentRuntime
-from .model_api import (
-    assistant_message_from_response,
-    effective_escalated_max_tokens,
-)
+from .model_api import assistant_message_from_response
 from .tool_registry import (
     delegated_policy_for_role,
     effective_tool_names,
@@ -287,10 +284,6 @@ def run_role_agent(
     prompt: str,
     cwd: Path,
     runtime: AgentRuntime | None = None,
-    *,
-    synthesize_invalid_json: bool = True,
-    global_model_call_fuse_only: bool = False,
-    recover_max_tokens: bool = False,
 ) -> dict:
     profile = get_agent_profile(role)
     if profile is None:
@@ -364,38 +357,13 @@ def run_role_agent(
     successful_read_paths: set[str] = set()
     read_cache: set[tuple[str, object, object]] = set()
     executed_tool_calls = 0
-    request_max_tokens = profile.max_response_tokens
-    max_tokens_escalated = False
-    while global_model_call_fuse_only or tool_rounds < profile.max_tool_rounds:
+    for _ in range(profile.max_tool_rounds):
         response = _request_with_deadline(
             system=system, messages=messages, tools=tools,
             purpose="subagent", role=profile.name,
-            max_tokens=request_max_tokens,
+            max_tokens=profile.max_response_tokens,
             runtime=role_runtime,
         )
-        stop_reason = getattr(response, "stop_reason", "")
-        if (recover_max_tokens
-                and stop_reason == "max_tokens"
-                and not max_tokens_escalated):
-            provider_name = (
-                role_runtime.config.model_provider
-                if role_runtime is not None else MODEL_PROVIDER
-            )
-            model = (
-                role_runtime.config.model
-                if role_runtime is not None else MODEL
-            )
-            request_max_tokens = effective_escalated_max_tokens(
-                provider_name,
-                model,
-                current_max_tokens=request_max_tokens,
-                configured_escalated_max_tokens=ESCALATED_MAX_TOKENS,
-            )
-            max_tokens_escalated = True
-            continue
-        if stop_reason != "max_tokens":
-            request_max_tokens = profile.max_response_tokens
-            max_tokens_escalated = False
         messages.append(assistant_message_from_response(response))
         text = extract_text(response.content)
         if text:
@@ -510,7 +478,7 @@ def run_role_agent(
     else:
         needs_synthesis = True
 
-    if needs_synthesis and synthesize_invalid_json:
+    if needs_synthesis:
         if profile.name == "review":
             synthesis_instruction = (
                 '<synthesis>Tool use is over. Return one compact JSON object and '
@@ -584,13 +552,11 @@ def run_role_agent(
         )
         messages.append(assistant_message_from_response(response))
         final_text = extract_text(response.content)
-    result = _parse_role_result(final_text, profile.name)
-    if not synthesize_invalid_json and result.get("invalid_json"):
-        # The automatic test audit is evidence for the Lead, not a protocol
-        # consumed by the harness. Preserve arbitrary Markdown/DSML/plain text
-        # instead of truncating it or spending another model call on repair.
-        result["summary"] = str(final_text or "").strip()
-    return _finalize_role_result(result, profile, successful_read_paths)
+    return _finalize_role_result(
+        _parse_role_result(final_text, profile.name),
+        profile,
+        successful_read_paths,
+    )
 
 
 def delegate_agent(
@@ -654,14 +620,7 @@ def delegate_agent(
     )
     try:
         result = run_role_agent(
-            normalized_role,
-            prompt,
-            role_workdir,
-            runtime,
-            synthesize_invalid_json=(name != "test-audit"),
-            global_model_call_fuse_only=(name == "test-audit"),
-            recover_max_tokens=(name == "test-audit"),
-        )
+            normalized_role, prompt, role_workdir, runtime)
     except Exception as exc:
         record_event(
             "subagent_finish", agent_role=normalized_role,

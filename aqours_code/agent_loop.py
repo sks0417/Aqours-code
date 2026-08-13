@@ -5,13 +5,11 @@ from .runtime_state import *
 from pathlib import Path as _Path
 import shutil as _shutil
 import os as _os
-import subprocess as _subprocess
 import time as _time
 from .command_executor import CaseTimeoutError as _CaseTimeoutError
 from .agent_profiles import (
     assess_task_complexity,
     complex_delegation_briefing,
-    get_agent_profile,
     normalize_agent_role,
 )
 from .model_budget import (
@@ -440,245 +438,6 @@ def _finalization_budget_message(snapshot: dict) -> str:
         "remaining calls only for unresolved fixes, targeted verification, and "
         "one final answer.</finalization_budget>"
     )
-
-
-_TEST_AUDIT_ASSIGNMENT = """\
-You are performing one independent test audit of the current implementation.
-
-The Lead agent has completed an implementation and is preparing its final answer.
-Your job is not to reimplement the task and not to review coding style.
-Your only job is to find concrete behavioral omissions by designing and running
-focused tests.
-
-Workflow:
-
-1. Read the authoritative task specification or README.
-2. Inspect the current git diff and only the directly relevant implementation files.
-3. Inspect the existing public tests to understand what is already covered.
-4. Identify a small number of explicit documented contracts that are not directly
-   exercised by the public tests.
-5. Generate focused temporary tests for the highest-risk uncovered contracts.
-6. Run those tests against the current workspace.
-7. Report only evidence produced by actual test execution.
-
-Prioritize generally risky boundaries such as equality conditions, exceptions after
-a side effect succeeds, retries, duplicate calls, idempotency, persisted state,
-reports that disagree with side effects, partial success, uncovered failure paths,
-and invariants after concurrency or recovery. Do not invent requirements.
-
-Important constraints:
-
-- Do not modify production source files.
-- Do not modify repository tests, README files, configuration, or fixtures.
-- Temporary test files must be created outside the repository, under
-  /tmp/aqours_test_audit_*.
-- Prefer one compact temporary test module instead of many files.
-- Do not run a broad repository exploration.
-- Do not rerun the entire public suite unless a focused test requires it.
-- Batch independent file reads where possible.
-- A suspected issue is not a finding unless a focused executable test reproduces it.
-- Passing generated tests are evidence that no failure was reproduced, not proof
-  that the implementation is correct.
-- Finish after this single audit. Do not edit the implementation.
-
-Return a concise report containing the documented contracts selected, temporary
-test commands executed, pass/fail result for each generated test, exact failure
-output for any reproduced issue, and remaining untested risks. If no focused test
-reproduces a problem, explicitly state:
-NO_CONCRETE_FAILURE_REPRODUCED
-"""
-
-
-def _git_diff_stat(workdir: _Path) -> str:
-    try:
-        result = _subprocess.run(
-            ["git", "diff", "--stat", "--"],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-            check=False,
-        )
-    except (OSError, _subprocess.SubprocessError):
-        return "(git diff --stat unavailable)"
-    if result.returncode != 0:
-        return "(git diff --stat unavailable)"
-    return result.stdout.strip() or "(no tracked diff stat available)"
-
-
-def _test_audit_assignment(
-    root_task: str,
-    changed_files: list[str],
-    workdir: _Path,
-) -> str:
-    changed = "\n".join(f"- {path}" for path in changed_files)
-    return (
-        f"{_TEST_AUDIT_ASSIGNMENT}\n"
-        "\n<original_user_task>\n"
-        f"{root_task}\n"
-        "</original_user_task>\n"
-        "\n<current_changed_files>\n"
-        f"{changed or '(none recorded)'}\n"
-        "</current_changed_files>\n"
-        "\n<current_git_diff_stat>\n"
-        f"{_git_diff_stat(workdir)}\n"
-        "</current_git_diff_stat>\n"
-        "\nRead the complete current diff yourself with git diff when needed.\n"
-    )
-
-
-def _test_audit_raw_summary(delegation: dict) -> str:
-    result = delegation.get("result", {})
-    if isinstance(result, dict):
-        summary = result.get("summary", "")
-    else:
-        summary = result
-    return str(summary or delegation.get("summary", "")).strip()
-
-
-def _test_audit_message(raw_result: str, changed_files: list[str]) -> str:
-    warning = ""
-    if changed_files:
-        paths = "\n".join(f"- {path}" for path in changed_files)
-        warning = (
-            "WARNING: The test audit unexpectedly modified repository files. "
-            "No files were restored automatically. Inspect and handle these "
-            f"changes before finishing:\n{paths}\n\n"
-        )
-    report = raw_result.strip() or "(No textual audit report was returned.)"
-    return (
-        "<test_audit_result>\n"
-        f"{warning}"
-        "The following result was produced by an independent subagent that "
-        "generated and executed temporary tests against the current workspace.\n\n"
-        "The complete delegate_agent result is included without parsing or "
-        "rewriting its findings:\n\n"
-        f"{report}\n\n"
-        "Review the executed-test evidence above.\n\n"
-        "- If a concrete failing test demonstrates a documented contract "
-        "violation, inspect the implementation, fix it, and rerun the relevant "
-        "test.\n"
-        "- If the report contains only speculation or no reproduced failure, do "
-        "not change code merely to satisfy the speculation.\n"
-        "- After handling the evidence, complete the task normally.\n"
-        "- Do not invoke another test audit.\n"
-        "</test_audit_result>"
-    )
-
-
-def _run_test_audit(
-    *,
-    delegate_handler,
-    model_client,
-    root_task: str,
-    changed_files: list[str],
-    mutation_revision: int,
-    workdir: _Path,
-) -> dict:
-    """Run one optional audit without interpreting its behavioral conclusion."""
-    profile = get_agent_profile("general-purpose")
-    estimated_calls = profile.max_tool_rounds + 1
-    budget_allowed, budget_before = can_spend_optional_calls(
-        model_client, estimated_calls,
-    )
-    budget_payload = {
-        key: value for key, value in budget_before.items()
-        if key != "available"
-    }
-    if not budget_allowed:
-        record_event(
-            "test_audit_skipped", reason="budget_reserved", **budget_payload,
-        )
-        return {"message": "", "changed_files": [], "status": "skipped"}
-    if delegate_handler is None:
-        record_event(
-            "test_audit_skipped", reason="delegate_agent_unavailable",
-        )
-        return {"message": "", "changed_files": [], "status": "skipped"}
-
-    assignment = _test_audit_assignment(root_task, changed_files, workdir)
-    record_event(
-        "test_audit_started",
-        role="general-purpose",
-        mutation_revision=mutation_revision,
-    )
-    try:
-        output = call_tool_handler(
-            delegate_handler,
-            {
-                "role": "general-purpose",
-                "prompt": assignment,
-                "name": "test-audit",
-            },
-            "delegate_agent",
-        )
-    except Exception as exc:
-        record_event(
-            "test_audit_completed",
-            status="inconclusive",
-            error_type=type(exc).__name__,
-            error=str(exc)[:1000],
-            changed_files=[],
-        )
-        return {"message": "", "changed_files": [], "status": "inconclusive"}
-
-    raw_result = str(output or "")
-    delegation = _tool_json(output)
-    audit_changed_files = delegation.get("changed_files", [])
-    if not isinstance(audit_changed_files, list):
-        audit_changed_files = []
-    audit_changed_files = sorted({
-        str(path).strip() for path in audit_changed_files
-        if str(path).strip()
-    })
-    status = str(delegation.get("status", "")).lower()
-    if status == "budget_reserved":
-        record_event(
-            "test_audit_skipped", reason="budget_reserved",
-            **{key: value for key, value in delegation.get("budget", {}).items()
-               if key != "available"},
-        )
-        return {"message": "", "changed_files": [], "status": "skipped"}
-
-    _, budget_after = can_spend_optional_calls(
-        model_client, 0, retry_margin=False,
-    )
-    model_calls = 0
-    if budget_before.get("available") and budget_after.get("available"):
-        model_calls = max(
-            0,
-            int(budget_after.get("used_calls", 0))
-            - int(budget_before.get("used_calls", 0)),
-        )
-
-    has_raw_report = bool(
-        raw_result.strip()
-        and not raw_result.lower().startswith("error:")
-        and (
-            not delegation
-            or bool(_test_audit_raw_summary(delegation))
-        )
-    )
-    completed_status = (
-        "completed" if status == "completed" or (not delegation and has_raw_report)
-        else "inconclusive"
-    )
-    record_event(
-        "test_audit_completed",
-        status=completed_status,
-        model_calls=model_calls,
-        changed_files=audit_changed_files,
-    )
-    message = ""
-    if has_raw_report or audit_changed_files:
-        message = _test_audit_message(raw_result, audit_changed_files)
-    return {
-        "message": message,
-        "changed_files": audit_changed_files,
-        "status": completed_status,
-    }
 
 
 def _context_stats(
@@ -1115,7 +874,6 @@ def agent_loop(
     mutation_revision = 0
     reviewer_attempted_revision = -1
     reviewer_cached_result = ""
-    test_audit_attempted = False
     finalization_budget_notice_sent = False
     budget_snapshot_observed = False
     if multiagent_required:
@@ -1304,19 +1062,6 @@ def agent_loop(
         state.has_escalated = False
         messages.append(assistant_message_from_response(response))
         if force_final_response:
-            if (
-                multiagent_required
-                and mutation_revision > 0
-                and changed_file_paths
-                and not test_audit_attempted
-            ):
-                test_audit_attempted = True
-                record_event(
-                    "test_audit_skipped",
-                    reason="budget_reserved",
-                    remaining_calls=budget_snapshot.get("remaining_calls"),
-                    reserve_calls=budget_snapshot.get("reserve_calls"),
-                )
             unresolved = _incomplete_todos(runtime)
             if unresolved:
                 _append_todo_warning(response.content, unresolved)
@@ -1351,41 +1096,6 @@ def agent_loop(
             notification_wait = 2.0 if remaining is None else max(0, min(2.0, remaining))
             if wait_for_imminent_once(notification_wait):
                 continue
-            if (
-                multiagent_required
-                and mutation_revision > 0
-                and changed_file_paths
-                and not test_audit_attempted
-            ):
-                test_audit_attempted = True
-                audit = _run_test_audit(
-                    delegate_handler=handlers.get("delegate_agent"),
-                    model_client=model_client,
-                    root_task=root_task,
-                    changed_files=sorted(changed_file_paths),
-                    mutation_revision=mutation_revision,
-                    workdir=(
-                        runtime.paths.workdir
-                        if runtime is not None else _Path(WORKDIR).resolve()
-                    ),
-                )
-                audit_changed_files = audit["changed_files"]
-                if audit_changed_files:
-                    mutation_revision += 1
-                    changed_file_paths.update(audit_changed_files)
-                if audit["message"]:
-                    messages.append({
-                        "role": "user",
-                        "content": audit["message"],
-                    })
-                    continue
-                # A skipped or text-free failed audit is inconclusive. Keep the
-                # exact final-like response that triggered it instead of adding
-                # retries, protocol repair, or another Lead turn.
-                record_hook("Stop")
-                trigger_hooks("Stop", messages)
-                finish_run(extract_text(response.content))
-                return
             unresolved_todos = _incomplete_todos(runtime)
             if unresolved_todos:
                 if not todo_completion_followup_sent:
