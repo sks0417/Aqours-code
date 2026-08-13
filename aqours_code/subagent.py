@@ -2,7 +2,10 @@ from .runtime_state import *
 from .agent_profiles import get_agent_profile, normalize_agent_role
 from .model_budget import can_spend_optional_calls
 from .runtime import AgentRuntime
-from .model_api import assistant_message_from_response
+from .model_api import (
+    assistant_message_from_response,
+    effective_escalated_max_tokens,
+)
 from .tool_registry import (
     delegated_policy_for_role,
     effective_tool_names,
@@ -287,6 +290,7 @@ def run_role_agent(
     *,
     synthesize_invalid_json: bool = True,
     global_model_call_fuse_only: bool = False,
+    recover_max_tokens: bool = False,
 ) -> dict:
     profile = get_agent_profile(role)
     if profile is None:
@@ -360,13 +364,38 @@ def run_role_agent(
     successful_read_paths: set[str] = set()
     read_cache: set[tuple[str, object, object]] = set()
     executed_tool_calls = 0
+    request_max_tokens = profile.max_response_tokens
+    max_tokens_escalated = False
     while global_model_call_fuse_only or tool_rounds < profile.max_tool_rounds:
         response = _request_with_deadline(
             system=system, messages=messages, tools=tools,
             purpose="subagent", role=profile.name,
-            max_tokens=profile.max_response_tokens,
+            max_tokens=request_max_tokens,
             runtime=role_runtime,
         )
+        stop_reason = getattr(response, "stop_reason", "")
+        if (recover_max_tokens
+                and stop_reason == "max_tokens"
+                and not max_tokens_escalated):
+            provider_name = (
+                role_runtime.config.model_provider
+                if role_runtime is not None else MODEL_PROVIDER
+            )
+            model = (
+                role_runtime.config.model
+                if role_runtime is not None else MODEL
+            )
+            request_max_tokens = effective_escalated_max_tokens(
+                provider_name,
+                model,
+                current_max_tokens=request_max_tokens,
+                configured_escalated_max_tokens=ESCALATED_MAX_TOKENS,
+            )
+            max_tokens_escalated = True
+            continue
+        if stop_reason != "max_tokens":
+            request_max_tokens = profile.max_response_tokens
+            max_tokens_escalated = False
         messages.append(assistant_message_from_response(response))
         text = extract_text(response.content)
         if text:
@@ -631,6 +660,7 @@ def delegate_agent(
             runtime,
             synthesize_invalid_json=(name != "test-audit"),
             global_model_call_fuse_only=(name == "test-audit"),
+            recover_max_tokens=(name == "test-audit"),
         )
     except Exception as exc:
         record_event(

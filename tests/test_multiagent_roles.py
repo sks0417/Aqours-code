@@ -1091,6 +1091,83 @@ def test_test_audit_uses_shared_global_budget_beyond_six_tool_rounds(tmp_path):
     }
 
 
+def test_test_audit_retries_empty_max_tokens_at_escalated_budget(tmp_path):
+    class MessageSnapshotClient(BudgetedScriptedClient):
+        def __init__(self, responses, max_calls):
+            super().__init__(responses, max_calls)
+            self.message_snapshots = []
+
+        def create(self, **kwargs):
+            self.message_snapshots.append(list(kwargs["messages"]))
+            return super().create(**kwargs)
+
+    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+    trace_path = tmp_path / "trace.jsonl"
+    truncated = SimpleNamespace(content=[], stop_reason="max_tokens")
+    report = (
+        "Command: python /tmp/aqours_test_audit_tokens/test_service.py\n"
+        "PASS\nNO_CONCRETE_FAILURE_REPRODUCED"
+    )
+    client = MessageSnapshotClient([
+        response(tool_block(
+            "edit_file",
+            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+            "edit",
+        )),
+        response(text_block("ready for final")),
+        truncated,
+        response(tool_block(
+            "read_file", {"path": "service.py"}, "audit-read",
+        )),
+        response(text_block(report)),
+        response(text_block("finished after recovered audit")),
+    ], max_calls=64)
+
+    result = agent_loop.run_agent_task(
+        complex_implementation_task(), str(tmp_path), str(trace_path),
+        model_client=client, model_provider="deepseek",
+        model="deepseek-v4-flash",
+        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+    )
+
+    assert result["final_answer"] == "finished after recovered audit"
+    audit_call_indexes = [
+        index for index, call in enumerate(client.calls)
+        if "You are the general-purpose role" in call["system"]
+    ]
+    assert len(audit_call_indexes) == 3
+    first, retry, after_tool = audit_call_indexes
+    assert client.calls[first]["max_tokens"] == 8_000
+    assert client.calls[retry]["max_tokens"] == 64_000
+    assert client.calls[after_tool]["max_tokens"] == 8_000
+    assert len(client.message_snapshots[first]) == 1
+    assert client.message_snapshots[retry] == client.message_snapshots[first]
+    assert not any(
+        message.get("role") == "assistant"
+        for message in client.message_snapshots[retry]
+    )
+    lead_audit_context = "\n".join(
+        str(message.get("content"))
+        for message in client.calls[-1]["messages"]
+    )
+    assert "aqours_test_audit_tokens/test_service.py" in lead_audit_context
+    assert "NO_CONCRETE_FAILURE_REPRODUCED" in lead_audit_context
+    assert len(client.calls) == 6
+    assert client.budget_snapshot() == {
+        "max_calls": 64,
+        "call_count": 6,
+        "max_provider_retries": 0,
+    }
+    events = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    completed = [
+        event for event in events if event["type"] == "test_audit_completed"
+    ]
+    assert completed[-1]["model_calls"] == 3
+
+
 def test_regular_general_purpose_keeps_six_tool_round_limit(
     tmp_path, monkeypatch,
 ):
