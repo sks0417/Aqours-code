@@ -286,6 +286,7 @@ def run_role_agent(
     runtime: AgentRuntime | None = None,
     *,
     synthesize_invalid_json: bool = True,
+    global_model_call_fuse_only: bool = False,
 ) -> dict:
     profile = get_agent_profile(role)
     if profile is None:
@@ -359,7 +360,7 @@ def run_role_agent(
     successful_read_paths: set[str] = set()
     read_cache: set[tuple[str, object, object]] = set()
     executed_tool_calls = 0
-    for _ in range(profile.max_tool_rounds):
+    while global_model_call_fuse_only or tool_rounds < profile.max_tool_rounds:
         response = _request_with_deadline(
             system=system, messages=messages, tools=tools,
             purpose="subagent", role=profile.name,
@@ -629,6 +630,7 @@ def delegate_agent(
             role_workdir,
             runtime,
             synthesize_invalid_json=(name != "test-audit"),
+            global_model_call_fuse_only=(name == "test-audit"),
         )
     except Exception as exc:
         record_event(

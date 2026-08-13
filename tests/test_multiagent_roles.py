@@ -1028,6 +1028,107 @@ def test_complex_task_starts_one_general_purpose_test_audit(tmp_path):
     assert completed[0]["changed_files"] == []
 
 
+def test_test_audit_uses_shared_global_budget_beyond_six_tool_rounds(tmp_path):
+    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+    for index in range(8):
+        (tmp_path / f"audit_{index}.py").write_text(
+            f"VALUE = {index}\n", encoding="utf-8",
+        )
+    trace_path = tmp_path / "trace.jsonl"
+    audit_tool_rounds = [
+        response(tool_block(
+            "read_file", {"path": f"audit_{index}.py"}, f"audit-read-{index}",
+        ))
+        for index in range(8)
+    ]
+    report = (
+        "Command: python /tmp/aqours_test_audit_long/test_service.py\n"
+        "PASS\nNO_CONCRETE_FAILURE_REPRODUCED"
+    )
+    client = BudgetedScriptedClient([
+        response(tool_block(
+            "edit_file",
+            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+            "edit",
+        )),
+        response(text_block("ready for final")),
+        *audit_tool_rounds,
+        response(text_block(report)),
+        response(text_block("finished after long audit")),
+    ], max_calls=64)
+
+    result = agent_loop.run_agent_task(
+        complex_implementation_task(), str(tmp_path), str(trace_path),
+        model_client=client, model_provider="scripted", model="scripted",
+        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+    )
+
+    assert result["final_answer"] == "finished after long audit"
+    audit_calls = [
+        call for call in client.calls
+        if "You are the general-purpose role" in call["system"]
+    ]
+    assert len(audit_calls) == 9
+    assert len(client.calls) == 12
+    lead_audit_context = "\n".join(
+        str(message.get("content"))
+        for message in client.calls[-1]["messages"]
+    )
+    assert "aqours_test_audit_long/test_service.py" in lead_audit_context
+    assert "NO_CONCRETE_FAILURE_REPRODUCED" in lead_audit_context
+    events = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    completed = [
+        event for event in events if event["type"] == "test_audit_completed"
+    ]
+    assert completed[-1]["model_calls"] == 9
+    assert client.budget_snapshot() == {
+        "max_calls": 64,
+        "call_count": 12,
+        "max_provider_retries": 0,
+    }
+
+
+def test_regular_general_purpose_keeps_six_tool_round_limit(
+    tmp_path, monkeypatch,
+):
+    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+    client = ScriptedClient([
+        *[
+            response(tool_block(
+                "read_file", {"path": "service.py", "offset": index},
+                f"read-{index}",
+            ))
+            for index in range(6)
+        ],
+        response(text_block(json.dumps({
+            "verdict": "blocked",
+            "summary": "stopped after the ordinary six tool rounds",
+            "changed_files": [],
+            "tests": [],
+            "remaining_risks": ["more inspection was requested"],
+        }))),
+    ])
+    monkeypatch.setattr(subagent, "client", client)
+    monkeypatch.setattr(subagent, "MODEL", "scripted")
+    monkeypatch.setattr(subagent, "CURRENT_ROOT_TASK", "Inspect service.py")
+
+    result = json.loads(subagent.delegate_agent(
+        "general-purpose", "Inspect service.py", name="ordinary-agent",
+    ))
+
+    assert result["status"] == "completed"
+    assert len(client.calls) == 7
+    assert all(call["tools"] for call in client.calls[:6])
+    assert client.calls[6]["tools"] == []
+    assert any(
+        "<synthesis>" in str(message.get("content"))
+        for message in client.calls[6]["messages"]
+    )
+
+
 @pytest.mark.parametrize(
     ("task", "edit_workspace"),
     [
