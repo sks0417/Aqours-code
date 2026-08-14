@@ -1,0 +1,1248 @@
+From f8759d3df67016ce4ebe5ac4254356973207d8ce Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 13 Aug 2026 06:07:32 -0700
+Subject: [PATCH] Remove automatic verifier and clarify cache contracts
+
+---
+ aqours_code/agent_loop.py                     | 290 ---------
+ aqours_code/subagent.py                       |  61 +-
+ .../workspace/README.md                       |  69 ++-
+ tests/test_multiagent_roles.py                | 557 +-----------------
+ 4 files changed, 82 insertions(+), 895 deletions(-)
+
+diff --git a/aqours_code/agent_loop.py b/aqours_code/agent_loop.py
+index aa49c6b..ce9a7e4 100644
+--- a/aqours_code/agent_loop.py
++++ b/aqours_code/agent_loop.py
+@@ -5,13 +5,11 @@ from .runtime_state import *
+ from pathlib import Path as _Path
+ import shutil as _shutil
+ import os as _os
+-import subprocess as _subprocess
+ import time as _time
+ from .command_executor import CaseTimeoutError as _CaseTimeoutError
+ from .agent_profiles import (
+     assess_task_complexity,
+     complex_delegation_briefing,
+-    get_agent_profile,
+     normalize_agent_role,
+ )
+ from .model_budget import (
+@@ -442,245 +440,6 @@ def _finalization_budget_message(snapshot: dict) -> str:
+     )
+ 
+ 
+-_TEST_AUDIT_ASSIGNMENT = """\
+-You are performing one independent test audit of the current implementation.
+-
+-The Lead agent has completed an implementation and is preparing its final answer.
+-Your job is not to reimplement the task and not to review coding style.
+-Your only job is to find concrete behavioral omissions by designing and running
+-focused tests.
+-
+-Workflow:
+-
+-1. Read the authoritative task specification or README.
+-2. Inspect the current git diff and only the directly relevant implementation files.
+-3. Inspect the existing public tests to understand what is already covered.
+-4. Identify a small number of explicit documented contracts that are not directly
+-   exercised by the public tests.
+-5. Generate focused temporary tests for the highest-risk uncovered contracts.
+-6. Run those tests against the current workspace.
+-7. Report only evidence produced by actual test execution.
+-
+-Prioritize generally risky boundaries such as equality conditions, exceptions after
+-a side effect succeeds, retries, duplicate calls, idempotency, persisted state,
+-reports that disagree with side effects, partial success, uncovered failure paths,
+-and invariants after concurrency or recovery. Do not invent requirements.
+-
+-Important constraints:
+-
+-- Do not modify production source files.
+-- Do not modify repository tests, README files, configuration, or fixtures.
+-- Temporary test files must be created outside the repository, under
+-  /tmp/aqours_test_audit_*.
+-- Prefer one compact temporary test module instead of many files.
+-- Do not run a broad repository exploration.
+-- Do not rerun the entire public suite unless a focused test requires it.
+-- Batch independent file reads where possible.
+-- A suspected issue is not a finding unless a focused executable test reproduces it.
+-- Passing generated tests are evidence that no failure was reproduced, not proof
+-  that the implementation is correct.
+-- Finish after this single audit. Do not edit the implementation.
+-
+-Return a concise report containing the documented contracts selected, temporary
+-test commands executed, pass/fail result for each generated test, exact failure
+-output for any reproduced issue, and remaining untested risks. If no focused test
+-reproduces a problem, explicitly state:
+-NO_CONCRETE_FAILURE_REPRODUCED
+-"""
+-
+-
+-def _git_diff_stat(workdir: _Path) -> str:
+-    try:
+-        result = _subprocess.run(
+-            ["git", "diff", "--stat", "--"],
+-            cwd=workdir,
+-            capture_output=True,
+-            text=True,
+-            encoding="utf-8",
+-            errors="replace",
+-            timeout=10,
+-            check=False,
+-        )
+-    except (OSError, _subprocess.SubprocessError):
+-        return "(git diff --stat unavailable)"
+-    if result.returncode != 0:
+-        return "(git diff --stat unavailable)"
+-    return result.stdout.strip() or "(no tracked diff stat available)"
+-
+-
+-def _test_audit_assignment(
+-    root_task: str,
+-    changed_files: list[str],
+-    workdir: _Path,
+-) -> str:
+-    changed = "\n".join(f"- {path}" for path in changed_files)
+-    return (
+-        f"{_TEST_AUDIT_ASSIGNMENT}\n"
+-        "\n<original_user_task>\n"
+-        f"{root_task}\n"
+-        "</original_user_task>\n"
+-        "\n<current_changed_files>\n"
+-        f"{changed or '(none recorded)'}\n"
+-        "</current_changed_files>\n"
+-        "\n<current_git_diff_stat>\n"
+-        f"{_git_diff_stat(workdir)}\n"
+-        "</current_git_diff_stat>\n"
+-        "\nRead the complete current diff yourself with git diff when needed.\n"
+-    )
+-
+-
+-def _test_audit_raw_summary(delegation: dict) -> str:
+-    result = delegation.get("result", {})
+-    if isinstance(result, dict):
+-        summary = result.get("summary", "")
+-    else:
+-        summary = result
+-    return str(summary or delegation.get("summary", "")).strip()
+-
+-
+-def _test_audit_message(raw_result: str, changed_files: list[str]) -> str:
+-    warning = ""
+-    if changed_files:
+-        paths = "\n".join(f"- {path}" for path in changed_files)
+-        warning = (
+-            "WARNING: The test audit unexpectedly modified repository files. "
+-            "No files were restored automatically. Inspect and handle these "
+-            f"changes before finishing:\n{paths}\n\n"
+-        )
+-    report = raw_result.strip() or "(No textual audit report was returned.)"
+-    return (
+-        "<test_audit_result>\n"
+-        f"{warning}"
+-        "The following result was produced by an independent subagent that "
+-        "generated and executed temporary tests against the current workspace.\n\n"
+-        "The complete delegate_agent result is included without parsing or "
+-        "rewriting its findings:\n\n"
+-        f"{report}\n\n"
+-        "Review the executed-test evidence above.\n\n"
+-        "- If a concrete failing test demonstrates a documented contract "
+-        "violation, inspect the implementation, fix it, and rerun the relevant "
+-        "test.\n"
+-        "- If the report contains only speculation or no reproduced failure, do "
+-        "not change code merely to satisfy the speculation.\n"
+-        "- After handling the evidence, complete the task normally.\n"
+-        "- Do not invoke another test audit.\n"
+-        "</test_audit_result>"
+-    )
+-
+-
+-def _run_test_audit(
+-    *,
+-    delegate_handler,
+-    model_client,
+-    root_task: str,
+-    changed_files: list[str],
+-    mutation_revision: int,
+-    workdir: _Path,
+-) -> dict:
+-    """Run one optional audit without interpreting its behavioral conclusion."""
+-    profile = get_agent_profile("general-purpose")
+-    estimated_calls = profile.max_tool_rounds + 1
+-    budget_allowed, budget_before = can_spend_optional_calls(
+-        model_client, estimated_calls,
+-    )
+-    budget_payload = {
+-        key: value for key, value in budget_before.items()
+-        if key != "available"
+-    }
+-    if not budget_allowed:
+-        record_event(
+-            "test_audit_skipped", reason="budget_reserved", **budget_payload,
+-        )
+-        return {"message": "", "changed_files": [], "status": "skipped"}
+-    if delegate_handler is None:
+-        record_event(
+-            "test_audit_skipped", reason="delegate_agent_unavailable",
+-        )
+-        return {"message": "", "changed_files": [], "status": "skipped"}
+-
+-    assignment = _test_audit_assignment(root_task, changed_files, workdir)
+-    record_event(
+-        "test_audit_started",
+-        role="general-purpose",
+-        mutation_revision=mutation_revision,
+-    )
+-    try:
+-        output = call_tool_handler(
+-            delegate_handler,
+-            {
+-                "role": "general-purpose",
+-                "prompt": assignment,
+-                "name": "test-audit",
+-            },
+-            "delegate_agent",
+-        )
+-    except Exception as exc:
+-        record_event(
+-            "test_audit_completed",
+-            status="inconclusive",
+-            error_type=type(exc).__name__,
+-            error=str(exc)[:1000],
+-            changed_files=[],
+-        )
+-        return {"message": "", "changed_files": [], "status": "inconclusive"}
+-
+-    raw_result = str(output or "")
+-    delegation = _tool_json(output)
+-    audit_changed_files = delegation.get("changed_files", [])
+-    if not isinstance(audit_changed_files, list):
+-        audit_changed_files = []
+-    audit_changed_files = sorted({
+-        str(path).strip() for path in audit_changed_files
+-        if str(path).strip()
+-    })
+-    status = str(delegation.get("status", "")).lower()
+-    if status == "budget_reserved":
+-        record_event(
+-            "test_audit_skipped", reason="budget_reserved",
+-            **{key: value for key, value in delegation.get("budget", {}).items()
+-               if key != "available"},
+-        )
+-        return {"message": "", "changed_files": [], "status": "skipped"}
+-
+-    _, budget_after = can_spend_optional_calls(
+-        model_client, 0, retry_margin=False,
+-    )
+-    model_calls = 0
+-    if budget_before.get("available") and budget_after.get("available"):
+-        model_calls = max(
+-            0,
+-            int(budget_after.get("used_calls", 0))
+-            - int(budget_before.get("used_calls", 0)),
+-        )
+-
+-    has_raw_report = bool(
+-        raw_result.strip()
+-        and not raw_result.lower().startswith("error:")
+-        and (
+-            not delegation
+-            or bool(_test_audit_raw_summary(delegation))
+-        )
+-    )
+-    completed_status = (
+-        "completed" if status == "completed" or (not delegation and has_raw_report)
+-        else "inconclusive"
+-    )
+-    record_event(
+-        "test_audit_completed",
+-        status=completed_status,
+-        model_calls=model_calls,
+-        changed_files=audit_changed_files,
+-    )
+-    message = ""
+-    if has_raw_report or audit_changed_files:
+-        message = _test_audit_message(raw_result, audit_changed_files)
+-    return {
+-        "message": message,
+-        "changed_files": audit_changed_files,
+-        "status": completed_status,
+-    }
+-
+-
+ def _context_stats(
+     messages: list,
+     *,
+@@ -1115,7 +874,6 @@ def agent_loop(
+     mutation_revision = 0
+     reviewer_attempted_revision = -1
+     reviewer_cached_result = ""
+-    test_audit_attempted = False
+     finalization_budget_notice_sent = False
+     budget_snapshot_observed = False
+     if multiagent_required:
+@@ -1304,19 +1062,6 @@ def agent_loop(
+         state.has_escalated = False
+         messages.append(assistant_message_from_response(response))
+         if force_final_response:
+-            if (
+-                multiagent_required
+-                and mutation_revision > 0
+-                and changed_file_paths
+-                and not test_audit_attempted
+-            ):
+-                test_audit_attempted = True
+-                record_event(
+-                    "test_audit_skipped",
+-                    reason="budget_reserved",
+-                    remaining_calls=budget_snapshot.get("remaining_calls"),
+-                    reserve_calls=budget_snapshot.get("reserve_calls"),
+-                )
+             unresolved = _incomplete_todos(runtime)
+             if unresolved:
+                 _append_todo_warning(response.content, unresolved)
+@@ -1351,41 +1096,6 @@ def agent_loop(
+             notification_wait = 2.0 if remaining is None else max(0, min(2.0, remaining))
+             if wait_for_imminent_once(notification_wait):
+                 continue
+-            if (
+-                multiagent_required
+-                and mutation_revision > 0
+-                and changed_file_paths
+-                and not test_audit_attempted
+-            ):
+-                test_audit_attempted = True
+-                audit = _run_test_audit(
+-                    delegate_handler=handlers.get("delegate_agent"),
+-                    model_client=model_client,
+-                    root_task=root_task,
+-                    changed_files=sorted(changed_file_paths),
+-                    mutation_revision=mutation_revision,
+-                    workdir=(
+-                        runtime.paths.workdir
+-                        if runtime is not None else _Path(WORKDIR).resolve()
+-                    ),
+-                )
+-                audit_changed_files = audit["changed_files"]
+-                if audit_changed_files:
+-                    mutation_revision += 1
+-                    changed_file_paths.update(audit_changed_files)
+-                if audit["message"]:
+-                    messages.append({
+-                        "role": "user",
+-                        "content": audit["message"],
+-                    })
+-                    continue
+-                # A skipped or text-free failed audit is inconclusive. Keep the
+-                # exact final-like response that triggered it instead of adding
+-                # retries, protocol repair, or another Lead turn.
+-                record_hook("Stop")
+-                trigger_hooks("Stop", messages)
+-                finish_run(extract_text(response.content))
+-                return
+             unresolved_todos = _incomplete_todos(runtime)
+             if unresolved_todos:
+                 if not todo_completion_followup_sent:
+diff --git a/aqours_code/subagent.py b/aqours_code/subagent.py
+index df7f73d..84f849f 100644
+--- a/aqours_code/subagent.py
++++ b/aqours_code/subagent.py
+@@ -2,10 +2,7 @@ from .runtime_state import *
+ from .agent_profiles import get_agent_profile, normalize_agent_role
+ from .model_budget import can_spend_optional_calls
+ from .runtime import AgentRuntime
+-from .model_api import (
+-    assistant_message_from_response,
+-    effective_escalated_max_tokens,
+-)
++from .model_api import assistant_message_from_response
+ from .tool_registry import (
+     delegated_policy_for_role,
+     effective_tool_names,
+@@ -287,10 +284,6 @@ def run_role_agent(
+     prompt: str,
+     cwd: Path,
+     runtime: AgentRuntime | None = None,
+-    *,
+-    synthesize_invalid_json: bool = True,
+-    global_model_call_fuse_only: bool = False,
+-    recover_max_tokens: bool = False,
+ ) -> dict:
+     profile = get_agent_profile(role)
+     if profile is None:
+@@ -364,38 +357,13 @@ def run_role_agent(
+     successful_read_paths: set[str] = set()
+     read_cache: set[tuple[str, object, object]] = set()
+     executed_tool_calls = 0
+-    request_max_tokens = profile.max_response_tokens
+-    max_tokens_escalated = False
+-    while global_model_call_fuse_only or tool_rounds < profile.max_tool_rounds:
++    for _ in range(profile.max_tool_rounds):
+         response = _request_with_deadline(
+             system=system, messages=messages, tools=tools,
+             purpose="subagent", role=profile.name,
+-            max_tokens=request_max_tokens,
++            max_tokens=profile.max_response_tokens,
+             runtime=role_runtime,
+         )
+-        stop_reason = getattr(response, "stop_reason", "")
+-        if (recover_max_tokens
+-                and stop_reason == "max_tokens"
+-                and not max_tokens_escalated):
+-            provider_name = (
+-                role_runtime.config.model_provider
+-                if role_runtime is not None else MODEL_PROVIDER
+-            )
+-            model = (
+-                role_runtime.config.model
+-                if role_runtime is not None else MODEL
+-            )
+-            request_max_tokens = effective_escalated_max_tokens(
+-                provider_name,
+-                model,
+-                current_max_tokens=request_max_tokens,
+-                configured_escalated_max_tokens=ESCALATED_MAX_TOKENS,
+-            )
+-            max_tokens_escalated = True
+-            continue
+-        if stop_reason != "max_tokens":
+-            request_max_tokens = profile.max_response_tokens
+-            max_tokens_escalated = False
+         messages.append(assistant_message_from_response(response))
+         text = extract_text(response.content)
+         if text:
+@@ -510,7 +478,7 @@ def run_role_agent(
+     else:
+         needs_synthesis = True
+ 
+-    if needs_synthesis and synthesize_invalid_json:
++    if needs_synthesis:
+         if profile.name == "review":
+             synthesis_instruction = (
+                 '<synthesis>Tool use is over. Return one compact JSON object and '
+@@ -584,13 +552,11 @@ def run_role_agent(
+         )
+         messages.append(assistant_message_from_response(response))
+         final_text = extract_text(response.content)
+-    result = _parse_role_result(final_text, profile.name)
+-    if not synthesize_invalid_json and result.get("invalid_json"):
+-        # The automatic test audit is evidence for the Lead, not a protocol
+-        # consumed by the harness. Preserve arbitrary Markdown/DSML/plain text
+-        # instead of truncating it or spending another model call on repair.
+-        result["summary"] = str(final_text or "").strip()
+-    return _finalize_role_result(result, profile, successful_read_paths)
++    return _finalize_role_result(
++        _parse_role_result(final_text, profile.name),
++        profile,
++        successful_read_paths,
++    )
+ 
+ 
+ def delegate_agent(
+@@ -654,14 +620,7 @@ def delegate_agent(
+     )
+     try:
+         result = run_role_agent(
+-            normalized_role,
+-            prompt,
+-            role_workdir,
+-            runtime,
+-            synthesize_invalid_json=(name != "test-audit"),
+-            global_model_call_fuse_only=(name == "test-audit"),
+-            recover_max_tokens=(name == "test-audit"),
+-        )
++            normalized_role, prompt, role_workdir, runtime)
+     except Exception as exc:
+         record_event(
+             "subagent_finish", agent_role=normalized_role,
+diff --git a/evals/cases/stress_atomic_cache_recovery/workspace/README.md b/evals/cases/stress_atomic_cache_recovery/workspace/README.md
+index 94faa37..1ff50ed 100644
+--- a/evals/cases/stress_atomic_cache_recovery/workspace/README.md
++++ b/evals/cases/stress_atomic_cache_recovery/workspace/README.md
+@@ -7,7 +7,9 @@ Fix the implementation while preserving the contracts below.
+ ## Public API
+ 
+ The package exports `ArtifactCache`, the immutable request/result models, the public
+-exceptions, and the manifest constants listed in `artifact_cache.__all__`.
++exceptions, and the manifest constants listed in `artifact_cache.__all__`. Existing
++export names, constant values, public dataclass field order, and public method
++signatures are part of the API and must remain unchanged.
+ 
+ ```python
+ cache = ArtifactCache(
+@@ -26,21 +28,27 @@ report = cache.recover()
+ ```
+ 
+ `root` is a path. `clock` is a zero-argument callable returning a finite numeric
+-time; it defaults to a monotonic clock. `lease_seconds` must be finite and positive.
+-Tests and callers may inject a clock, so the implementation must not sleep.
++time; it defaults to a monotonic clock. `lease_seconds` must be finite and positive;
++booleans are not accepted as numeric clock or duration values. Tests and callers may
++inject a clock, so the implementation must not sleep.
+ `fault_hook`, when supplied, is called as `fault_hook(stage, path)` at documented
+ publication boundaries (`artifact_staged`, `manifest_staged`, `before_publish`, and
+ `after_publish`). It may raise to simulate a crash or I/O failure.
+ 
+ `BuildRequest` contains:
+ 
+-- `inputs`: a mapping of logical input names to `bytes` or `str` content;
++- `inputs`: a non-empty mapping whose logical input names are non-empty strings and
++  whose content values are `bytes` or `str`;
+ - `options`: a nested value made from mappings with string keys, lists, tuples,
+   sets/frozensets, JSON scalar values, and bytes;
+ - `tool_version`, `namespace_version`, and `artifact_format`: non-empty strings;
+ - optional `scratch_dir`, an execution-only location that never changes output
+   identity and therefore must not affect a cache key.
+ 
++Unsupported request values, non-string option keys, empty required strings, and
++non-finite numbers are invalid and raise `InvalidRequest`. `writer_id` must likewise
++be a non-empty string.
++
+ `get` returns `None` for a missing or invalid cache entry. A returned `CacheEntry`
+ contains detached artifact bytes, a detached normalized manifest mapping, and a
+ `cache_hit` flag. `commit` returns `cache_hit=False`; reads and build reuse return
+@@ -53,6 +61,13 @@ opaque token may publish. Expired, replaced, forged, or cross-key leases raise
+ `StaleWriter` without changing cache data, lock state, or another writer's staging
+ directory. `abort` is idempotent and may clean only its own staging data.
+ 
++Lease expiry uses a strict live interval: a lease is live only while the current time
++is less than `expires_at`; equality is already expired. A successful publication
++transitions the matching active record to terminal `committed`, and an ordinary
++pre-publication failure or explicit abort transitions it to terminal `aborted`.
++Terminal records are durable history: retries and recovery must not reactivate or
++rewrite them.
++
+ `commit` accepts bytes-like data, a path inside the lease's staging directory, or
+ `None` when the builder already wrote `artifact.bin` there. A path outside that
+ directory is invalid. Builders passed to `get_or_build` receive the private staging
+@@ -83,13 +98,23 @@ A fault raised at `after_publish` occurs after durable publication. The lease mu
+ be recorded as terminally `committed` rather than remaining `active` or becoming
+ `aborted`. Retrying the exact lease and bytes returns the published entry without
+ rebuilding, while retrying the consumed lease with different bytes is stale and has
+-no side effects.
++no side effects. Once the current pointer has been replaced, later hook behavior or
++clock advancement cannot turn that durable publication into an aborted transaction.
+ 
+-Current manifests use schema version 2 and contain at least `schema_version`,
++Current manifests use schema version 2 and contain exactly `schema_version`,
+ `cache_key`, `digest`, `size`, `artifact_format`, `generation`, `writer_id`,
+-`lease_token`, and `created_at`. `digest` is a lowercase SHA-256 hex digest. Every
+-cache read, including a legacy read, verifies digest and size before returning a hit.
+-Corrupt, truncated, replaced, malformed, or mismatched entries are safe misses.
++`lease_token`, and `created_at`. The schema version is the integer `2`; `cache_key`
++and `digest` are lowercase SHA-256 hex strings; `size` and `generation` are
++non-negative integers; `artifact_format`, `writer_id`, and `lease_token` are
++non-empty strings; and `created_at` is finite. Booleans are not valid numeric field
++values. Every cache read, including a legacy read, verifies digest and size before
++returning a hit. Corrupt, truncated, replaced, malformed, or mismatched entries are
++safe misses.
++The current pointer has the JSON shape `{"version": "<version-directory>"}` and must
++name a safe version directory belonging to the same cache key. The pointed directory
++must contain both a readable artifact and a valid matching manifest. A malformed
++pointer, unsafe version name, missing file, incomplete version, cache-key mismatch,
++digest mismatch, or size mismatch must never become a cache hit.
+ 
+ The durable layout is:
+ 
+@@ -136,10 +161,32 @@ directories, and invalid current pointers/pointed entries. An expired active loc
+ be marked abandoned, but committed/aborted records must not become active again.
+ Keys are recovered independently.
+ 
++Recovery applies the following observable rules independently to each cache key:
++
++- A valid current pointer and complete matching version remain readable and increment
++  `kept_entries`.
++- A malformed or unsafe current pointer, a pointer to a missing version, or a pointed
++  version with a missing, malformed, corrupt, or mismatched artifact/manifest is one
++  invalid entry. Recovery removes the current pointer, removes the invalid pointed
++  version when it is a safe cache-owned directory, increments `invalid_entries`,
++  increments `removed_versions` when that directory is removed, and includes the key
++  in `removed_cache_keys`. The invalid data must remain a cache miss before and after
++  recovery; recovery must never promote a partial version into a hit.
++- A cache-owned version not named by a valid current pointer is unreachable and is
++  removed and counted in `removed_versions`, while the valid current version survives.
++- Staging belonging to an exact live active lease is preserved and reported through
++  `kept_active_builds` and `active_cache_keys`. Expired, abandoned, or orphaned
++  cache-owned staging is removed and counted in `removed_staging_dirs` and
++  `removed_cache_keys`.
++- Existing terminal `committed` and `aborted` lock records are left unchanged. Files
++  unrelated to the cache layout are left untouched.
++
+ `RecoveryReport` reports `kept_entries`, `kept_active_builds`,
+ `removed_staging_dirs`, `removed_versions`, `invalid_entries`, and sorted tuples of
+-the affected cache keys. Running recovery again without external changes reports no
+-new removals.
++the affected cache keys. Counts describe filesystem actions performed by that run;
++the key tuples are sorted and contain no duplicates. Running recovery again without
++external changes reports the still-kept valid/live state but no new removals or new
++invalidations.
+ 
+ ## Failure behavior
+ 
+diff --git a/tests/test_multiagent_roles.py b/tests/test_multiagent_roles.py
+index 7f6487b..4a18564 100644
+--- a/tests/test_multiagent_roles.py
++++ b/tests/test_multiagent_roles.py
+@@ -5,8 +5,6 @@ import subprocess
+ from pathlib import Path
+ from types import SimpleNamespace
+ 
+-import pytest
+-
+ from aqours_code import bootstrap
+ 
+ bootstrap()
+@@ -16,7 +14,6 @@ from aqours_code import (
+     autonomous,
+     subagent,
+     task_system,
+-    tool_handlers,
+     worktree_system,
+ )
+ from aqours_code.agent_profiles import (
+@@ -52,10 +49,7 @@ class ScriptedClient:
+ 
+     def create(self, **kwargs):
+         self.calls.append(kwargs)
+-        item = self.responses.pop(0)
+-        if isinstance(item, Exception):
+-            raise item
+-        return item
++        return self.responses.pop(0)
+ 
+ 
+ class BudgetedScriptedClient(ScriptedClient):
+@@ -446,10 +440,6 @@ def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
+         }))),
+         response(tool_block("todo_write", {"todos": completed_todos}, "complete")),
+         response(text_block("completed after independent review")),
+-        response(text_block(
+-            "NO_CONCRETE_FAILURE_REPRODUCED\nfocused checkpoint test passed"
+-        )),
+-        response(text_block("completed after independent test audit")),
+     ])
+     task = (
+         "Implement an end-to-end repository change from the README contract. "
+@@ -464,9 +454,9 @@ def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
+         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+     )
+ 
+-    assert result["final_answer"] == "completed after independent test audit"
++    assert result["final_answer"] == "completed after independent review"
+     assert (tmp_path / "service.py").read_text(encoding="utf-8") == "FIXED = True\n"
+-    assert len(client.calls) == 10
++    assert len(client.calls) == 8
+     explorer_calls = [
+         call for call in client.calls
+         if "You are the explore role" in call["system"]
+@@ -478,12 +468,6 @@ def test_complex_lead_can_use_explorer_and_fresh_reviewer(tmp_path):
+         if "You are the review role" in call["system"]
+     ]
+     assert len(reviewer_calls) == 1
+-    audit_calls = [
+-        call for call in client.calls
+-        if "You are the general-purpose role" in call["system"]
+-    ]
+-    assert len(audit_calls) == 1
+-    assert "independent test audit" in audit_calls[0]["messages"][0]["content"]
+ 
+ 
+ def test_inconclusive_explorer_is_reused_and_does_not_lock_lead(tmp_path):
+@@ -530,9 +514,9 @@ def test_inconclusive_explorer_is_reused_and_does_not_lock_lead(tmp_path):
+         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+     )
+ 
+-    assert result["final_answer"] == "finished from lead evidence"
++    assert result["final_answer"] == "final attempt"
+     assert (tmp_path / "service.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+-    assert len(client.calls) == 8
++    assert len(client.calls) == 6
+     assert client.calls[2]["tools"] == []
+     assert len([
+         call for call in client.calls
+@@ -544,20 +528,6 @@ def test_inconclusive_explorer_is_reused_and_does_not_lock_lead(tmp_path):
+     )
+ 
+ 
+-def complex_implementation_task() -> str:
+-    return (
+-        "Implement an end-to-end atomic transaction rollback and idempotency "
+-        "consistency change across multiple files with state and security risks.\n"
+-        "- inspect the producer path\n- retain rollback semantics\n"
+-        "- update the adapter\n- verify the final state transition\n"
+-        + "Keep each cross-file change focused and maintainable. " * 8
+-    )
+-    assert len([
+-        call for call in client.calls
+-        if "You are the general-purpose role" in call["system"]
+-    ]) == 1
+-
+-
+ def test_invalid_reviewer_json_preserves_an_actionable_finding():
+     result = subagent._parse_role_result(
+         "**Critical issue:** state.py allows CANCELED -> CONFIRMED, which "
+@@ -949,9 +919,8 @@ def test_runtime_role_signal_requires_repeat_cross_scope_and_tail_budget():
+     assert docker_paths["scope_count"] == 3
+ 
+ 
+-def test_complex_task_starts_one_general_purpose_test_audit(tmp_path):
++def test_complex_task_does_not_start_an_automatic_reviewer(tmp_path):
+     (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+-    trace_path = tmp_path / "trace.jsonl"
+     task = (
+         "Implement an end-to-end atomic transaction rollback and idempotency "
+         "consistency change across multiple files with state and security risks.\n"
+@@ -967,521 +936,27 @@ def test_complex_task_starts_one_general_purpose_test_audit(tmp_path):
+             "edit",
+         )),
+         response(text_block("ready for final")),
+-        response(text_block(
+-            "Contracts: atomic rollback.\n"
+-            "Command: python /tmp/aqours_test_audit_1/test_service.py\n"
+-            "PASS\nNO_CONCRETE_FAILURE_REPRODUCED"
+-        )),
+-        response(text_block("finished after audit")),
+-    ], max_calls=20)
++        response(text_block("finished with reserved calls")),
++    ], max_calls=7)
+ 
+     result = agent_loop.run_agent_task(
+-        task, str(tmp_path), str(trace_path), model_client=client,
++        task, str(tmp_path), model_client=client,
+         model_provider="scripted", model="scripted",
+         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+     )
+ 
+-    assert result["final_answer"] == "finished after audit"
+-    assert len(client.calls) == 4
++    assert result["final_answer"] == "ready for final"
++    assert len(client.calls) == 2
+     assert all(
+         any(tool["name"] == "delegate_agent" for tool in call["tools"])
+-        for call in (client.calls[0], client.calls[-1])
+-    )
+-    assert not any(
+-        "You are the review role" in call["system"]
+         for call in client.calls
+     )
+-    audit_calls = [
+-        call for call in client.calls
+-        if "You are the general-purpose role" in call["system"]
+-    ]
+-    assert len(audit_calls) == 1
+-    assignment = audit_calls[0]["messages"][0]["content"]
+-    assert task in assignment
+-    assert "service.py" in assignment
+-    assert "/tmp/aqours_test_audit_*" in assignment
+-    assert "git diff --stat" not in assignment or "current_git_diff_stat" in assignment
+-    assert any(
+-        "python /tmp/aqours_test_audit_1/test_service.py" in str(
+-            message.get("content")
+-        )
+-        for message in client.calls[-1]["messages"]
+-    )
+-    events = [
+-        json.loads(line)
+-        for line in trace_path.read_text(encoding="utf-8").splitlines()
+-    ]
+-    assert any(
+-        event["type"] == "subagent_start"
+-        and event["agent_role"] == "general-purpose"
+-        and event["name"] == "test-audit"
+-        for event in events
+-    )
+-    started = [event for event in events if event["type"] == "test_audit_started"]
+-    completed = [
+-        event for event in events if event["type"] == "test_audit_completed"
+-    ]
+-    assert len(started) == len(completed) == 1
+-    assert started[0]["mutation_revision"] == 1
+-    assert completed[0]["status"] == "completed"
+-    assert completed[0]["model_calls"] == 1
+-    assert completed[0]["changed_files"] == []
+-
+-
+-def test_test_audit_uses_shared_global_budget_beyond_six_tool_rounds(tmp_path):
+-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+-    for index in range(8):
+-        (tmp_path / f"audit_{index}.py").write_text(
+-            f"VALUE = {index}\n", encoding="utf-8",
+-        )
+-    trace_path = tmp_path / "trace.jsonl"
+-    audit_tool_rounds = [
+-        response(tool_block(
+-            "read_file", {"path": f"audit_{index}.py"}, f"audit-read-{index}",
+-        ))
+-        for index in range(8)
+-    ]
+-    report = (
+-        "Command: python /tmp/aqours_test_audit_long/test_service.py\n"
+-        "PASS\nNO_CONCRETE_FAILURE_REPRODUCED"
+-    )
+-    client = BudgetedScriptedClient([
+-        response(tool_block(
+-            "edit_file",
+-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+-            "edit",
+-        )),
+-        response(text_block("ready for final")),
+-        *audit_tool_rounds,
+-        response(text_block(report)),
+-        response(text_block("finished after long audit")),
+-    ], max_calls=64)
+-
+-    result = agent_loop.run_agent_task(
+-        complex_implementation_task(), str(tmp_path), str(trace_path),
+-        model_client=client, model_provider="scripted", model="scripted",
+-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+-    )
+-
+-    assert result["final_answer"] == "finished after long audit"
+-    audit_calls = [
+-        call for call in client.calls
+-        if "You are the general-purpose role" in call["system"]
+-    ]
+-    assert len(audit_calls) == 9
+-    assert len(client.calls) == 12
+-    lead_audit_context = "\n".join(
+-        str(message.get("content"))
+-        for message in client.calls[-1]["messages"]
+-    )
+-    assert "aqours_test_audit_long/test_service.py" in lead_audit_context
+-    assert "NO_CONCRETE_FAILURE_REPRODUCED" in lead_audit_context
+-    events = [
+-        json.loads(line)
+-        for line in trace_path.read_text(encoding="utf-8").splitlines()
+-    ]
+-    completed = [
+-        event for event in events if event["type"] == "test_audit_completed"
+-    ]
+-    assert completed[-1]["model_calls"] == 9
+-    assert client.budget_snapshot() == {
+-        "max_calls": 64,
+-        "call_count": 12,
+-        "max_provider_retries": 0,
+-    }
+-
+-
+-def test_test_audit_retries_empty_max_tokens_at_escalated_budget(tmp_path):
+-    class MessageSnapshotClient(BudgetedScriptedClient):
+-        def __init__(self, responses, max_calls):
+-            super().__init__(responses, max_calls)
+-            self.message_snapshots = []
+-
+-        def create(self, **kwargs):
+-            self.message_snapshots.append(list(kwargs["messages"]))
+-            return super().create(**kwargs)
+-
+-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+-    trace_path = tmp_path / "trace.jsonl"
+-    truncated = SimpleNamespace(content=[], stop_reason="max_tokens")
+-    report = (
+-        "Command: python /tmp/aqours_test_audit_tokens/test_service.py\n"
+-        "PASS\nNO_CONCRETE_FAILURE_REPRODUCED"
+-    )
+-    client = MessageSnapshotClient([
+-        response(tool_block(
+-            "edit_file",
+-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+-            "edit",
+-        )),
+-        response(text_block("ready for final")),
+-        truncated,
+-        response(tool_block(
+-            "read_file", {"path": "service.py"}, "audit-read",
+-        )),
+-        response(text_block(report)),
+-        response(text_block("finished after recovered audit")),
+-    ], max_calls=64)
+-
+-    result = agent_loop.run_agent_task(
+-        complex_implementation_task(), str(tmp_path), str(trace_path),
+-        model_client=client, model_provider="deepseek",
+-        model="deepseek-v4-flash",
+-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+-    )
+-
+-    assert result["final_answer"] == "finished after recovered audit"
+-    audit_call_indexes = [
+-        index for index, call in enumerate(client.calls)
+-        if "You are the general-purpose role" in call["system"]
+-    ]
+-    assert len(audit_call_indexes) == 3
+-    first, retry, after_tool = audit_call_indexes
+-    assert client.calls[first]["max_tokens"] == 8_000
+-    assert client.calls[retry]["max_tokens"] == 64_000
+-    assert client.calls[after_tool]["max_tokens"] == 8_000
+-    assert len(client.message_snapshots[first]) == 1
+-    assert client.message_snapshots[retry] == client.message_snapshots[first]
+-    assert not any(
+-        message.get("role") == "assistant"
+-        for message in client.message_snapshots[retry]
+-    )
+-    lead_audit_context = "\n".join(
+-        str(message.get("content"))
+-        for message in client.calls[-1]["messages"]
+-    )
+-    assert "aqours_test_audit_tokens/test_service.py" in lead_audit_context
+-    assert "NO_CONCRETE_FAILURE_REPRODUCED" in lead_audit_context
+-    assert len(client.calls) == 6
+-    assert client.budget_snapshot() == {
+-        "max_calls": 64,
+-        "call_count": 6,
+-        "max_provider_retries": 0,
+-    }
+-    events = [
+-        json.loads(line)
+-        for line in trace_path.read_text(encoding="utf-8").splitlines()
+-    ]
+-    completed = [
+-        event for event in events if event["type"] == "test_audit_completed"
+-    ]
+-    assert completed[-1]["model_calls"] == 3
+-
+-
+-def test_regular_general_purpose_keeps_six_tool_round_limit(
+-    tmp_path, monkeypatch,
+-):
+-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+-    client = ScriptedClient([
+-        *[
+-            response(tool_block(
+-                "read_file", {"path": "service.py", "offset": index},
+-                f"read-{index}",
+-            ))
+-            for index in range(6)
+-        ],
+-        response(text_block(json.dumps({
+-            "verdict": "blocked",
+-            "summary": "stopped after the ordinary six tool rounds",
+-            "changed_files": [],
+-            "tests": [],
+-            "remaining_risks": ["more inspection was requested"],
+-        }))),
+-    ])
+-    monkeypatch.setattr(subagent, "client", client)
+-    monkeypatch.setattr(subagent, "MODEL", "scripted")
+-    monkeypatch.setattr(subagent, "CURRENT_ROOT_TASK", "Inspect service.py")
+-
+-    result = json.loads(subagent.delegate_agent(
+-        "general-purpose", "Inspect service.py", name="ordinary-agent",
+-    ))
+-
+-    assert result["status"] == "completed"
+-    assert len(client.calls) == 7
+-    assert all(call["tools"] for call in client.calls[:6])
+-    assert client.calls[6]["tools"] == []
+-    assert any(
+-        "<synthesis>" in str(message.get("content"))
+-        for message in client.calls[6]["messages"]
+-    )
+-
+-
+-@pytest.mark.parametrize(
+-    ("task", "edit_workspace"),
+-    [
+-        ("What does this function do?", True),
+-        (complex_implementation_task(), False),
+-        (
+-            "Write a detailed non-code project retrospective with risks, "
+-            "requirements, tests, atomic state, concurrency, and rollback. " * 8,
+-            True,
+-        ),
+-    ],
+-    ids=("simple_question", "no_workspace_change", "non_code_task"),
+-)
+-def test_test_audit_does_not_run_without_all_triggers(
+-    tmp_path, task, edit_workspace,
+-):
+-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+-    responses = []
+-    if edit_workspace:
+-        responses.append(response(tool_block(
+-            "edit_file",
+-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+-            "edit",
+-        )))
+-    responses.append(response(text_block("original final")))
+-    client = ScriptedClient(responses)
+-
+-    result = agent_loop.run_agent_task(
+-        task, str(tmp_path), model_client=client,
+-        model_provider="scripted", model="scripted",
+-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+-    )
+-
+-    assert result["final_answer"] == "original final"
+     assert not any(
+-        "You are the general-purpose role" in call["system"]
++        "You are the review role" in call["system"]
+         for call in client.calls
+     )
+ 
+ 
+-def test_test_audit_budget_skip_keeps_original_final_and_traces_reason(tmp_path):
+-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+-    trace_path = tmp_path / "trace.jsonl"
+-    client = BudgetedScriptedClient([
+-        response(tool_block("todo_write", {"todos": [{
+-            "content": "still pending",
+-            "status": "pending",
+-        }]}, "todo")),
+-        response(tool_block(
+-            "edit_file",
+-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+-            "edit",
+-        )),
+-        response(text_block("original final")),
+-    ], max_calls=11)
+-
+-    result = agent_loop.run_agent_task(
+-        complex_implementation_task(), str(tmp_path), str(trace_path),
+-        model_client=client, model_provider="scripted", model="scripted",
+-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+-    )
+-
+-    assert result["final_answer"] == "original final"
+-    assert len(client.calls) == 3
+-    assert not any(
+-        "todo_completion_reminder" in str(message.get("content"))
+-        for call in client.calls for message in call["messages"]
+-    )
+-    events = [
+-        json.loads(line)
+-        for line in trace_path.read_text(encoding="utf-8").splitlines()
+-    ]
+-    skipped = [event for event in events if event["type"] == "test_audit_skipped"]
+-    assert len(skipped) == 1
+-    assert skipped[0]["reason"] == "budget_reserved"
+-
+-
+-@pytest.mark.parametrize("failure", [TimeoutError("late"), RuntimeError("provider")])
+-def test_test_audit_failure_keeps_original_final(tmp_path, failure):
+-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+-    trace_path = tmp_path / "trace.jsonl"
+-    client = ScriptedClient([
+-        response(tool_block(
+-            "edit_file",
+-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+-            "edit",
+-        )),
+-        response(text_block("original final")),
+-        failure,
+-    ])
+-
+-    result = agent_loop.run_agent_task(
+-        complex_implementation_task(), str(tmp_path), str(trace_path),
+-        model_client=client,
+-        model_provider="scripted", model="scripted",
+-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+-    )
+-
+-    assert result["final_answer"] == "original final"
+-    assert len(client.calls) == 3
+-    events = [
+-        json.loads(line)
+-        for line in trace_path.read_text(encoding="utf-8").splitlines()
+-    ]
+-    completed = [event for event in events if event["type"] == "test_audit_completed"]
+-    assert completed[-1]["status"] == "inconclusive"
+-
+-
+-def test_test_audit_invalid_json_raw_summary_reaches_lead_without_synthesis(tmp_path):
+-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+-    raw_report = (
+-        "<audit>command: python /tmp/aqours_test_audit_x/test_service.py\n"
+-        "AssertionError: expected persisted state</audit>"
+-    )
+-    client = ScriptedClient([
+-        response(tool_block(
+-            "edit_file",
+-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+-            "edit",
+-        )),
+-        response(text_block("first final")),
+-        response(text_block(raw_report)),
+-        response(text_block("second final")),
+-    ])
+-
+-    result = agent_loop.run_agent_task(
+-        complex_implementation_task(), str(tmp_path), model_client=client,
+-        model_provider="scripted", model="scripted",
+-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+-    )
+-
+-    assert result["final_answer"] == "second final"
+-    assert len(client.calls) == 4
+-    audit_context = "\n".join(
+-        str(message.get("content"))
+-        for message in client.calls[-1]["messages"]
+-    )
+-    assert "python /tmp/aqours_test_audit_x/test_service.py" in audit_context
+-    assert "AssertionError: expected persisted state" in audit_context
+-
+-
+-def test_test_audit_error_with_raw_summary_still_reaches_lead(tmp_path, monkeypatch):
+-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+-    client = ScriptedClient([
+-        response(tool_block(
+-            "edit_file",
+-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+-            "edit",
+-        )),
+-        response(text_block("first final")),
+-        response(text_block("second final")),
+-    ])
+-    original_delegate = subagent.delegate_agent
+-
+-    def raw_error_delegate(role, prompt, name="", runtime=None):
+-        if name == "test-audit":
+-            return json.dumps({
+-                "status": "error",
+-                "role": "general-purpose",
+-                "verdict": "blocked",
+-                "error": "provider response was invalid",
+-                "result": {
+-                    "summary": (
+-                        "command: python /tmp/aqours_test_audit_raw/test_service.py\n"
+-                        "AssertionError: persisted state mismatch"
+-                    ),
+-                    "invalid_json": True,
+-                },
+-                "changed_files": [],
+-            })
+-        return original_delegate(role, prompt, name, runtime)
+-
+-    monkeypatch.setattr(subagent, "delegate_agent", raw_error_delegate)
+-    monkeypatch.setattr(agent_loop, "delegate_agent", raw_error_delegate)
+-    monkeypatch.setattr(tool_handlers, "delegate_agent", raw_error_delegate)
+-
+-    result = agent_loop.run_agent_task(
+-        complex_implementation_task(), str(tmp_path), model_client=client,
+-        model_provider="scripted", model="scripted",
+-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+-    )
+-
+-    assert result["final_answer"] == "second final"
+-    audit_context = "\n".join(
+-        str(message.get("content"))
+-        for message in client.calls[-1]["messages"]
+-    )
+-    assert "aqours_test_audit_raw/test_service.py" in audit_context
+-    assert "persisted state mismatch" in audit_context
+-
+-
+-def test_test_audit_runs_only_once_after_lead_edits_again(tmp_path):
+-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+-    client = ScriptedClient([
+-        response(tool_block(
+-            "edit_file",
+-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+-            "edit-1",
+-        )),
+-        response(text_block("first final")),
+-        response(text_block(
+-            "python /tmp/aqours_test_audit_x/test_service.py failed: "
+-            "AssertionError: expected 3"
+-        )),
+-        response(tool_block(
+-            "edit_file",
+-            {"path": "service.py", "old_text": "VALUE = 2", "new_text": "VALUE = 3"},
+-            "edit-2",
+-        )),
+-        response(text_block("final after fix")),
+-    ])
+-
+-    result = agent_loop.run_agent_task(
+-        complex_implementation_task(), str(tmp_path), model_client=client,
+-        model_provider="scripted", model="scripted",
+-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+-    )
+-
+-    assert result["final_answer"] == "final after fix"
+-    assert (tmp_path / "service.py").read_text(encoding="utf-8") == "VALUE = 3\n"
+-    assert len([
+-        call for call in client.calls
+-        if "You are the general-purpose role" in call["system"]
+-    ]) == 1
+-
+-
+-def test_test_audit_workspace_change_is_warned_without_restore(tmp_path, monkeypatch):
+-    (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+-    client = ScriptedClient([
+-        response(tool_block(
+-            "edit_file",
+-            {"path": "service.py", "old_text": "VALUE = 1", "new_text": "VALUE = 2"},
+-            "edit",
+-        )),
+-        response(text_block("first final")),
+-        response(text_block("final after warning")),
+-    ])
+-    original_delegate = subagent.delegate_agent
+-
+-    def changing_delegate(role, prompt, name="", runtime=None):
+-        if name == "test-audit":
+-            (tmp_path / "audit_wrote.txt").write_text("unexpected\n", encoding="utf-8")
+-            return json.dumps({
+-                "status": "completed",
+-                "role": "general-purpose",
+-                "verdict": "blocked",
+-                "result": {
+-                    "verdict": "blocked",
+-                    "summary": "focused test was inconclusive",
+-                    "invalid_json": True,
+-                },
+-                "changed_files": ["audit_wrote.txt"],
+-            })
+-        return original_delegate(role, prompt, name, runtime)
+-
+-    monkeypatch.setattr(subagent, "delegate_agent", changing_delegate)
+-    monkeypatch.setattr(agent_loop, "delegate_agent", changing_delegate)
+-    monkeypatch.setattr(tool_handlers, "delegate_agent", changing_delegate)
+-
+-    result = agent_loop.run_agent_task(
+-        complex_implementation_task(), str(tmp_path), model_client=client,
+-        model_provider="scripted", model="scripted",
+-        tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+-    )
+-
+-    assert result["final_answer"] == "final after warning"
+-    assert (tmp_path / "audit_wrote.txt").read_text(encoding="utf-8") == "unexpected\n"
+-    assert any(
+-        "WARNING: The test audit unexpectedly modified repository files" in str(
+-            message.get("content")
+-        )
+-        and "audit_wrote.txt" in str(message.get("content"))
+-        for message in client.calls[-1]["messages"]
+-    )
+-
+-
+ def test_last_budget_call_is_forced_to_be_a_tool_free_final(tmp_path):
+     (tmp_path / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+     client = BudgetedScriptedClient([
+@@ -1543,10 +1018,6 @@ def test_reviewer_gap_stays_in_tool_output_without_hidden_todo(tmp_path):
+             "missing_evidence": [],
+         }))),
+         response(text_block("finished with the reviewer concern reported")),
+-        response(text_block(
+-            "NO_CONCRETE_FAILURE_REPRODUCED\nfocused rollback test passed"
+-        )),
+-        response(text_block("finished after test audit")),
+     ])
+ 
+     result = agent_loop.run_agent_task(
+@@ -1555,8 +1026,8 @@ def test_reviewer_gap_stays_in_tool_output_without_hidden_todo(tmp_path):
+         tool_policy=run_eval.DOCKER_EVAL_TOOL_POLICY,
+     )
+ 
+-    assert result["final_answer"] == "finished after test audit"
+-    assert len(client.calls) == 6
++    assert result["final_answer"] == "finished with the reviewer concern reported"
++    assert len(client.calls) == 4
+     assert any(
+         "rollback is incomplete" in str(message.get("content"))
+         for message in client.calls[-1]["messages"]
+-- 
+2.51.1
+

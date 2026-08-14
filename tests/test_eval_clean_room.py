@@ -251,6 +251,43 @@ def test_pytest_cache_is_ignored_as_agent_runtime_output(tmp_path):
     )
 
 
+def test_nested_python_caches_are_ignored_as_agent_runtime_output(tmp_path):
+    metadata, before, agent, _grading = prepare_case(AUTH_CASE, tmp_path)
+    package = agent / "src" / "auth" / "__pycache__"
+    package.mkdir(parents=True)
+    pyc = package / "service.cpython-311.pyc"
+    pyo = package / "service.cpython-311.pyo"
+    pyc.write_bytes(b"compiled bytecode")
+    pyo.write_bytes(b"optimized bytecode")
+    nested_pytest_cache = agent / "src" / "auth" / ".pytest_cache"
+    nested_pytest_cache.mkdir()
+    (nested_pytest_cache / "README.md").write_text(
+        "pytest cache", encoding="utf-8",
+    )
+
+    assert run_eval.is_runtime_artifact(
+        "src/auth/__pycache__/service.cpython-311.pyc"
+    )
+    assert run_eval.is_runtime_artifact(
+        "src/auth/__pycache__/service.cpython-311.pyo"
+    )
+
+    after = run_eval.workspace_snapshot(agent)
+    manifest = run_eval.build_change_manifest(
+        before=before, after=after, metadata=metadata,
+    )
+    ignored = {
+        "src/auth/__pycache__/service.cpython-311.pyc",
+        "src/auth/__pycache__/service.cpython-311.pyo",
+        "src/auth/.pytest_cache/README.md",
+    }
+
+    assert ignored.isdisjoint(after)
+    assert ignored.isdisjoint(manifest["added"])
+    assert ignored.isdisjoint(manifest["unexpected_changes"])
+    assert ignored.isdisjoint(manifest["forbidden_changes"])
+
+
 def test_case_copy_ignores_local_test_and_python_caches(tmp_path):
     case = tmp_path / "case"
     workspace = case / "workspace"

@@ -118,7 +118,7 @@ def test_escalated_tokens_are_provider_specific_and_monotonic():
         "deepseek-v4-flash",
         current_max_tokens=8000,
         configured_escalated_max_tokens=16000,
-    ) == DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS == 64000
+    ) == DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS == 128000
     assert effective_escalated_max_tokens(
         "openai",
         "gpt-test",
@@ -128,9 +128,9 @@ def test_escalated_tokens_are_provider_specific_and_monotonic():
     assert effective_escalated_max_tokens(
         "deepseek",
         "deepseek-v4-flash",
-        current_max_tokens=128000,
+        current_max_tokens=256000,
         configured_escalated_max_tokens=16000,
-    ) == 128000
+    ) == 256000
 
 
 def test_openai_conversion_drops_empty_assistant_reasoning_turn():

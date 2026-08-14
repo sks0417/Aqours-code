@@ -46,8 +46,9 @@ publication boundaries (`artifact_staged`, `manifest_staged`, `before_publish`, 
   identity and therefore must not affect a cache key.
 
 Unsupported request values, non-string option keys, empty required strings, and
-non-finite numbers are invalid and raise `InvalidRequest`. `writer_id` must likewise
-be a non-empty string.
+non-finite numbers are invalid and raise `InvalidRequest`. `writer_id` must contain
+at least one non-whitespace character; empty or whitespace-only values raise
+`InvalidRequest`.
 
 `get` returns `None` for a missing or invalid cache entry. A returned `CacheEntry`
 contains detached artifact bytes, a detached normalized manifest mapping, and a
@@ -57,9 +58,21 @@ contains detached artifact bytes, a detached normalized manifest mapping, and a
 `begin_build` creates an exclusive lease for one cache key. A live lease raises
 `BuildInProgress` for another explicit writer. At or after expiry, a later writer may
 acquire the next generation. Only the exact current key, writer, generation, and
-opaque token may publish. Expired, replaced, forged, or cross-key leases raise
-`StaleWriter` without changing cache data, lock state, or another writer's staging
-directory. `abort` is idempotent and may clean only its own staging data.
+opaque token may publish.
+
+A `commit` rejected with `StaleWriter` is a validation rejection and must perform no
+state or filesystem mutation. This applies to expired, replaced, forged, and
+cross-key leases, including a lease that is still recorded as the current lock owner
+but has expired at the exact `expires_at` boundary. `expires_at == now` is expired.
+The rejected lease's own staging directory must remain unchanged, as must every
+other writer's staging directory, the cache entry, current pointer, and lock state.
+
+A successful publication must finalize and remove its owned staging directory before
+`commit` returns; recovery must not need to collect staging left by a successful
+commit. Staging removal is permitted only through successful owned publication
+finalization, an explicit owned `abort`, an owned build or publication failure after
+successful lease validation, or recovery. `abort` is idempotent and may clean only
+its own staging data.
 
 Lease expiry uses a strict live interval: a lease is live only while the current time
 is less than `expires_at`; equality is already expired. A successful publication
@@ -167,9 +180,12 @@ exact manifest shape is:
 
 For schema 1 only, size is derived from `artifact.bin`, `artifact_format` defaults to
 `"binary"`, and generation defaults to zero. The digest is still mandatory and must
-be verified. Unknown schemas, missing required fields, unsafe version names, and
-values that cannot be interpreted unambiguously are rejected. All new writes use
-schema 2.
+be verified. A schema 1 manifest returned through `CacheEntry.manifest` is normalized
+to exactly `schema_version`, `cache_key`, `digest`, `size`, `artifact_format`, and
+`generation`; the on-disk `sha256` field is exposed as `digest` and is not retained
+as an additional returned field. Unknown schemas, missing required fields, unsafe
+version names, and values that cannot be interpreted unambiguously are rejected. All
+new writes use schema 2.
 
 ## Recovery
 
@@ -209,11 +225,12 @@ invalidations.
 
 ## Failure behavior
 
-Builder, staging-write, manifest-write, pre-publication, and pointer-publication
-failures release the current writer and clean its private staging data without
-damaging an existing valid entry. If `after_publish` raises, publication remains a
-valid success on disk and a client retry returns that entry without rebuilding.
-Failures for one key do not block or modify another key.
+After lease validation succeeds, an owned builder, staging-write, manifest-write,
+pre-publication, or pointer-publication failure releases the current writer and
+cleans that lease's private staging data without damaging an existing valid entry.
+If `after_publish` raises, publication remains a valid success on disk and a client
+retry returns that entry without rebuilding. Failures for one key do not block or
+modify another key.
 
 Run the public tests with:
 

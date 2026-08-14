@@ -150,10 +150,10 @@ RUNTIME_IGNORE_PATTERNS = [
     ".transcripts/**",
     ".mailboxes/**",
     ".worktrees/**",
-    ".pytest_cache/**",
-    "__pycache__/**",
-    "*/__pycache__/**",
-    "*.pyc",
+    "**/.pytest_cache/**",
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/*.pyo",
 ]
 CASE_COPY_IGNORE = shutil.ignore_patterns(
     ".pytest_cache", "__pycache__", "*.pyc", "*.pyo",

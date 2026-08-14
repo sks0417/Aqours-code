@@ -505,12 +505,12 @@ def test_eval_cli_forwards_request_and_overall_docker_timeouts(
 
 def test_eval_runtime_configuration_records_experiment_values():
     assert run_eval.eval_runtime_configuration(
-        escalated_max_tokens=64000,
+        escalated_max_tokens=128000,
         request_timeout_seconds=720,
         docker_timeout_seconds=1500,
     ) == {
         "default_max_tokens": 8000,
-        "escalated_max_tokens": 64000,
+        "escalated_max_tokens": 128000,
         "max_recovery_retries": 0,
         "request_timeout_seconds": 720.0,
         "docker_timeout_seconds": 1500.0,

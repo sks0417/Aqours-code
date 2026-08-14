@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -14,7 +15,7 @@ from types import SimpleNamespace
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
-MAX_TOKENS_PER_CALL = 16000
+MAX_TOKENS_PER_CALL = 128_000
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _ALLOWED_CREATE_KEYS = {"model", "system", "messages", "tools", "max_tokens"}
 DEFAULT_PROVIDER_RETRIES = 1
@@ -113,7 +114,10 @@ def _provider_error_kind(exc: BaseException) -> str:
     if (any(isinstance(item, TimeoutError) for item in chain)
             or "timed out" in combined or "timeout" in combined):
         return "provider_timeout"
-    if (any(isinstance(item, ConnectionError) for item in chain)
+    if (any(isinstance(item, (ConnectionError, http.client.IncompleteRead))
+            for item in chain)
+            or "incompleteread" in combined
+            or "incomplete read" in combined
             or "connection reset" in combined
             or "connection refused" in combined
             or "temporarily unavailable" in combined):

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 DEEPSEEK_V4_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
 DEEPSEEK_REASONING_EFFORT = "high"
-DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS = 64_000
+DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS = 128_000
 
 
 def uses_deepseek_thinking(provider_name: str, model: str) -> bool:

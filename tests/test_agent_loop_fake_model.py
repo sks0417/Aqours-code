@@ -400,7 +400,7 @@ def test_max_tokens_triggers_continuation_path(monkeypatch):
     assert messages[-1]["content"][0].text == "complete"
 
 
-def test_deepseek_thinking_max_tokens_escalates_to_64000(monkeypatch):
+def test_deepseek_thinking_max_tokens_escalates_to_128000(monkeypatch):
     from aqours_code import recovery
 
     install_common_agent_mocks(monkeypatch)
@@ -417,7 +417,7 @@ def test_deepseek_thinking_max_tokens_escalates_to_64000(monkeypatch):
 
     assert [
         call["max_tokens"] for call in fake_client.messages.calls
-    ] == [8000, 64000]
+    ] == [8000, 128000]
     assert messages[-1]["content"][0].text == "complete"
 
 
@@ -445,7 +445,7 @@ def test_empty_max_tokens_response_is_not_replayed(monkeypatch):
         call["max_tokens"] for call in fake_client.messages.calls
     ] == [
         agent_loop.DEFAULT_MAX_TOKENS,
-        64000,
+        128000,
     ]
     assert not any(
         message.get("role") == "assistant"
@@ -477,7 +477,7 @@ def test_max_tokens_recovery_retries_can_be_disabled(monkeypatch):
 
     assert [
         call["max_tokens"] for call in fake_client.messages.calls
-    ] == [8000, 64000]
+    ] == [8000, 128000]
     assert sum(
         message.get("content") == agent_loop.CONTINUATION_PROMPT
         for message in messages
