@@ -73,8 +73,8 @@ def run_bash(command: str, cwd: Path = None,
             command, workdir, effective_timeout)
         out = (result["stdout"] + result["stderr"]).strip()
         if result["timed_out"]:
-            return f"Error: Timeout ({timeout:g}s)" + (f"\n{out[:50000]}" if out else "")
-        return out[:50000] if out else "(no output)"
+            return f"Error: Timeout ({timeout:g}s)" + (f"\n{out}" if out else "")
+        return out if out else "(no output)"
     except CaseTimeoutError:
         raise
     except Exception as exc:

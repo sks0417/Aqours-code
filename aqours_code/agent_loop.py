@@ -3,8 +3,10 @@ from __future__ import annotations
 from .runtime_state import *
 
 from pathlib import Path as _Path
+import hashlib as _hashlib
 import shutil as _shutil
 import os as _os
+import re as _re
 import time as _time
 from .command_executor import CaseTimeoutError as _CaseTimeoutError
 from .agent_profiles import (
@@ -27,6 +29,7 @@ from .model_api import (
 agent_lock = threading.Lock()
 _MUTATING_FILE_TOOLS = {"write_file", "edit_file"}
 _MAIN_MUTATION_TOOLS = _MUTATING_FILE_TOOLS | {"integrate_worktree"}
+_TOOL_RESULT_PREVIEW_CHARS = 4_000
 
 
 def _message_text(content) -> str:
@@ -461,7 +464,253 @@ def _context_stats(
 
 
 def _compact_target_chars() -> int:
-    return COMPACT_TRIGGER_TOKENS * CONTEXT_CHARS_PER_TOKEN
+    return (
+        COMPACT_TRIGGER_TOKENS - COMPACT_HEADROOM_TOKENS
+    ) * CONTEXT_CHARS_PER_TOKEN
+
+
+def _tool_field(block, name: str, default=None):
+    return (
+        block.get(name, default)
+        if isinstance(block, dict)
+        else getattr(block, name, default)
+    )
+
+
+def _tool_output_metadata(output: str) -> dict:
+    encoded = output.encode("utf-8", errors="replace")
+    return {
+        "original_estimated_tokens": estimate_context_tokens(len(output)),
+        "original_chars": len(output),
+        "original_lines": len(output.splitlines()),
+        "digest": _hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _workspace_path(path: str, runtime: AgentRuntime | None) -> _Path | None:
+    try:
+        workdir = (
+            runtime.paths.workdir
+            if runtime is not None else _Path(WORKDIR).resolve()
+        )
+        resolved = (workdir / str(path)).resolve()
+        return resolved if resolved.is_relative_to(workdir) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _relative_tool_path(path: _Path, runtime: AgentRuntime | None) -> str:
+    workdir = (
+        runtime.paths.workdir
+        if runtime is not None else _Path(WORKDIR).resolve()
+    )
+    try:
+        return path.resolve().relative_to(workdir).as_posix()
+    except (OSError, ValueError):
+        return str(path)
+
+
+def _safe_tool_result_path(
+    tool_use_id: str,
+    runtime: AgentRuntime | None,
+) -> _Path:
+    directory = _Path(
+        runtime.paths.tool_results_dir
+        if runtime is not None else TOOL_RESULTS_DIR
+    ).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    raw_id = str(tool_use_id or "")
+    safe_id = _re.sub(r"[^A-Za-z0-9._-]+", "_", raw_id).strip("._-")
+    if not safe_id:
+        safe_id = _hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:16]
+    if safe_id != raw_id or len(safe_id) > 100:
+        suffix = _hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:12]
+        safe_id = f"{safe_id[:80]}-{suffix}"
+    target = (directory / f"{safe_id}.txt").resolve()
+    if not target.is_relative_to(directory):
+        raise ValueError("Unsafe tool result path")
+    return target
+
+
+def _head_tail_preview(output: str) -> tuple[str, str]:
+    return (
+        output[:_TOOL_RESULT_PREVIEW_CHARS],
+        output[-_TOOL_RESULT_PREVIEW_CHARS:],
+    )
+
+
+def _externalized_result_text(
+    *,
+    tool_name: str,
+    output: str,
+    metadata: dict,
+    backing_path: str,
+    source_details: list[str],
+) -> str:
+    head, tail = _head_tail_preview(output)
+    details = "\n".join(source_details)
+    return (
+        "[Tool result externalized]\n"
+        "externalized: true\n"
+        "incomplete: true\n"
+        f"tool: {tool_name}\n"
+        f"backing_path: {json.dumps(backing_path, ensure_ascii=False)}\n"
+        f"original_chars: {metadata['original_chars']}\n"
+        f"original_lines: {metadata['original_lines']}\n"
+        "original_estimated_tokens: "
+        f"{metadata['original_estimated_tokens']}\n"
+        f"digest: {metadata['digest']}\n"
+        f"{details}\n"
+        "--- head preview ---\n"
+        f"{head}\n"
+        "--- tail preview ---\n"
+        f"{tail}\n"
+        "--- end incomplete preview ---\n"
+        "The preview is incomplete. Read exact ranges with "
+        f"read_file(path={json.dumps(backing_path, ensure_ascii=False)}, "
+        "offset=<line>, limit=<count>), or locate text with "
+        f"bash rg -n <pattern> {json.dumps(backing_path, ensure_ascii=False)}."
+    )
+
+
+def _materialize_tool_result(
+    block,
+    output,
+    runtime: AgentRuntime | None,
+    *,
+    force_externalize: bool = False,
+    reason: str = "result_exceeds_inline_limit",
+) -> tuple[str, dict]:
+    text = str(output)
+    metadata = _tool_output_metadata(text)
+    metadata.update({
+        "externalized": False,
+        "backing_path": "",
+        "externalization_reason": "",
+    })
+    if (
+        not force_externalize
+        and metadata["original_estimated_tokens"]
+        <= MAX_INLINE_TOOL_RESULT_TOKENS
+    ):
+        return text, metadata
+
+    tool_name = str(_tool_field(block, "name", ""))
+    tool_use_id = str(_tool_field(block, "id", ""))
+    tool_input = _tool_field(block, "input", {}) or {}
+    backing_path = ""
+    source_details: list[str] = []
+
+    if tool_name == "read_file" and isinstance(tool_input, dict):
+        source = _workspace_path(str(tool_input.get("path", "")), runtime)
+        if source is not None and source.is_file():
+            source_text = source.read_bytes().decode(errors="replace")
+            backing_path = _relative_tool_path(source, runtime)
+            source_details = [
+                f"source_path: {json.dumps(backing_path, ensure_ascii=False)}",
+                f"requested_offset: {int(tool_input.get('offset', 0) or 0)}",
+                "requested_limit: "
+                + json.dumps(tool_input.get("limit"), ensure_ascii=False),
+                f"total_lines: {len(source_text.splitlines())}",
+            ]
+
+    if not backing_path:
+        target = _safe_tool_result_path(tool_use_id, runtime)
+        target.write_text(text, encoding="utf-8")
+        backing_path = _relative_tool_path(target, runtime)
+        source_details = [f"output_path: {json.dumps(backing_path, ensure_ascii=False)}"]
+
+    metadata.update({
+        "externalized": True,
+        "backing_path": backing_path,
+        "externalization_reason": reason,
+    })
+    return _externalized_result_text(
+        tool_name=tool_name,
+        output=text,
+        metadata=metadata,
+        backing_path=backing_path,
+        source_details=source_details,
+    ), metadata
+
+
+def _accepted_tool_result(
+    block,
+    output,
+    runtime: AgentRuntime | None,
+) -> dict:
+    content, metadata = _materialize_tool_result(block, output, runtime)
+    record_tool_result(
+        str(_tool_field(block, "id", "")),
+        str(_tool_field(block, "name", "")),
+        content,
+        **metadata,
+    )
+    return {
+        "type": "tool_result",
+        "tool_use_id": str(_tool_field(block, "id", "")),
+        "content": content,
+    }
+
+
+def _hard_limit_externalize_unconsumed_results(
+    messages: list,
+    runtime: AgentRuntime | None,
+) -> int:
+    assistant_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "assistant"
+        ),
+        -1,
+    )
+    if assistant_index < 0 or assistant_index + 1 >= len(messages):
+        return 0
+    assistant = messages[assistant_index]
+    result_message = messages[assistant_index + 1]
+    if not message_has_tool_use(assistant) or not is_tool_result_message(result_message):
+        return 0
+    uses = {
+        str(_tool_field(block, "id", "")): block
+        for block in assistant.get("content", [])
+        if block_type(block) == "tool_use" and _tool_field(block, "id", "")
+    }
+    result_blocks = [
+        block for block in result_message.get("content", [])
+        if block_type(block) == "tool_result"
+    ]
+    result_ids = {
+        str(_tool_field(block, "tool_use_id", "")) for block in result_blocks
+    }
+    if not uses or result_ids != set(uses):
+        return 0
+
+    changed = 0
+    for result_block in result_blocks:
+        tool_use_id = str(_tool_field(result_block, "tool_use_id", ""))
+        original = str(_tool_field(result_block, "content", ""))
+        if original.startswith("[Tool result externalized]\n"):
+            continue
+        content, metadata = _materialize_tool_result(
+            uses[tool_use_id],
+            original,
+            runtime,
+            force_externalize=True,
+            reason="hard_context_limit_fallback",
+        )
+        if isinstance(result_block, dict):
+            result_block["content"] = content
+        else:
+            setattr(result_block, "content", content)
+        record_event(
+            "tool_result_externalized",
+            tool_use_id=tool_use_id,
+            tool=str(_tool_field(uses[tool_use_id], "name", "")),
+            **metadata,
+        )
+        changed += 1
+    return changed
 
 
 def _latest_genuine_user_signature(messages: list) -> str:
@@ -555,16 +804,6 @@ def prepare_context(
     context: dict | None = None,
     tools: list | None = None,
 ) -> list:
-    # A per-result hard limit applies before both complete-request sizing and
-    # the next provider call. This deterministic replacement is independent of
-    # whether semantic compaction reaches its trigger.
-    raw_messages = list(messages)
-    sanitized_messages, sanitized_count = sanitize_context_tool_results(
-        messages
-    )
-    if sanitized_count:
-        messages[:] = sanitized_messages
-
     budget_context = (
         context
         if context is not None
@@ -583,30 +822,6 @@ def prepare_context(
         assemble_system_prompt(budget_context, runtime)
         if runtime is not None else assemble_system_prompt(budget_context)
     )
-    if sanitized_count:
-        raw_stats = _context_stats(
-            raw_messages,
-            system=system,
-            tools=budget_tools,
-        )
-        sanitized_stats = _context_stats(
-            messages,
-            system=system,
-            tools=budget_tools,
-        )
-        record_event(
-            "context_compact",
-            stage="tool_result_limit",
-            changed=True,
-            summary_attempted=False,
-            omitted_tool_result_count=sanitized_count,
-            before_messages=raw_stats["message_count"],
-            after_messages=sanitized_stats["message_count"],
-            before_size=raw_stats["estimated_size"],
-            after_size=sanitized_stats["estimated_size"],
-            before_tokens=raw_stats["estimated_tokens"],
-            after_tokens=sanitized_stats["estimated_tokens"],
-        )
     before = _context_stats(messages, system=system, tools=budget_tools)
     record_event(
         "context_budget",
@@ -662,6 +877,43 @@ def prepare_context(
         )
         if changed:
             _record_context_integrity(messages, latest_user_before)
+        if after["estimated_tokens"] >= AGENT_CONTEXT_LIMIT_TOKENS:
+            externalized_count = _hard_limit_externalize_unconsumed_results(
+                messages,
+                runtime,
+            )
+            if externalized_count:
+                hard_limit_before = after
+                refreshed_context = (
+                    update_context(budget_context, messages, runtime)
+                    if runtime is not None else update_context(
+                        budget_context, messages
+                    )
+                )
+                refreshed_system = (
+                    assemble_system_prompt(refreshed_context, runtime)
+                    if runtime is not None else assemble_system_prompt(
+                        refreshed_context
+                    )
+                )
+                after = _context_stats(
+                    messages,
+                    system=refreshed_system,
+                    tools=budget_tools,
+                )
+                record_event(
+                    "context_compact",
+                    stage="hard_limit_tool_result_externalization",
+                    changed=True,
+                    reason="hard_context_limit_fallback",
+                    externalized_tool_result_count=externalized_count,
+                    before_messages=hard_limit_before["message_count"],
+                    after_messages=after["message_count"],
+                    before_size=hard_limit_before["estimated_size"],
+                    after_size=after["estimated_size"],
+                    before_tokens=hard_limit_before["estimated_tokens"],
+                    after_tokens=after["estimated_tokens"],
+                )
     return messages
 
 
@@ -1149,10 +1401,7 @@ def agent_loop(
                     "delegation_reused", agent_role="explore",
                     tool_use_id=block.id,
                 )
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": output})
-                record_tool_result(block.id, block.name, output)
+                results.append(_accepted_tool_result(block, output, runtime))
                 continue
             if (block.name in {"delegate_agent", "task"}
                     and delegated_role == "review"
@@ -1164,10 +1413,7 @@ def agent_loop(
                     "delegation_reused", agent_role="review",
                     tool_use_id=block.id, mutation_revision=mutation_revision,
                 )
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": output})
-                record_tool_result(block.id, block.name, output)
+                results.append(_accepted_tool_result(block, output, runtime))
                 continue
             if block.name == "compact":
                 compact_sizer = _request_sizer(context, tools, runtime)
@@ -1187,6 +1433,7 @@ def agent_loop(
                     )
                 )
                 output = "[Compacted. Continue with summarized context.]"
+                accepted = _accepted_tool_result(block, output, runtime)
                 compact_tool_use_preserved = any(
                     candidate.get("role") == "assistant"
                     and any(block_type(item) == "tool_use"
@@ -1199,11 +1446,13 @@ def agent_loop(
                     messages.append({"role": "user", "content": [{
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": output,
+                        "content": accepted["content"],
                     }]})
                 else:
-                    messages.append({"role": "user", "content": output})
-                record_tool_result(block.id, block.name, output)
+                    messages.append({
+                        "role": "user",
+                        "content": accepted["content"],
+                    })
                 compacted_now = True
                 break
 
@@ -1215,10 +1464,9 @@ def agent_loop(
                             tool_use_id=block.id, input=block.input,
                             decision="blocked", reason=blocked_text,
                             recoverable=is_recoverable_tool_rejection(blocked))
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": blocked_text})
-                record_tool_result(block.id, block.name, blocked_text)
+                results.append(
+                    _accepted_tool_result(block, blocked_text, runtime)
+                )
                 if is_recoverable_tool_rejection(blocked):
                     continue
                 if is_permission_denied_output(blocked_text):
@@ -1247,10 +1495,7 @@ def agent_loop(
                           "rerun the same command, poll with check_inbox, or "
                           "launch a task/subagent just to wait; continue "
                           "independent work or finish your turn.")
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": output})
-                record_tool_result(block.id, block.name, output)
+                results.append(_accepted_tool_result(block, output, runtime))
                 continue
 
             handler = handlers.get(block.name)
@@ -1368,9 +1613,7 @@ def agent_loop(
                                 **event_budget,
                             )
 
-            results.append({"type": "tool_result",
-                            "tool_use_id": block.id, "content": output})
-            record_tool_result(block.id, block.name, output)
+            results.append(_accepted_tool_result(block, output, runtime))
             if is_permission_denied_output(output):
                 stop_after_permission_denied(messages, str(output))
                 finish_run(str(output))

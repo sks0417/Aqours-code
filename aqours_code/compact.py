@@ -17,7 +17,8 @@ from .runtime_state import *
 CONTEXT_CHECKPOINT_MARKER = "[Context checkpoint]"
 RECENT_TOOL_RESULT_COUNT = 4
 RECENT_TAIL_MAX_TOKENS = 20_000
-MAX_TOOL_RESULT_TOKENS = 8_000
+MAX_INLINE_TOOL_RESULT_TOKENS = 24_000
+COMPACT_HEADROOM_TOKENS = 8_000
 ESTIMATED_CHARS_PER_TOKEN = CONTEXT_CHARS_PER_TOKEN
 # Leave room for estimation error and Provider-side message framing without
 # coupling the summary input window to either the Agent window or output size.
@@ -224,6 +225,34 @@ def _is_tool_exchange_unit(unit: list[dict]) -> bool:
     )
 
 
+def _unconsumed_tool_use_ids(messages: list) -> set[str]:
+    """Return the final tool batch when no later Assistant has consumed it."""
+    assistant_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "assistant"
+        ),
+        -1,
+    )
+    if assistant_index < 0 or not message_has_tool_use(messages[assistant_index]):
+        return set()
+    result_index = assistant_index + 1
+    if result_index >= len(messages):
+        return set()
+    use_ids = _tool_use_ids(messages[assistant_index])
+    result_ids = _tool_result_ids(messages[result_index])
+    if not result_ids or result_ids != use_ids:
+        return set()
+    return use_ids
+
+
+def _unit_tool_use_ids(unit: list[dict]) -> set[str]:
+    if not _is_tool_exchange_unit(unit):
+        return set()
+    return _tool_use_ids(unit[0])
+
+
 def _is_checkpoint_message(message: dict) -> bool:
     content = message.get("content")
     if isinstance(content, str):
@@ -301,7 +330,7 @@ def _flatten(units: list[list[dict]]) -> list[dict]:
 
 def _select_prefix_and_recent_tail(
     messages: list,
-) -> tuple[list[dict], list[dict], dict | None]:
+) -> tuple[list[dict], list[dict], dict | None, set[str]]:
     """Select an old contiguous prefix and keep recent tool exchanges atomic.
 
     The boundary preserves as much recent raw context as fits under both the
@@ -310,21 +339,49 @@ def _select_prefix_and_recent_tail(
     separately and remains an ordinary, unmodified message.
     """
     units = _history_units(messages)
+    protected_tool_ids = _unconsumed_tool_use_ids(messages)
     if len(units) < 2:
         latest, _ = _latest_user_message(messages)
-        return [], _copy_messages(messages), latest
+        return [], _copy_messages(messages), latest, protected_tool_ids
 
     latest, latest_message_id = _latest_user_message(messages)
     tail_limit_chars = (
         RECENT_TAIL_MAX_TOKENS * ESTIMATED_CHARS_PER_TOKEN
     )
 
-    # Find the earliest unit allowed in the raw suffix. The latest user message
-    # is a separate required message, so it does not consume the raw-tail cap.
-    tail_start = len(units)
-    tail_size = 0
-    tool_count = 0
-    for index in range(len(units) - 1, -1, -1):
+    protected_index = next(
+        (
+            index
+            for index, unit in enumerate(units)
+            if protected_tool_ids
+            and _unit_tool_use_ids(unit) == protected_tool_ids
+        ),
+        -1,
+    )
+    if protected_index >= 0:
+        # The newest unconsumed exchange is mandatory even when it exceeds the
+        # best-effort recent-tail budget. Keeping a contiguous suffix also
+        # retains any user-side notifications appended after the result.
+        tail_start = protected_index
+        tail_size = sum(
+            0 if id(message) == latest_message_id else estimate_size([message])
+            for unit in units[protected_index:]
+            for message in unit
+        )
+        tool_count = sum(
+            1 for unit in units[protected_index:]
+            if _is_tool_exchange_unit(unit)
+        )
+        scan_start = protected_index - 1
+    else:
+        tail_start = len(units)
+        tail_size = 0
+        tool_count = 0
+        scan_start = len(units) - 1
+
+    # Add older raw units while the best-effort four-exchange and total-tail
+    # budgets permit. The latest user message is separately mandatory.
+    for index in range(scan_start, -1, -1):
         unit = units[index]
         is_tool = _is_tool_exchange_unit(unit)
         unit_size = sum(
@@ -353,12 +410,12 @@ def _select_prefix_and_recent_tail(
         ),
         -1,
     )
-    if latest_unit_index >= 0:
+    if latest_unit_index >= 0 and protected_index < 0:
         tail_start = max(tail_start, latest_unit_index)
 
     boundary = tail_start
     if boundary <= 0:
-        return [], _copy_messages(messages), latest
+        return [], _copy_messages(messages), latest, protected_tool_ids
 
     prefix_units = units[:boundary]
     tail_units = units[boundary:]
@@ -374,38 +431,13 @@ def _select_prefix_and_recent_tail(
         for message in unit
         if id(message) != latest_message_id
     ]
-    return prefix, tail, latest
-
-
-def sanitize_context_tool_results(
-    messages: list,
-) -> tuple[list, int]:
-    """Replace oversized result bodies in a copy while preserving protocol IDs."""
-    copied = _copy_messages(messages)
-    replaced = 0
-    for _, _, block in collect_tool_results(copied):
-        output = str(_block_field(block, "content", ""))
-        token_count = estimate_context_tokens(len(output))
-        if token_count <= MAX_TOOL_RESULT_TOKENS:
-            continue
-        placeholder = (
-            "[Large tool result omitted]\n"
-            f"Original result size: {token_count} estimated tokens.\n"
-            "Reason: exceeded MAX_TOOL_RESULT_TOKENS."
-        )
-        if isinstance(block, dict):
-            block["content"] = placeholder
-        else:
-            setattr(block, "content", placeholder)
-        replaced += 1
-    return copied, replaced
+    return prefix, tail, latest, protected_tool_ids
 
 
 def write_transcript(
     messages: list,
     runtime: AgentRuntime | None = None,
 ) -> Path:
-    safe_messages, _ = sanitize_context_tool_results(messages)
     transcript_dir = (
         runtime.paths.transcript_dir
         if runtime is not None
@@ -414,7 +446,7 @@ def write_transcript(
     transcript_dir.mkdir(parents=True, exist_ok=True)
     path = transcript_dir / f"transcript_{time.time_ns()}.jsonl"
     with path.open("w", encoding="utf-8") as stream:
-        for message in safe_messages:
+        for message in messages:
             stream.write(json.dumps(
                 message,
                 default=str,
@@ -595,7 +627,6 @@ def _record_compact(
     summary: str,
     success: bool,
     failure_reason: str = "",
-    omitted_tool_results: int = 0,
     summary_model_calls: int = 0,
 ) -> None:
     try:
@@ -616,8 +647,6 @@ def _record_compact(
             summary_length=len(summary),
             success=success,
             failure_reason=failure_reason,
-            oversized_result_handled=omitted_tool_results > 0,
-            omitted_tool_result_count=omitted_tool_results,
             summary_model_calls=summary_model_calls,
         )
     except Exception:
@@ -638,8 +667,7 @@ def _compact(
 ) -> list:
     sizer = _request_sizer(request_size_fn, system=system, tools=tools)
     original_size = sizer(messages)
-    sanitized, omitted_count = sanitize_context_tool_results(messages)
-    active_messages = sanitized if omitted_count else messages
+    active_messages = messages
     active_size = sizer(active_messages)
     transcript = write_transcript(active_messages, runtime)
     target = max(
@@ -647,7 +675,9 @@ def _compact(
         int(
             target_context_budget
             if target_context_budget is not None
-            else COMPACT_TRIGGER_TOKENS * ESTIMATED_CHARS_PER_TOKEN
+            else (
+                COMPACT_TRIGGER_TOKENS - COMPACT_HEADROOM_TOKENS
+            ) * ESTIMATED_CHARS_PER_TOKEN
         ),
     )
     signature = _compact_signature(
@@ -660,8 +690,6 @@ def _compact(
         not force
         and estimate_context_tokens(active_size) < COMPACT_TRIGGER_TOKENS
     ):
-        if omitted_count:
-            _clear_failed_compact(runtime)
         _record_compact(
             reason=reason,
             transcript=transcript,
@@ -674,7 +702,6 @@ def _compact(
             summary="",
             success=False,
             failure_reason="below compact trigger",
-            omitted_tool_results=omitted_count,
         )
         return active_messages
 
@@ -698,11 +725,10 @@ def _compact(
             summary="",
             success=False,
             failure_reason=failure,
-            omitted_tool_results=omitted_count,
         )
         return active_messages
 
-    prefix, tail, latest_user_message = (
+    prefix, tail, latest_user_message, protected_tool_ids = (
         _select_prefix_and_recent_tail(active_messages)
     )
     if not prefix:
@@ -725,7 +751,6 @@ def _compact(
             summary="",
             success=False,
             failure_reason=failure,
-            omitted_tool_results=omitted_count,
         )
         return active_messages
 
@@ -739,9 +764,13 @@ def _compact(
         latest_user_message,
     )) > target:
         tail_units = _history_units(tail)
-        if not tail_units:
+        if (
+            not tail_units
+            or protected_tool_ids
+            and _unit_tool_use_ids(tail_units[0]) == protected_tool_ids
+        ):
             failure = (
-                "checkpoint and latest user message cannot fit within target"
+                "checkpoint and protected recent context cannot fit within target"
             )
             _remember_failed_compact(
                 runtime,
@@ -761,7 +790,6 @@ def _compact(
                 summary="",
                 success=False,
                 failure_reason=failure,
-                omitted_tool_results=omitted_count,
             )
             return active_messages
         prefix.extend(_copy_messages(tail_units[0]))
@@ -805,7 +833,6 @@ def _compact(
             summary="",
             success=False,
             failure_reason=failure,
-            omitted_tool_results=omitted_count,
         )
         return active_messages
 
@@ -835,7 +862,6 @@ def _compact(
             summary="",
             success=False,
             failure_reason="model summary call unavailable",
-            omitted_tool_results=omitted_count,
         )
         return active_messages
 
@@ -859,7 +885,6 @@ def _compact(
             summary="",
             success=False,
             failure_reason=failure,
-            omitted_tool_results=omitted_count,
             summary_model_calls=1,
         )
         return active_messages
@@ -887,7 +912,6 @@ def _compact(
             summary=summary,
             success=False,
             failure_reason=failure,
-            omitted_tool_results=omitted_count,
             summary_model_calls=1,
         )
         _remember_failed_compact(
@@ -909,7 +933,6 @@ def _compact(
         tail=tail,
         summary=summary,
         success=True,
-        omitted_tool_results=omitted_count,
         summary_model_calls=1,
     )
     _clear_failed_compact(runtime)

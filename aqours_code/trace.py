@@ -1095,9 +1095,9 @@ def record_tool_use(block):
                  input=getattr(block, "input", {}))
 
 
-def record_tool_result(tool_use_id: str, tool: str, result):
+def record_tool_result(tool_use_id: str, tool: str, result, **metadata):
     record_event("tool_result", tool=tool, tool_use_id=tool_use_id,
-                 content=_truncate(result))
+                 content=_truncate(result), **metadata)
 
 
 def record_error(error):

@@ -1,3 +1,5 @@
+import copy
+import json
 from types import SimpleNamespace
 
 from aqours_code import agent_loop
@@ -25,9 +27,11 @@ class FakeMessages:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
+        self.message_snapshots = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
+        self.message_snapshots.append(copy.deepcopy(kwargs.get("messages", [])))
         if not self.responses:
             raise AssertionError("No fake response left")
         item = self.responses.pop(0)
@@ -86,6 +90,197 @@ def test_read_file_tool_use_executes_and_appends_tool_result(tmp_path, monkeypat
     assert tool_message["content"][0]["type"] == "tool_result"
     assert tool_message["content"][0]["content"] == "hello Aqours_code"
     assert messages[-1]["content"][0].text == "finished"
+
+
+def _result_content(messages, tool_use_id: str) -> str:
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") != "user" or not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and block.get("tool_use_id") == tool_use_id
+            ):
+                return str(block.get("content", ""))
+    raise AssertionError(f"missing tool result {tool_use_id}")
+
+
+def test_result_above_old_8k_limit_reaches_first_provider_request_intact(
+    tmp_path,
+    monkeypatch,
+):
+    from aqours_code import basic_tools, compact
+
+    real_prepare_context = agent_loop.prepare_context
+    install_common_agent_mocks(monkeypatch)
+    monkeypatch.setattr(agent_loop, "prepare_context", real_prepare_context)
+    monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
+    monkeypatch.setattr(basic_tools, "WORKDIR", tmp_path)
+    full_result = "HEAD-8K\n" + (
+        "x" * (9_000 * compact.ESTIMATED_CHARS_PER_TOKEN)
+    ) + "\nTAIL-8K"
+    (tmp_path / "medium.txt").write_text(full_result, encoding="utf-8")
+    fake_client = FakeClient([
+        response([tool_block("read_file", {"path": "medium.txt"}, "medium")]),
+        response([text_block("finished")]),
+    ])
+    monkeypatch.setattr(agent_loop, "client", fake_client)
+
+    messages = [{"role": "user", "content": "read the medium file"}]
+    agent_loop.agent_loop(messages, {})
+
+    first_request_with_result = fake_client.messages.message_snapshots[1]
+    assert _result_content(first_request_with_result, "medium") == full_result
+    assert "[Large tool result omitted]" not in json.dumps(
+        first_request_with_result,
+        default=str,
+    )
+
+
+def test_oversized_read_file_uses_source_path_and_head_tail_preview(
+    tmp_path,
+    monkeypatch,
+):
+    from aqours_code import basic_tools, compact
+
+    install_common_agent_mocks(monkeypatch)
+    monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
+    monkeypatch.setattr(basic_tools, "WORKDIR", tmp_path)
+    result_dir = tmp_path / ".task_outputs" / "tool-results"
+    monkeypatch.setattr(agent_loop, "TOOL_RESULTS_DIR", result_dir)
+    full_result = "READ-HEAD\n" + (
+        "r" * (
+            compact.MAX_INLINE_TOOL_RESULT_TOKENS
+            * compact.ESTIMATED_CHARS_PER_TOKEN
+            + 20
+        )
+    ) + "\nREAD-TAIL"
+    source = tmp_path / "large.txt"
+    source.write_text(full_result, encoding="utf-8")
+    recorded = []
+    monkeypatch.setattr(
+        agent_loop,
+        "record_tool_result",
+        lambda tool_use_id, tool, result, **metadata: recorded.append({
+            "tool_use_id": tool_use_id,
+            "tool": tool,
+            "result": result,
+            **metadata,
+        }),
+    )
+    fake_client = FakeClient([
+        response([tool_block("read_file", {"path": "large.txt"}, "large-read")]),
+        response([text_block("finished")]),
+    ])
+    monkeypatch.setattr(agent_loop, "client", fake_client)
+
+    messages = [{"role": "user", "content": "read the large file"}]
+    agent_loop.agent_loop(messages, {})
+
+    preview = _result_content(
+        fake_client.messages.message_snapshots[1],
+        "large-read",
+    )
+    assert "externalized: true" in preview
+    assert "incomplete: true" in preview
+    assert 'source_path: "large.txt"' in preview
+    assert "requested_offset: 0" in preview
+    assert "requested_limit: null" in preview
+    assert "total_lines: 3" in preview
+    assert "READ-HEAD" in preview
+    assert "READ-TAIL" in preview
+    assert "--- head preview ---" in preview
+    assert "--- tail preview ---" in preview
+    assert not result_dir.exists()
+    assert recorded[-1]["externalized"] is True
+    assert recorded[-1]["backing_path"] == "large.txt"
+    assert recorded[-1]["original_estimated_tokens"] > 24_000
+    assert len(recorded[-1]["digest"]) == 64
+
+
+def test_oversized_non_file_output_is_recoverable_from_tool_results_dir(
+    tmp_path,
+    monkeypatch,
+):
+    from aqours_code import basic_tools, compact
+
+    install_common_agent_mocks(monkeypatch)
+    monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
+    monkeypatch.setattr(basic_tools, "WORKDIR", tmp_path)
+    result_dir = tmp_path / ".task_outputs" / "tool-results"
+    monkeypatch.setattr(agent_loop, "TOOL_RESULTS_DIR", result_dir)
+    full_result = "BASH-HEAD\n" + (
+        "b" * (
+            compact.MAX_INLINE_TOOL_RESULT_TOKENS
+            * compact.ESTIMATED_CHARS_PER_TOKEN
+            + 20
+        )
+    ) + "\nBASH-TAIL"
+    class VerboseExecutor:
+        def execute(self, command, cwd, timeout):
+            return {
+                "stdout": full_result,
+                "stderr": "",
+                "timed_out": False,
+                "returncode": 0,
+            }
+
+    monkeypatch.setattr(basic_tools, "COMMAND_EXECUTOR", VerboseExecutor())
+    recorded = []
+    monkeypatch.setattr(
+        agent_loop,
+        "record_tool_result",
+        lambda tool_use_id, tool, result, **metadata: recorded.append({
+            "tool_use_id": tool_use_id,
+            "tool": tool,
+            "result": result,
+            **metadata,
+        }),
+    )
+    unsafe_id = "../../unsafe/tool"
+    fake_client = FakeClient([
+        response([tool_block("bash", {"command": "ignored"}, unsafe_id)]),
+        response([text_block("finished")]),
+    ])
+    monkeypatch.setattr(agent_loop, "client", fake_client)
+
+    messages = [{"role": "user", "content": "run a verbose command"}]
+    agent_loop.agent_loop(messages, {})
+
+    preview = _result_content(
+        fake_client.messages.message_snapshots[1],
+        unsafe_id,
+    )
+    assert "incomplete: true" in preview
+    assert "BASH-HEAD" in preview
+    assert "BASH-TAIL" in preview
+    assert "--- head preview ---" in preview
+    assert "--- tail preview ---" in preview
+    output_files = list(result_dir.glob("*.txt"))
+    assert len(output_files) == 1
+    output_file = output_files[0]
+    assert output_file.parent == result_dir
+    assert output_file.read_text(encoding="utf-8") == full_result
+    relative_path = output_file.relative_to(tmp_path).as_posix()
+    assert basic_tools.run_read(
+        relative_path,
+        offset=0,
+        limit=1,
+        cwd=tmp_path,
+    ) == "BASH-HEAD\n... (2 more lines)"
+    assert basic_tools.run_read(
+        relative_path,
+        offset=2,
+        limit=1,
+        cwd=tmp_path,
+    ) == "BASH-TAIL"
+    assert recorded[-1]["externalized"] is True
+    assert recorded[-1]["backing_path"] == relative_path
+    assert recorded[-1]["original_chars"] == len(full_result)
+    assert recorded[-1]["original_lines"] == 3
+    assert len(recorded[-1]["digest"]) == 64
 
 
 def test_glob_double_star_recurses_into_nested_source_tree(tmp_path):

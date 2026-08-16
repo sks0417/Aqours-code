@@ -120,6 +120,8 @@ def test_default_context_and_summary_budgets_are_independent():
     assert compact.COMPACT_TRIGGER_RATIO == 100_000 / 128_000
     assert compact.SUMMARY_INPUT_LIMIT_TOKENS == 256_000
     assert compact.SUMMARY_MAX_TOKENS == 6_000
+    assert compact.MAX_INLINE_TOOL_RESULT_TOKENS == 24_000
+    assert compact.COMPACT_HEADROOM_TOKENS == 8_000
     assert compact.estimate_context_tokens(compact.CONTEXT_LIMIT) == 128_000
     assert compact.estimate_context_tokens(trigger_chars) == 100_000
     assert 128_000 - 100_000 >= agent_loop.DEFAULT_MAX_TOKENS
@@ -205,10 +207,7 @@ def test_successful_compact_has_checkpoint_and_recent_raw_tail(monkeypatch):
         messages[0],
     ]
     assert result[1] is not messages[0]
-    assert (
-        compact.MAX_TOOL_RESULT_TOKENS
-        < compact.RECENT_TAIL_MAX_TOKENS
-    )
+    assert compact.RECENT_TOOL_RESULT_COUNT == 4
     assert "## Handoff" in render(result)
     assert result[-len(expected_tail):] == expected_tail
     assert_tool_pairs(result)
@@ -410,7 +409,7 @@ def test_cut_point_never_splits_tool_exchange(monkeypatch):
 
 
 def test_parallel_tool_calls_remain_one_atomic_exchange(monkeypatch):
-    install_summary(monkeypatch)
+    calls = install_summary(monkeypatch)
     multi_use = {
         "role": "assistant",
         "content": [
@@ -433,46 +432,47 @@ def test_parallel_tool_calls_remain_one_atomic_exchange(monkeypatch):
     result = force_compact(messages)
 
     assert result[-2:] == [multi_use, multi_result]
+    assert '"id":"a"' not in render(calls[0])
+    assert '"id":"b"' not in render(calls[0])
     assert_tool_pairs(result)
 
 
-def test_oversized_recent_tool_result_becomes_short_placeholder(
+def test_unconsumed_result_above_recent_tail_budget_stays_out_of_summary(
     tmp_path,
     monkeypatch,
 ):
-    install_summary(monkeypatch)
+    calls = install_summary(monkeypatch)
     runtime = make_runtime(tmp_path)
     huge = "H" * (
-        compact.MAX_TOOL_RESULT_TOKENS
+        (compact.RECENT_TAIL_MAX_TOKENS + 1_000)
         * compact.ESTIMATED_CHARS_PER_TOKEN
-        + 3
     )
     messages = long_history(8, width=100)
     messages.extend(exchange(99, huge))
     original = json.loads(json.dumps(messages))
 
-    result = force_compact(messages, runtime=runtime)
+    result = force_compact(
+        messages,
+        runtime=runtime,
+        target_context_budget=100_000,
+    )
 
     result_block = result[-1]["content"][0]
     assert result_block["tool_use_id"] == "tool-99"
-    assert result_block["content"].startswith("[Large tool result omitted]")
-    assert "estimated tokens" in result_block["content"]
-    assert len(result_block["content"]) < 200
+    assert result_block["content"] == huge
+    assert huge not in render(calls[0])
     assert messages == original
-    assert messages[-1]["content"][0]["content"] == huge
     assert_tool_pairs(result)
     transcript = next(runtime.paths.transcript_dir.glob("transcript_*.jsonl"))
     transcript_text = transcript.read_text(encoding="utf-8")
-    assert huge not in transcript_text
-    assert "[Large tool result omitted]" in transcript_text
+    assert huge in transcript_text
 
 
-def test_oversized_prefix_result_is_masked_only_in_summary_copy(monkeypatch):
+def test_consumed_prefix_result_is_summarized_without_blanket_masking(monkeypatch):
     calls = install_summary(monkeypatch)
     huge = "P" * (
-        compact.MAX_TOOL_RESULT_TOKENS
+        9_000
         * compact.ESTIMATED_CHARS_PER_TOKEN
-        + 3
     )
     messages = [
         {"role": "user", "content": "Keep this task."},
@@ -484,18 +484,17 @@ def test_oversized_prefix_result_is_masked_only_in_summary_copy(monkeypatch):
 
     force_compact(messages)
 
-    assert "[Large tool result omitted]" in render(calls[0])
-    assert huge not in render(calls[0])
+    assert huge in render(calls[0])
+    assert "[Large tool result omitted]" not in render(calls[0])
     assert messages == original
 
 
-def test_prepare_context_limits_oversized_result_below_compact_trigger(
+def test_prepare_context_keeps_result_above_old_8k_limit_inline(
     monkeypatch,
 ):
     huge = "H" * (
-        compact.MAX_TOOL_RESULT_TOKENS
+        9_000
         * compact.ESTIMATED_CHARS_PER_TOKEN
-        + 3
     )
     messages = exchange(1, huge)
     summary_calls = []
@@ -523,17 +522,51 @@ def test_prepare_context_limits_oversized_result_below_compact_trigger(
 
     assert summary_calls == []
     assert messages[1]["content"][0]["tool_use_id"] == "tool-1"
-    assert messages[1]["content"][0]["content"].startswith(
-        "[Large tool result omitted]"
-    )
+    assert messages[1]["content"][0]["content"] == huge
     assert_tool_pairs(messages)
     changed = [
         event for event in events
         if event["type"] == "context_compact"
     ]
-    assert len(changed) == 1
-    assert changed[0]["stage"] == "tool_result_limit"
-    assert changed[0]["changed"] is True
+    assert changed == []
+
+
+def test_prepare_context_compacts_old_history_before_unconsumed_result(
+    monkeypatch,
+):
+    latest_result = "LATEST-RESULT-START\n" + (
+        "z" * (9_000 * compact.ESTIMATED_CHARS_PER_TOKEN)
+    ) + "\nLATEST-RESULT-END"
+    messages = [{"role": "user", "content": "Keep this request exact."}]
+    for index in range(11):
+        messages.extend(exchange(
+            index,
+            "old-" + str(index) + "-" + (
+                "o" * (9_000 * compact.ESTIMATED_CHARS_PER_TOKEN)
+            ),
+        ))
+    latest_exchange = exchange(99, latest_result)
+    messages.extend(latest_exchange)
+    calls = install_summary(monkeypatch, "bounded checkpoint")
+    monkeypatch.setattr(agent_loop, "assemble_tool_pool", lambda *args: ([], {}))
+    monkeypatch.setattr(
+        agent_loop, "assemble_system_prompt", lambda *args: "system"
+    )
+    monkeypatch.setattr(agent_loop, "update_context", lambda *args: {})
+
+    agent_loop.prepare_context(messages)
+
+    assert len(calls) == 1
+    assert latest_result not in render(calls[0])
+    assert messages[-2:] == latest_exchange
+    assert messages[-1]["content"][0]["content"] == latest_result
+    assert_tool_pairs(messages)
+    complete_request_tokens = compact.estimate_context_tokens(
+        compact.estimate_context_size(messages, system="system", tools=[])
+    )
+    assert complete_request_tokens < (
+        compact.COMPACT_TRIGGER_TOKENS - compact.COMPACT_HEADROOM_TOKENS
+    )
 
 
 @pytest.mark.parametrize("changes_history", [False, True])
@@ -620,16 +653,15 @@ def test_prepare_context_below_trigger_does_not_report_compact(monkeypatch):
         lambda *_args, **_kwargs: " ",
     ],
 )
-def test_summary_failure_keeps_placeholder_but_not_full_large_result(
+def test_summary_failure_keeps_latest_full_result(
     tmp_path,
     monkeypatch,
     summary_behavior,
 ):
     runtime = make_runtime(tmp_path)
     huge = "Q" * (
-        compact.MAX_TOOL_RESULT_TOKENS
+        (compact.RECENT_TAIL_MAX_TOKENS + 1_000)
         * compact.ESTIMATED_CHARS_PER_TOKEN
-        + 3
     )
     messages = [
         {"role": "user", "content": "Keep ordinary history."},
@@ -639,13 +671,61 @@ def test_summary_failure_keeps_placeholder_but_not_full_large_result(
         messages.extend(exchange(index, "normal"))
     monkeypatch.setattr(compact, "summarize_history", summary_behavior)
 
-    result = force_compact(messages, runtime=runtime)
+    result = force_compact(
+        messages,
+        runtime=runtime,
+        target_context_budget=100_000,
+    )
 
     assert "Keep ordinary history." in render(result)
-    assert huge not in render(result)
-    assert "[Large tool result omitted]" in render(result)
+    assert huge in render(result)
+    assert "[Large tool result omitted]" not in render(result)
     assert_tool_pairs(result)
     assert runtime.state.metadata.get("compact_generation", 0) == 0
+
+
+def test_failed_automatic_compact_below_hard_limit_keeps_result_and_cools_down(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = make_runtime(tmp_path)
+    latest_result = "LATEST-UNCHANGED-START\n" + (
+        "l" * (9_000 * compact.ESTIMATED_CHARS_PER_TOKEN)
+    ) + "\nLATEST-UNCHANGED-END"
+    messages = [{"role": "user", "content": "Keep the latest result."}]
+    for index in range(10):
+        messages.extend(exchange(
+            index,
+            "old-" + ("o" * (9_100 * compact.ESTIMATED_CHARS_PER_TOKEN)),
+        ))
+    messages.extend(exchange(99, latest_result))
+    original = json.loads(json.dumps(messages))
+    calls = []
+
+    def fail_once(summary_input, runtime=None):
+        calls.append(render(summary_input))
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(compact, "summarize_history", fail_once)
+    monkeypatch.setattr(
+        agent_loop, "assemble_system_prompt", lambda *args: "system"
+    )
+    monkeypatch.setattr(agent_loop, "update_context", lambda *args: {})
+    request_tokens = compact.estimate_context_tokens(
+        compact.estimate_context_size(messages, system="system", tools=[])
+    )
+    assert compact.COMPACT_TRIGGER_TOKENS <= request_tokens < (
+        compact.AGENT_CONTEXT_LIMIT_TOKENS
+    )
+
+    agent_loop.prepare_context(messages, runtime, {}, [])
+    agent_loop.prepare_context(messages, runtime, {}, [])
+
+    assert len(calls) == 1
+    assert messages == original
+    assert messages[-1]["content"][0]["content"] == latest_result
+    assert "[Tool result externalized]" not in render(messages)
+    assert_tool_pairs(messages)
 
 
 def test_normal_recent_tool_result_is_not_modified(monkeypatch):
@@ -703,21 +783,21 @@ def test_near_limit_tool_result_allows_compact_to_progress(monkeypatch):
     for index in range(5):
         messages.extend(exchange(index, f"small-{index}"))
     near_limit = "N" * (
-        (compact.MAX_TOOL_RESULT_TOKENS - 100)
+        (compact.MAX_INLINE_TOOL_RESULT_TOKENS - 100)
         * compact.ESTIMATED_CHARS_PER_TOKEN
     )
     messages.extend(exchange(99, near_limit))
 
     result = force_compact(
         messages,
-        target_context_budget=50_000,
+        target_context_budget=100_000,
     )
 
     assert len(calls) == 1
     assert result[1] == latest
     assert near_limit in render(result)
     assert "[Large tool result omitted]" not in render(result)
-    assert compact.estimate_size(result) <= 50_000
+    assert compact.estimate_size(result) <= 100_000
     assert_tool_pairs(result)
 
 
@@ -1126,9 +1206,8 @@ def test_list_form_instruction_and_multiple_result_blocks_are_supported(
 ):
     exact = "LIST BLOCK REQUIREMENT"
     huge = "Z" * (
-        compact.MAX_TOOL_RESULT_TOKENS
+        9_000
         * compact.ESTIMATED_CHARS_PER_TOKEN
-        + 3
     )
     multi_use = {
         "role": "assistant",
@@ -1148,11 +1227,7 @@ def test_list_form_instruction_and_multiple_result_blocks_are_supported(
              "content": "small exact"},
         ],
     }
-    monkeypatch.setattr(
-        compact,
-        "summarize_history",
-        lambda *_args, **_kwargs: "summary",
-    )
+    calls = install_summary(monkeypatch, "summary")
     messages = [
         {"role": "user", "content": [{"type": "text", "text": exact}]},
         multi_use,
@@ -1161,16 +1236,11 @@ def test_list_form_instruction_and_multiple_result_blocks_are_supported(
     for index in range(6):
         messages.extend(exchange(index, "work"))
 
-    sanitized, count = compact.sanitize_context_tool_results(messages)
     result = force_compact(messages)
 
-    assert count == 1
-    sanitized_results = compact.collect_tool_results(sanitized)
-    assert sanitized_results[0][2]["tool_use_id"] == "large"
-    assert sanitized_results[0][2]["content"].startswith(
-        "[Large tool result omitted]"
-    )
-    assert sanitized_results[1][2]["content"] == "small exact"
     assert exact in render(result)
+    assert huge in render(calls[0])
     assert huge not in render(result)
+    assert "small exact" in render(calls[0])
+    assert "[Large tool result omitted]" not in render(calls[0])
     assert_tool_pairs(result)
