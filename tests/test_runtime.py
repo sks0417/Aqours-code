@@ -44,6 +44,9 @@ def test_runtime_paths_and_mutable_state_are_isolated(tmp_path):
     assert runtime_b.state.changed_files == set()
     assert runtime_b.state.lead_read_counts == {}
     assert runtime_a.paths.memory_index == tmp_path / "state-a" / ".memory" / "MEMORY.md"
+    assert runtime_a.paths.tool_results_dir == (
+        tmp_path / "workspace-a" / ".task_outputs" / "tool-results"
+    ).resolve()
     assert runtime_b.paths.workdir == (tmp_path / "workspace-b").resolve()
     child = runtime_a.child()
     assert child.paths.state_root == runtime_a.paths.state_root

@@ -93,7 +93,7 @@ def test_teammate_focus_never_removes_team_protocol(tmp_path, monkeypatch):
 
 def test_registry_policy_metadata_drives_existing_policy_categories():
     assert TOOL_REGISTRY.get("bash").safety_policy == "command_guard"
-    assert TOOL_REGISTRY.get("bash").background_policy == "slow_or_explicit"
+    assert TOOL_REGISTRY.get("bash").background_policy == "explicit"
     assert TOOL_REGISTRY.get("read_file").background_policy == "foreground"
     assert TOOL_REGISTRY.get("write_file").safety_policy == "workspace_write"
     assert TOOL_REGISTRY.get("edit_file").safety_policy == "workspace_write"
@@ -271,5 +271,7 @@ def test_tool_strategy_batches_only_safe_independent_operations():
     assert "Tools execute in response order" in strategy
     assert "partial failure does not roll back" in strategy
     assert "Complete one coherent phase" in strategy
-    assert "mutable-alias boundaries" in strategy
-    assert "shared-dependency fan-in" in strategy
+    assert "one specific, named contract risk" in strategy
+    assert "do not generate broad multi-scenario audit scripts" in strategy
+    assert "mutable-alias boundaries" not in strategy
+    assert "shared-dependency fan-in" not in strategy

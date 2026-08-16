@@ -20,6 +20,20 @@ def uses_deepseek_thinking(provider_name: str, model: str) -> bool:
     )
 
 
+def effective_initial_max_tokens(
+    provider_name: str,
+    model: str,
+    *,
+    configured_default_max_tokens: int,
+) -> int:
+    if uses_deepseek_thinking(provider_name, model):
+        return max(
+            int(configured_default_max_tokens),
+            DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS,
+        )
+    return int(configured_default_max_tokens)
+
+
 def effective_escalated_max_tokens(
     provider_name: str,
     model: str,
@@ -199,7 +213,10 @@ class OpenAICompatibleMessages:
         self.extra_headers = extra_headers or {}
         self.provider_name = provider_name
 
-    def create(self, *, model: str, system: str | None = None, messages: list[dict], tools: list[dict] | None = None, max_tokens: int = 8000, **kwargs):
+    def create(self, *, model: str, system: str | None = None,
+               messages: list[dict], tools: list[dict] | None = None,
+               max_tokens: int = 8000, thinking: dict | None = None,
+               **kwargs):
         api_key = _validate_api_key(self.api_key, self.provider_name)
         payload_messages = []
         if system:
@@ -210,8 +227,17 @@ class OpenAICompatibleMessages:
             self.provider_name, model,
         )
         if deepseek_thinking:
-            payload["thinking"] = {"type": "enabled"}
-            payload["reasoning_effort"] = DEEPSEEK_REASONING_EFFORT
+            thinking_config = (
+                thinking if thinking is not None else {"type": "enabled"}
+            )
+            if thinking_config not in (
+                {"type": "enabled"},
+                {"type": "disabled"},
+            ):
+                raise ValueError("invalid DeepSeek thinking configuration")
+            payload["thinking"] = thinking_config
+            if thinking_config["type"] == "enabled":
+                payload["reasoning_effort"] = DEEPSEEK_REASONING_EFFORT
         if tools:
             payload["tools"] = _tools_to_openai(tools)
             if not deepseek_thinking:

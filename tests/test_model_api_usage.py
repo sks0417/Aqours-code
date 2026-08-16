@@ -8,6 +8,7 @@ from aqours_code.model_api import (
     _messages_to_openai,
     _openai_message_to_response,
     assistant_message_from_response,
+    effective_initial_max_tokens,
     effective_escalated_max_tokens,
     sanitize_base_url,
 )
@@ -131,6 +132,63 @@ def test_escalated_tokens_are_provider_specific_and_monotonic():
         current_max_tokens=256000,
         configured_escalated_max_tokens=16000,
     ) == 256000
+
+
+def test_deepseek_thinking_starts_at_provider_budget_without_8k_probe():
+    assert effective_initial_max_tokens(
+        "deepseek",
+        "deepseek-v4-flash",
+        configured_default_max_tokens=8_000,
+    ) == 128_000
+    assert effective_initial_max_tokens(
+        "openai",
+        "gpt-test",
+        configured_default_max_tokens=8_000,
+    ) == 8_000
+
+
+def test_deepseek_disabled_thinking_omits_reasoning_effort(monkeypatch):
+    captured = {}
+
+    class FakeHttpResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "choices": [{
+                    "message": {"content": "summary"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {},
+            }).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeHttpResponse()
+
+    monkeypatch.setattr(
+        "aqours_code.model_api.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    messages = OpenAICompatibleMessages(
+        "sk-test",
+        "https://api.deepseek.com",
+        provider_name="DeepSeek",
+    )
+
+    messages.create(
+        model="deepseek-v4-flash",
+        messages=[{"role": "user", "content": "summarize"}],
+        max_tokens=6_000,
+        thinking={"type": "disabled"},
+    )
+
+    assert captured["payload"]["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in captured["payload"]
 
 
 def test_openai_conversion_drops_empty_assistant_reasoning_turn():

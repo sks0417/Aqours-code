@@ -136,10 +136,12 @@ def _process_metrics(trace_path: Path) -> dict:
         "automatic_compactions": sum(1 for event in events
             if event.get("type") == "compact" and event.get("kind") == "automatic"
             and event.get("success") is True),
-        "oversized_tool_results_omitted": sum(
-            int(event.get("omitted_tool_result_count") or 0) for event in events
-            if event.get("type") == "context_compact"
-            and event.get("stage") == "tool_result_limit"),
+        "externalized_tool_results": sum(1 for event in events
+            if (event.get("type") == "tool_result"
+                and event.get("externalized") is True)
+            or event.get("type") == "tool_result_externalized"
+            or (event.get("type") == "task_notification"
+                and event.get("externalized") is True)),
         "exact_repeated_test_commands": sum(
             count - 1 for count in test_counts.values() if count > 1),
         "targeted_test_commands": sum(1 for command in test_commands

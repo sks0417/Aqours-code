@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/opt/aqours-code-src
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends --yes git ca-certificates \
+    && apt-get install --no-install-recommends --yes git ca-certificates ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \

@@ -8,8 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from aqours_code import agent_loop, background
+from aqours_code import agent_loop, background, basic_tools
 from aqours_code.command_executor import CaseTimeoutError, LocalCommandExecutor
+from aqours_code.runtime import AgentRuntime
 from evals import run_eval
 
 
@@ -37,24 +38,13 @@ def tool_block():
     "docker build .",
     "bash -lc 'pytest -q'",
 ])
-def test_slow_command_classifier_recognizes_command_structure(command):
-    assert background.is_slow_operation("bash", {"command": command}) is True
+def test_commands_stay_foreground_without_explicit_request(command):
+    tool_input = {"command": command}
+    assert background.background_reason("bash", tool_input) is None
+    assert background.should_run_background("bash", tool_input) is False
 
 
-@pytest.mark.parametrize("command", [
-    "cat tests/test_public_api.py",
-    "rg test src/",
-    "grep -n 'def test_' tests/test_api.py",
-    "echo build",
-    "python /tmp/debug_test.py",
-    "python -c \"print('pytest')\"",
-    "cat << 'PY' > /tmp/debug.py\npython -m pytest -q\nPY\npython /tmp/debug.py",
-])
-def test_slow_command_classifier_ignores_arguments_paths_and_heredocs(command):
-    assert background.is_slow_operation("bash", {"command": command}) is False
-
-
-def test_explicit_background_request_has_priority_over_classifier():
+def test_explicit_background_request_is_honored():
     tool_input = {
         "command": "cat tests/test_public_api.py",
         "run_in_background": True,
@@ -286,17 +276,69 @@ def test_interactive_loop_returns_while_long_background_task_keeps_running(
     )
 
 
-def test_background_notification_preserves_long_test_result_tail():
+def test_background_notification_externalizes_large_result_in_workspace(
+    tmp_path,
+):
     block = tool_block()
-    output = "pytest session starts\n" + ("collection output\n" * 500)
-    output += "\n================ 5 passed in 0.42s ================"
+    output = "pytest session starts\n" + (
+        "collection output\n"
+        * 5_000
+    )
+    output += "================ 5 passed in 0.42s ================"
+    workdir = tmp_path / "workspace"
+    state_root = tmp_path / "state"
+    workdir.mkdir()
+    state_root.mkdir()
+    runtime = AgentRuntime.create(
+        workdir=workdir,
+        state_root=state_root,
+        model_client=SimpleNamespace(),
+        command_executor=SimpleNamespace(),
+        model_provider="test",
+        model="test",
+    )
 
-    background.start_background_task(block, {"bash": lambda **_kwargs: output})
+    background.start_background_task(
+        block,
+        {"bash": lambda **_kwargs: output},
+        runtime=runtime,
+        result_materializer=agent_loop._materialize_tool_result,
+    )
     assert background.wait_for_background_tasks(1.0) is True
 
     notes = background.collect_background_results()
 
     assert len(notes) == 1
+    assert notes[0].externalized is True
     assert "pytest session starts" in notes[0]
-    assert "characters omitted" in notes[0]
     assert "5 passed in 0.42s" in notes[0]
+    assert not Path(notes[0].backing_path).is_absolute()
+    artifact = workdir / notes[0].backing_path
+    assert artifact.read_text(encoding="utf-8") == output
+    assert basic_tools.run_read(
+        notes[0].backing_path,
+        offset=len(output.splitlines()) - 1,
+        limit=1,
+        runtime=runtime,
+    ) == "================ 5 passed in 0.42s ================"
+
+
+def test_background_materialization_failure_finishes_as_failed_notification():
+    block = tool_block()
+
+    def fail_materialization(_block, _result, _runtime):
+        raise OSError("artifact storage unavailable")
+
+    background.start_background_task(
+        block,
+        {"bash": lambda **_kwargs: "large result"},
+        result_materializer=fail_materialization,
+    )
+    assert background.wait_for_background_tasks(1.0) is True
+
+    notes = background.collect_background_results()
+
+    assert len(notes) == 1
+    assert notes[0].status == "failed"
+    assert "artifact storage unavailable" in notes[0]
+    assert background.background_workers_alive() is False

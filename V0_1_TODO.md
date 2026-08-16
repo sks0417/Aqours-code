@@ -9,7 +9,7 @@
 - [x] Context Compact 的根任务保留、工具调用对、失败回退和重复压缩行为通过回归测试。
 - [x] 权限拒绝、测试失败、constraint violation 和 grader 失败不会被错误宣布为成功。
 - [x] Trace 能记录模型/工具过程和 v0.1 运行元数据，并对 Key、Header 与 Base URL 认证信息脱敏。
-- [x] Context 窗口只暴露一个 Token 上限配置，默认 64K，Compact 比例保持内部固定值。
+- [x] Agent Context 默认硬上限为 128K、100K 触发 Compact；摘要输入与输出预算独立配置。
 - [x] 移除未进入 Context/决策链、但会反复扫描 Workspace 的 RunKnowledge 状态机；重复读取指标继续由 Trace 提供。
 - [x] GitHub Actions 在 Python 3.11 上执行安装、编译、完整 pytest 和 CLI smoke，并补充 MIT License。
 - [x] 删除已被当前文档替代的历史功能审计、旧临时 dump 脚本和对应死代码/测试；保留 Eval、Trace、权限与协作主链路。

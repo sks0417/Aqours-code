@@ -11,7 +11,13 @@ from aqours_code.command_executor import LocalCommandExecutor
 from aqours_code.runtime import AgentRuntime
 
 
-def make_runtime(tmp_path: Path, responses=()) -> AgentRuntime:
+def make_runtime(
+    tmp_path: Path,
+    responses=(),
+    *,
+    model_provider: str = "test",
+    model: str = "test",
+) -> AgentRuntime:
     class Messages:
         def __init__(self, values):
             self.values = list(values)
@@ -32,8 +38,8 @@ def make_runtime(tmp_path: Path, responses=()) -> AgentRuntime:
         state_root=tmp_path / "state",
         model_client=SimpleNamespace(messages=Messages(responses)),
         command_executor=LocalCommandExecutor(),
-        model_provider="test",
-        model="test",
+        model_provider=model_provider,
+        model=model,
         root_task="compact test",
     )
 
@@ -243,6 +249,21 @@ def test_summary_model_receives_configured_6000_output_tokens(tmp_path):
 
     assert summary.startswith("## Checkpoint")
     assert runtime.services.model_client.messages.calls[0]["max_tokens"] == 6_000
+
+
+def test_deepseek_summary_disables_thinking(tmp_path):
+    runtime = make_runtime(
+        tmp_path,
+        responses=["## Checkpoint\nDone."],
+        model_provider="deepseek",
+        model="deepseek-v4-flash",
+    )
+
+    compact.summarize_history(exchange(1, "useful result"), runtime)
+
+    call = runtime.services.model_client.messages.calls[0]
+    assert call["thinking"] == {"type": "disabled"}
+    assert call["max_tokens"] == 6_000
 
 
 def test_prior_checkpoint_is_folded_into_replacement_without_stacking(
@@ -990,7 +1011,18 @@ def test_unchanged_failed_automatic_compact_is_not_retried(
         target_context_budget=350_000,
         request_size_fn=sizer,
     )
-    changed = [*second, {"role": "assistant", "content": "new history"}]
+    still_cooling_down = [*second, *exchange(98, "one new exchange")]
+    compact.compact_history(
+        still_cooling_down,
+        runtime=runtime,
+        allow_model_summary=True,
+        target_context_budget=350_000,
+        request_size_fn=sizer,
+    )
+    changed = [
+        *still_cooling_down,
+        *exchange(99, "second new exchange"),
+    ]
     compact.compact_history(
         changed,
         runtime=runtime,

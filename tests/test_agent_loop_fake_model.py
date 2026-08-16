@@ -1,8 +1,13 @@
 import copy
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from aqours_code import agent_loop
+from aqours_code.command_executor import LocalCommandExecutor
+from aqours_code.runtime import AgentRuntime
 from evals import run_eval
 
 
@@ -105,6 +110,17 @@ def _result_content(messages, tool_use_id: str) -> str:
             ):
                 return str(block.get("content", ""))
     raise AssertionError(f"missing tool result {tool_use_id}")
+
+
+def _runtime(workdir, state_root):
+    return AgentRuntime.create(
+        workdir=workdir,
+        state_root=state_root,
+        model_client=SimpleNamespace(),
+        command_executor=LocalCommandExecutor(),
+        model_provider="test",
+        model="test",
+    )
 
 
 def test_result_above_old_8k_limit_reaches_first_provider_request_intact(
@@ -281,6 +297,83 @@ def test_oversized_non_file_output_is_recoverable_from_tool_results_dir(
     assert recorded[-1]["original_chars"] == len(full_result)
     assert recorded[-1]["original_lines"] == 3
     assert len(recorded[-1]["digest"]) == 64
+
+
+def test_externalized_output_is_readable_when_state_root_is_separate(tmp_path):
+    from aqours_code import basic_tools, compact
+
+    workdir = tmp_path / "workspace"
+    state_root = tmp_path / "state"
+    workdir.mkdir()
+    state_root.mkdir()
+    runtime = _runtime(workdir, state_root)
+    output = "HEAD\n" + (
+        "x" * (
+            compact.MAX_INLINE_TOOL_RESULT_TOKENS
+            * compact.ESTIMATED_CHARS_PER_TOKEN
+            + 20
+        )
+    ) + "\nTAIL"
+    block = tool_block("bash", {"command": "ignored"}, "large-output")
+
+    preview, metadata = agent_loop._materialize_tool_result(
+        block,
+        output,
+        runtime,
+    )
+
+    assert "[Tool result externalized]" in preview
+    assert not Path(metadata["backing_path"]).is_absolute()
+    assert runtime.paths.tool_results_dir.is_relative_to(workdir)
+    assert basic_tools.run_read(
+        metadata["backing_path"],
+        offset=2,
+        limit=1,
+        runtime=runtime,
+    ) == "TAIL"
+
+
+def test_prepare_context_never_returns_above_hard_limit(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = _runtime(tmp_path / "workspace", tmp_path / "state")
+    runtime.paths.workdir.mkdir()
+    runtime.paths.state_root.mkdir()
+    messages = [
+        {"role": "user", "content": "u" * 390_000},
+        {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "latest",
+                "name": "bash",
+                "input": {"command": "ignored"},
+            }],
+        },
+        {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "latest",
+                "content": "r" * 27_000,
+            }],
+        },
+    ]
+    monkeypatch.setattr(
+        agent_loop,
+        "compact_history",
+        lambda current, **_kwargs: current,
+    )
+    monkeypatch.setattr(agent_loop, "update_context", lambda *args: {})
+    monkeypatch.setattr(
+        agent_loop,
+        "assemble_system_prompt",
+        lambda *args: "system",
+    )
+
+    with pytest.raises(RuntimeError, match="above the hard limit"):
+        agent_loop.prepare_context(messages, runtime, {}, [])
 
 
 def test_glob_double_star_recurses_into_nested_source_tree(tmp_path):
@@ -595,14 +688,13 @@ def test_max_tokens_triggers_continuation_path(monkeypatch):
     assert messages[-1]["content"][0].text == "complete"
 
 
-def test_deepseek_thinking_max_tokens_escalates_to_128000(monkeypatch):
+def test_deepseek_thinking_starts_at_128000_without_probe(monkeypatch):
     from aqours_code import recovery
 
     install_common_agent_mocks(monkeypatch)
     monkeypatch.setattr(agent_loop, "MODEL_PROVIDER", "deepseek")
     monkeypatch.setattr(recovery, "PRIMARY_MODEL", "deepseek-v4-flash")
     fake_client = FakeClient([
-        response([], stop_reason="max_tokens"),
         response([text_block("complete")]),
     ])
     monkeypatch.setattr(agent_loop, "client", fake_client)
@@ -612,7 +704,7 @@ def test_deepseek_thinking_max_tokens_escalates_to_128000(monkeypatch):
 
     assert [
         call["max_tokens"] for call in fake_client.messages.calls
-    ] == [8000, 128000]
+    ] == [128000]
     assert messages[-1]["content"][0].text == "complete"
 
 
@@ -624,12 +716,8 @@ def test_empty_max_tokens_response_is_not_replayed(monkeypatch):
     monkeypatch.setattr(recovery, "PRIMARY_MODEL", "deepseek-v4-flash")
     first_truncation = response([], stop_reason="max_tokens")
     first_truncation.reasoning_content = "unfinished reasoning"
-    second_truncation = response([], stop_reason="max_tokens")
-    second_truncation.reasoning_content = "still unfinished reasoning"
     fake_client = FakeClient([
         first_truncation,
-        second_truncation,
-        response([text_block("complete")]),
     ])
     monkeypatch.setattr(agent_loop, "client", fake_client)
 
@@ -638,10 +726,7 @@ def test_empty_max_tokens_response_is_not_replayed(monkeypatch):
 
     assert [
         call["max_tokens"] for call in fake_client.messages.calls
-    ] == [
-        agent_loop.DEFAULT_MAX_TOKENS,
-        128000,
-    ]
+    ] == [128000]
     assert not any(
         message.get("role") == "assistant"
         and not agent_loop.extract_text(message.get("content"))
@@ -672,7 +757,7 @@ def test_max_tokens_recovery_retries_can_be_disabled(monkeypatch):
 
     assert [
         call["max_tokens"] for call in fake_client.messages.calls
-    ] == [8000, 128000]
+    ] == [128000]
     assert sum(
         message.get("content") == agent_loop.CONTINUATION_PROMPT
         for message in messages

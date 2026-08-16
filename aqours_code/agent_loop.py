@@ -21,6 +21,7 @@ from .model_budget import (
 from .runtime import AgentRuntime
 from .model_api import (
     assistant_message_from_response,
+    effective_initial_max_tokens,
     effective_escalated_max_tokens,
 )
 
@@ -30,6 +31,7 @@ agent_lock = threading.Lock()
 _MUTATING_FILE_TOOLS = {"write_file", "edit_file"}
 _MAIN_MUTATION_TOOLS = _MUTATING_FILE_TOOLS | {"integrate_worktree"}
 _TOOL_RESULT_PREVIEW_CHARS = 4_000
+_TOOL_RESULT_REFERENCE_OVERHEAD_CHARS = 2_000
 
 
 def _message_text(content) -> str:
@@ -653,6 +655,83 @@ def _accepted_tool_result(
     }
 
 
+def _externalize_result_block(
+    result_block,
+    tool_use,
+    runtime: AgentRuntime | None,
+    *,
+    reason: str,
+) -> bool:
+    original = str(_tool_field(result_block, "content", ""))
+    if original.startswith("[Tool result externalized]\n"):
+        return False
+    if len(original) <= (
+        2 * _TOOL_RESULT_PREVIEW_CHARS
+        + _TOOL_RESULT_REFERENCE_OVERHEAD_CHARS
+    ):
+        return False
+    content, metadata = _materialize_tool_result(
+        tool_use,
+        original,
+        runtime,
+        force_externalize=True,
+        reason=reason,
+    )
+    if isinstance(result_block, dict):
+        result_block["content"] = content
+    else:
+        setattr(result_block, "content", content)
+    record_event(
+        "tool_result_externalized",
+        tool_use_id=str(_tool_field(result_block, "tool_use_id", "")),
+        tool=str(_tool_field(tool_use, "name", "")),
+        **metadata,
+    )
+    return True
+
+
+def _externalize_oldest_consumed_tool_result(
+    messages: list,
+    runtime: AgentRuntime | None,
+) -> bool:
+    """Externalize one old consumed result before touching the newest batch."""
+    latest_assistant_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "assistant"
+        ),
+        -1,
+    )
+    for index in range(max(0, len(messages) - 1)):
+        if index == latest_assistant_index or index + 1 >= len(messages):
+            continue
+        assistant = messages[index]
+        result_message = messages[index + 1]
+        if not message_has_tool_use(assistant) or not is_tool_result_message(
+            result_message
+        ):
+            continue
+        uses = {
+            str(_tool_field(block, "id", "")): block
+            for block in assistant.get("content", [])
+            if block_type(block) == "tool_use" and _tool_field(block, "id", "")
+        }
+        for result_block in result_message.get("content", []):
+            if block_type(result_block) != "tool_result":
+                continue
+            tool_use_id = str(_tool_field(result_block, "tool_use_id", ""))
+            tool_use = uses.get(tool_use_id)
+            if tool_use is not None and _externalize_result_block(
+                result_block,
+                tool_use,
+                runtime,
+                reason="hard_context_limit_consumed_result",
+            ):
+                return True
+    return False
+
+
 def _hard_limit_externalize_unconsumed_results(
     messages: list,
     runtime: AgentRuntime | None,
@@ -689,27 +768,13 @@ def _hard_limit_externalize_unconsumed_results(
     changed = 0
     for result_block in result_blocks:
         tool_use_id = str(_tool_field(result_block, "tool_use_id", ""))
-        original = str(_tool_field(result_block, "content", ""))
-        if original.startswith("[Tool result externalized]\n"):
-            continue
-        content, metadata = _materialize_tool_result(
+        if _externalize_result_block(
+            result_block,
             uses[tool_use_id],
-            original,
             runtime,
-            force_externalize=True,
-            reason="hard_context_limit_fallback",
-        )
-        if isinstance(result_block, dict):
-            result_block["content"] = content
-        else:
-            setattr(result_block, "content", content)
-        record_event(
-            "tool_result_externalized",
-            tool_use_id=tool_use_id,
-            tool=str(_tool_field(uses[tool_use_id], "name", "")),
-            **metadata,
-        )
-        changed += 1
+            reason="hard_context_limit_unconsumed_result",
+        ):
+            changed += 1
     return changed
 
 
@@ -878,12 +943,23 @@ def prepare_context(
         if changed:
             _record_context_integrity(messages, latest_user_before)
         if after["estimated_tokens"] >= AGENT_CONTEXT_LIMIT_TOKENS:
-            externalized_count = _hard_limit_externalize_unconsumed_results(
-                messages,
-                runtime,
-            )
-            if externalized_count:
-                hard_limit_before = after
+            hard_limit_before = after
+            externalized_count = 0
+            while after["estimated_tokens"] >= AGENT_CONTEXT_LIMIT_TOKENS:
+                changed_count = int(
+                    _externalize_oldest_consumed_tool_result(
+                        messages,
+                        runtime,
+                    )
+                )
+                if not changed_count:
+                    changed_count = _hard_limit_externalize_unconsumed_results(
+                        messages,
+                        runtime,
+                    )
+                if not changed_count:
+                    break
+                externalized_count += changed_count
                 refreshed_context = (
                     update_context(budget_context, messages, runtime)
                     if runtime is not None else update_context(
@@ -901,6 +977,7 @@ def prepare_context(
                     system=refreshed_system,
                     tools=budget_tools,
                 )
+            if externalized_count:
                 record_event(
                     "context_compact",
                     stage="hard_limit_tool_result_externalization",
@@ -913,6 +990,13 @@ def prepare_context(
                     after_size=after["estimated_size"],
                     before_tokens=hard_limit_before["estimated_tokens"],
                     after_tokens=after["estimated_tokens"],
+                )
+            if after["estimated_tokens"] >= AGENT_CONTEXT_LIMIT_TOKENS:
+                raise RuntimeError(
+                    "Agent context remains above the hard limit after "
+                    "compaction and tool-result externalization: "
+                    f"{after['estimated_tokens']} >= "
+                    f"{AGENT_CONTEXT_LIMIT_TOKENS} estimated tokens"
                 )
     return messages
 
@@ -939,6 +1023,11 @@ def _record_background_notifications(notes: list, injection: str):
             summary=getattr(note, "summary", str(note)),
             original_size=getattr(note, "original_size", len(str(note))),
             truncated=bool(getattr(note, "truncated", False)),
+            externalized=bool(getattr(note, "externalized", False)),
+            backing_path=getattr(note, "backing_path", ""),
+            original_estimated_tokens=int(
+                getattr(note, "original_estimated_tokens", 0)),
+            digest=getattr(note, "digest", ""),
         )
 
 
@@ -1090,7 +1179,15 @@ def agent_loop(
     state = RecoveryState()
     if runtime is not None:
         state.current_model = runtime.config.primary_model
-    max_tokens = DEFAULT_MAX_TOKENS
+    provider_name = (
+        runtime.config.model_provider
+        if runtime is not None else MODEL_PROVIDER
+    )
+    max_tokens = effective_initial_max_tokens(
+        provider_name,
+        state.current_model,
+        configured_default_max_tokens=DEFAULT_MAX_TOKENS,
+    )
     # Todos are scoped to one user/cron turn. Incomplete items remain available
     # through every context compaction inside this loop.
     current_todos = _runtime_todos(runtime)
@@ -1285,19 +1382,19 @@ def agent_loop(
                 finish_run(extract_text(response.content))
                 return
             if not state.has_escalated:
-                provider_name = (
-                    runtime.config.model_provider
-                    if runtime is not None else MODEL_PROVIDER
-                )
-                max_tokens = effective_escalated_max_tokens(
+                escalated_max_tokens = effective_escalated_max_tokens(
                     provider_name,
                     state.current_model,
                     current_max_tokens=max_tokens,
                     configured_escalated_max_tokens=ESCALATED_MAX_TOKENS,
                 )
-                state.has_escalated = True
-                print(f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m")
-                continue
+                if escalated_max_tokens > max_tokens:
+                    max_tokens = escalated_max_tokens
+                    state.has_escalated = True
+                    print(
+                        f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m"
+                    )
+                    continue
             # Some thinking models can spend the entire response budget on
             # hidden reasoning and return no text or tool call. Replaying that
             # as an empty assistant message is invalid for OpenAI-compatible
@@ -1310,7 +1407,11 @@ def agent_loop(
                 continue
             return
 
-        max_tokens = DEFAULT_MAX_TOKENS
+        max_tokens = effective_initial_max_tokens(
+            provider_name,
+            state.current_model,
+            configured_default_max_tokens=DEFAULT_MAX_TOKENS,
+        )
         state.has_escalated = False
         messages.append(assistant_message_from_response(response))
         if force_final_response:
@@ -1477,11 +1578,13 @@ def agent_loop(
             record_hook("PreToolUse", tool=block.name, decision="allowed")
 
             if should_run_background(block.name, block.input):
-                routing_reason = (
-                    "explicit" if block.input.get("run_in_background")
-                    else "slow_command"
+                routing_reason = "explicit"
+                bg_id = start_background_task(
+                    block,
+                    handlers,
+                    runtime=runtime,
+                    result_materializer=_materialize_tool_result,
                 )
-                bg_id = start_background_task(block, handlers)
                 record_event(
                     "background_routed",
                     tool=block.name,

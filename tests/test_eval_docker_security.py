@@ -389,7 +389,7 @@ def test_eval_trace_storage_is_separate_and_exposes_normal_process_metrics(
         "duplicate_tool_calls", "tool_counts", "read_file_calls",
         "post_compact_redundant_reads",
         "post_compact_redundant_read_details",
-        "automatic_compactions", "oversized_tool_results_omitted",
+        "automatic_compactions", "externalized_tool_results",
         "exact_repeated_test_commands", "targeted_test_commands",
         "context_integrity_events", "context_integrity_failures",
         "context_configuration", "team_event_counts",

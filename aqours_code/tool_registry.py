@@ -23,7 +23,7 @@ KNOWN_SAFETY_POLICIES = frozenset({
 })
 KNOWN_BACKGROUND_POLICIES = frozenset({
     "foreground",
-    "slow_or_explicit",
+    "explicit",
 })
 
 

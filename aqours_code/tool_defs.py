@@ -311,7 +311,7 @@ _SAFETY_POLICIES = {
     "remove_worktree": "destructive_confirmation",
     "integrate_worktree": "workspace_integration",
 }
-_BACKGROUND_POLICIES = {"bash": "slow_or_explicit"}
+_BACKGROUND_POLICIES = {"bash": "explicit"}
 
 TOOL_REGISTRY = ToolRegistry(
     ToolSpec(

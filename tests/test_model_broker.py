@@ -100,6 +100,7 @@ def test_broker_round_trip_supports_only_messages_create_and_cleans_files(tmp_pa
             messages=[{"role": "user", "content": "hello"}],
             tools=[{"name": "read_file", "input_schema": {}}],
             max_tokens=123,
+            thinking={"type": "disabled"},
         )
     finally:
         stopped = broker.stop()
@@ -108,6 +109,7 @@ def test_broker_round_trip_supports_only_messages_create_and_cleans_files(tmp_pa
     assert broker.call_count == 1
     assert messages.calls[0]["model"] == "scripted"
     assert messages.calls[0]["max_tokens"] == 123
+    assert messages.calls[0]["thinking"] == {"type": "disabled"}
     assert response.stop_reason == "tool_use"
     assert response.content[0].text == "brokered"
     assert response.content[1].name == "read_file"
@@ -123,6 +125,20 @@ def test_broker_client_rejects_extra_rpc_surface_before_writing(tmp_path):
     with pytest.raises(BrokerProtocolError, match="unsupported arguments"):
         client.messages.create(
             model="scripted", messages=[], temperature=0.5)
+
+    assert not (tmp_path / "requests").exists()
+
+
+def test_broker_client_rejects_enabled_thinking_override(tmp_path):
+    nonce = uuid.uuid4().hex
+    client = BrokerModelClient(tmp_path, nonce, request_timeout=0.1)
+
+    with pytest.raises(BrokerProtocolError, match="disabled thinking"):
+        client.messages.create(
+            model="scripted",
+            messages=[],
+            thinking={"type": "enabled"},
+        )
 
     assert not (tmp_path / "requests").exists()
 

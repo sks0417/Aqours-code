@@ -91,12 +91,13 @@ does not remove any Lead tool.
 
 Every model turn is budgeted as one assembled request: rebuilt system prompt,
 API tool schemas, dynamic runtime state, and messages. Ordinary turns leave
-history untouched. At 85% of the configured context budget, the lifecycle is:
+history untouched. With the default configuration, Compact begins near 80% of
+the hard context budget. The lifecycle is:
 
 ```text
 assemble the complete current request
--> replace Tool Results above 8,000 estimated tokens with placeholders
--> measure the complete sanitized request and decide whether to compact
+-> externalize Tool Results above 24,000 estimated tokens with a recoverable preview
+-> measure the complete request and decide whether to compact
 -> choose a bounded recent raw suffix of at most four Tool exchanges
 -> copy the latest real user message verbatim as a standalone message
 -> reserve checkpoint + tail + system/tool budget before calling the summarizer
@@ -104,6 +105,10 @@ assemble the complete current request
 -> assemble checkpoint + latest user message + recent complete tail
 -> verify the complete next request fits the target
 ```
+
+`bash` runs in the foreground by default, including test commands. It is routed
+to a worker only when the model explicitly sends `run_in_background=true`, so a
+fast test does not create an extra model turn merely to wait for its result.
 
 The checkpoint is an ordinary internal user message marked
 `[Context checkpoint]`. A later compact includes the old checkpoint in the
@@ -135,23 +140,29 @@ Tool Results and harness control messages are not treated as instructions. If
 the same user message falls inside the raw-tail selection, it appears only once.
 
 Before request sizing or any provider call, a Tool Result above
-`MAX_TOOL_RESULT_TOKENS` (currently 8,000 estimated tokens) has only its content
-replaced by a short size/reason placeholder. The Tool-result message,
-corresponding Tool-use, and `tool_use_id` remain intact. Normal results are
-unchanged, and no complete oversized result is written to disk or made
-recoverable later.
+`MAX_INLINE_TOOL_RESULT_TOKENS` (currently 24,000 estimated tokens) is persisted
+under the workspace's `.task_outputs/tool-results/` directory. The model sees a
+bounded head/tail preview, integrity metadata, and a workspace-relative path it
+can inspect with `read_file` or `rg`; the full result remains recoverable. A
+smaller newest Tool Result remains inline and is protected as the latest
+unconsumed exchange while Compact summarizes older history first. If the full
+request still reaches the hard context limit after Compact, older consumed Tool
+Results are externalized one at a time, the request is remeasured after each
+change, and the provider call is refused if the hard-limit postcondition still
+cannot be met.
 
 One compact attempt issues at most one summary model call. The complete summary
-prompt is measured before that call. Model failure, empty output, an unsafe
-boundary, or an over-budget assembled candidate preserves ordinary history and
-any deterministic placeholder replacements. One runtime-only SHA-256 signature
-suppresses a repeated automatic summary attempt for the same failed history;
-manual Compact may retry and any history change produces a new signature.
-There is no recursive summary, disk fallback, or second call.
+prompt is measured before that call. DeepSeek Thinking is disabled for this
+compression-only request while the lead retains its configured Thinking mode.
+Model failure, empty output, an unsafe boundary, or an over-budget assembled
+candidate preserves ordinary history and any deterministic externalizations.
+A runtime-only SHA-256 signature plus a small message-growth cooldown suppresses
+immediate automatic retries after a failed summary; manual Compact may retry.
+There is no recursive summary or second summary call.
 
 Compact trace records reason, before/after messages and token estimates,
 summarized prefix size, raw-tail size, summary length, outcome,
-oversized-result placeholder count, and the exact summary-call count.
+externalized-result count, and the exact summary-call count.
 Successful compaction increments a small runtime generation
 counter used only by the post-compact redundant-read metric.
 

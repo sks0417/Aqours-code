@@ -7,6 +7,7 @@ from copy import copy as shallow_copy
 from pathlib import Path
 
 from .model_budget import can_spend_optional_calls
+from .model_api import uses_deepseek_thinking
 from .runtime import AgentRuntime
 from .runtime_state import *
 
@@ -19,6 +20,7 @@ RECENT_TOOL_RESULT_COUNT = 4
 RECENT_TAIL_MAX_TOKENS = 20_000
 MAX_INLINE_TOOL_RESULT_TOKENS = 24_000
 COMPACT_HEADROOM_TOKENS = 8_000
+COMPACT_RETRY_MESSAGE_GROWTH = 4
 ESTIMATED_CHARS_PER_TOKEN = CONTEXT_CHARS_PER_TOKEN
 # Leave room for estimation error and Provider-side message framing without
 # coupling the summary input window to either the Agent window or output size.
@@ -499,10 +501,18 @@ def _call_compact_model(
         purpose=purpose,
         agent_role="",
     )
+    request = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": SUMMARY_MAX_TOKENS,
+    }
+    provider_name = (
+        runtime.config.model_provider if runtime is not None else MODEL_PROVIDER
+    )
+    if uses_deepseek_thinking(provider_name, model):
+        request["thinking"] = {"type": "disabled"}
     response = model_client.messages.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=SUMMARY_MAX_TOKENS,
+        **request,
     )
     record_llm_response(response, purpose=purpose, agent_role="")
     return extract_text(response.content)
@@ -600,11 +610,15 @@ def _remember_failed_compact(
     reason: str,
     signature: str,
     failure: str,
+    message_count: int,
 ) -> None:
     if runtime is None or reason != "automatic":
         return
     runtime.state.metadata["last_failed_compact_signature"] = signature
     runtime.state.metadata["last_failed_compact_reason"] = failure[:500]
+    runtime.state.metadata["last_failed_compact_message_count"] = int(
+        message_count
+    )
 
 
 def _clear_failed_compact(runtime: AgentRuntime | None) -> None:
@@ -612,6 +626,7 @@ def _clear_failed_compact(runtime: AgentRuntime | None) -> None:
         return
     runtime.state.metadata.pop("last_failed_compact_signature", None)
     runtime.state.metadata.pop("last_failed_compact_reason", None)
+    runtime.state.metadata.pop("last_failed_compact_message_count", None)
 
 
 def _record_compact(
@@ -709,24 +724,39 @@ def _compact(
         not force
         and reason == "automatic"
         and runtime is not None
-        and runtime.state.metadata.get("last_failed_compact_signature")
-        == signature
     ):
-        failure = "unchanged history matches the last failed compact"
-        _record_compact(
-            reason=reason,
-            transcript=transcript,
-            before_messages=len(messages),
-            before_size=original_size,
-            after_messages=len(active_messages),
-            after_size=active_size,
-            summarized_prefix=0,
-            tail=active_messages,
-            summary="",
-            success=False,
-            failure_reason=failure,
+        failed_count = runtime.state.metadata.get(
+            "last_failed_compact_message_count"
         )
-        return active_messages
+        unchanged = (
+            runtime.state.metadata.get("last_failed_compact_signature")
+            == signature
+        )
+        cooling_down = (
+            isinstance(failed_count, int)
+            and len(active_messages)
+            < failed_count + COMPACT_RETRY_MESSAGE_GROWTH
+        )
+        if unchanged or cooling_down:
+            failure = (
+                "unchanged history matches the last failed compact"
+                if unchanged
+                else "compact retry cooldown awaiting more message growth"
+            )
+            _record_compact(
+                reason=reason,
+                transcript=transcript,
+                before_messages=len(messages),
+                before_size=original_size,
+                after_messages=len(active_messages),
+                after_size=active_size,
+                summarized_prefix=0,
+                tail=active_messages,
+                summary="",
+                success=False,
+                failure_reason=failure,
+            )
+            return active_messages
 
     prefix, tail, latest_user_message, protected_tool_ids = (
         _select_prefix_and_recent_tail(active_messages)
@@ -738,6 +768,7 @@ def _compact(
             reason=reason,
             signature=signature,
             failure=failure,
+            message_count=len(active_messages),
         )
         _record_compact(
             reason=reason,
@@ -777,6 +808,7 @@ def _compact(
                 reason=reason,
                 signature=signature,
                 failure=failure,
+                message_count=len(active_messages),
             )
             _record_compact(
                 reason=reason,
@@ -820,6 +852,7 @@ def _compact(
             reason=reason,
             signature=signature,
             failure=failure,
+            message_count=len(active_messages),
         )
         _record_compact(
             reason=reason,
@@ -839,6 +872,14 @@ def _compact(
     model_client = runtime.services.model_client if runtime is not None else client
     budget_allowed, budget = can_spend_optional_calls(model_client, 1)
     if allow_model_summary is False or not budget_allowed:
+        failure = "model summary call unavailable"
+        _remember_failed_compact(
+            runtime,
+            reason=reason,
+            signature=signature,
+            failure=failure,
+            message_count=len(active_messages),
+        )
         record_event(
             "model_budget_guard",
             decision="compact_skipped",
@@ -861,7 +902,7 @@ def _compact(
             tail=active_messages,
             summary="",
             success=False,
-            failure_reason="model summary call unavailable",
+            failure_reason=failure,
         )
         return active_messages
 
@@ -872,6 +913,7 @@ def _compact(
             reason=reason,
             signature=signature,
             failure=failure,
+            message_count=len(active_messages),
         )
         _record_compact(
             reason=reason,
@@ -919,6 +961,7 @@ def _compact(
             reason=reason,
             signature=signature,
             failure=failure,
+            message_count=len(active_messages),
         )
         return active_messages
 

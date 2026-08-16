@@ -48,7 +48,10 @@ class RuntimePaths:
             state_root=root,
             skills_dir=root / "skills",
             transcript_dir=root / ".transcripts",
-            tool_results_dir=root / ".task_outputs" / "tool-results",
+            # Tool-result artifacts must remain readable through read_file.
+            # Runtime state may live outside the workspace (for example /state
+            # in Docker evals), so these artifacts belong to the workspace.
+            tool_results_dir=workspace / ".task_outputs" / "tool-results",
             memory_dir=root / ".memory",
             memory_index=root / ".memory" / "MEMORY.md",
             mailbox_dir=root / ".mailboxes",
