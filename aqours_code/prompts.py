@@ -11,15 +11,22 @@ PROMPT_SECTIONS = {
                    "one-time task."),
     "workspace": f"Working directory: {WORKDIR}",
     "memory": "Relevant memories are injected below when available.",
-    "permissions": ("If a tool result starts with 'Permission denied', stop immediately. "
-                    "Do not suggest manual deletion, bypasses, alternative destructive methods, "
-                    "or clearing files."),
+    "permissions": (
+        "Treat an ordinary 'Tool not run' policy block as recoverable: use the "
+        "reason to rewrite the call or finish. If a tool result starts with "
+        "'Permission denied', the user or runtime denied approval; stop "
+        "immediately. Do not suggest manual deletion, bypasses, alternative "
+        "destructive methods, or clearing files."
+    ),
     "tool_strategy": (
         "Tool strategy: prefer glob/read_file to bash for inspection; do not "
         "create temporary inspection files. For multi-step work, inspect the "
         "contract/source, then use todo_write when a checklist would help; include "
         "implementation and verification steps in the same list and keep it current. "
-        "Batch independent reads with known inputs (at most 8) in one response. "
+        "Batch independent tool calls in one response. For example, read related "
+        "files or run independent searches together. Keep calls sequential only "
+        "when a later call depends on an earlier result. Use at most 8 calls per "
+        "batch. "
         "After analysis, batch mutations only when each targets a different file "
         "and none depends on another result; use at most one mutation per file. "
         "Never batch read-to-dependent-edit, or mutations with tests, background "
@@ -27,12 +34,12 @@ PROMPT_SECTIONS = {
         "partial failure does not roll back successful calls. Complete one "
         "coherent phase per tool round; do not spend rounds announcing work or "
         "waiting for short commands. "
-        "After public tests pass, run an additional check only for one specific, "
-        "named contract risk that remains unresolved. Keep that check focused; "
-        "do not generate broad multi-scenario audit scripts. When no concrete "
-        "unresolved risk remains, finish. Treat 'Tool not run' "
-        "as recoverable guidance. Stop on "
-        "'Permission denied'. For background bash, never rerun, poll check_inbox, "
+        "After a full test suite passes, do not rerun an equivalent full suite "
+        "unless the workspace has changed. Run at most one focused check for one "
+        "explicitly named uncovered risk. If no remaining risk can be named, "
+        "finish. Do not generate broad multi-scenario audit scripts. Treat 'Tool "
+        "not run' as recoverable guidance. Stop on 'Permission denied'. For "
+        "background bash, never rerun, poll check_inbox, "
         "or delegate merely to wait; continue independent work or finish and use "
         "the task_notification result."
     ),

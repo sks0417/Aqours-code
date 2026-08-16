@@ -222,9 +222,9 @@ def test_every_declared_policy_has_an_execution_dispatcher(monkeypatch):
         input={"name": "../outside", "cleanup": True},
     )
     assert hooks.permission_hook(destructive)["recoverable"] is False
-    assert "invalid Worktree name" in hooks.permission_hook(
-        invalid_integration,
-    )
+    invalid_result = hooks.permission_hook(invalid_integration)
+    assert invalid_result["recoverable"] is True
+    assert "invalid Worktree name" in invalid_result["message"]
     assert background.background_reason(
         "read_file", {"run_in_background": True},
     ) is None
@@ -261,7 +261,9 @@ def test_fixed_prompt_and_lead_tool_schema_stay_below_phase_two_budget(
 def test_tool_strategy_batches_only_safe_independent_operations():
     strategy = prompts.PROMPT_SECTIONS["tool_strategy"]
 
-    assert "Batch independent reads" in strategy
+    assert "Batch independent tool calls in one response" in strategy
+    assert "read related files or run independent searches together" in strategy
+    assert "later call depends on an earlier result" in strategy
     assert "at most 8" in strategy
     assert "each targets a different file" in strategy
     assert "at most one mutation per file" in strategy
@@ -271,7 +273,9 @@ def test_tool_strategy_batches_only_safe_independent_operations():
     assert "Tools execute in response order" in strategy
     assert "partial failure does not roll back" in strategy
     assert "Complete one coherent phase" in strategy
-    assert "one specific, named contract risk" in strategy
-    assert "do not generate broad multi-scenario audit scripts" in strategy
+    assert "do not rerun an equivalent full suite" in strategy
+    assert "explicitly named uncovered risk" in strategy
+    assert "If no remaining risk can be named, finish" in strategy
+    assert "Do not generate broad multi-scenario audit scripts" in strategy
     assert "mutable-alias boundaries" not in strategy
     assert "shared-dependency fan-in" not in strategy

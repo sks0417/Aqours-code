@@ -9,6 +9,7 @@ from aqours_code import agent_loop
 from aqours_code.command_executor import LocalCommandExecutor
 from aqours_code.runtime import AgentRuntime
 from evals import run_eval
+from evals.grader_common import is_test_command
 
 
 def text_block(text: str):
@@ -95,6 +96,85 @@ def test_read_file_tool_use_executes_and_appends_tool_result(tmp_path, monkeypat
     assert tool_message["content"][0]["type"] == "tool_result"
     assert tool_message["content"][0]["content"] == "hello Aqours_code"
     assert messages[-1]["content"][0].text == "finished"
+
+
+def test_three_independent_tool_calls_share_one_result_batch(
+    tmp_path,
+    monkeypatch,
+):
+    from aqours_code import basic_tools
+
+    install_common_agent_mocks(monkeypatch)
+    monkeypatch.setattr(agent_loop, "WORKDIR", tmp_path)
+    monkeypatch.setattr(basic_tools, "WORKDIR", tmp_path)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+    fake_client = FakeClient([
+        response([
+            tool_block("read_file", {"path": name}, f"read_{index}")
+            for index, name in enumerate(("a.txt", "b.txt", "c.txt"), 1)
+        ]),
+        response([text_block("done")]),
+    ])
+    monkeypatch.setattr(agent_loop, "client", fake_client)
+
+    messages = [{"role": "user", "content": "read all three"}]
+    agent_loop.agent_loop(messages, {})
+
+    assert len(fake_client.messages.calls) == 2
+    batch = fake_client.messages.message_snapshots[1][-1]
+    assert batch["role"] == "user"
+    assert [item["tool_use_id"] for item in batch["content"]] == [
+        "read_1", "read_2", "read_3",
+    ]
+    assert [item["content"] for item in batch["content"]] == [
+        "a.txt", "b.txt", "c.txt",
+    ]
+
+
+def test_blocked_call_in_batch_keeps_other_results_and_ids(tmp_path):
+    (tmp_path / "note.txt").write_text("visible", encoding="utf-8")
+
+    class BatchedBlockedClient:
+        def __init__(self):
+            self.messages = self
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return response([
+                    tool_block("read_file", {"path": "note.txt"}, "read"),
+                    tool_block(
+                        "bash",
+                        {"command": "Remove-Item -Recurse -Force ."},
+                        "blocked",
+                    ),
+                    tool_block("glob", {"pattern": "*.txt"}, "glob"),
+                ])
+            batch = kwargs["messages"][-1]
+            assert [item["tool_use_id"] for item in batch["content"]] == [
+                "read", "blocked", "glob",
+            ]
+            assert batch["content"][0]["content"] == "visible"
+            assert batch["content"][1]["content"].startswith("Tool not run:")
+            assert batch["content"][2]["content"] == "note.txt"
+            return response([text_block("recovered")])
+
+    client = BatchedBlockedClient()
+    executor = LocalCommandExecutor()
+    result = agent_loop.run_agent_task(
+        "inspect without deletion",
+        str(tmp_path),
+        model_client=client,
+        model_provider="test",
+        model="fake",
+        command_executor=executor,
+    )
+
+    assert client.calls == 2
+    assert executor.command_execution_count == 0
+    assert result["final_answer"] == "recovered"
 
 
 def _result_content(messages, tool_use_id: str) -> str:
@@ -842,6 +922,349 @@ def test_real_context_pipeline_keeps_eight_reads_visible_before_edit(
     assert (tmp_path / "file_0.txt").read_text(encoding="utf-8").startswith(
         "fixed 0")
     assert result["final_answer"] == "inspected and edited"
+
+
+@pytest.mark.parametrize("command, collect_only", [
+    ("pytest", False),
+    ("pytest -q", False),
+    ("python -m pytest", False),
+    ("pytest -q 2>&1 | tail -20", False),
+    ("pytest 2>&1 | grep passed", False),
+    ("pytest --collect-only", True),
+])
+def test_full_pytest_classifier_accepts_equivalent_suites(
+    command,
+    collect_only,
+):
+    assert agent_loop._classify_full_pytest_command(command) == {
+        "test_family": "pytest",
+        "collect_only": collect_only,
+    }
+
+
+@pytest.mark.parametrize("command", [
+    "pytest tests/test_x.py",
+    "pytest tests/test_x.py::TestThing",
+    "pytest tests/test_x.py::TestThing::test_case",
+    "pytest -k cache",
+])
+def test_full_pytest_classifier_rejects_focused_tests(command):
+    assert agent_loop._classify_full_pytest_command(command) is None
+
+
+class OutcomeExecutor(LocalCommandExecutor):
+    def __init__(self, outcomes):
+        super().__init__()
+        self.outcomes = list(outcomes)
+        self.commands = []
+
+    def execute(self, command, cwd, timeout):
+        self.command_execution_count += 1
+        self.commands.append(command)
+        if not self.outcomes:
+            raise AssertionError("unexpected command execution")
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return {
+            "command": command,
+            "exit_code": outcome.get("exit_code"),
+            "stdout": outcome.get("stdout", ""),
+            "stderr": outcome.get("stderr", ""),
+            "timed_out": outcome.get("timed_out", False),
+            "duration_ms": 1,
+        }
+
+
+def _passing_outcome(text="12 passed"):
+    return {"exit_code": 0, "stdout": text, "timed_out": False}
+
+
+def test_equivalent_full_suite_is_deduplicated_with_trace_and_protocol(tmp_path):
+    trace_path = tmp_path / "trace.jsonl"
+    executor = OutcomeExecutor([_passing_outcome()])
+    client = FakeClient([
+        response([tool_block("bash", {"command": "pytest -q"}, "suite_1")]),
+        response([tool_block(
+            "bash", {"command": "python -m pytest"}, "suite_2"
+        )]),
+        response([text_block("done")]),
+    ])
+
+    agent_loop.run_agent_task(
+        "run tests once",
+        str(tmp_path),
+        str(trace_path),
+        model_client=client,
+        model_provider="test",
+        model="fake",
+        command_executor=executor,
+    )
+
+    assert executor.commands == ["pytest -q"]
+    reused = _result_content(
+        client.messages.message_snapshots[2], "suite_2"
+    )
+    assert reused.startswith(
+        "Full test suite already passed on the current workspace revision."
+    )
+    assert "Reused passing result from: pytest -q" in reused
+    events = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    deduplicated = [
+        event for event in events
+        if event.get("type") == "test_command_deduplicated"
+    ]
+    assert len(deduplicated) == 1
+    assert deduplicated[0]["original_command"] == "python -m pytest"
+    assert deduplicated[0]["previous_command"] == "pytest -q"
+    assert deduplicated[0]["workspace_change_generation"] == 0
+    test_tool_uses = [
+        event for event in events
+        if event.get("type") == "tool_use"
+        and event.get("tool") == "bash"
+        and "pytest" in str(event.get("input", {}).get("command", ""))
+    ]
+    assert [event["input"]["command"] for event in test_tool_uses] == [
+        "pytest -q"
+    ]
+    assert sum(
+        is_test_command(str(event.get("input", {}).get("command", "")))
+        for event in events if event.get("type") == "tool_use"
+    ) == 1
+
+
+@pytest.mark.parametrize("wrapped_command", [
+    "pytest -q 2>&1 | tail -20",
+    "pytest 2>&1 | grep passed",
+])
+def test_passing_display_wrappers_seed_full_suite_cache(
+    tmp_path,
+    wrapped_command,
+):
+    executor = OutcomeExecutor([_passing_outcome()])
+    client = FakeClient([
+        response([tool_block(
+            "bash", {"command": wrapped_command}, "wrapped"
+        )]),
+        response([tool_block(
+            "bash", {"command": "python -m pytest"}, "equivalent"
+        )]),
+        response([text_block("done")]),
+    ])
+
+    agent_loop.run_agent_task(
+        "test with a display wrapper",
+        str(tmp_path),
+        model_client=client,
+        model_provider="test",
+        model="fake",
+        command_executor=executor,
+    )
+
+    assert executor.commands == [wrapped_command]
+
+
+def test_workspace_edit_allows_full_suite_to_run_again(tmp_path):
+    (tmp_path / "value.txt").write_text("old", encoding="utf-8")
+    executor = OutcomeExecutor([_passing_outcome(), _passing_outcome("13 passed")])
+    client = FakeClient([
+        response([tool_block("bash", {"command": "pytest"}, "suite_1")]),
+        response([tool_block(
+            "edit_file",
+            {"path": "value.txt", "old_text": "old", "new_text": "new"},
+            "edit",
+        )]),
+        response([tool_block(
+            "bash", {"command": "python -m pytest -q"}, "suite_2"
+        )]),
+        response([text_block("done")]),
+    ])
+
+    agent_loop.run_agent_task(
+        "edit and retest",
+        str(tmp_path),
+        model_client=client,
+        model_provider="test",
+        model="fake",
+        command_executor=executor,
+    )
+
+    assert executor.commands == ["pytest", "python -m pytest -q"]
+    assert (tmp_path / "value.txt").read_text(encoding="utf-8") == "new"
+
+
+@pytest.mark.parametrize("first_outcome", [
+    {"exit_code": 1, "stdout": "1 failed", "timed_out": False},
+    {"exit_code": None, "stderr": "too slow", "timed_out": True},
+    RuntimeError("executor unavailable"),
+])
+def test_failed_timeout_or_error_full_suite_is_not_cached(
+    tmp_path,
+    first_outcome,
+):
+    executor = OutcomeExecutor([first_outcome, _passing_outcome()])
+    client = FakeClient([
+        response([tool_block("bash", {"command": "pytest -q"}, "suite_1")]),
+        response([tool_block(
+            "bash", {"command": "python -m pytest"}, "suite_2"
+        )]),
+        response([text_block("done")]),
+    ])
+
+    agent_loop.run_agent_task(
+        "retry uncertain tests",
+        str(tmp_path),
+        model_client=client,
+        model_provider="test",
+        model="fake",
+        command_executor=executor,
+    )
+
+    assert executor.commands == ["pytest -q", "python -m pytest"]
+
+
+def test_display_pipeline_exit_zero_without_pass_summary_is_not_cached(tmp_path):
+    executor = OutcomeExecutor([
+        {"exit_code": 0, "stdout": "1 failed", "timed_out": False},
+        _passing_outcome(),
+    ])
+    client = FakeClient([
+        response([tool_block(
+            "bash", {"command": "pytest -q 2>&1 | tail -20"}, "suite_1"
+        )]),
+        response([tool_block(
+            "bash", {"command": "python -m pytest"}, "suite_2"
+        )]),
+        response([text_block("done")]),
+    ])
+
+    agent_loop.run_agent_task(
+        "retry a failed displayed suite",
+        str(tmp_path),
+        model_client=client,
+        model_provider="test",
+        model="fake",
+        command_executor=executor,
+    )
+
+    assert executor.commands == [
+        "pytest -q 2>&1 | tail -20", "python -m pytest"
+    ]
+
+
+def test_focused_test_always_runs_after_full_suite(tmp_path):
+    executor = OutcomeExecutor([_passing_outcome(), _passing_outcome("1 passed")])
+    client = FakeClient([
+        response([tool_block("bash", {"command": "pytest -q"}, "suite")]),
+        response([tool_block(
+            "bash", {"command": "pytest tests/test_x.py"}, "focused"
+        )]),
+        response([text_block("done")]),
+    ])
+
+    agent_loop.run_agent_task(
+        "run full then focused",
+        str(tmp_path),
+        model_client=client,
+        model_provider="test",
+        model="fake",
+        command_executor=executor,
+    )
+
+    assert executor.commands == ["pytest -q", "pytest tests/test_x.py"]
+
+
+def test_blocked_full_suite_is_not_cached(tmp_path, monkeypatch):
+    from aqours_code import hooks
+
+    executor = OutcomeExecutor([_passing_outcome()])
+    client = FakeClient([
+        response([tool_block("bash", {"command": "pytest -q"}, "blocked")]),
+        response([tool_block(
+            "bash", {"command": "python -m pytest"}, "actual"
+        )]),
+        response([text_block("done")]),
+    ])
+    real_trigger_hooks = agent_loop.trigger_hooks
+    blocked_once = False
+
+    def trigger(event, *args):
+        nonlocal blocked_once
+        if event == "PreToolUse" and not blocked_once:
+            block = args[0]
+            if block.name == "bash":
+                blocked_once = True
+                return hooks.recoverable_tool_rejection(
+                    "Tool not run: test command blocked for this check."
+                )
+        return real_trigger_hooks(event, *args)
+
+    monkeypatch.setattr(agent_loop, "trigger_hooks", trigger)
+    agent_loop.run_agent_task(
+        "retry a blocked suite",
+        str(tmp_path),
+        model_client=client,
+        model_provider="test",
+        model="fake",
+        command_executor=executor,
+    )
+
+    assert executor.commands == ["python -m pytest"]
+
+
+def test_collect_only_never_creates_passing_cache(tmp_path):
+    executor = OutcomeExecutor([
+        _passing_outcome("collected 12 items"),
+        _passing_outcome(),
+    ])
+    client = FakeClient([
+        response([tool_block(
+            "bash", {"command": "pytest --collect-only"}, "collect_1"
+        )]),
+        response([tool_block("bash", {"command": "pytest -q"}, "suite")]),
+        response([tool_block(
+            "bash", {"command": "pytest --collect-only"}, "collect_2"
+        )]),
+        response([text_block("done")]),
+    ])
+
+    agent_loop.run_agent_task(
+        "collect, test, and collect again",
+        str(tmp_path),
+        model_client=client,
+        model_provider="test",
+        model="fake",
+        command_executor=executor,
+    )
+
+    assert executor.commands == ["pytest --collect-only", "pytest -q"]
+    reused = _result_content(
+        client.messages.message_snapshots[3], "collect_2"
+    )
+    assert reused.startswith(
+        "Full test suite already passed on the current workspace revision."
+    )
+
+
+def test_case_timeout_remains_a_runtime_failure(tmp_path):
+    from aqours_code.command_executor import CaseTimeoutError
+
+    executor = OutcomeExecutor([CaseTimeoutError("runtime deadline")])
+    client = FakeClient([
+        response([tool_block("bash", {"command": "pytest -q"}, "suite")]),
+    ])
+
+    with pytest.raises(CaseTimeoutError, match="runtime deadline"):
+        agent_loop.run_agent_task(
+            "run tests",
+            str(tmp_path),
+            model_client=client,
+            model_provider="test",
+            model="fake",
+            command_executor=executor,
+        )
 
 
 def test_turns_and_tool_calls_remain_trace_metrics_without_loop_limits(tmp_path):

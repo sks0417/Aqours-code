@@ -93,10 +93,17 @@ def _command_guard_policy(block):
                  "read-only analysis; use glob/read_file or a read-only "
                  "cmd command instead. Do not retry a delete command."),
             )
-        return "Permission denied: delete commands are disabled for bash"
+        return recoverable_tool_rejection(
+            "Tool not run: the command contains a blocked deletion operation.",
+            ("Rewrite the check without explicit deletion, or finish if "
+             "existing evidence is sufficient."),
+        )
     for pattern in DENY_LIST:
         if pattern in command:
-            return f"Permission denied: '{pattern}' is on the deny list"
+            return recoverable_tool_rejection(
+                f"Tool not run: '{pattern}' is blocked by the bash policy.",
+                "Rewrite the command without the blocked operation.",
+            )
     if any(token in command for token in DESTRUCTIVE):
         if APPROVAL_MODE != "interactive":
             return noninteractive_permission_denial(
@@ -113,7 +120,10 @@ def _workspace_write_policy(block):
     try:
         safe_path(path)
     except Exception:
-        return f"Permission denied: path escapes workspace: {path}"
+        return recoverable_tool_rejection(
+            f"Tool not run: path escapes workspace: {path}",
+            "Use a path inside the current workspace.",
+        )
     return None
 
 
@@ -136,11 +146,17 @@ def _destructive_confirmation_policy(block):
 def _workspace_integration_policy(block):
     name = str(block.input.get("name", "")).strip()
     if not name or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
-        return "Permission denied: invalid Worktree name"
+        return recoverable_tool_rejection(
+            "Tool not run: invalid Worktree name.",
+            "Use the exact name of a managed Worktree.",
+        )
     root = Path(WORKTREES_DIR).resolve()
     target = (root / name).resolve()
     if not target.is_relative_to(root):
-        return "Permission denied: Worktree escapes managed root"
+        return recoverable_tool_rejection(
+            "Tool not run: Worktree escapes managed root.",
+            "Use the exact name of a managed Worktree.",
+        )
     return None
 
 

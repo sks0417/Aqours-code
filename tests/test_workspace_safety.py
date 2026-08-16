@@ -31,12 +31,17 @@ def test_permission_hook_blocks_delete_command_variants():
         "rm -rf .",
     ]
     for command in commands:
-        assert hooks.permission_hook(_bash_block(command)) == "Permission denied: delete commands are disabled for bash"
+        result = hooks.permission_hook(_bash_block(command))
+        assert result["kind"] == "tool_policy_rejection"
+        assert result["recoverable"] is True
+        assert result["message"].startswith("Tool not run:")
 
 
 def test_run_bash_blocks_delete_command_even_without_hook(tmp_path):
     output = basic_tools.run_bash("Remove-Item -Recurse -Force .", cwd=tmp_path)
-    assert output == "Permission denied: delete commands are disabled for bash"
+    assert output.startswith(
+        "Tool not run: the command contains a blocked deletion operation."
+    )
     assert tmp_path.exists()
 
 

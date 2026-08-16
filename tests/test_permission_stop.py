@@ -26,22 +26,41 @@ class DeniedThenTextClient:
                     )
                 ],
             )
+        if self.calls == 2:
+            blocked = kwargs["messages"][-1]["content"][0]
+            assert blocked["tool_use_id"] == "call_1"
+            assert blocked["content"].startswith("Tool not run:")
+            return SimpleNamespace(
+                stop_reason="tool_use",
+                content=[SimpleNamespace(
+                    type="tool_use",
+                    id="call_2",
+                    name="bash",
+                    input={"command": "echo safe"},
+                )],
+            )
         return SimpleNamespace(
             stop_reason="end_turn",
-            content=[SimpleNamespace(type="text", text="try deleting manually")],
+            content=[SimpleNamespace(type="text", text="recovered safely")],
         )
 
 
-def test_agent_loop_stops_after_permission_denied(monkeypatch):
+def test_agent_loop_recovers_after_ordinary_policy_block(tmp_path):
     fake_client = DeniedThenTextClient()
-    monkeypatch.setattr(agent_loop, "client", fake_client)
+    executor = LocalCommandExecutor()
 
-    messages = [{"role": "user", "content": "delete current project"}]
-    agent_loop.agent_loop(messages, {})
+    result = agent_loop.run_agent_task(
+        "inspect safely",
+        str(tmp_path),
+        model_client=fake_client,
+        model_provider="test",
+        model="fake",
+        command_executor=executor,
+    )
 
-    assert fake_client.calls == 1
-    assert messages[-1]["role"] == "assistant"
-    assert messages[-1]["content"][0]["text"] == "Permission denied: delete commands are disabled for bash"
+    assert fake_client.calls == 3
+    assert executor.command_execution_count == 1
+    assert result["final_answer"] == "recovered safely"
 
 
 class RecoverableCleanupClient:
@@ -181,3 +200,39 @@ def test_interactive_permission_approval_still_uses_input(monkeypatch):
 
     assert result is None
     assert prompts == ["  Allow? [y/N] "]
+
+
+def test_user_cancel_still_terminates_agent_loop(monkeypatch, tmp_path):
+    class ApprovalClient:
+        def __init__(self):
+            self.messages = self
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls > 1:
+                raise AssertionError("user cancellation must stop the loop")
+            return SimpleNamespace(
+                stop_reason="tool_use",
+                content=[approval_block(
+                    "bash", {"command": "echo unsafe > /etc/aqours-code-eval"}
+                )],
+            )
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+    client = ApprovalClient()
+    executor = LocalCommandExecutor()
+
+    result = agent_loop.run_agent_task(
+        "request an approval-gated operation",
+        str(tmp_path),
+        model_client=client,
+        model_provider="test",
+        model="fake",
+        command_executor=executor,
+        approval_mode="interactive",
+    )
+
+    assert client.calls == 1
+    assert executor.command_execution_count == 0
+    assert result["final_answer"] == "Permission denied by user"

@@ -219,7 +219,7 @@ def test_successful_compact_has_checkpoint_and_recent_raw_tail(monkeypatch):
     assert_tool_pairs(result)
 
 
-def test_compaction_prompt_requires_concrete_self_contained_markdown(
+def test_compaction_prompt_requires_structured_truthful_checkpoint(
     monkeypatch,
 ):
     captured = {}
@@ -235,8 +235,26 @@ def test_compaction_prompt_requires_concrete_self_contained_markdown(
 
     assert summary.startswith("## Checkpoint")
     assert "reservation requires an idempotency key" in captured["prompt"]
-    assert "Do not merely state that a file was inspected." in captured["prompt"]
-    assert "self-contained Markdown" in captured["prompt"]
+    for heading in (
+        "## Task contracts",
+        "## Confirmed code facts",
+        "## Changes already made",
+        "## Tests and evidence",
+        "## Unresolved risks",
+        "## Next action",
+    ):
+        assert heading in captured["prompt"]
+    assert "path:symbol" in captured["prompt"]
+    assert (
+        "Do not claim\nthat a test passed unless it was actually run and passed"
+        in captured["prompt"]
+    )
+    assert "collect-only commands are not passing tests" in captured["prompt"]
+    assert (
+        "Do not present a\npossibility as a confirmed fact" in captured["prompt"]
+    )
+    assert "Do not generate new requirements" in captured["prompt"]
+    assert "Write None if there are no unresolved risks" in captured["prompt"]
     assert "Return concise Markdown only" in captured["prompt"]
     assert "archive IDs" in captured["prompt"]
     assert "recovery tool" not in captured["prompt"]

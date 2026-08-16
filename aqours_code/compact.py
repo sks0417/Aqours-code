@@ -35,24 +35,38 @@ You are creating a context checkpoint for another coding-agent model
 that will continue the current task.
 
 Summarize only the supplied older conversation history into one concise,
-self-contained Markdown continuation handoff. Recent messages remain available
-verbatim outside this summary.
+self-contained Markdown continuation checkpoint. Recent messages remain
+available verbatim outside this summary. Use exactly these sections:
 
-Preserve:
-- the user's final goal, explicit constraints, and completion criteria
-- completed work, modified files, current focus, and remaining work
-- important decisions and the reasons for them
-- concrete conclusions learned from important files and tool results
-- relevant paths, classes, functions, symbols, configuration, interfaces,
-  behavior, constraints, and cross-file relationships
-- commands and tests run, including exact outcomes
-- errors, failed attempts, and their causes when still relevant
-- unresolved problems and explicit next steps
+## Task contracts
+- The user's explicit requirements and required behavior.
+- Do not add hidden requirements inferred by the model.
 
-Do not merely state that a file was inspected.
-Preserve the concrete conclusions learned from it, including relevant
-paths, symbols, behavior, constraints, errors, commands, test results,
-decisions, and unresolved work.
+## Confirmed code facts
+- path:symbol — a concrete confirmed fact still needed for later work.
+- Retain relevant files already read and the facts confirmed from them.
+
+## Changes already made
+- path:symbol — what changed and why.
+- Write None if no changes were made.
+
+## Tests and evidence
+- command — pass/fail, followed by the key output.
+- Inspection and collect-only commands are not passing tests.
+
+## Unresolved risks
+- List each specific risk that has not been verified.
+- Write None if there are no unresolved risks.
+
+## Next action
+- Write exactly one most concrete next action.
+
+Prefer path:symbol references, exception types, failed assertions, and key state
+transitions. Preserve concrete conclusions from relevant files already read.
+Do not narrate lengthy exploration or repeat large source excerpts. Do not claim
+that a test passed unless it was actually run and passed. Do not present a
+possibility as a confirmed fact. Do not generate new requirements or generic
+coding advice.
 
 If an earlier context checkpoint is present, merge it with the newer history:
 preserve facts that remain true, remove stale facts, and return one replacement
