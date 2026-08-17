@@ -7,7 +7,6 @@ import hashlib as _hashlib
 import shutil as _shutil
 import os as _os
 import re as _re
-import shlex as _shlex
 import time as _time
 from .command_executor import CaseTimeoutError as _CaseTimeoutError
 from .agent_profiles import (
@@ -1061,135 +1060,6 @@ def tool_rejection_text(output) -> str:
     return text
 
 
-_PYTEST_RUNNER = _re.compile(
-    r"^\s*(?:(?:\"[^\"]*python(?:\d+(?:\.\d+)*)?(?:\.exe)?\"|"
-    r"'[^']*python(?:\d+(?:\.\d+)*)?(?:\.exe)?'|"
-    r"\S*python(?:\d+(?:\.\d+)*)?(?:\.exe)?|py(?:\.exe)?)\s+-m\s+pytest|"
-    r"pytest(?:\.exe)?|py\.test(?:\.exe)?)(?=\s|$)(.*)$",
-    _re.IGNORECASE,
-)
-_PYTEST_SELECTION_OPTIONS = {
-    "-k", "-m", "--pyargs", "--deselect", "--ignore", "--ignore-glob",
-    "--lf", "--last-failed", "--ff", "--failed-first", "--nf",
-    "--new-first", "--sw", "--stepwise", "--stepwise-skip",
-}
-_PYTEST_OPTIONS_WITH_VALUES = {
-    "--basetemp", "--capture", "--color", "--confcutdir", "--durations",
-    "--junitxml", "--maxfail", "--override-ini", "--rootdir", "--tb",
-    "-c", "-o",
-}
-_READ_ONLY_SHELL_COMMAND = _re.compile(
-    r"^(?:rg|grep|find|findstr|ls|dir|pwd|cat|type|get-content|"
-    r"get-childitem|test-path|resolve-path|select-string|select-object|"
-    r"measure-object|sort-object)(?:\s|$)",
-    _re.IGNORECASE,
-)
-
-
-def _pytest_command_args(command: str) -> str | None:
-    """Return pytest arguments for a direct invocation with display wrappers."""
-    pieces = str(command or "").split("|")
-    base = _re.sub(r"\s*2\s*>\s*&\s*1\s*", " ", pieces[0]).strip()
-    if any(
-        not _re.match(r"^\s*(?:tail|grep)(?:\s|$)", piece, _re.IGNORECASE)
-        for piece in pieces[1:]
-    ):
-        return None
-    if _re.search(r"(?:&&|;|\r|\n)", base):
-        return None
-    match = _PYTEST_RUNNER.match(base)
-    return match.group(1).strip() if match else None
-
-
-def _classify_full_pytest_command(command: str) -> dict | None:
-    """Recognize only direct, repository-wide pytest invocations."""
-    arguments = _pytest_command_args(command)
-    if arguments is None or "::" in arguments:
-        return None
-    try:
-        tokens = _shlex.split(arguments, posix=True)
-    except ValueError:
-        return None
-    collect_only = False
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        option = token.split("=", 1)[0]
-        if (option in _PYTEST_SELECTION_OPTIONS
-                or (token.startswith("-k") and not token.startswith("--"))
-                or (token.startswith("-m") and not token.startswith("--"))):
-            return None
-        if token in {"--collect-only", "--collectonly"}:
-            collect_only = True
-        if not token.startswith("-"):
-            return None
-        if option in _PYTEST_OPTIONS_WITH_VALUES and "=" not in token:
-            index += 1
-            if index >= len(tokens):
-                return None
-        index += 1
-    return {"test_family": "pytest", "collect_only": collect_only}
-
-
-def _bash_is_confirmed_read_only(command: str) -> bool:
-    if _pytest_command_args(command) is not None:
-        return True
-    normalized = _re.sub(r"\s*2\s*>\s*&\s*1\s*", " ", str(command)).strip()
-    if not normalized or _re.search(r"(?<!\d)>|>>|&&|;|\r|\n", normalized):
-        return False
-    parts = [part.strip() for part in normalized.split("|")]
-    if not parts or not all(parts):
-        return False
-    first = parts[0]
-    if _re.match(
-        r"^git\s+(?:status|diff|log|show|branch|rev-parse)(?:\s|$)",
-        first,
-        _re.IGNORECASE,
-    ):
-        return all(
-            _READ_ONLY_SHELL_COMMAND.match(part) for part in parts[1:]
-        )
-    return all(_READ_ONLY_SHELL_COMMAND.match(part) for part in parts)
-
-
-def _concise_test_result(output: object, limit: int = 500) -> str:
-    text = " ".join(str(output).split())
-    if len(text) > limit:
-        text = "..." + text[-(limit - 3):]
-    return text or "(no output)"
-
-
-def _pytest_execution_confirmed_pass(
-    command: str,
-    output: object,
-    execution: dict,
-) -> bool:
-    if not (
-        execution.get("executed") is True
-        and execution.get("exit_code") == 0
-        and execution.get("timed_out") is False
-        and execution.get("error") is False
-    ):
-        return False
-    if "|" not in command:
-        return True
-    text = str(output).lower()
-    return bool(
-        _re.search(r"\b\d+\s+passed\b", text)
-        and not _re.search(r"\b\d+\s+(?:failed|errors?)\b", text)
-    )
-
-
-def _deduplicated_test_result(previous: dict) -> str:
-    return (
-        "Full test suite already passed on the current workspace revision.\n"
-        "The command was not rerun. Run one focused check for a specifically "
-        "named remaining risk, or finish the task.\n"
-        f"Reused passing result from: {previous['command']}\n"
-        f"Previous result: {previous['concise_result']}"
-    )
-
-
 def _runtime_role_benefit(read_counts: dict[str, int], model_client) -> dict:
     """Describe a conservative, evidence-based opportunity for one Explorer."""
     unique_paths = len(read_counts)
@@ -1350,8 +1220,7 @@ def agent_loop(
     explorer_attempted = False
     runtime_benefit_signal_sent = False
     explorer_cached_result = ""
-    workspace_change_generation = 0
-    last_full_test_pass: dict | None = None
+    mutation_revision = 0
     reviewer_attempted_revision = -1
     reviewer_cached_result = ""
     finalization_budget_notice_sent = False
@@ -1613,30 +1482,7 @@ def agent_loop(
             if block.type != "tool_use":
                 continue
             print(f"\033[36m> {block.name}\033[0m")
-            full_test_request = (
-                _classify_full_pytest_command(
-                    str(block.input.get("command", ""))
-                )
-                if block.name == "bash" else None
-            )
-            deduplicate_full_test = bool(
-                full_test_request
-                and last_full_test_pass
-                and last_full_test_pass["test_family"]
-                == full_test_request["test_family"]
-                and last_full_test_pass["workspace_change_generation"]
-                == workspace_change_generation
-            )
-            if deduplicate_full_test:
-                record_event(
-                    "tool_use", tool=block.name, tool_use_id=block.id,
-                    input={
-                        "command": "[deduplicated full test suite]",
-                        "deduplicated": True,
-                    },
-                )
-            else:
-                record_tool_use(block)
+            record_tool_use(block)
 
             mutation_requested = block.name in _MAIN_MUTATION_TOOLS
             delegated_role = ""
@@ -1660,15 +1506,14 @@ def agent_loop(
                 continue
             if (block.name in {"delegate_agent", "task"}
                     and delegated_role == "review"
-                    and reviewer_attempted_revision
-                    == workspace_change_generation):
+                    and reviewer_attempted_revision == mutation_revision):
                 cached = _tool_json(reviewer_cached_result)
                 cached["reused"] = True
                 output = json.dumps(cached)
                 record_event(
                     "delegation_reused", agent_role="review",
                     tool_use_id=block.id,
-                    mutation_revision=workspace_change_generation,
+                    mutation_revision=mutation_revision,
                 )
                 results.append(_accepted_tool_result(block, output, runtime))
                 continue
@@ -1733,17 +1578,6 @@ def agent_loop(
                 continue
             record_hook("PreToolUse", tool=block.name, decision="allowed")
 
-            if deduplicate_full_test:
-                output = _deduplicated_test_result(last_full_test_pass)
-                record_event(
-                    "test_command_deduplicated",
-                    original_command=str(block.input.get("command", "")),
-                    previous_command=last_full_test_pass["command"],
-                    workspace_change_generation=workspace_change_generation,
-                )
-                results.append(_accepted_tool_result(block, output, runtime))
-                continue
-
             if should_run_background(block.name, block.input):
                 routing_reason = "explicit"
                 bg_id = start_background_task(
@@ -1766,14 +1600,9 @@ def agent_loop(
                           "launch a task/subagent just to wait; continue "
                           "independent work or finish your turn.")
                 results.append(_accepted_tool_result(block, output, runtime))
-                if (block.name == "bash" and not _bash_is_confirmed_read_only(
-                        str(block.input.get("command", "")))):
-                    workspace_change_generation += 1
                 continue
 
             handler = handlers.get(block.name)
-            if runtime is not None and block.name == "bash":
-                runtime.state.metadata.pop("_last_bash_execution", None)
             output = call_tool_handler(
                 handler,
                 block.input,
@@ -1803,7 +1632,7 @@ def agent_loop(
                         verdict=verdict or "unknown",
                     )
                 elif delegated_role == "review":
-                    reviewer_attempted_revision = workspace_change_generation
+                    reviewer_attempted_revision = mutation_revision
                     reviewer_cached_result = str(output)
                     screening = _screen_reviewer_findings(
                         delegation, runtime,
@@ -1823,27 +1652,8 @@ def agent_loop(
                         finding_count=len(findings),
                         raw_finding_count=screening["raw_count"],
                         suppressed_finding_count=len(screening["suppressed"]),
-                        mutation_revision=workspace_change_generation,
+                        mutation_revision=mutation_revision,
                     )
-
-            if (full_test_request
-                    and not full_test_request["collect_only"]
-                    and runtime is not None):
-                execution = runtime.state.metadata.get(
-                    "_last_bash_execution", {})
-                if _pytest_execution_confirmed_pass(
-                    str(block.input.get("command", "")),
-                    output,
-                    execution,
-                ):
-                    last_full_test_pass = {
-                        "test_family": full_test_request["test_family"],
-                        "workspace_change_generation": (
-                            workspace_change_generation
-                        ),
-                        "command": str(block.input.get("command", "")),
-                        "concise_result": _concise_test_result(output),
-                    }
 
             mutation_succeeded = (
                 (mutation_requested or bool(delegated_changed_files))
@@ -1856,14 +1666,8 @@ def agent_loop(
             )
             if block.name == "integrate_worktree":
                 mutation_succeeded = integration.get("status") == "integrated"
-            bash_may_have_mutated = (
-                block.name == "bash"
-                and not _bash_is_confirmed_read_only(
-                    str(block.input.get("command", ""))
-                )
-            )
-            if mutation_succeeded or bash_may_have_mutated:
-                workspace_change_generation += 1
+            if mutation_succeeded:
+                mutation_revision += 1
                 changed_path = str(block.input.get("path", "")).strip()
                 if changed_path:
                     changed_file_paths.add(changed_path)

@@ -51,15 +51,7 @@ def run_bash(command: str, cwd: Path = None,
              run_in_background: bool = False, timeout: float = 120,
              executor=None, runtime: AgentRuntime | None = None) -> str:
     # run_in_background is consumed by the dispatcher; direct execution ignores it.
-    execution_key = "_last_bash_execution"
-    if runtime is not None:
-        runtime.state.metadata.pop(execution_key, None)
     if looks_like_delete_command(command):
-        if runtime is not None:
-            runtime.state.metadata[execution_key] = {
-                "executed": False,
-                "blocked": True,
-            }
         return (
             "Tool not run: the command contains a blocked deletion operation.\n"
             "Guidance: Rewrite the check without explicit deletion, or finish "
@@ -83,32 +75,13 @@ def run_bash(command: str, cwd: Path = None,
         workdir = _runtime_workdir(runtime, cwd)
         result = selected_executor.execute(
             command, workdir, effective_timeout)
-        if runtime is not None:
-            runtime.state.metadata[execution_key] = {
-                "executed": True,
-                "exit_code": result.get("exit_code"),
-                "timed_out": bool(result.get("timed_out")),
-                "error": False,
-            }
         out = (result["stdout"] + result["stderr"]).strip()
         if result["timed_out"]:
             return f"Error: Timeout ({timeout:g}s)" + (f"\n{out}" if out else "")
         return out if out else "(no output)"
     except CaseTimeoutError:
-        if runtime is not None:
-            runtime.state.metadata[execution_key] = {
-                "executed": False,
-                "timed_out": True,
-                "error": True,
-            }
         raise
     except Exception as exc:
-        if runtime is not None:
-            runtime.state.metadata[execution_key] = {
-                "executed": False,
-                "timed_out": False,
-                "error": True,
-            }
         return f"Error: {type(exc).__name__}: {exc}"
 
 
