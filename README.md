@@ -1,38 +1,38 @@
 # Aqours_code
 
-`Aqours_code` 是一个面向本地代码仓库的 Coding Agent Harness。它把模型调用、工具执行、上下文压缩、权限拦截、Trace 和 Docker 隔离评测串成一条可检查的工程链路，目标是学习并验证 Coding Agent 的核心设计，而不是提供生产级托管服务。
+`Aqours_code` is a local coding-agent harness for working with software repositories. It connects model inference, tool execution, context compaction, permission enforcement, structured tracing, and isolated Docker evaluation into one inspectable workflow. The project is intended for studying and evaluating coding-agent engineering decisions rather than providing a production-hosted service.
 
-## 核心能力
+## Core Capabilities
 
-- 在当前目录启动交互式 Agent Loop，并让模型读取、修改和测试代码。
-- 提供 Bash、文件读写/精确编辑、Glob、Todo 和 Context Compact 工具。
-- 对危险操作执行权限检查，对模型瞬时错误进行有界重试和恢复。
-- 为每次运行保存脱敏 Trace、时间线、最终输出和运行元数据。
-- 在 Docker 中隔离 Agent，并由独立的 trusted grader 对 clean-room workspace 评分。
+- Runs an interactive agent loop in the current repository so a model can inspect, modify, and test code.
+- Provides Bash, file read/write/edit, Glob, Todo, and Context Compact tools.
+- Applies permission checks to dangerous operations and bounded recovery to transient model failures.
+- Stores redacted traces, timelines, final responses, and run metadata for every execution.
+- Evaluates agents inside Docker and scores a clean-room workspace with a separate trusted grader.
 
-## 功能状态（v0.1）
+## Feature Status (v0.1)
 
-Stable 表示默认单 Agent 路径已接线，并有代码和自动化测试支持；Experimental 表示实现仍被保留用于实验，但不构成 v0.1 稳定性承诺。
+**Stable** means the default single-agent path is integrated and supported by code and automated tests. **Experimental** means the implementation remains available for research and iteration but is not part of the v0.1 stability guarantee.
 
-| 状态 | 功能 | 真实范围 |
+| Status | Feature | Current Scope |
 | --- | --- | --- |
-| Stable | Agent Loop | 交互式与非交互式单 Agent 主循环 |
-| Stable | Bash | 前台命令、超时、失败结果与权限边界 |
-| Stable | Read / Write / Edit | workspace 内文件读取、写入和精确替换 |
-| Stable | Glob / Search | 原生 Glob；文本搜索通过 Bash 中的 `rg`/系统搜索命令完成 |
-| Stable | Todo | 可选的轻量任务清单；仅包含稳定 ID、内容和状态 |
-| Stable | Context Compact | 原子保留工具调用对、根任务和最近上下文；失败时保留安全历史 |
-| Stable | Permission Hooks | 危险操作拦截，非交互执行默认拒绝 |
-| Stable | Retry / Recovery | 有界重试；v0.1 不会静默切换到另一个模型 |
-| Stable | Trace | 脱敏事件、时间线、状态、运行索引和最小运行元数据 |
-| Stable | Docker Eval | 一次性 Agent 容器、clean-room workspace、独立 trusted grader 和可信评分 |
-| Experimental | Subagent / Plan Review | 有界临时角色与 Reviewer 流程，不是默认单 Agent 成功的前置条件 |
-| Experimental | Persistent Task / Teammate / Message Bus / Multi-Agent | 共享任务和协作原型，保留但不承诺完整生命周期 |
-| Experimental | Worktree | 隔离 Worker 修改与显式集成原型 |
-| Experimental | Skills / MCP | 动态扩展入口，依赖具体环境和配置 |
-| Experimental | Background / Cron | 后台与调度原型，不作为 v0.1 默认使用路径 |
+| Stable | Agent Loop | Interactive and non-interactive single-agent execution |
+| Stable | Bash | Foreground commands, timeouts, failure results, and permission boundaries |
+| Stable | Read / Write / Edit | Workspace-scoped file reading, writing, and exact replacement |
+| Stable | Glob / Search | Native Glob; text search through `rg` or platform search commands via Bash |
+| Stable | Todo | Optional lightweight checklist with stable IDs, content, and status |
+| Stable | Context Compact | Preserves atomic tool exchanges, the root task, and recent context; retains safe history on failure |
+| Stable | Permission Hooks | Blocks dangerous operations and denies unapproved actions in non-interactive runs |
+| Stable | Retry / Recovery | Bounded retries; v0.1 never switches silently to another model |
+| Stable | Trace | Redacted events, timelines, run state, indexes, and minimal runtime metadata |
+| Stable | Docker Eval | One-shot agent container, clean-room workspace, separate trusted grader, and trusted scoring |
+| Experimental | Subagent / Plan Review | Bounded temporary roles and reviewer flow; not required by the default single-agent path |
+| Experimental | Persistent Task / Teammate / Message Bus / Multi-Agent | Shared-task and collaboration prototypes without a complete lifecycle guarantee |
+| Experimental | Worktree | Prototype for isolated worker changes and explicit integration |
+| Experimental | Skills / MCP | Dynamic extension points that depend on the runtime environment and configuration |
+| Experimental | Background / Cron | Background execution and scheduling prototypes outside the default v0.1 path |
 
-## 架构
+## Architecture
 
 ```text
 Aqours_code CLI
@@ -40,25 +40,25 @@ Aqours_code CLI
   -> Model adapter
   -> authoritative ToolRegistry
   -> local workspace
-  -> .aqours_code/runs/<run_id> Trace
+  -> .aqours_code/runs/<run_id> trace artifacts
 
 Docker Eval
-  -> host Model Broker（凭据留在宿主机）
+  -> host Model Broker (credentials remain on the host)
   -> network-disabled one-shot Agent container
   -> disposable workspace + collected artifacts
   -> separate trusted Grader container
   -> pass/fail + continuous score
 ```
 
-默认入口只启动单 Agent Coding 流程。Experimental 模块不会为了“看起来完整”而被强制接入主链路。
+The default entry point starts only the single-agent coding workflow. Experimental modules are not forced into the main execution path merely to make the harness appear more feature-complete.
 
 ## Quick Start
 
-官方验证环境是 **Python 3.11**。
+The supported environment for v0.1 is **Python 3.11**.
 
 ```bash
-git clone <repository>
-cd Aqours_code
+git clone https://github.com/sks0417/Aqours-code.git
+cd Aqours-code
 
 python -m venv .venv
 # Windows PowerShell: .\.venv\Scripts\Activate.ps1
@@ -67,7 +67,7 @@ python -m venv .venv
 python -m pip install -e .
 ```
 
-根据示例创建本地配置：
+Create a local configuration file from the provided example:
 
 ```bash
 # Windows PowerShell
@@ -77,23 +77,24 @@ Copy-Item .env.example .env
 cp .env.example .env
 ```
 
-填写配置后，从要修改的仓库目录运行唯一推荐入口：
+Fill in the required model settings, then run the CLI from the repository you want the agent to modify:
 
 ```bash
 Aqours_code
 ```
 
-启动信息会显示项目名、当前 workspace、provider 和模型名，不会显示 API Key。默认 workspace 是启动命令所在的当前目录。
+The startup banner shows the project name, active workspace, provider, and model without displaying the API key. The workspace defaults to the directory from which the command is launched.
 
-## API 配置
+## Model Configuration
 
-`.env.example` 与代码使用同一组权威字段：
+`.env.example` and the runtime use the same authoritative fields:
 
 ```dotenv
-AQOURS_CODE_PROVIDER=openai_compatible
+AQOURS_CODE_PROVIDER=
 AQOURS_CODE_API_KEY=
 AQOURS_CODE_BASE_URL=
 AQOURS_CODE_MODEL=
+
 # AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS=200000
 # AQOURS_CODE_COMPACT_TRIGGER_TOKENS=80000
 # AQOURS_CODE_SUMMARY_INPUT_LIMIT_TOKENS=256000
@@ -101,31 +102,27 @@ AQOURS_CODE_MODEL=
 # AQOURS_CODE_CONTEXT_LIMIT_TOKENS=200000  # legacy alias
 ```
 
-`AQOURS_CODE_PROVIDER` 可选值为 `openai_compatible`、`openai`、`deepseek` 或 `anthropic`。前三者使用 OpenAI-compatible messages 接口；`anthropic` 使用 Anthropic SDK。Key、Base URL 和模型名没有旧变量别名、provider 专属回退或默认模型。任一必填字段缺失时，CLI 会在进入交互循环前失败并指出字段名。
+`AQOURS_CODE_PROVIDER` accepts `openai_compatible`, `openai`, `deepseek`, or `anthropic`. The first three use an OpenAI-compatible messages API; `anthropic` uses the Anthropic SDK. The runtime has no default model and does not silently fall back to provider-specific credentials or model names. Missing required fields are reported before the interactive loop starts.
 
-`.env` 已被 Git 忽略。API Key 和认证 Header 会从 Trace 中移除；Trace 中的 Base URL 也会删除 userinfo 和认证类 query 参数。
+`.env` is ignored by Git. API keys and authentication headers are removed from traces, and authentication-related user information or query parameters are removed from recorded base URLs.
 
-Context 与 Compact 的公开配置均以估算 Token 为单位：Agent 活跃上下文
-默认上限为 `200000`，达到 `80000` 时主动 Compact；单次摘要输入上限为
-`256000`，摘要最大输出为 `6000`。内部仍使用保守的三字符/Token 估算，
-但四个预算分别推导。旧的 `AQOURS_CODE_CONTEXT_LIMIT_TOKENS` 继续作为
-`AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS` 的兼容别名。
+All public Context and Compact settings use estimated tokens. The active agent context has a default hard limit of `200000` tokens and starts automatic compaction at `80000`. A summary request may read up to `256000` input tokens and produce up to `6000` output tokens. Internally, each budget is converted independently using a conservative estimate of three characters per token. `AQOURS_CODE_CONTEXT_LIMIT_TOKENS` remains a legacy alias for `AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS`.
 
-依赖的权威声明是 `pyproject.toml`。`evals/docker/requirements.lock` 只负责固定 Eval 镜像环境，不是第二份应用依赖清单。
+`pyproject.toml` is the authoritative dependency declaration. `evals/docker/requirements.lock` only pins the evaluation image and is not a second application dependency list.
 
-## 执行一个 Coding Task
+## Running a Coding Task
 
-在目标仓库根目录运行 `Aqours_code`，然后输入具体任务，例如：
+Launch `Aqours_code` from the target repository root and provide a concrete task, for example:
 
 ```text
-Aqours_code >> 修复订单金额计算的舍入错误，并运行相关 pytest；不要修改公开 API。
+Aqours_code >> Fix the order-total rounding bug, run the relevant pytest suite, and preserve the public API.
 ```
 
-Agent 会在当前 workspace 内读取代码、记录 Todo、执行修改和测试，并将本次运行写入 `.aqours_code/runs/<run_id>/`。危险或越界操作会被权限层拒绝；测试失败不会被转换成成功结果。
+The agent inspects the workspace, tracks optional Todo items, applies code changes, and runs tests. Each execution is written to `.aqours_code/runs/<run_id>/`. Permission failures, test failures, and grader failures are never converted into successful outcomes.
 
-## 测试与 Docker Eval
+## Tests and Docker Evaluation
 
-安装开发依赖并执行项目测试：
+Install development dependencies and run the project checks:
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -134,19 +131,19 @@ python -m pytest -q
 Aqours_code --help
 ```
 
-最小 Docker Eval smoke 使用确定性的 scripted model，但仍运行真实 Agent 容器和 Grader 容器：
+The minimal Docker smoke test uses a deterministic scripted model while still running a real agent container and a separate grader container:
 
 ```bash
 python evals/run_eval.py --scripted --execution docker --case read_file_basic
 ```
 
-Docker Eval 会在镜像缺失时自动构建；传入 `--docker-build` 可强制重建镜像。
+The evaluation runner builds the Docker image when it is missing. Use `--docker-build` to force a rebuild.
 
-真实模型 Eval 去掉 `--scripted`，并使用 `.env` 中的同一组 API 配置。Docker 启动或构建失败是硬失败，不会悄悄回退到本地执行。只有开发调试时才显式使用 `--execution local`。
+For a real-model evaluation, omit `--scripted` and use the same provider settings from `.env`. Docker startup or build failures are treated as hard failures and never fall back silently to local execution. Use `--execution local` only for explicit development debugging.
 
-## Trace 示例
+## Trace Artifacts
 
-每次运行至少生成 `metadata.json`、`trace.jsonl`、`timeline.jsonl`、`timeline.md` 和 `final.md`：
+Every run produces at least `metadata.json`, `trace.jsonl`, `timeline.jsonl`, `timeline.md`, and `final.md`:
 
 ```json
 {
@@ -164,21 +161,15 @@ Docker Eval 会在镜像缺失时自动构建；传入 `--docker-build` 可强�
 }
 ```
 
-Git 不可用或 workspace 不是仓库时，Git 字段可以为空；元数据采集失败只会记录降级信息，不会终止 Agent。
+Git fields may be empty when Git is unavailable or the workspace is not a repository. Metadata collection failures are recorded as degraded metadata and do not terminate the agent.
 
-## 已知限制
+## Known Limitations
 
-- v0.1 只承诺 Python 3.11；其他 Python 版本未列为支持环境。
-- 稳定入口是本地交互式单 Agent，不包含 Web UI、远程服务或 GitHub PR 自动化。
-- Docker Eval 需要可用的 Docker daemon，并受本机镜像构建和资源限制影响。
-- Shell 命令行为取决于运行平台；跨平台路径和命令仍需由任务本身约束。
-- Experimental 功能有测试覆盖不等于完成产品化接入，不能作为默认 Coding Task 的稳定性依赖。
-- 项目不提供长期 Memory、生产级凭据管理、SLA 或多租户隔离。
+- v0.1 supports Python 3.11; other Python versions are outside the tested compatibility range.
+- The stable entry point is a local interactive single-agent workflow, not a web interface, remote service, or GitHub pull-request automation system.
+- Docker Eval requires a running Docker daemon and remains subject to local image-build and resource constraints.
+- Shell behavior depends on the host platform; task prompts must account for platform-specific commands and paths.
+- Test coverage for an Experimental module does not imply production-ready integration or make that module a dependency of the default coding workflow.
+- The project does not provide long-term memory, production credential management, service-level guarantees, or multi-tenant isolation.
 
-发布前尚未完成或需要真实环境复核的事项见 [`V0_1_TODO.md`](V0_1_TODO.md)。
-
-## 项目来源与个人工作
-
-Agent Harness 的核心设计主要参考并复现 `learn-claude-code`，包括分阶段构建 Coding Agent Loop、工具调用和 Context Compact 的学习路径。本项目不声称“完全从零自研 Claude Code”。
-
-在此基础上，本项目独立增加并重点建设了 Docker 隔离 Eval、clean-room trusted grader 与可信评分流程、Trace/Timeline 日志，以及围绕权限、失败语义、运行隔离、上下文正确性和测试可靠性的后续工程化修复。作品集目标是用可运行代码和测试验证 Coding Agent Harness 的工程设计取舍。
+Remaining v0.1 release checks are tracked in [`V0_1_TODO.md`](V0_1_TODO.md).
