@@ -259,23 +259,57 @@ def test_fixed_prompt_and_lead_tool_schema_stay_below_phase_two_budget(
 
 
 def test_tool_strategy_batches_only_safe_independent_operations():
-    strategy = prompts.PROMPT_SECTIONS["tool_strategy"]
+    system = prompts.assemble_system_prompt({})
 
-    assert "Batch independent tool calls in one response" in strategy
-    assert "read related files or run independent searches together" in strategy
-    assert "later call depends on an earlier result" in strategy
-    assert "at most 8" in strategy
-    assert "each targets a different file" in strategy
-    assert "at most one mutation per file" in strategy
-    assert "none depends on another result" in strategy
-    assert "read-to-dependent-edit" in strategy
-    assert "mutations with tests, background commands, or worktree" in strategy
-    assert "Tools execute in response order" in strategy
-    assert "partial failure does not roll back" in strategy
-    assert "Complete one coherent phase" in strategy
-    assert "do not rerun an equivalent full suite" in strategy
-    assert "explicitly named uncovered risk" in strategy
-    assert "If no remaining risk can be named, finish" in strategy
-    assert "Do not generate broad multi-scenario audit scripts" in strategy
-    assert "mutable-alias boundaries" not in strategy
-    assert "shared-dependency fan-in" not in strategy
+    assert "Batch independent calls" in system
+    assert "sequence dependencies" in system
+    assert "max 8/batch" in system
+    assert (
+        "Once the exact intended changes for multiple independent files are "
+        "known, emit their write_file or edit_file calls in the same response"
+        in system
+    )
+    assert "Do not spend one model round per independent file" in system
+    assert "Prefer minimal edits that preserve existing correct behavior" in system
+    assert (
+        "Do not rewrite an entire existing file merely to batch mutations or "
+        "simplify editing"
+        in system
+    )
+    assert "Batch only independent, already-determined patches" in system
+    assert (
+        "Preserve unrelated public API, validation, error-handling, and security "
+        "behavior"
+        in system
+    )
+    assert (
+        "Use write_file for a new file or when the task genuinely requires replacing "
+        "the complete file and its full behavior is already understood"
+        in system
+    )
+    assert (
+        "For an existing file, prefer targeted edit_file changes when the unaffected "
+        "structure and behavior can be preserved"
+        in system
+    )
+    assert "Do not reread already-known files just for this rule" in system
+    assert "max one/file/batch" in system
+    assert "Sequence same-file/result-dependent mutations" in system
+    assert "never batch with tests/background/worktree integration" in system
+    assert "Calls run in order" in system
+    assert "partial failures keep successes" in system
+    assert "Complete a phase" in system
+    assert (
+        "After final verification succeeds and the workspace has not changed "
+        "since that verification, do not reread unchanged source or test files"
+        in system
+    )
+    assert "Finish using the retained diff, checkpoint, and test evidence" in system
+    assert "Use tool evidence" in system
+    assert "Code changes permit reread/reverification" in system
+    assert "one concrete unresolved risk permits one focused check" in system
+    assert "despite passing public tests" in system
+    assert "avoid equivalent test reruns" in system
+    assert "broad audits" in system
+    assert "mutable-alias boundaries" not in system
+    assert "shared-dependency fan-in" not in system

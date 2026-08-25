@@ -420,7 +420,7 @@ def test_prepare_context_never_returns_above_hard_limit(
     runtime.paths.workdir.mkdir()
     runtime.paths.state_root.mkdir()
     messages = [
-        {"role": "user", "content": "u" * 390_000},
+        {"role": "user", "content": "u" * 610_000},
         {
             "role": "assistant",
             "content": [{
@@ -444,6 +444,23 @@ def test_prepare_context_never_returns_above_hard_limit(
         "compact_history",
         lambda current, **_kwargs: current,
     )
+    reactive_calls = []
+    events = []
+    monkeypatch.setattr(
+        agent_loop,
+        "reactive_compact",
+        lambda current, **kwargs: (
+            reactive_calls.append(json.loads(json.dumps(current))) or current
+        ),
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "record_event",
+        lambda event_type, **payload: events.append({
+            "type": event_type,
+            **payload,
+        }),
+    )
     monkeypatch.setattr(agent_loop, "update_context", lambda *args: {})
     monkeypatch.setattr(
         agent_loop,
@@ -453,6 +470,25 @@ def test_prepare_context_never_returns_above_hard_limit(
 
     with pytest.raises(RuntimeError, match="above the hard limit"):
         agent_loop.prepare_context(messages, runtime, {}, [])
+
+    assert len(reactive_calls) == 1
+    assert "[Tool result externalized]" in str(messages[-1]["content"][0]["content"])
+    hard_limit_event = next(
+        event for event in events
+        if event["type"] == "context_compact"
+        and event.get("stage") == "hard_limit_reactive_compact"
+    )
+    assert hard_limit_event["changed"] is False
+    assert hard_limit_event["success"] is False
+    assert hard_limit_event["before_tokens"] == hard_limit_event["after_tokens"]
+    assert hard_limit_event["failure_reason"] == (
+        "reactive compact made no change"
+    )
+    assert any(
+        event["type"] == "context_compact"
+        and event.get("stage") == "hard_limit_tool_result_externalization"
+        for event in events
+    )
 
 
 def test_glob_double_star_recurses_into_nested_source_tree(tmp_path):

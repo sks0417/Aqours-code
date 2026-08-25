@@ -943,6 +943,65 @@ def prepare_context(
         if changed:
             _record_context_integrity(messages, latest_user_before)
         if after["estimated_tokens"] >= AGENT_CONTEXT_LIMIT_TOKENS:
+            reactive_before = after
+            reactive = (
+                reactive_compact(
+                    messages,
+                    runtime=runtime,
+                    target_context_budget=_compact_target_chars(),
+                    request_size_fn=sizer,
+                )
+                if runtime is not None else reactive_compact(
+                    messages,
+                    target_context_budget=_compact_target_chars(),
+                    request_size_fn=sizer,
+                )
+            )
+            reactive_changed = reactive != messages
+            messages[:] = reactive
+            refreshed_context = (
+                update_context(budget_context, messages, runtime)
+                if runtime is not None else update_context(
+                    budget_context, messages
+                )
+            )
+            refreshed_system = (
+                assemble_system_prompt(refreshed_context, runtime)
+                if runtime is not None else assemble_system_prompt(
+                    refreshed_context
+                )
+            )
+            after = _context_stats(
+                messages,
+                system=refreshed_system,
+                tools=budget_tools,
+            )
+            reactive_success = (
+                reactive_changed
+                and after["estimated_tokens"] < AGENT_CONTEXT_LIMIT_TOKENS
+            )
+            record_event(
+                "context_compact",
+                stage="hard_limit_reactive_compact",
+                changed=reactive_changed,
+                success=reactive_success,
+                failure_reason=(
+                    "" if reactive_success else (
+                        "reactive compact made no change"
+                        if not reactive_changed else
+                        "reactive compact remains above the hard limit"
+                    )
+                ),
+                before_messages=reactive_before["message_count"],
+                after_messages=after["message_count"],
+                before_size=reactive_before["estimated_size"],
+                after_size=after["estimated_size"],
+                before_tokens=reactive_before["estimated_tokens"],
+                after_tokens=after["estimated_tokens"],
+            )
+            if reactive_changed:
+                _record_context_integrity(messages, latest_user_before)
+        if after["estimated_tokens"] >= AGENT_CONTEXT_LIMIT_TOKENS:
             hard_limit_before = after
             externalized_count = 0
             while after["estimated_tokens"] >= AGENT_CONTEXT_LIMIT_TOKENS:

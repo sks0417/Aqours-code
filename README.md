@@ -94,11 +94,11 @@ AQOURS_CODE_PROVIDER=openai_compatible
 AQOURS_CODE_API_KEY=
 AQOURS_CODE_BASE_URL=
 AQOURS_CODE_MODEL=
-# AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS=128000
-# AQOURS_CODE_COMPACT_TRIGGER_TOKENS=100000
+# AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS=200000
+# AQOURS_CODE_COMPACT_TRIGGER_TOKENS=80000
 # AQOURS_CODE_SUMMARY_INPUT_LIMIT_TOKENS=256000
 # AQOURS_CODE_SUMMARY_MAX_TOKENS=6000
-# AQOURS_CODE_CONTEXT_LIMIT_TOKENS=128000  # legacy alias
+# AQOURS_CODE_CONTEXT_LIMIT_TOKENS=200000  # legacy alias
 ```
 
 `AQOURS_CODE_PROVIDER` 可选值为 `openai_compatible`、`openai`、`deepseek` 或 `anthropic`。前三者使用 OpenAI-compatible messages 接口；`anthropic` 使用 Anthropic SDK。Key、Base URL 和模型名没有旧变量别名、provider 专属回退或默认模型。任一必填字段缺失时，CLI 会在进入交互循环前失败并指出字段名。
@@ -106,7 +106,7 @@ AQOURS_CODE_MODEL=
 `.env` 已被 Git 忽略。API Key 和认证 Header 会从 Trace 中移除；Trace 中的 Base URL 也会删除 userinfo 和认证类 query 参数。
 
 Context 与 Compact 的公开配置均以估算 Token 为单位：Agent 活跃上下文
-默认上限为 `128000`，达到 `100000` 时主动 Compact；单次摘要输入上限为
+默认上限为 `200000`，达到 `80000` 时主动 Compact；单次摘要输入上限为
 `256000`，摘要最大输出为 `6000`。内部仍使用保守的三字符/Token 估算，
 但四个预算分别推导。旧的 `AQOURS_CODE_CONTEXT_LIMIT_TOKENS` 继续作为
 `AQOURS_CODE_AGENT_CONTEXT_LIMIT_TOKENS` 的兼容别名。

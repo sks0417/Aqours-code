@@ -119,18 +119,18 @@ def test_default_context_and_summary_budgets_are_independent():
         * compact.ESTIMATED_CHARS_PER_TOKEN
     )
 
-    assert compact.AGENT_CONTEXT_LIMIT_TOKENS == 128_000
-    assert compact.CONTEXT_LIMIT_TOKENS == 128_000
-    assert compact.CONTEXT_LIMIT == 384_000
-    assert compact.COMPACT_TRIGGER_TOKENS == 100_000
-    assert compact.COMPACT_TRIGGER_RATIO == 100_000 / 128_000
+    assert compact.AGENT_CONTEXT_LIMIT_TOKENS == 200_000
+    assert compact.CONTEXT_LIMIT_TOKENS == 200_000
+    assert compact.CONTEXT_LIMIT == 600_000
+    assert compact.COMPACT_TRIGGER_TOKENS == 80_000
+    assert compact.COMPACT_TRIGGER_RATIO == 80_000 / 200_000
     assert compact.SUMMARY_INPUT_LIMIT_TOKENS == 256_000
     assert compact.SUMMARY_MAX_TOKENS == 6_000
     assert compact.MAX_INLINE_TOOL_RESULT_TOKENS == 24_000
     assert compact.COMPACT_HEADROOM_TOKENS == 8_000
-    assert compact.estimate_context_tokens(compact.CONTEXT_LIMIT) == 128_000
-    assert compact.estimate_context_tokens(trigger_chars) == 100_000
-    assert 128_000 - 100_000 >= agent_loop.DEFAULT_MAX_TOKENS
+    assert compact.estimate_context_tokens(compact.CONTEXT_LIMIT) == 200_000
+    assert compact.estimate_context_tokens(trigger_chars) == 80_000
+    assert 200_000 - 80_000 >= agent_loop.DEFAULT_MAX_TOKENS
     assert compact.RECENT_TAIL_MAX_TOKENS == 20_000
 
 
@@ -167,7 +167,7 @@ def test_automatic_trigger_uses_complete_request_size(monkeypatch):
 
 @pytest.mark.parametrize(
     ("estimated_tokens", "should_compact"),
-    [(99_999, False), (100_000, True), (100_001, True)],
+    [(79_999, False), (80_000, True), (80_001, True)],
 )
 def test_automatic_compact_uses_token_threshold(
     monkeypatch,
@@ -735,7 +735,7 @@ def test_failed_automatic_compact_below_hard_limit_keeps_result_and_cools_down(
     for index in range(10):
         messages.extend(exchange(
             index,
-            "old-" + ("o" * (9_100 * compact.ESTIMATED_CHARS_PER_TOKEN)),
+            "old-" + ("o" * (13_000 * compact.ESTIMATED_CHARS_PER_TOKEN)),
         ))
     messages.extend(exchange(99, latest_result))
     original = json.loads(json.dumps(messages))
@@ -750,10 +750,31 @@ def test_failed_automatic_compact_below_hard_limit_keeps_result_and_cools_down(
         agent_loop, "assemble_system_prompt", lambda *args: "system"
     )
     monkeypatch.setattr(agent_loop, "update_context", lambda *args: {})
+    monkeypatch.setattr(
+        agent_loop,
+        "reactive_compact",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a request below 200K must not enter hard-limit recovery"
+        ),
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "_externalize_oldest_consumed_tool_result",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a request below 200K must not externalize for hard-limit recovery"
+        ),
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "_hard_limit_externalize_unconsumed_results",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a request below 200K must not externalize the latest result"
+        ),
+    )
     request_tokens = compact.estimate_context_tokens(
         compact.estimate_context_size(messages, system="system", tools=[])
     )
-    assert compact.COMPACT_TRIGGER_TOKENS <= request_tokens < (
+    assert 128_000 <= request_tokens < (
         compact.AGENT_CONTEXT_LIMIT_TOKENS
     )
 
@@ -765,6 +786,178 @@ def test_failed_automatic_compact_below_hard_limit_keeps_result_and_cools_down(
     assert messages[-1]["content"][0]["content"] == latest_result
     assert "[Tool result externalized]" not in render(messages)
     assert_tool_pairs(messages)
+
+
+def test_hard_limit_reactive_compact_retries_after_consumed_exchange(
+    tmp_path,
+    monkeypatch,
+):
+    runtime = make_runtime(tmp_path)
+    latest_user = {
+        "role": "user",
+        "content": "LATEST-REAL-USER-REQUEST-MUST-STAY-EXACT",
+    }
+    messages = [latest_user]
+    for index in range(4):
+        messages.extend(exchange(
+            index,
+            "old-result-" + (
+                "o" * (25_000 * compact.ESTIMATED_CHARS_PER_TOKEN)
+            ),
+        ))
+    consumed_reasoning = "CONSUMED-REASONING-START\n" + (
+        "r" * (69_000 * compact.ESTIMATED_CHARS_PER_TOKEN)
+    ) + "\nCONSUMED-REASONING-END"
+    previously_unconsumed = exchange(90, "previous result")
+    previously_unconsumed[0]["reasoning_content"] = consumed_reasoning
+    messages.extend(previously_unconsumed)
+    original_before_failure = json.loads(json.dumps(messages))
+    summary_inputs = install_summary(monkeypatch, "reactive checkpoint")
+    events = []
+
+    def capture(event_type, **payload):
+        events.append({"type": event_type, **payload})
+
+    monkeypatch.setattr(compact, "record_event", capture)
+    monkeypatch.setattr(agent_loop, "record_event", capture)
+    monkeypatch.setattr(
+        agent_loop, "assemble_system_prompt", lambda *args: "system"
+    )
+    monkeypatch.setattr(agent_loop, "update_context", lambda *args: {})
+
+    initial_tokens = compact.estimate_context_tokens(
+        compact.estimate_context_size(messages, system="system", tools=[])
+    )
+    assert compact.COMPACT_TRIGGER_TOKENS <= initial_tokens < (
+        compact.AGENT_CONTEXT_LIMIT_TOKENS
+    )
+
+    agent_loop.prepare_context(messages, runtime, {}, [])
+
+    assert messages == original_before_failure
+    assert summary_inputs == []
+    assert runtime.state.metadata["last_failed_compact_message_count"] == len(
+        messages
+    )
+
+    newest_reasoning = "NEWEST-UNCONSUMED-REASONING-START\n" + (
+        "n" * (50_000 * compact.ESTIMATED_CHARS_PER_TOKEN)
+    ) + "\nNEWEST-UNCONSUMED-REASONING-END"
+    newest_batch = [
+        {
+            "role": "assistant",
+            "reasoning_content": newest_reasoning,
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "new-tool-a",
+                    "name": "read_file",
+                    "input": {"path": "src/a.py"},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "new-tool-b",
+                    "name": "read_file",
+                    "input": {"path": "src/b.py"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "new-tool-a",
+                    "content": "new-result-a",
+                },
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "new-tool-b",
+                    "content": "new-result-b",
+                },
+            ],
+        },
+    ]
+    messages.extend(newest_batch)
+    before_reactive = json.loads(json.dumps(messages))
+    assert len(messages) < (
+        runtime.state.metadata["last_failed_compact_message_count"]
+        + compact.COMPACT_RETRY_MESSAGE_GROWTH
+    )
+    assert compact.estimate_context_tokens(
+        compact.estimate_context_size(messages, system="system", tools=[])
+    ) >= compact.AGENT_CONTEXT_LIMIT_TOKENS
+    monkeypatch.setattr(
+        agent_loop,
+        "_externalize_oldest_consumed_tool_result",
+        lambda *_args, **_kwargs: pytest.fail(
+            "successful reactive compact must precede externalization"
+        ),
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "_hard_limit_externalize_unconsumed_results",
+        lambda *_args, **_kwargs: pytest.fail(
+            "successful reactive compact must not externalize the newest batch"
+        ),
+    )
+
+    agent_loop.prepare_context(messages, runtime, {}, [])
+
+    assert len(summary_inputs) == 1
+    assert any(
+        message.get("reasoning_content") == consumed_reasoning
+        for message in summary_inputs[0]
+    )
+    assert not any(
+        message.get("reasoning_content") == newest_reasoning
+        for message in summary_inputs[0]
+    )
+    assert latest_user not in summary_inputs[0]
+    assert messages[1] == latest_user
+    assert messages[-2:] == newest_batch
+    assert not any(
+        message.get("reasoning_content") == consumed_reasoning
+        for message in messages
+    )
+    assert compact.estimate_context_tokens(
+        compact.estimate_context_size(messages, system="system", tools=[])
+    ) < compact.AGENT_CONTEXT_LIMIT_TOKENS
+    assert_tool_pairs(messages)
+    automatic_failures = [
+        event for event in events
+        if event["type"] == "compact"
+        and event.get("reason") == "automatic"
+        and not event.get("success")
+    ]
+    assert automatic_failures[0]["failure_reason"] == (
+        "checkpoint and protected recent context cannot fit within target"
+    )
+    assert automatic_failures[-1]["failure_reason"] == (
+        "compact retry cooldown awaiting more message growth"
+    )
+    reactive_events = [
+        event for event in events
+        if event["type"] == "compact"
+        and event.get("reason") == "reactive"
+    ]
+    assert len(reactive_events) == 1
+    assert reactive_events[0]["success"] is True
+    assert reactive_events[0]["summary_model_calls"] == 1
+    hard_limit_event = next(
+        event for event in events
+        if event["type"] == "context_compact"
+        and event.get("stage") == "hard_limit_reactive_compact"
+    )
+    assert hard_limit_event["changed"] is True
+    assert hard_limit_event["success"] is True
+    assert hard_limit_event["before_tokens"] >= (
+        compact.AGENT_CONTEXT_LIMIT_TOKENS
+    )
+    assert hard_limit_event["after_tokens"] < (
+        compact.AGENT_CONTEXT_LIMIT_TOKENS
+    )
+    assert before_reactive[-2:] == newest_batch
 
 
 def test_normal_recent_tool_result_is_not_modified(monkeypatch):
