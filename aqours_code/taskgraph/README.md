@@ -35,9 +35,13 @@ Unknown fields are rejected everywhere.
 In Python, `Edge.from` is `Edge.from_`; it is always serialized as `from`.
 Use `load_graph(path)` and `dump_graph(graph, path)` for JSON I/O.
 
-Within one node, `modify`, `create` and `context_files` must not repeat a
-path, and no path may appear in both `modify` and `create`. These are schema
-errors.
+Within one node, `modify`, `create`, `context_files`, `requires`, `provides`
+and `edit_set.symbols` must not repeat an entry, and no path may appear in
+both `modify` and `create`. These are schema errors.
+
+The exported JSON Schema describes every field and, for the Planner, adds a
+`pattern` for symbols and `uniqueItems` for these lists. The Python
+validators remain authoritative.
 
 ### Execution semantics
 
@@ -57,7 +61,8 @@ by any ancestor (V6) and when it accepts an edit conflict ordered by any edge
 ### Paths and symbols
 
 All paths are repository-relative POSIX paths: `/` separators, no leading `/`,
-no drive letter, and no empty, `.` or `..` segments.
+no drive letter, no empty, `.` or `..` segments, no segment that starts or ends
+with whitespace, and no control characters.
 
 A symbol is `path::Qualified.name`, where the path is a `.py` file and the
 qualified name is one or more Python identifiers joined by `.`:
@@ -95,7 +100,7 @@ skipped and listed in `index.warnings`.
 | --- | --- |
 | V1 | Node ids are unique; edges reference existing nodes; no self-loops; no duplicate edge with the same `from`, `to` and `type`. |
 | V2 | The graph, with all edge types, has no cycle. |
-| V3 | `modify` files exist at the base commit; `create` files do not; `context_files` exist or are created by some node. *Needs an index.* |
+| V3 | Each `modify` file exists at the base commit or is created by an ancestor (a file created only by a non-ancestor is reported with its creator: missing edge?); `create` files do not exist at the base commit; `context_files` exist or are created by some node. *Needs an index.* |
 | V4 | Every node has at least one non-empty check command. |
 | V5 | Two nodes that edit a common file (`modify ∪ create`) must be ordered: one is an ancestor of the other. |
 | V6 | Every `requires` symbol exists at the base commit or is provided by an ancestor. A node's own `provides` does not count. *Needs an index.* |
@@ -103,13 +108,16 @@ skipped and listed in `index.warnings`.
 | V8 | `requires`, `provides` and `edit_set.symbols` are well-formed symbols. |
 | V9 | An `interface` edge starts at a `contract` node. |
 | V10 | Every `edit_set.symbols` entry belongs to a file in the same node's `modify` or `create`. |
+| V11 | Each new file is created by exactly one node. |
 | W1 | A `small` node has exactly one distinct direct successor (consider merging). |
 | W2 | A provided symbol is not required by any other node. |
 | W3 | `final_checks` is empty. |
 | W4 | A node requires a symbol provided by a node whose only direct edge to it is an `order` edge. |
+| W5 | A node requires a symbol that exists at the base commit, but non-ancestor nodes list it in `provides` (they change it, so the node may see the old version). *Needs an index.* |
 
-Without an index, V3 and V6 are skipped and reported as warnings. A single
-node graph is the fallback plan and passes when V3, V4, V7, V8 and V10 hold.
+Without an index, V3, V6 and W5 are skipped and reported as warnings. A single
+node graph is the fallback plan and passes when V3, V4, V7, V8, V10 and V11
+hold.
 
 ## Edge derivation
 
@@ -119,16 +127,26 @@ appended to `revision_log`:
 1. For each `requires` symbol that is not in the repository and has exactly one
    provider that is not yet an ancestor, add `provider -> node`
    (`interface` from a `contract` provider, otherwise `full`). When several
-   providers exist and none is an ancestor, no edge is added; an `other`
-   revision lists the node and every candidate provider with the reason
-   "multiple providers, edge not derived".
+   providers exist and none is an ancestor, no edge is added.
 2. For each pair of nodes that edit a common file and are not ordered, add an
-   `order` edge: a `contract` node goes first, otherwise the earlier node in
-   `nodes` goes first.
+   `order` edge. The direction, by priority:
+   1. if one node creates an overlapping file that the other modifies, the
+      creator goes first;
+   2. otherwise a `contract` node goes first;
+   3. otherwise the earlier node in `nodes` goes first.
+
+   If each node creates an overlapping file that the other modifies, no edge
+   is added and an `other` revision explains the conflicting creation
+   direction.
 
 Ancestry is recomputed after every edge. An edge that would create a cycle is
-not added and is recorded as an `other` revision. Run `validate()` on the
-result to decide whether it is usable.
+not added and is recorded as an `other` revision. After both steps, each
+multi-provider symbol from step 1 is checked against the final graph: if none
+of its providers is an ancestor of the requiring node, an `other` revision
+lists the node and every candidate provider with the reason "multiple
+providers, edge not derived". These entries come after all edge entries. Run
+`validate()` on the result to decide whether it is usable. W5 situations get
+no derived edge.
 
 ## CLI
 
@@ -141,7 +159,10 @@ python -m aqours_code.taskgraph export-schema [--out <path>]
 
 `--repo` indexes the repository at the graph's `base_commit`. Exit codes:
 `0` valid, `1` validation errors (for `derive`: the derived graph is still
-invalid), `2` unreadable input, schema mismatch, or git failure. Output lines
+invalid), `2` unreadable input, schema mismatch, an unwritable `--out`, or a
+git failure (including a missing `git` executable or an unknown commit). Exit
+code `2` errors go to stderr as one `error:` line; a schema mismatch is
+followed by pydantic's error details. Output lines
 look like:
 
 ```text
