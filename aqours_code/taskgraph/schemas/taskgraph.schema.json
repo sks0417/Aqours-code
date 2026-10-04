@@ -228,7 +228,7 @@
           "uniqueItems": true
         },
         "provides": {
-          "description": "Symbols this node adds or changes for other nodes to use.",
+          "description": "Symbols this node adds or changes for other nodes to use. Each symbol's file must be in this node's modify or create.",
           "items": {
             "description": "Symbol 'path/to/file.py::Qualified.name': a repository-relative path to a .py file, '::', then Python identifiers joined by '.'.",
             "pattern": "^[^:\\\\]+\\.py::[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$",

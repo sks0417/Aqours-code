@@ -228,7 +228,8 @@ class Node(_Model):
                      "be provided by an ancestor node."))
     provides: UniqueSymbols = Field(
         default_factory=list,
-        description="Symbols this node adds or changes for other nodes to use.")
+        description=("Symbols this node adds or changes for other nodes to use. Each "
+                     "symbol's file must be in this node's modify or create."))
     check: Check = Field(description="How to verify that the node is complete.")
     context_files: UniquePaths = Field(
         default_factory=list,

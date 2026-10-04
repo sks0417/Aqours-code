@@ -107,7 +107,7 @@ skipped and listed in `index.warnings`.
 | V7 | Every node edits at least one file. |
 | V8 | `requires`, `provides` and `edit_set.symbols` are well-formed symbols. |
 | V9 | An `interface` edge starts at a `contract` node. |
-| V10 | Every `edit_set.symbols` entry belongs to a file in the same node's `modify` or `create`. |
+| V10 | Every `edit_set.symbols` and `provides` entry belongs to a file in the same node's `modify` or `create` (a node cannot provide a symbol in a file it does not edit). |
 | V11 | Each new file is created by exactly one node. |
 | W1 | A `small` node has exactly one distinct direct successor (consider merging). |
 | W2 | A provided symbol is not required by any other node. |

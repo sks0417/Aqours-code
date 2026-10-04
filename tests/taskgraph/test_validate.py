@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from aqours_code.taskgraph import load_graph, validate
+from aqours_code.taskgraph import derive_edges, load_graph, validate
 from aqours_code.taskgraph.cli import main
 from aqours_code.taskgraph.validate import Issue
 from taskgraph_support import EXAMPLE_GRAPH, make_edge, make_graph, make_node
@@ -334,6 +334,48 @@ def test_v10_leaves_malformed_symbols_to_v8():
     assert errors_with(report, "V8") and not errors_with(report, "V10")
 
 
+def test_v10_provides_outside_edit_set_is_reported_even_after_derive(toy_index):
+    graph = make_graph([
+        make_node("A", modify=("runner.py",), provides=("store.py::new_fn",)),
+        make_node("B", modify=("models.py",), requires=("store.py::new_fn",)),
+    ])
+    derived, _ = derive_edges(graph, toy_index)
+    assert ("A", "B", "full") in [(e.from_, e.to, e.type) for e in derived.edges]
+    issues = errors_with(validate(derived, toy_index), "V10")
+    assert len(issues) == 1 and issues[0].nodes == ["A"]
+    assert issues[0].message == (
+        "provides store.py::new_fn, but store.py is not in edit_set.modify or "
+        "edit_set.create")
+
+
+def test_v10_provides_in_created_or_modified_file_passes(toy_index):
+    graph = make_graph([
+        make_node("A", create=("helpers.py",), modify=("runner.py",),
+                  provides=("helpers.py::new_fn", "runner.py::run_loop")),
+        make_node("B", modify=("models.py",),
+                  requires=("helpers.py::new_fn", "runner.py::run_loop")),
+    ], [make_edge("A", "B")])
+    report = validate(graph, toy_index)
+    assert report.ok, report.format()
+
+
+def test_v10_checks_provides_without_index():
+    graph = make_graph([
+        make_node("A", modify=("a.py",), provides=("b.py::f",), symbols=("c.py::g",)),
+    ])
+    messages = [issue.message for issue in errors_with(validate(graph), "V10")]
+    assert len(messages) == 2
+    assert messages[0].startswith("edit_set.symbols lists c.py::g")
+    assert messages[1].startswith("provides b.py::f")
+
+
+def test_v10_leaves_malformed_provides_to_v8():
+    graph = make_graph([make_node("A", modify=("a.py",))])
+    graph.nodes[0].provides.append("b.py:f")
+    report = validate(graph)
+    assert errors_with(report, "V8") and not errors_with(report, "V10")
+
+
 # ── warnings ──
 
 def test_w1_small_node_with_single_downstream():
@@ -393,8 +435,8 @@ def test_w5_existing_symbol_changed_by_non_ancestor(toy_index):
     graph = make_graph([
         make_node("X", modify=("store.py",), requires=("runner.py::run_loop",)),
         make_node("P", modify=("runner.py",), provides=("runner.py::run_loop",)),
-        make_node("Q", modify=("models.py",), provides=("runner.py::run_loop",)),
-    ])
+        make_node("Q", modify=("runner.py",), provides=("runner.py::run_loop",)),
+    ], [make_edge("P", "Q", "order")])  # P and Q both edit runner.py (V5)
     report = validate(graph, toy_index)
     assert report.ok
     issues = [issue for issue in report.warnings if issue.code == "W5"]
@@ -414,8 +456,8 @@ def test_w5_not_raised_when_changer_is_ancestor(toy_index):
 
 def test_w5_not_raised_for_symbols_missing_from_repo(toy_index):
     graph = make_graph([
-        make_node("X", modify=("store.py",), requires=("store.py::JobStore.purge",)),
-        make_node("P", modify=("runner.py",), provides=("store.py::JobStore.purge",)),
+        make_node("X", modify=("store.py",), requires=("runner.py::purge_jobs",)),
+        make_node("P", modify=("runner.py",), provides=("runner.py::purge_jobs",)),
     ])
     report = validate(graph, toy_index)
     assert "W5" not in report.warning_codes()

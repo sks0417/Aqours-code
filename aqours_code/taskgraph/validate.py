@@ -300,16 +300,18 @@ def _check_interface_sources(graph: Graph, report: ValidationReport) -> None:
 def _check_symbol_files(graph: Graph, report: ValidationReport) -> None:
     for node in graph.nodes:
         files = edit_files(node)
-        for symbol in node.edit_set.symbols:
-            try:
-                path = parse_symbol(symbol).path
-            except ValueError:
-                continue  # reported by V8
-            if path not in files:
-                report.errors.append(Issue(
-                    "V10", [node.id],
-                    f"edit_set.symbols lists {symbol}, but {path} is not in "
-                    "edit_set.modify or edit_set.create"))
+        for label, symbols in (("edit_set.symbols lists", node.edit_set.symbols),
+                               ("provides", node.provides)):
+            for symbol in symbols:
+                try:
+                    path = parse_symbol(symbol).path
+                except ValueError:
+                    continue  # reported by V8
+                if path not in files:
+                    report.errors.append(Issue(
+                        "V10", [node.id],
+                        f"{label} {symbol}, but {path} is not in "
+                        "edit_set.modify or edit_set.create"))
 
 
 def _warn_changed_existing_symbols(graph: Graph, index: RepoIndex,
