@@ -121,7 +121,8 @@ def commit_files(repo: Path, files: dict[str, str], message: str) -> str:
 
 
 def make_node(node_id: str, *, kind: str = "implement", modify: tuple = (),
-              create: tuple = (), requires: tuple = (), provides: tuple = (),
+              create: tuple = (), requires: tuple = (), requires_impl: tuple = (),
+              provides: tuple = (),
               commands: tuple = ("python -m pytest -q",), size: str | None = None,
               context_files: tuple = (), symbols: tuple = ()) -> dict:
     """Return a node dictionary with sensible defaults for tests."""
@@ -133,6 +134,7 @@ def make_node(node_id: str, *, kind: str = "implement", modify: tuple = (),
         "edit_set": {"modify": list(modify), "create": list(create),
                      "symbols": list(symbols)},
         "requires": list(requires),
+        "requires_impl": list(requires_impl),
         "provides": list(provides),
         "check": {"commands": list(commands)},
         "context_files": list(context_files),

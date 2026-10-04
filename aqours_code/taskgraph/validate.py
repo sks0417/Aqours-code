@@ -1,4 +1,4 @@
-"""Validation rules V1-V11 and warnings W1-W5 for task graphs."""
+"""Validation rules V1-V12 and warnings W1-W5 for task graphs."""
 from __future__ import annotations
 
 from collections import Counter, deque
@@ -103,6 +103,30 @@ def ancestors(graph: Graph) -> dict[str, set[str]]:
 def edit_files(node: Node) -> set[str]:
     """Return ``modify ∪ create`` for a node."""
     return set(node.edit_set.modify) | set(node.edit_set.create)
+
+
+def _changes_symbol(node: Node, symbol: str) -> bool:
+    return symbol in node.provides or symbol in node.edit_set.symbols
+
+
+def implementers(nodes: list[Node], symbol: str, exclude: str) -> list[Node]:
+    """Implement nodes that list ``symbol`` in provides or edit_set.symbols."""
+    return [node for node in nodes
+            if node.id != exclude and node.kind == "implement"
+            and _changes_symbol(node, symbol)]
+
+
+def declarers(nodes: list[Node], symbol: str, exclude: str) -> list[Node]:
+    """Contract nodes that list ``symbol`` in provides."""
+    return [node for node in nodes
+            if node.id != exclude and node.kind == "contract"
+            and symbol in node.provides]
+
+
+def modifiers(nodes: list[Node], symbol: str, exclude: str) -> list[Node]:
+    """Nodes of any kind that list ``symbol`` in provides or edit_set.symbols."""
+    return [node for node in nodes
+            if node.id != exclude and _changes_symbol(node, symbol)]
 
 
 def _find_cycles(graph: Graph) -> list[list[str]]:
@@ -297,6 +321,7 @@ def _check_edit_set_nonempty(graph: Graph, report: ValidationReport) -> None:
 def _check_symbol_format(graph: Graph, report: ValidationReport) -> None:
     for node in graph.nodes:
         for field_name, values in (("requires", node.requires),
+                                   ("requires_impl", node.requires_impl),
                                    ("provides", node.provides),
                                    ("edit_set.symbols", node.edit_set.symbols)):
             for value in values:
@@ -344,9 +369,8 @@ def _warn_changed_existing_symbols(graph: Graph, index: RepoIndex,
         for symbol in node.requires:
             if not index.has_symbol(symbol):
                 continue
-            changers = [other.id for other in nodes
-                        if other.id != node.id and symbol in other.provides
-                        and other.id not in ancestor_map[node.id]]
+            changers = [other.id for other in modifiers(nodes, symbol, node.id)
+                        if other.id not in ancestor_map[node.id]]
             if changers:
                 which = ("which is not an ancestor" if len(changers) == 1
                          else "which are not ancestors")
@@ -354,6 +378,40 @@ def _warn_changed_existing_symbols(graph: Graph, index: RepoIndex,
                     "W5", [node.id, *changers],
                     f"requires {symbol}; {symbol} exists at the base commit but "
                     f"is changed by {', '.join(changers)} {which} of {node.id}"))
+
+
+def _check_required_implementations(graph: Graph, index: RepoIndex,
+                                    ancestor_map: dict[str, set[str]],
+                                    report: ValidationReport) -> None:
+    nodes = unique_nodes(graph)
+    for node in nodes:
+        for symbol in node.requires_impl:
+            imps = implementers(nodes, symbol, node.id)
+            if imps:
+                missing = [imp.id for imp in imps
+                           if imp.id not in ancestor_map[node.id]]
+                if missing:
+                    which = ("is not an ancestor" if len(missing) == 1
+                             else "are not ancestors")
+                    report.errors.append(Issue(
+                        "V12", [node.id, *missing],
+                        f"requires the implementation of {symbol}, but "
+                        f"{', '.join(missing)} {which} of {node.id} (missing edge?)"))
+                continue
+            if index.has_symbol(symbol):
+                continue  # the existing implementation is used
+            contracts = [contract.id for contract in declarers(nodes, symbol, node.id)]
+            if contracts:
+                report.errors.append(Issue(
+                    "V12", [node.id, *contracts],
+                    f"requires the implementation of {symbol}, but {symbol} is "
+                    f"only declared by contract {', '.join(contracts)}; no "
+                    "implement node implements it"))
+            else:
+                report.errors.append(Issue(
+                    "V12", [node.id],
+                    f"requires the implementation of {symbol}, which is neither "
+                    "defined at the base commit nor implemented by any node"))
 
 
 def _check_single_creator(graph: Graph, report: ValidationReport) -> None:
@@ -381,12 +439,20 @@ def _warn_order_edge_for_required_symbols(graph: Graph,
         upstream, downstream = by_id[upstream_id], by_id[downstream_id]
         shared = [symbol for symbol in downstream.requires
                   if symbol in upstream.provides]
+        shared_impl = [symbol for symbol in downstream.requires_impl
+                       if upstream.kind == "implement"
+                       and _changes_symbol(upstream, symbol)]
+        needs = []
         if shared:
+            needs.append(f"requires {', '.join(shared)}")
+        if shared_impl:
+            needs.append(f"requires the implementation of {', '.join(shared_impl)}")
+        if needs:
             report.warnings.append(Issue(
                 "W4", [upstream_id, downstream_id],
-                f"{downstream_id} requires {', '.join(shared)} from "
-                f"{upstream_id}, but {upstream_id} -> {downstream_id} is only an "
-                "order edge; use interface or full"))
+                f"{downstream_id} {' and '.join(needs)} from {upstream_id}, but "
+                f"{upstream_id} -> {downstream_id} is only an order edge; use "
+                "interface or full"))
 
 
 def _warn_small_single_successor(graph: Graph, report: ValidationReport) -> None:
@@ -403,7 +469,8 @@ def _warn_small_single_successor(graph: Graph, report: ValidationReport) -> None
 def _warn_unused_provides(graph: Graph, report: ValidationReport) -> None:
     for node in graph.nodes:
         for symbol in node.provides:
-            if not any(symbol in other.requires for other in graph.nodes
+            if not any(symbol in other.requires or symbol in other.requires_impl
+                       for other in graph.nodes
                        if other is not node and other.id != node.id):
                 report.warnings.append(Issue(
                     "W2", [node.id],
@@ -411,10 +478,10 @@ def _warn_unused_provides(graph: Graph, report: ValidationReport) -> None:
 
 
 def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
-    """Check ``graph`` against rules V1-V11 and warnings W1-W5.
+    """Check ``graph`` against rules V1-V12 and warnings W1-W5.
 
-    Checks that need repository information (V3, V6, W5) are skipped, with a
-    warning, when ``index`` is None.
+    Checks that need repository information (V3, V6, V12, W5) are skipped,
+    with a warning, when ``index`` is None.
     """
     report = ValidationReport()
     ancestor_map = ancestors(graph)
@@ -431,9 +498,11 @@ def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
     _check_interface_sources(graph, report)
     _check_symbol_files(graph, report)
     _check_single_creator(graph, report)
+    if index is not None:
+        _check_required_implementations(graph, index, ancestor_map, report)
 
     if index is None:
-        for code in ("V3", "V6", "W5"):
+        for code in ("V3", "V6", "V12", "W5"):
             report.warnings.append(Issue(
                 code, [], "skipped: no repository index was provided"))
     _warn_small_single_successor(graph, report)

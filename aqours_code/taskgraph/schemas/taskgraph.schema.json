@@ -217,13 +217,24 @@
           "description": "Files the node may change."
         },
         "requires": {
-          "description": "Symbols this node uses. Each must exist at the base commit or be provided by an ancestor node.",
+          "description": "Symbols whose interface is enough for this node (name and signature). Each must exist at the base commit or be provided by an ancestor node, contract or implement.",
           "items": {
             "description": "Symbol 'path/to/file.py::Qualified.name': a repository-relative path to a .py file, '::', then Python identifiers joined by '.'.",
             "pattern": "^[^:\\\\]+\\.py::[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$",
             "type": "string"
           },
           "title": "Requires",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "requires_impl": {
+          "description": "Symbols this node needs a working implementation of, for example to call them in an integration test. The node starts only after every implement node that implements these symbols (lists them in provides or edit_set.symbols) has finished and been merged. A symbol must not appear in both requires and requires_impl.",
+          "items": {
+            "description": "Symbol 'path/to/file.py::Qualified.name': a repository-relative path to a .py file, '::', then Python identifiers joined by '.'.",
+            "pattern": "^[^:\\\\]+\\.py::[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$",
+            "type": "string"
+          },
+          "title": "Requires Impl",
           "type": "array",
           "uniqueItems": true
         },

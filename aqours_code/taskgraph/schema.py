@@ -224,8 +224,17 @@ class Node(_Model):
     edit_set: EditSet = Field(description="Files the node may change.")
     requires: UniqueSymbols = Field(
         default_factory=list,
-        description=("Symbols this node uses. Each must exist at the base commit or "
-                     "be provided by an ancestor node."))
+        description=("Symbols whose interface is enough for this node (name and "
+                     "signature). Each must exist at the base commit or be provided "
+                     "by an ancestor node, contract or implement."))
+    requires_impl: UniqueSymbols = Field(
+        default_factory=list,
+        description=("Symbols this node needs a working implementation of, for "
+                     "example to call them in an integration test. The node starts "
+                     "only after every implement node that implements these symbols "
+                     "(lists them in provides or edit_set.symbols) has finished and "
+                     "been merged. A symbol must not appear in both requires and "
+                     "requires_impl."))
     provides: UniqueSymbols = Field(
         default_factory=list,
         description=("Symbols this node adds or changes for other nodes to use. Each "
@@ -244,6 +253,14 @@ class Node(_Model):
         if not value.strip():
             raise ValueError("goal must not be empty")
         return value
+
+    @model_validator(mode="after")
+    def _requires_and_requires_impl_disjoint(self) -> "Node":
+        both = sorted(set(self.requires) & set(self.requires_impl))
+        if both:
+            raise ValueError(
+                f"symbols listed in both requires and requires_impl: {', '.join(both)}")
+        return self
 
 
 class Edge(_Model):

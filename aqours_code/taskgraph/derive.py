@@ -5,7 +5,7 @@ from typing import Literal
 
 from .repo_index import RepoIndex
 from .schema import Edge, Graph, Node, RevisionEntry
-from .validate import ancestors, edit_files, unique_nodes
+from .validate import ancestors, edit_files, implementers, unique_nodes
 
 
 def _try_add_edge(graph: Graph, edge: Edge, entries: list[RevisionEntry],
@@ -34,7 +34,19 @@ _PendingProviders = tuple[str, str, list[str]]
 
 def _derive_dependency_edges(graph: Graph, index: RepoIndex,
                              entries: list[RevisionEntry]) -> list[_PendingProviders]:
-    """Add dependency edges; return unresolved ``(node, symbol, providers)``."""
+    """Add dependency edges (1a requires, 1b requires_impl, 1c context files).
+
+    Return the unresolved ``(node, symbol, providers)`` items from step 1a.
+    """
+    pending = _derive_interface_edges(graph, index, entries)
+    _derive_implementation_edges(graph, entries)
+    _derive_context_file_edges(graph, index, entries)
+    return pending
+
+
+def _derive_interface_edges(graph: Graph, index: RepoIndex,
+                            entries: list[RevisionEntry]) -> list[_PendingProviders]:
+    """Step 1a: one provider per ``requires`` symbol, a contract first."""
     nodes = unique_nodes(graph)
     by_id = {node.id: node for node in nodes}
     pending: list[_PendingProviders] = []
@@ -47,14 +59,18 @@ def _derive_dependency_edges(graph: Graph, index: RepoIndex,
                 continue
             providers = [other for other in nodes
                          if other.id != node.id and symbol in other.provides]
-            if len(providers) > 1:
-                item = (node.id, symbol, [other.id for other in providers])
+            contracts = [other for other in providers if other.kind == "contract"]
+            # A contract declares the interface, so implement providers of the
+            # same symbol do not make it ambiguous.
+            candidates = contracts or providers
+            if len(candidates) > 1:
+                item = (node.id, symbol, [other.id for other in candidates])
                 if item not in pending:
                     pending.append(item)
                 continue
-            if not providers:
+            if not candidates:
                 continue
-            provider = providers[0]
+            provider = candidates[0]
             edge_type: Literal["interface", "full"] = (
                 "interface" if provider.kind == "contract" else "full")
             description = f"{node.id} requires {symbol} provided by {provider.id}"
@@ -62,8 +78,23 @@ def _derive_dependency_edges(graph: Graph, index: RepoIndex,
                 from_=provider.id, to=node.id, type=edge_type, source="derived",
                 reason=description,
             ), entries, description)
-    _derive_context_file_edges(graph, index, entries)
     return pending
+
+
+def _derive_implementation_edges(graph: Graph, entries: list[RevisionEntry]) -> None:
+    """Step 1b: every implementer of a ``requires_impl`` symbol precedes the node."""
+    nodes = unique_nodes(graph)
+    for node in nodes:
+        for symbol in node.requires_impl:
+            for implementer in implementers(nodes, symbol, node.id):
+                if implementer.id in ancestors(graph)[node.id]:
+                    continue
+                description = (f"{node.id} requires implementation of {symbol} "
+                               f"by {implementer.id}")
+                _try_add_edge(graph, Edge(
+                    from_=implementer.id, to=node.id, type="full", source="derived",
+                    reason=description,
+                ), entries, description)
 
 
 def _derive_context_file_edges(graph: Graph, index: RepoIndex,
@@ -92,8 +123,9 @@ def _derive_context_file_edges(graph: Graph, index: RepoIndex,
 
 def _unresolved_provider_entries(graph: Graph,
                                  pending: list[_PendingProviders]) -> list[RevisionEntry]:
-    """Record multi-provider symbols that no provider satisfies in the final graph."""
+    """Record multi-provider symbols still unsatisfied (as V6 sees it) at the end."""
     ancestor_map = ancestors(graph)
+    by_id = {node.id: node for node in unique_nodes(graph)}
     return [
         RevisionEntry(
             action="other",
@@ -101,7 +133,7 @@ def _unresolved_provider_entries(graph: Graph,
             reason=f"{node_id} requires {symbol}: multiple providers, edge not derived",
         )
         for node_id, symbol, providers in pending
-        if not any(provider in ancestor_map[node_id] for provider in providers)
+        if not any(symbol in by_id[a].provides for a in ancestor_map[node_id])
     ]
 
 
@@ -169,19 +201,29 @@ def _derive_order_edges(graph: Graph, entries: list[RevisionEntry]) -> None:
 def derive_edges(graph: Graph, index: RepoIndex) -> tuple[Graph, list[RevisionEntry]]:
     """Return a copy of ``graph`` with derived edges, plus the revision entries.
 
-    Dependency edges are added first: for ``requires`` symbols, then for
-    ``context_files`` that a single other node creates (creator -> reader).
-    Ordering edges follow; ancestry is
-    recomputed after every added edge. An ordering edge goes from the node
-    that creates a file the other node modifies; otherwise from a contract
-    node; otherwise from the node listed first. When each node creates a
-    file the other modifies, no edge is added and an ``other`` entry explains
-    the conflict. Entries for added edges, for edges skipped because of a
-    cycle, and for creation conflicts come first, in the order they happened. A
-    symbol with several providers gets no edge; once all edges are added, an
-    ``other`` entry is recorded for it only if, in the final graph, none of
-    its providers is an ancestor of the requiring node. Those entries come
-    last. The entries are also appended to the new graph's ``revision_log``.
+    Step 1 adds dependency edges:
+
+    1a. ``requires`` (an interface is enough): a single contract provider of
+        the symbol gets an ``interface`` edge even if implement nodes also
+        provide it; with no contract provider, a single implement provider
+        gets a ``full`` edge; several contract providers, or several
+        implement providers and no contract, get no edge.
+    1b. ``requires_impl``: every implementer (an implement node listing the
+        symbol in ``provides`` or ``edit_set.symbols``) that is not yet an
+        ancestor gets a ``full`` edge.
+    1c. ``context_files`` that a single other node creates (creator -> reader).
+
+    Step 2 adds ordering edges. Ancestry is recomputed after every added
+    edge. An ordering edge goes from the node that creates a file the other
+    node modifies; otherwise from a contract node; otherwise from the node
+    listed first. When each node creates a file the other modifies, no edge
+    is added and an ``other`` entry explains the conflict. Entries for added
+    edges, for edges skipped because of a cycle, and for creation conflicts
+    come first, in the order they happened. For a step 1a symbol left without
+    an edge because of several providers, an ``other`` entry is recorded
+    after all edges are added, only if no ancestor of the requiring node
+    provides the symbol in the final graph. Those entries come last. The
+    entries are also appended to the new graph's ``revision_log``.
     Whether the result is valid is decided by
     :func:`aqours_code.taskgraph.validate.validate`.
     """
