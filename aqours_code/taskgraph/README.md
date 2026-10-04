@@ -202,3 +202,126 @@ errors (1):
 [V5] C, D: both edit runner.py but neither is an ancestor of the other
 warnings (0):
 ```
+
+## Running a graph
+
+```bash
+python -m aqours_code.taskgraph run <graph.json> --repo <path>
+    [--out runs] [--workers 2] [--max-attempts 2]
+    [--worker aqours|command] [--command-map <json>]
+    [--max-model-calls 40] [--worker-timeout 1800]
+    [--hidden-tests <dir>]
+```
+
+Run experiments on Linux or WSL2. Check commands, `final_checks`, and the
+`--command-map` commands run through the system shell, so write them for a
+POSIX shell. The process exits with `0` for `success`, `1` for any other
+status or an invalid graph, and `2` for input or git errors.
+
+### Three schemes, one pipeline
+
+| Scheme | How to run it |
+| --- | --- |
+| Single-agent baseline | A graph with one node that edits every file |
+| Sequential | `--workers 1` |
+| Parallel | `--workers N` |
+
+All schemes use the same worker: `AqoursWorker` runs
+`aqours_code.agent_loop.run_agent_task()` in a child process
+(`python -m aqours_code.taskgraph.worker_entry --config <file>`) with one fixed
+tool policy (`bash`, `read_file`, `write_file`, `edit_file`, `glob`,
+`todo_write`, `compact`; no MCP, memory, skills, teammates, or background
+tasks) and a model-call budget of `--max-model-calls` per attempt. The model
+comes from the Aqours `.env` and environment. `--worker command` runs a fixed
+shell command per node instead (tests and debugging only).
+
+### Flow
+
+1. **Prepare.** Index `base_commit` and run `validate()`; any error stops the
+   run before anything executes. Clone the repository to `repo/`, create
+   `tg/integration` at `base_commit`, and add the Aqours runtime directories
+   and Python caches to `.git/info/exclude` so workers' runtime files are never
+   committed.
+2. **Schedule.** A node is ready when every direct upstream node is merged. A
+   ready node starts when fewer than `--workers` nodes are running and its
+   `modify ∪ create` does not overlap a running node; ties start in `nodes`
+   order. When a node fails, its descendants are `skipped`
+   (`upstream_failed`); unrelated nodes continue. All git operations on the
+   shared clone run under one lock.
+3. **Each node**, up to `--max-attempts` times (default 2): create
+   `tg/node/<id>` and worktree `wt/<id>` from the integration HEAD, write the
+   prompt, run the worker, and commit `attempt <n>`. The attempt fails on a
+   worker error, timeout or exhausted budget, on no change since the start
+   commit (`no_changes`), or on a failing check command run in the worktree
+   (`check_failed`). A retry continues in the same worktree with the failure
+   reason and the last 4000 characters of output in the prompt.
+4. **Merge.** Squash-merge the node branch into `tg/integration` as one commit
+   `[taskgraph] <id>: <title>`. A conflict resets the branch and fails the node
+   (`merge_conflict`); the node's checks then run again on the integration
+   branch, and a failure undoes the merge (`post_merge_check_failed`). Neither
+   is retried. Changed files outside `modify ∪ create` are recorded as
+   `out_of_scope_files` but do not fail the node.
+5. **Final stage.** Run every `final_checks` command on the integration branch
+   and record each result. With `--hidden-tests DIR`, check out the
+   integration HEAD into `final/`, copy `DIR` to `final/_hidden_tests/`, and
+   run `python -m pytest -q _hidden_tests -p no:cacheprovider --junitxml=...`.
+   Workers never see these tests.
+
+The run status is `success` when every node is merged and every final check
+passes, `partial` when some node is merged, and `failed` otherwise. Hidden
+test results are reported separately and do not change the status.
+
+Each node check command has the node's `check.timeout_s`; each final check
+command has 1800 s, as do the hidden tests. A worker gets `--worker-timeout`
+seconds; its process tree is killed 30 s after that if it has not stopped.
+
+### Run directory
+
+```text
+runs/<run_id>/            run_id = UTC timestamp + 4 random hex characters
+  config.json             run parameters, worker provider/model, validation warnings
+  graph.json              the graph that was executed
+  events.jsonl            event stream (for Gantt charts)
+  summary.json            results
+  final_checks.txt        output of final_checks
+  hidden_tests.xml/.txt   hidden test results, if any
+  repo/                   clone; tg/integration is checked out here
+  wt/<node_id>/           node worktrees (removed when the node ends)
+  nodes/<node_id>/        prompt_<n>.md, worker_<n>.json, worker_<n>_config.json,
+                          worker_<n>_stdout.txt, trace_<n>.jsonl, aqours_<n>/,
+                          check_<n>.txt, post_merge_check.txt, diff.patch
+  final/                  clean checkout of the integration HEAD for hidden tests
+```
+
+### events.jsonl
+
+One JSON object per line with `ts` (ISO 8601, UTC), `t` (seconds since the
+run started), `type`, and `node` where it applies. Types: `run_start`,
+`node_ready`, `node_start`, `worker_start`, `worker_end` (with `ok`,
+`reason`, `duration_s`, `model_calls`, `input_tokens`, `output_tokens`),
+`check_start`, `check_end`, `merge_start`, `merge_end`,
+`post_merge_check_end`, `node_merged`, `node_failed`, `node_skipped`,
+`final_checks_end`, `hidden_tests_end`, `run_end`.
+
+### summary.json
+
+- `run_id`, `status`, `wall_time_s`, `config`, `integration_commit`;
+- `nodes.<id>`: `status`, `reason`, `attempts`, `start_t`, `end_t`,
+  `worker_time_s`, `check_time_s` (node and post-merge checks),
+  `model_calls`, `input_tokens`, `output_tokens`, `changed_files`,
+  `out_of_scope_files`, `merge_commit`, `error`;
+- `totals`: `model_calls`, `input_tokens`, `output_tokens`;
+- `final_checks`: one entry per command (`command`, `ok`, `exit_code`,
+  `timed_out`, `duration_s`);
+- `hidden_tests`: `passed`, `failed`, `errors`, `skipped`, `exit_code`,
+  `timed_out`, `duration_s`, or `null`.
+
+### Smoke test on the toy repository
+
+With a model configured in the Aqours `.env`, recreate the toy repository
+(its commit matches `base_commit` in the example) and run the example:
+
+```bash
+python -c "import sys; sys.path.insert(0, 'tests/taskgraph'); from pathlib import Path; from taskgraph_support import TOY_FILES, commit_files, git; repo = Path('toy-repo'); repo.mkdir(); git(repo, 'init', '-q'); print(commit_files(repo, TOY_FILES, 'toy repository'))"
+python -m aqours_code.taskgraph run aqours_code/taskgraph/examples/toy_graph.json --repo toy-repo --workers 2
+```
