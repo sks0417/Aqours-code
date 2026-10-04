@@ -209,11 +209,33 @@ def _check_files(graph: Graph, index: RepoIndex, ancestor_map: dict[str, set[str
                     "V3", [node.id],
                     f"creates {path}, which already exists at the base commit"))
         for path in node.context_files:
-            if not index.has_file(path) and path not in created:
+            if index.has_file(path):
+                continue
+            if path not in created:
                 report.errors.append(Issue(
                     "V3", [node.id],
                     f"context file {path} neither exists at the base commit "
                     "nor is created by any node"))
+                continue
+            # A node never reads its own new file: it does not exist yet when
+            # the node starts, so the node itself counts as a non-ancestor.
+            creators = [other.id for other in unique_nodes(graph)
+                        if path in other.edit_set.create]
+            if any(creator in ancestor_map[node.id] for creator in creators):
+                continue
+            if creators == [node.id]:
+                report.errors.append(Issue(
+                    "V3", [node.id],
+                    f"context file {path} is created by {node.id} itself, so it "
+                    f"does not exist when {node.id} starts"))
+                continue
+            names = ", ".join(creators)
+            which = ("which is not an ancestor" if len(creators) == 1
+                     else "which are not ancestors")
+            report.errors.append(Issue(
+                "V3", [node.id, *(c for c in creators if c != node.id)],
+                f"context file {path} is created by {names}, {which} of "
+                f"{node.id} (missing edge?)"))
 
 
 def _check_commands(graph: Graph, report: ValidationReport) -> None:

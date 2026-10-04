@@ -100,7 +100,7 @@ skipped and listed in `index.warnings`.
 | --- | --- |
 | V1 | Node ids are unique; edges reference existing nodes; no self-loops; no duplicate edge with the same `from`, `to` and `type`. |
 | V2 | The graph, with all edge types, has no cycle. |
-| V3 | Each `modify` file exists at the base commit or is created by an ancestor (a file created only by a non-ancestor is reported with its creator: missing edge?); `create` files do not exist at the base commit; `context_files` exist or are created by some node. *Needs an index.* |
+| V3 | Each `modify` file exists at the base commit or is created by an ancestor (a file created only by a non-ancestor is reported with its creator: missing edge?); `create` files do not exist at the base commit; each `context_files` file exists at the base commit or is created by an ancestor (one created by a non-ancestor, including the node itself, is reported with its creator: missing edge?). *Needs an index.* |
 | V4 | Every node has at least one non-empty check command. |
 | V5 | Two nodes that edit a common file (`modify ∪ create`) must be ordered: one is an ancestor of the other. |
 | V6 | Every `requires` symbol exists at the base commit or is provided by an ancestor. A node's own `provides` does not count. *Needs an index.* |
@@ -128,6 +128,11 @@ appended to `revision_log`:
    provider that is not yet an ancestor, add `provider -> node`
    (`interface` from a `contract` provider, otherwise `full`). When several
    providers exist and none is an ancestor, no edge is added.
+
+   Then, for each `context_files` file that is not in the repository and is
+   created by exactly one other node that is not yet an ancestor, add
+   `creator -> node` with the same `interface`/`full` rule. A file created by
+   the node itself or by several nodes gets no edge (V3 and V11 report them).
 2. For each pair of nodes that edit a common file and are not ordered, add an
    `order` edge. The direction, by priority:
    1. if one node creates an overlapping file that the other modifies, the

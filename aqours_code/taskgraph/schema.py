@@ -234,7 +234,7 @@ class Node(_Model):
     context_files: UniquePaths = Field(
         default_factory=list,
         description=("Files the worker should read first. Each must exist at the base "
-                     "commit or be created by some node."))
+                     "commit or be created by an ancestor node."))
     size: Literal["small", "medium", "large"] | None = Field(
         default=None, description="Expected size of the change.")
 

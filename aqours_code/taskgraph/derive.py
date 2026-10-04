@@ -62,7 +62,32 @@ def _derive_dependency_edges(graph: Graph, index: RepoIndex,
                 from_=provider.id, to=node.id, type=edge_type, source="derived",
                 reason=description,
             ), entries, description)
+    _derive_context_file_edges(graph, index, entries)
     return pending
+
+
+def _derive_context_file_edges(graph: Graph, index: RepoIndex,
+                               entries: list[RevisionEntry]) -> None:
+    """Order the single creator of a new context file before its reader."""
+    nodes = unique_nodes(graph)
+    for node in nodes:
+        for path in node.context_files:
+            if index.has_file(path):
+                continue
+            creators = [other for other in nodes if path in other.edit_set.create]
+            if len(creators) != 1 or creators[0].id == node.id:
+                continue  # no creator (V3), several (V11), or the node itself (V3)
+            creator = creators[0]
+            if creator.id in ancestors(graph)[node.id]:
+                continue
+            edge_type: Literal["interface", "full"] = (
+                "interface" if creator.kind == "contract" else "full")
+            description = (f"{node.id} reads context file {path} created by "
+                           f"{creator.id}")
+            _try_add_edge(graph, Edge(
+                from_=creator.id, to=node.id, type=edge_type, source="derived",
+                reason=description,
+            ), entries, description)
 
 
 def _unresolved_provider_entries(graph: Graph,
@@ -144,7 +169,9 @@ def _derive_order_edges(graph: Graph, entries: list[RevisionEntry]) -> None:
 def derive_edges(graph: Graph, index: RepoIndex) -> tuple[Graph, list[RevisionEntry]]:
     """Return a copy of ``graph`` with derived edges, plus the revision entries.
 
-    Dependency edges are added first, then ordering edges; ancestry is
+    Dependency edges are added first: for ``requires`` symbols, then for
+    ``context_files`` that a single other node creates (creator -> reader).
+    Ordering edges follow; ancestry is
     recomputed after every added edge. An ordering edge goes from the node
     that creates a file the other node modifies; otherwise from a contract
     node; otherwise from the node listed first. When each node creates a

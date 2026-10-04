@@ -81,6 +81,62 @@ def test_conflicting_creation_direction_adds_no_edge(toy_index):
     assert not validate(derived, toy_index).ok
 
 
+def test_context_file_creator_is_ordered_before_reader(toy_index):
+    graph = make_graph([
+        make_node("A", create=("contract.py",)),
+        make_node("B", modify=("store.py",), context_files=("contract.py",)),
+    ])
+    assert "V3" in validate(graph, toy_index).codes()
+    derived, entries = derive_edges(graph, toy_index)
+    assert edge_tuples(derived) == [("A", "B", "full", "derived")]
+    assert "context file contract.py" in derived.edges[0].reason
+    assert [entry.action for entry in entries] == ["add_edge"]
+    report = validate(derived, toy_index)
+    assert report.ok, report.format()
+
+
+def test_context_file_from_contract_creator_gets_interface_edge(toy_index):
+    graph = make_graph([
+        make_node("B", modify=("store.py",), context_files=("contract.py",)),
+        make_node("C", kind="contract", create=("contract.py",)),
+    ])
+    derived, _ = derive_edges(graph, toy_index)
+    assert edge_tuples(derived) == [("C", "B", "interface", "derived")]
+    assert validate(derived, toy_index).ok
+
+
+def test_context_file_created_by_the_node_itself_gets_no_edge(toy_index):
+    graph = make_graph([
+        make_node("B", create=("contract.py",), context_files=("contract.py",)),
+    ])
+    derived, entries = derive_edges(graph, toy_index)
+    assert derived.edges == [] and entries == []
+    assert "V3" in validate(derived, toy_index).codes()
+
+
+def test_context_file_created_downstream_is_not_derived_because_of_cycle(toy_index):
+    graph = make_graph([
+        make_node("B", modify=("store.py",), context_files=("contract.py",)),
+        make_node("A", create=("contract.py",)),
+    ], [make_edge("B", "A")])
+    derived, entries = derive_edges(graph, toy_index)
+    assert edge_tuples(derived) == [("B", "A", "full", "manual")]
+    assert len(entries) == 1 and entries[0].action == "other"
+    assert "cycle" in entries[0].reason and "contract.py" in entries[0].reason
+    assert "V3" in validate(derived, toy_index).codes()
+
+
+def test_context_file_with_several_creators_is_left_to_v11(toy_index):
+    graph = make_graph([
+        make_node("A1", create=("contract.py",)),
+        make_node("A2", create=("contract.py",)),
+        make_node("B", modify=("store.py",), context_files=("contract.py",)),
+    ])
+    derived, _ = derive_edges(graph, toy_index)
+    assert not [edge for edge in derived.edges if edge.to == "B"]
+    assert "V11" in validate(derived, toy_index).codes()
+
+
 def test_contract_node_is_ordered_first(toy_index):
     graph = make_graph([
         make_node("impl", modify=("models.py",)),

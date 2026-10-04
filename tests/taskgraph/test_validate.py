@@ -155,6 +155,53 @@ def test_v3_modify_file_created_by_descendant(toy_index):
     assert [issue.nodes for issue in issues] == [["B", "A"]]
 
 
+def test_v3_context_file_created_by_non_ancestor(toy_index):
+    graph = make_graph([
+        make_node("A", create=("contract.py",)),
+        make_node("B", modify=("store.py",), context_files=("contract.py",)),
+    ])
+    issues = errors_with(validate(graph, toy_index), "V3")
+    assert len(issues) == 1 and issues[0].nodes == ["B", "A"]
+    assert issues[0].message == (
+        "context file contract.py is created by A, which is not an ancestor of B "
+        "(missing edge?)")
+
+
+def test_v3_context_file_created_by_ancestor(toy_index):
+    graph = make_graph([
+        make_node("A", create=("contract.py",)),
+        make_node("M", modify=("models.py",)),
+        make_node("B", modify=("store.py",), context_files=("contract.py",)),
+    ], [make_edge("A", "M", "order"), make_edge("M", "B", "order")])
+    assert validate(graph, toy_index).ok
+
+
+def test_v3_context_file_created_by_the_node_itself(toy_index):
+    graph = make_graph([
+        make_node("B", create=("contract.py",), context_files=("contract.py",)),
+    ])
+    issues = errors_with(validate(graph, toy_index), "V3")
+    assert len(issues) == 1 and issues[0].nodes == ["B"]
+    assert "created by B itself" in issues[0].message
+
+
+def test_v3_context_file_created_by_downstream_node(toy_index):
+    graph = make_graph([
+        make_node("B", modify=("store.py",), context_files=("contract.py",)),
+        make_node("A", create=("contract.py",)),
+    ], [make_edge("B", "A")])
+    issues = errors_with(validate(graph, toy_index), "V3")
+    assert [issue.nodes for issue in issues] == [["B", "A"]]
+
+
+def test_v3_context_file_without_creator_keeps_original_message(toy_index):
+    graph = make_graph([make_node("B", modify=("store.py",), context_files=("nowhere.md",))])
+    issues = errors_with(validate(graph, toy_index), "V3")
+    assert [issue.message for issue in issues] == [
+        "context file nowhere.md neither exists at the base commit nor is created "
+        "by any node"]
+
+
 # ── V11 single creator ──
 
 def test_v11_passes_for_distinct_new_files():
