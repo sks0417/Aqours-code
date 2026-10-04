@@ -229,6 +229,53 @@ def test_post_merge_check_failure_is_undone(toy_repo, tmp_path):
     assert gitops.is_clean(result.run_dir / "repo")
 
 
+def slow_post_merge_scenario(toy_repo, tmp_path, post_merge_ok: bool):
+    """X's post-merge check takes 1.5 s; F fails fast and frees a slot for Y.
+
+    X's worker leaves a marker in an excluded directory, so its check is fast
+    in the worktree and slow (and, if requested, failing) after the merge.
+    """
+    exit_code = "0" if post_merge_ok else "0 if here else 1"
+    x_check = py("import pathlib, sys, time; here = pathlib.Path('.task_outputs/here')"
+                 f".exists(); time.sleep(0 if here else 1.5); sys.exit({exit_code})")
+    graph = graph_for(toy_repo, [node("X", create=("x.txt",), check=x_check),
+                                 node("F", create=("f.txt",)),
+                                 node("Y", create=("y.txt",))])
+    commands = {
+        "X": py("import pathlib; pathlib.Path('x.txt').write_text('X'); "
+                "pathlib.Path('.task_outputs').mkdir(); "
+                "pathlib.Path('.task_outputs/here').write_text('1')"),
+        "F": py("import sys, time; time.sleep(0.2); sys.exit(1)"),
+        "Y": write("y.txt", "Y"),
+    }
+    result = run(toy_repo, tmp_path, graph, commands, workers=2)
+    evts = events(result)
+    # Y got F's slot while X's post-merge check was still running.
+    assert event_t(evts, "worker_start", "Y") < event_t(evts, "post_merge_check_end", "X")
+    assert event_t(evts, "worker_start", "Y") > event_t(evts, "merge_end", "X")
+    return result
+
+
+def test_slow_post_merge_check_does_not_block_other_nodes(toy_repo, tmp_path):
+    result = slow_post_merge_scenario(toy_repo, tmp_path, post_merge_ok=True)
+    nodes = result.summary["nodes"]
+    assert nodes["X"]["status"] == "merged" and nodes["Y"]["status"] == "merged"
+    repo = result.run_dir / "repo"
+    assert (repo / "x.txt").is_file() and (repo / "y.txt").is_file()
+
+
+def test_undone_merge_does_not_leak_into_a_node_started_during_its_check(
+        toy_repo, tmp_path):
+    result = slow_post_merge_scenario(toy_repo, tmp_path, post_merge_ok=False)
+    nodes = result.summary["nodes"]
+    assert nodes["X"]["status"] == "failed"
+    assert nodes["X"]["reason"] == "post_merge_check_failed"
+    assert nodes["Y"]["status"] == "merged" and nodes["Y"]["changed_files"] == ["y.txt"]
+    repo = result.run_dir / "repo"
+    assert not (repo / "x.txt").exists() and (repo / "y.txt").is_file()
+    assert integration_subjects(result) == ["[taskgraph] Y: Y"]
+
+
 def test_invalid_graph_is_not_executed(toy_repo, tmp_path, capsys):
     graph = graph_for(toy_repo, [node("C", modify=("runner.py",)),
                                  node("D", modify=("runner.py",))])

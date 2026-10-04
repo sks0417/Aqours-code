@@ -2,7 +2,9 @@
 
 Every edge means the downstream node starts only after the upstream node has
 been merged into the integration branch. Workers run in threads that each
-drive one node; all git operations on the shared clone happen under one lock.
+drive one node. Every git command on the shared clone runs under ``git_lock``;
+a merge, its post-merge check, and a possible undo run as one unit under
+``merge_lock``, and the check itself does not hold ``git_lock``.
 """
 from __future__ import annotations
 
@@ -147,7 +149,8 @@ class Coordinator:
     """Executes one graph in one run directory."""
 
     def __init__(self, graph: Graph, index: RepoIndex, worker: Worker,
-                 options: RunOptions, run_dir: Path, events: EventLog):
+                 options: RunOptions, run_dir: Path, events: EventLog,
+                 base_commit: str):
         self.graph = graph
         self.index = index
         self.worker = worker
@@ -156,6 +159,11 @@ class Coordinator:
         self.repo = run_dir / "repo"
         self.events = events
         self.git_lock = threading.Lock()
+        self.merge_lock = threading.Lock()
+        # Last integration commit whose post-merge check passed. New worktrees
+        # start here, never from a merge still being checked, so an undone
+        # merge cannot leak into another node's branch.
+        self.integration_head = base_commit
         self.nodes = unique_nodes(graph)
         self.by_id = {node.id: node for node in self.nodes}
         self.records = {node.id: NodeRecord() for node in self.nodes}
@@ -238,7 +246,8 @@ class Coordinator:
         record.start_t = self.events.elapsed()
         self.events.emit("node_start", node=node.id)
         with self.git_lock:
-            start = gitops.add_node_worktree(self.repo, node.id, worktree)
+            start = self.integration_head
+            gitops.add_node_worktree(self.repo, node.id, worktree, start)
         try:
             if self._attempt_until_checked(node, record, log_dir, worktree, start):
                 self._merge(node, record, log_dir)
@@ -312,12 +321,13 @@ class Coordinator:
 
     def _merge(self, node: Node, record: NodeRecord, log_dir: Path) -> None:
         branch = gitops.NODE_BRANCH_PREFIX + node.id
-        with self.git_lock:
-            self.events.emit("merge_start", node=node.id)
-            commit = gitops.squash_merge(self.repo, branch,
-                                         f"[taskgraph] {node.id}: {node.title}")
-            self.events.emit("merge_end", node=node.id, ok=commit is not None,
-                             commit=commit)
+        with self.merge_lock:
+            with self.git_lock:
+                self.events.emit("merge_start", node=node.id)
+                commit = gitops.squash_merge(self.repo, branch,
+                                             f"[taskgraph] {node.id}: {node.title}")
+                self.events.emit("merge_end", node=node.id, ok=commit is not None,
+                                 commit=commit)
             if commit is None:
                 record.status, record.reason = "failed", "merge_conflict"
                 return
@@ -326,10 +336,12 @@ class Coordinator:
             record.check_time_s += check.duration_s
             self.events.emit("post_merge_check_end", node=node.id, ok=check.ok,
                              duration_s=round(check.duration_s, 3))
-            if not check.ok:
-                gitops.undo_last_commit(self.repo)
-                record.status, record.reason = "failed", "post_merge_check_failed"
-                return
+            with self.git_lock:
+                if not check.ok:
+                    gitops.undo_last_commit(self.repo)
+                    record.status, record.reason = "failed", "post_merge_check_failed"
+                    return
+                self.integration_head = commit
         record.status, record.merge_commit = "merged", commit
         self.events.emit("node_merged", node=node.id, commit=commit,
                          attempts=record.attempts)
@@ -428,8 +440,8 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
     events.emit("run_start", run_id=run_id, workers=options.workers,
                 nodes=[node.id for node in unique_nodes(graph)])
 
-    gitops.clone_for_run(repo, run_dir / "repo", graph.base_commit)
-    coordinator = Coordinator(graph, index, worker, options, run_dir, events)
+    base = gitops.clone_for_run(repo, run_dir / "repo", graph.base_commit)
+    coordinator = Coordinator(graph, index, worker, options, run_dir, events, base)
     coordinator.execute()
     final_results = coordinator.final_checks()
     hidden = (coordinator.hidden_tests(Path(options.hidden_tests))

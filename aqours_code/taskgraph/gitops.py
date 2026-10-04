@@ -60,15 +60,10 @@ def clone_for_run(source: Path, dest: Path, base_commit: str) -> str:
     return base
 
 
-def add_node_worktree(repo: Path, node_id: str, path: Path) -> str:
-    """Create branch ``tg/node/<id>`` and its worktree at the integration HEAD.
-
-    Returns the start commit.
-    """
-    start = head(repo, INTEGRATION_BRANCH)
+def add_node_worktree(repo: Path, node_id: str, path: Path, start: str) -> None:
+    """Create branch ``tg/node/<id>`` and its worktree at commit ``start``."""
     git(repo, "worktree", "add", "-q", "-b", NODE_BRANCH_PREFIX + node_id,
         str(path), start)
-    return start
 
 
 def add_detached_worktree(repo: Path, path: Path, ref: str) -> None:

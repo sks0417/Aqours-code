@@ -248,10 +248,14 @@ shell command per node instead (tests and debugging only).
    ready node starts when fewer than `--workers` nodes are running and its
    `modify ∪ create` does not overlap a running node; ties start in `nodes`
    order. When a node fails, its descendants are `skipped`
-   (`upstream_failed`); unrelated nodes continue. All git operations on the
-   shared clone run under one lock.
+   (`upstream_failed`); unrelated nodes continue. Every git command on the
+   shared clone runs under one lock; a merge, its post-merge check, and a
+   possible undo run as one unit under a separate merge lock, so a slow
+   post-merge check never blocks other nodes from starting or committing.
 3. **Each node**, up to `--max-attempts` times (default 2): create
-   `tg/node/<id>` and worktree `wt/<id>` from the integration HEAD, write the
+   `tg/node/<id>` and worktree `wt/<id>` from the last integration commit
+   whose post-merge check passed (never from a merge still being checked, so
+   an undone merge cannot leak into another branch), write the
    prompt, run the worker, and commit `attempt <n>`. The attempt fails on a
    worker error (`worker_error`), on a timeout without changes
    (`worker_timeout`), on no change since the start
