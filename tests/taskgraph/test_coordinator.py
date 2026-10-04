@@ -9,7 +9,13 @@ import pytest
 
 from aqours_code.taskgraph import gitops
 from aqours_code.taskgraph.cli import main
-from aqours_code.taskgraph.coordinator import GraphInvalid, RunOptions, run_graph
+from aqours_code.taskgraph.coordinator import (
+    AQOURS_SOURCE,
+    TASKGRAPH_VERSION,
+    GraphInvalid,
+    RunOptions,
+    run_graph,
+)
 from aqours_code.taskgraph.workers import CommandWorker
 from taskgraph_support import make_edge, make_graph, make_node
 
@@ -331,3 +337,17 @@ def test_cli_run_with_command_worker(toy_repo, tmp_path, capsys):
     assert len(run_dirs) == 1
     config = json.loads((run_dirs[0] / "config.json").read_text(encoding="utf-8"))
     assert config["workers"] == 1 and config["worker"] == {"worker": "command"}
+    assert config["taskgraph_version"] == TASKGRAPH_VERSION
+    expected = gitops.source_state(AQOURS_SOURCE)
+    assert config["aqours_commit"] == expected
+    if expected is not None:
+        assert len(expected["head"]) == 40 and isinstance(expected["dirty"], bool)
+
+
+def test_source_state_is_none_outside_a_checkout_root(toy_repo, tmp_path):
+    assert gitops.source_state(tmp_path) is None
+    assert gitops.source_state(toy_repo.path / "tests") is None
+    state = gitops.source_state(toy_repo.path)
+    assert state == {"head": toy_repo.commit, "dirty": False}
+    (toy_repo.path / "new.txt").write_text("x", encoding="utf-8")
+    assert gitops.source_state(toy_repo.path)["dirty"] is True

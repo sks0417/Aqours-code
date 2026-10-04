@@ -289,7 +289,9 @@ seconds; its process tree is killed 30 s after that if it has not stopped.
 
 ```text
 runs/<run_id>/            run_id = UTC timestamp + 4 random hex characters
-  config.json             run parameters, worker provider/model, validation warnings
+  config.json             run parameters, worker provider/model, validation warnings,
+                          taskgraph_version, aqours_commit ({head, dirty} of the Aqours
+                          checkout running the coordinator, or null)
   graph.json              the graph that was executed
   events.jsonl            event stream (for Gantt charts)
   summary.json            results

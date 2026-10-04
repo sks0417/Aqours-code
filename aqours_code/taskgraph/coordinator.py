@@ -29,6 +29,8 @@ from .schema import Graph, Node, dump_graph
 from .validate import ValidationReport, edit_files, unique_nodes, usable_edges, validate
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
+TASKGRAPH_VERSION = "coordinator-v0.2"
+AQOURS_SOURCE = Path(__file__).resolve().parents[2]
 DEFAULT_WORKERS = 2
 DEFAULT_MAX_ATTEMPTS = 2
 FINAL_CHECK_TIMEOUT_S = 1800.0
@@ -431,6 +433,8 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "worker_timeout_s": options.worker_timeout_s,
         "hidden_tests": str(options.hidden_tests) if options.hidden_tests else None,
         "worker": worker.describe(),
+        "taskgraph_version": TASKGRAPH_VERSION,
+        "aqours_commit": gitops.source_state(AQOURS_SOURCE),
         "validation_warnings": [issue.format() for issue in report.warnings],
         "python": platform.python_version(),
         "platform": sys.platform,

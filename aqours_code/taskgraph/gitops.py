@@ -127,3 +127,22 @@ def commit_subjects(repo: Path, start: str, end: str = "HEAD") -> list[str]:
 def is_clean(repo: Path) -> bool:
     """True when the working tree has no tracked or untracked changes."""
     return not git(repo, "status", "--porcelain").stdout.strip()
+
+
+def source_state(path: Path) -> dict | None:
+    """HEAD and dirtiness of the git checkout rooted at ``path``, or None.
+
+    Returns None when ``path`` is not the top level of a git working tree
+    (for example an installed package inside some other repository).
+    """
+    try:
+        top = git(path, "rev-parse", "--show-toplevel", check=False)
+        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != path.resolve():
+            return None
+        commit = git(path, "rev-parse", "HEAD", check=False)
+        status = git(path, "status", "--porcelain", check=False)
+    except GitError:
+        return None
+    if commit.returncode != 0 or status.returncode != 0:
+        return None
+    return {"head": commit.stdout.strip(), "dirty": bool(status.stdout.strip())}
