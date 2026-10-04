@@ -29,10 +29,15 @@ def _try_add_edge(graph: Graph, edge: Edge, entries: list[RevisionEntry],
     return True
 
 
+_PendingProviders = tuple[str, str, list[str]]
+
+
 def _derive_dependency_edges(graph: Graph, index: RepoIndex,
-                             entries: list[RevisionEntry]) -> None:
+                             entries: list[RevisionEntry]) -> list[_PendingProviders]:
+    """Add dependency edges; return unresolved ``(node, symbol, providers)``."""
     nodes = unique_nodes(graph)
     by_id = {node.id: node for node in nodes}
+    pending: list[_PendingProviders] = []
     for node in nodes:
         for symbol in node.requires:
             if index.has_symbol(symbol):
@@ -43,12 +48,9 @@ def _derive_dependency_edges(graph: Graph, index: RepoIndex,
             providers = [other for other in nodes
                          if other.id != node.id and symbol in other.provides]
             if len(providers) > 1:
-                entries.append(RevisionEntry(
-                    action="other",
-                    nodes=[node.id, *(other.id for other in providers)],
-                    reason=(f"{node.id} requires {symbol}: multiple providers, "
-                            "edge not derived"),
-                ))
+                item = (node.id, symbol, [other.id for other in providers])
+                if item not in pending:
+                    pending.append(item)
                 continue
             if not providers:
                 continue
@@ -60,6 +62,22 @@ def _derive_dependency_edges(graph: Graph, index: RepoIndex,
                 from_=provider.id, to=node.id, type=edge_type, source="derived",
                 reason=description,
             ), entries, description)
+    return pending
+
+
+def _unresolved_provider_entries(graph: Graph,
+                                 pending: list[_PendingProviders]) -> list[RevisionEntry]:
+    """Record multi-provider symbols that no provider satisfies in the final graph."""
+    ancestor_map = ancestors(graph)
+    return [
+        RevisionEntry(
+            action="other",
+            nodes=[node_id, *providers],
+            reason=f"{node_id} requires {symbol}: multiple providers, edge not derived",
+        )
+        for node_id, symbol, providers in pending
+        if not any(provider in ancestor_map[node_id] for provider in providers)
+    ]
 
 
 def _ordered_pair(first: Node, second: Node) -> tuple[Node, Node]:
@@ -93,13 +111,19 @@ def derive_edges(graph: Graph, index: RepoIndex) -> tuple[Graph, list[RevisionEn
     """Return a copy of ``graph`` with derived edges, plus the revision entries.
 
     Dependency edges are added first, then ordering edges; ancestry is
-    recomputed after every added edge. The entries are also appended to the
-    new graph's ``revision_log``. Whether the result is valid is decided by
-    :func:`taskgraph.validate.validate`.
+    recomputed after every added edge. Entries for added edges and for edges
+    skipped because of a cycle come first, in the order they happened. A
+    symbol with several providers gets no edge; once all edges are added, an
+    ``other`` entry is recorded for it only if, in the final graph, none of
+    its providers is an ancestor of the requiring node. Those entries come
+    last. The entries are also appended to the new graph's ``revision_log``.
+    Whether the result is valid is decided by
+    :func:`aqours_code.taskgraph.validate.validate`.
     """
     derived = graph.model_copy(deep=True)
     entries: list[RevisionEntry] = []
-    _derive_dependency_edges(derived, index, entries)
+    pending = _derive_dependency_edges(derived, index, entries)
     _derive_order_edges(derived, entries)
+    entries.extend(_unresolved_provider_entries(derived, pending))
     derived.revision_log.extend(entry.model_copy() for entry in entries)
     return derived, entries

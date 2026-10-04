@@ -112,6 +112,62 @@ def test_multiple_providers_are_left_to_the_validator(toy_index):
     assert "V6" in validate(derived, toy_index).codes()
 
 
+def test_multiple_provider_entry_dropped_when_later_dependency_edge_resolves_it(toy_index):
+    graph = make_graph([
+        make_node("X", modify=("store.py",),
+                  requires=("store.py::JobStore.b", "store.py::JobStore.a")),
+        make_node("P", modify=("runner.py",),
+                  provides=("store.py::JobStore.a", "store.py::JobStore.b")),
+        make_node("Q", modify=("models.py",), provides=("store.py::JobStore.b",)),
+    ])
+    derived, entries = derive_edges(graph, toy_index)
+    assert edge_tuples(derived) == [("P", "X", "full", "derived")]
+    assert [entry.action for entry in entries] == ["add_edge"]
+    assert validate(derived, toy_index).ok
+
+
+def test_multiple_provider_entry_dropped_when_order_edge_resolves_it(toy_index):
+    graph = make_graph([
+        make_node("P1", modify=("store.py",), provides=("store.py::JobStore.purge",)),
+        make_node("X", modify=("store.py",), requires=("store.py::JobStore.purge",)),
+        make_node("P2", modify=("models.py",), provides=("store.py::JobStore.purge",)),
+    ])
+    derived, entries = derive_edges(graph, toy_index)
+    # P1 and X both edit store.py, so the order edge P1 -> X is added in step 2.
+    # That makes P1 an ancestor of X, so no multi-provider entry is written.
+    assert edge_tuples(derived) == [("P1", "X", "order", "derived")]
+    assert [entry.action for entry in entries] == ["add_edge"]
+    report = validate(derived, toy_index)
+    assert not [issue for issue in report.errors if issue.code == "V6"]
+
+
+def test_multiple_provider_entry_kept_when_order_edge_points_away(toy_index):
+    graph = make_graph([
+        make_node("X", modify=("store.py",), requires=("store.py::JobStore.purge",)),
+        make_node("P1", modify=("store.py",), provides=("store.py::JobStore.purge",)),
+        make_node("P2", modify=("models.py",), provides=("store.py::JobStore.purge",)),
+    ])
+    derived, entries = derive_edges(graph, toy_index)
+    # The order edge X -> P1 does not make a provider an ancestor of X.
+    assert [entry.action for entry in entries] == ["add_edge", "other"]
+    assert entries[-1].nodes == ["X", "P1", "P2"]
+    assert "multiple providers, edge not derived" in entries[-1].reason
+
+
+def test_unresolved_multiple_provider_entries_come_after_edge_entries(toy_index):
+    graph = make_graph([
+        make_node("X", modify=("store.py",), requires=("store.py::JobStore.purge",)),
+        make_node("P1", modify=("runner.py",), provides=("store.py::JobStore.purge",)),
+        make_node("P2", modify=("models.py",), provides=("store.py::JobStore.purge",)),
+        make_node("C", modify=("runner.py",)),
+    ])
+    derived, entries = derive_edges(graph, toy_index)
+    assert [entry.action for entry in entries] == ["add_edge", "other"]
+    assert entries[0].nodes == ["P1", "C"]
+    assert entries[1].nodes == ["X", "P1", "P2"]
+    assert derived.revision_log == entries
+
+
 def test_multiple_providers_with_one_ancestor_need_no_entry(toy_index):
     graph = make_graph([
         make_node("X", modify=("store.py",), requires=("store.py::JobStore.purge",)),
