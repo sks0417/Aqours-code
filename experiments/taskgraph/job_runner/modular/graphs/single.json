@@ -1,0 +1,55 @@
+{
+  "request_id": "job-runner-modular-single",
+  "request": "Add job cancellation, automatic retries for failed jobs, and recovery after a process restart to this job runner. Expose cancellation and retry status through the REST API and show them on the web dashboard. Follow the behaviour specified in SPEC.md.",
+  "repo": "job_runner/modular",
+  "base_commit": "5de03b5c11976fbd5584e6d974b6f79fe1ec09a9",
+  "final_checks": [
+    "python -m pytest -q tests"
+  ],
+  "generator": {
+    "kind": "manual",
+    "revision_mode": "none"
+  },
+  "nodes": [
+    {
+      "id": "solve",
+      "title": "Implement the whole request",
+      "kind": "implement",
+      "goal": "Add job cancellation, automatic retries for failed jobs, and recovery after a process restart to this job runner. Expose cancellation and retry status through the REST API and show them on the web dashboard. Follow the behaviour specified in SPEC.md.\nFollow SPEC.md. Keep the public interface listed in SPEC.md and keep the existing tests passing; add tests for the new behaviour.",
+      "edit_set": {
+        "modify": [
+          "jobrunner/models.py",
+          "jobrunner/errors.py",
+          "jobrunner/store.py",
+          "jobrunner/scheduler.py",
+          "jobrunner/retry.py",
+          "jobrunner/recovery.py",
+          "jobrunner/runner.py",
+          "jobrunner/api.py",
+          "jobrunner/dashboard.py"
+        ],
+        "create": [
+          "jobrunner/cancellation.py",
+          "tests/test_new_features.py"
+        ],
+        "symbols": []
+      },
+      "requires": [],
+      "requires_impl": [],
+      "provides": [],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "SPEC.md",
+        "README.md"
+      ],
+      "size": "large"
+    }
+  ],
+  "edges": [],
+  "revision_log": []
+}
