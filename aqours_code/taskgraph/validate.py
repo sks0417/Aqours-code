@@ -1,4 +1,4 @@
-"""Validation rules V1-V11 and warnings W1-W4 for task graphs."""
+"""Validation rules V1-V11 and warnings W1-W5 for task graphs."""
 from __future__ import annotations
 
 from collections import Counter, deque
@@ -312,6 +312,26 @@ def _check_symbol_files(graph: Graph, report: ValidationReport) -> None:
                     "edit_set.modify or edit_set.create"))
 
 
+def _warn_changed_existing_symbols(graph: Graph, index: RepoIndex,
+                                   ancestor_map: dict[str, set[str]],
+                                   report: ValidationReport) -> None:
+    nodes = unique_nodes(graph)
+    for node in nodes:
+        for symbol in node.requires:
+            if not index.has_symbol(symbol):
+                continue
+            changers = [other.id for other in nodes
+                        if other.id != node.id and symbol in other.provides
+                        and other.id not in ancestor_map[node.id]]
+            if changers:
+                which = ("which is not an ancestor" if len(changers) == 1
+                         else "which are not ancestors")
+                report.warnings.append(Issue(
+                    "W5", [node.id, *changers],
+                    f"requires {symbol}; {symbol} exists at the base commit but "
+                    f"is changed by {', '.join(changers)} {which} of {node.id}"))
+
+
 def _check_single_creator(graph: Graph, report: ValidationReport) -> None:
     creators: dict[str, list[str]] = {}
     for node in unique_nodes(graph):
@@ -367,9 +387,9 @@ def _warn_unused_provides(graph: Graph, report: ValidationReport) -> None:
 
 
 def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
-    """Check ``graph`` against rules V1-V11 and warnings W1-W4.
+    """Check ``graph`` against rules V1-V11 and warnings W1-W5.
 
-    Rules that need repository information (V3, V6) are skipped, with a
+    Checks that need repository information (V3, V6, W5) are skipped, with a
     warning, when ``index`` is None.
     """
     report = ValidationReport()
@@ -389,7 +409,7 @@ def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
     _check_single_creator(graph, report)
 
     if index is None:
-        for code in ("V3", "V6"):
+        for code in ("V3", "V6", "W5"):
             report.warnings.append(Issue(
                 code, [], "skipped: no repository index was provided"))
     _warn_small_single_successor(graph, report)
@@ -397,4 +417,6 @@ def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
     if not any(command.strip() for command in graph.final_checks):
         report.warnings.append(Issue("W3", [], "final_checks is empty"))
     _warn_order_edge_for_required_symbols(graph, report)
+    if index is not None:
+        _warn_changed_existing_symbols(graph, index, ancestor_map, report)
     return report

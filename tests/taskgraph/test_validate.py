@@ -389,6 +389,48 @@ def test_w4_not_raised_for_full_or_mixed_edges_or_unrelated_order_edges():
     assert "W4" not in validate(graph).warning_codes()
 
 
+def test_w5_existing_symbol_changed_by_non_ancestor(toy_index):
+    graph = make_graph([
+        make_node("X", modify=("store.py",), requires=("runner.py::run_loop",)),
+        make_node("P", modify=("runner.py",), provides=("runner.py::run_loop",)),
+        make_node("Q", modify=("models.py",), provides=("runner.py::run_loop",)),
+    ])
+    report = validate(graph, toy_index)
+    assert report.ok
+    issues = [issue for issue in report.warnings if issue.code == "W5"]
+    assert len(issues) == 1
+    assert issues[0].nodes == ["X", "P", "Q"]
+    assert ("runner.py::run_loop exists at the base commit but is changed by P, Q "
+            "which are not ancestors of X") in issues[0].message
+
+
+def test_w5_not_raised_when_changer_is_ancestor(toy_index):
+    graph = make_graph([
+        make_node("P", modify=("runner.py",), provides=("runner.py::run_loop",)),
+        make_node("X", modify=("store.py",), requires=("runner.py::run_loop",)),
+    ], [make_edge("P", "X")])
+    assert "W5" not in validate(graph, toy_index).warning_codes()
+
+
+def test_w5_not_raised_for_symbols_missing_from_repo(toy_index):
+    graph = make_graph([
+        make_node("X", modify=("store.py",), requires=("store.py::JobStore.purge",)),
+        make_node("P", modify=("runner.py",), provides=("store.py::JobStore.purge",)),
+    ])
+    report = validate(graph, toy_index)
+    assert "W5" not in report.warning_codes()
+    assert "V6" in report.codes()
+
+
+def test_w5_skipped_without_index():
+    graph = make_graph([
+        make_node("X", modify=("store.py",), requires=("runner.py::run_loop",)),
+        make_node("P", modify=("runner.py",), provides=("runner.py::run_loop",)),
+    ])
+    skipped = [issue for issue in validate(graph).warnings if issue.code == "W5"]
+    assert len(skipped) == 1 and "skipped" in skipped[0].message
+
+
 # ── report and CLI ──
 
 def test_issue_format_without_nodes():
