@@ -1,0 +1,276 @@
+from __future__ import annotations
+
+from aqours_code.taskgraph import load_graph, validate
+from aqours_code.taskgraph.cli import main
+from aqours_code.taskgraph.validate import Issue
+from taskgraph_support import EXAMPLE_GRAPH, make_edge, make_graph, make_node
+
+
+def errors_with(report, code):
+    return [issue for issue in report.errors if issue.code == code]
+
+
+# ── example and single-node graphs ──
+
+def test_example_graph_passes(toy_index):
+    report = validate(load_graph(EXAMPLE_GRAPH), toy_index)
+    assert report.ok, report.format()
+    assert report.warnings == []
+
+
+def test_single_node_graph_passes(toy_index):
+    graph = make_graph([make_node("only", modify=("runner.py",),
+                                  requires=("runner.py::run_loop",))])
+    report = validate(graph, toy_index)
+    assert report.ok, report.format()
+
+
+def test_single_node_graph_still_checks_files_and_commands(toy_index):
+    graph = make_graph([make_node("only", modify=("missing.py",), commands=())])
+    report = validate(graph, toy_index)
+    assert report.codes() == ["V3", "V4"]
+
+
+def test_without_index_v3_and_v6_are_skipped_with_warnings():
+    graph = make_graph([make_node("only", modify=("missing.py",),
+                                  requires=("nowhere.py::x",))])
+    report = validate(graph)
+    assert report.ok
+    skipped = [issue for issue in report.warnings if issue.code in {"V3", "V6"}]
+    assert [issue.code for issue in skipped] == ["V3", "V6"]
+    assert all("skipped" in issue.message for issue in skipped)
+
+
+# ── V1 structure ──
+
+def test_v1_passes_for_distinct_edges(toy_index):
+    graph = make_graph(
+        [make_node("A", modify=("models.py",)), make_node("B", modify=("store.py",))],
+        [make_edge("A", "B", "full"), make_edge("A", "B", "order")],
+    )
+    assert not errors_with(validate(graph, toy_index), "V1")
+
+
+def test_v1_duplicate_node_id():
+    graph = make_graph([make_node("A", modify=("a.py",)), make_node("A", modify=("b.py",))])
+    issues = errors_with(validate(graph), "V1")
+    assert len(issues) == 1 and issues[0].nodes == ["A"]
+
+
+def test_v1_unknown_node_and_self_loop_and_duplicate_edge():
+    graph = make_graph(
+        [make_node("A", modify=("a.py",)), make_node("B", modify=("b.py",))],
+        [make_edge("A", "ghost"), make_edge("B", "B"),
+         make_edge("A", "B"), make_edge("A", "B")],
+    )
+    messages = [issue.message for issue in errors_with(validate(graph), "V1")]
+    assert len(messages) == 3
+    assert "unknown node(s): ghost" in messages[0]
+    assert "self-loop" in messages[1]
+    assert "duplicate full edge A -> B" in messages[2]
+
+
+# ── V2 acyclic ──
+
+def test_v2_passes_for_dag():
+    graph = make_graph(
+        [make_node(n, modify=(f"{n}.py",)) for n in "ABC"],
+        [make_edge("A", "B"), make_edge("B", "C"), make_edge("A", "C", "order")],
+    )
+    assert not errors_with(validate(graph), "V2")
+
+
+def test_v2_reports_cycle_nodes():
+    graph = make_graph(
+        [make_node(n, modify=(f"{n}.py",)) for n in "ABCD"],
+        [make_edge("A", "B"), make_edge("B", "C", "order"),
+         make_edge("C", "A", "interface"), make_edge("C", "D")],
+    )
+    issues = errors_with(validate(graph), "V2")
+    assert len(issues) == 1
+    assert issues[0].nodes == ["A", "B", "C"]
+    assert "A -> B -> C -> A" in issues[0].message
+
+
+# ── V3 file existence ──
+
+def test_v3_passes(toy_index):
+    graph = make_graph([
+        make_node("A", modify=("store.py",), create=("new_mod.py",),
+                  context_files=("README.md",)),
+        make_node("B", create=("other.py",), context_files=("new_mod.py",)),
+    ], [make_edge("A", "B")])
+    assert not errors_with(validate(graph, toy_index), "V3")
+
+
+def test_v3_failures(toy_index):
+    graph = make_graph([
+        make_node("A", modify=("missing.py",), create=("runner.py",),
+                  context_files=("nowhere.md",)),
+    ])
+    messages = [issue.message for issue in errors_with(validate(graph, toy_index), "V3")]
+    assert len(messages) == 3
+    assert "modifies missing.py" in messages[0]
+    assert "creates runner.py" in messages[1]
+    assert "context file nowhere.md" in messages[2]
+
+
+# ── V4 check commands ──
+
+def test_v4_failures():
+    graph = make_graph([
+        make_node("A", modify=("a.py",), commands=()),
+        make_node("B", modify=("b.py",), commands=("", "   ")),
+        make_node("C", modify=("c.py",), commands=("", "pytest")),
+    ])
+    assert [issue.nodes for issue in errors_with(validate(graph), "V4")] == [["A"], ["B"]]
+
+
+# ── V5 edit conflicts ──
+
+def test_v5_passes_when_one_is_ancestor_via_any_edge_type():
+    graph = make_graph(
+        [make_node("A", modify=("runner.py",)), make_node("B", modify=("x.py",)),
+         make_node("C", modify=("runner.py",))],
+        [make_edge("A", "B", "order"), make_edge("B", "C", "interface")],
+    )
+    assert not errors_with(validate(graph), "V5")
+
+
+def test_v5_reports_overlapping_files():
+    graph = make_graph([
+        make_node("A", modify=("models.py",)),
+        make_node("C", modify=("runner.py", "store.py")),
+        make_node("D", modify=("runner.py",), create=("store.py",)),
+    ])
+    issues = errors_with(validate(graph), "V5")
+    assert len(issues) == 1
+    assert issues[0].format() == (
+        "[V5] C, D: both edit runner.py, store.py but neither is an ancestor "
+        "of the other")
+
+
+# ── V6 required symbols ──
+
+def test_v6_passes_from_repo_and_ancestor(toy_index):
+    graph = make_graph([
+        make_node("A", kind="contract", modify=("models.py",),
+                  provides=("models.py::JobStatus.FAILED",)),
+        make_node("B", modify=("store.py",)),
+        make_node("C", modify=("runner.py",),
+                  requires=("runner.py::run_loop", "models.py::JobStatus.FAILED")),
+    ], [make_edge("A", "B", "interface"), make_edge("B", "C", "order")])
+    assert not errors_with(validate(graph, toy_index), "V6")
+
+
+def test_v6_provider_not_ancestor(toy_index):
+    graph = make_graph([
+        make_node("P", modify=("models.py",), provides=("models.py::JobStatus.FAILED",)),
+        make_node("X", modify=("store.py",), requires=("models.py::JobStatus.FAILED",)),
+    ])
+    issues = errors_with(validate(graph, toy_index), "V6")
+    assert len(issues) == 1
+    assert issues[0].nodes == ["X", "P"]
+    assert "provided by P" in issues[0].message and "missing dependency edge" in issues[0].message
+
+
+def test_v6_no_source(toy_index):
+    graph = make_graph([
+        make_node("X", modify=("store.py",), requires=("store.py::JobStore.purge",)),
+    ])
+    issues = errors_with(validate(graph, toy_index), "V6")
+    assert len(issues) == 1 and issues[0].nodes == ["X"]
+    assert "neither defined at the base commit nor provided" in issues[0].message
+
+
+def test_v6_self_provided_symbol_is_not_a_source(toy_index):
+    graph = make_graph([
+        make_node("X", modify=("store.py",), requires=("store.py::JobStore.purge",),
+                  provides=("store.py::JobStore.purge",)),
+    ])
+    assert len(errors_with(validate(graph, toy_index), "V6")) == 1
+
+
+# ── V7 non-empty edit set ──
+
+def test_v7():
+    graph = make_graph([make_node("A", modify=("a.py",)), make_node("B")])
+    assert [issue.nodes for issue in errors_with(validate(graph), "V7")] == [["B"]]
+
+
+# ── V8 symbol format ──
+
+def test_v8_passes_for_schema_validated_graph():
+    graph = make_graph([make_node("A", modify=("a.py",), requires=("a.py::x",),
+                                  symbols=("a.py::Klass.method",))])
+    assert not errors_with(validate(graph), "V8")
+
+
+def test_v8_catches_symbols_that_bypassed_the_schema():
+    graph = make_graph([make_node("A", modify=("a.py",))])
+    graph.nodes[0].requires.append("a.py:x")
+    graph.nodes[0].provides.append("a.py::1x")
+    graph.nodes[0].edit_set.symbols.append("../a.py::x")
+    issues = errors_with(validate(graph), "V8")
+    assert len(issues) == 3
+    assert "requires" in issues[0].message
+    assert "provides" in issues[1].message
+    assert "edit_set.symbols" in issues[2].message
+
+
+# ── warnings ──
+
+def test_w1_small_node_with_single_downstream():
+    graph = make_graph(
+        [make_node("A", modify=("a.py",), size="small"), make_node("B", modify=("b.py",)),
+         make_node("S", modify=("s.py",), size="small"), make_node("T", modify=("t.py",)),
+         make_node("U", modify=("u.py",))],
+        [make_edge("A", "B"), make_edge("A", "B", "order"),
+         make_edge("S", "T"), make_edge("S", "U")],
+    )
+    issues = [issue for issue in validate(graph).warnings if issue.code == "W1"]
+    assert [issue.nodes for issue in issues] == [["A", "B"]]
+
+
+def test_w2_unused_provides():
+    graph = make_graph([
+        make_node("A", modify=("a.py",), provides=("a.py::used", "a.py::unused")),
+        make_node("B", modify=("b.py",), requires=("a.py::used",)),
+    ], [make_edge("A", "B")])
+    issues = [issue for issue in validate(graph).warnings if issue.code == "W2"]
+    assert len(issues) == 1 and "a.py::unused" in issues[0].message
+
+
+def test_w3_missing_final_checks():
+    graph = make_graph([make_node("A", modify=("a.py",))], final_checks=())
+    report = validate(graph)
+    assert report.ok
+    assert "W3" in report.warning_codes()
+
+
+# ── report and CLI ──
+
+def test_issue_format_without_nodes():
+    assert Issue("W3", [], "final_checks is empty").format() == "[W3] final_checks is empty"
+
+
+def test_cli_validate_exit_codes(tmp_path, toy_repo, capsys):
+    good = tmp_path / "good.json"
+    good.write_text(EXAMPLE_GRAPH.read_text(encoding="utf-8").replace(
+        "48e0476cbc3aac7a8ed14cde30fde8165053b4b5", toy_repo.commit), encoding="utf-8")
+    assert main(["validate", str(good), "--repo", str(toy_repo.path)]) == 0
+    assert "errors (0):" in capsys.readouterr().out
+
+    bad = tmp_path / "bad.json"
+    graph = make_graph([make_node("C", modify=("runner.py",)),
+                        make_node("D", modify=("runner.py",))])
+    from aqours_code.taskgraph import dump_graph
+    dump_graph(graph, bad)
+    assert main(["validate", str(bad)]) == 1
+    out = capsys.readouterr().out
+    assert ("[V5] C, D: both edit runner.py but neither is an ancestor of the other"
+            in out.splitlines())
+
+    broken = tmp_path / "broken.json"
+    broken.write_text('{"request_id": 1}', encoding="utf-8")
+    assert main(["validate", str(broken)]) == 2

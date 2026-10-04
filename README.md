@@ -31,6 +31,7 @@
 | Experimental | Worktree | Prototype for isolated worker changes and explicit integration |
 | Experimental | Skills / MCP | Dynamic extension points that depend on the runtime environment and configuration |
 | Experimental | Background / Cron | Background execution and scheduling prototypes outside the default v0.1 path |
+| Experimental | Task Graph | Task graph schema, repository symbol index, validator, and rule-based edge derivation in `aqours_code/taskgraph/` ([details](aqours_code/taskgraph/README.md)); not imported by the default single-agent path |
 
 ## Architecture
 

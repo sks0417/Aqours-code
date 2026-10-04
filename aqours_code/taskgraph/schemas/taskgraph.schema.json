@@ -1,0 +1,357 @@
+{
+  "$defs": {
+    "Check": {
+      "additionalProperties": false,
+      "description": "Commands that verify one node.",
+      "properties": {
+        "commands": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Commands",
+          "type": "array"
+        },
+        "timeout_s": {
+          "default": 300,
+          "exclusiveMinimum": 0,
+          "title": "Timeout S",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "commands"
+      ],
+      "title": "Check",
+      "type": "object"
+    },
+    "Edge": {
+      "additionalProperties": false,
+      "description": "A dependency or ordering constraint between two nodes.",
+      "properties": {
+        "from": {
+          "title": "From",
+          "type": "string"
+        },
+        "to": {
+          "title": "To",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "interface",
+            "full",
+            "order"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "manual",
+            "llm",
+            "derived"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "type",
+        "source",
+        "reason"
+      ],
+      "title": "Edge",
+      "type": "object"
+    },
+    "EditSet": {
+      "additionalProperties": false,
+      "description": "Files a node may change, plus optional informational symbols.",
+      "properties": {
+        "modify": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Modify",
+          "type": "array"
+        },
+        "create": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Create",
+          "type": "array"
+        },
+        "symbols": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Symbols",
+          "type": "array"
+        }
+      },
+      "required": [
+        "modify",
+        "create"
+      ],
+      "title": "EditSet",
+      "type": "object"
+    },
+    "Generator": {
+      "additionalProperties": false,
+      "description": "Where a graph came from.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "manual",
+            "planner"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "planner_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Planner Version"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "revision_mode": {
+          "anyOf": [
+            {
+              "enum": [
+                "llm",
+                "rule_assisted",
+                "none"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Revision Mode"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Generator",
+      "type": "object"
+    },
+    "Node": {
+      "additionalProperties": false,
+      "description": "One sub-task handed to a worker.",
+      "properties": {
+        "id": {
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "title": "Id",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "contract",
+            "implement"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "goal": {
+          "title": "Goal",
+          "type": "string"
+        },
+        "edit_set": {
+          "$ref": "#/$defs/EditSet"
+        },
+        "requires": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Requires",
+          "type": "array"
+        },
+        "provides": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provides",
+          "type": "array"
+        },
+        "check": {
+          "$ref": "#/$defs/Check"
+        },
+        "context_files": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Context Files",
+          "type": "array"
+        },
+        "size": {
+          "anyOf": [
+            {
+              "enum": [
+                "small",
+                "medium",
+                "large"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Size"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "kind",
+        "goal",
+        "edit_set",
+        "check"
+      ],
+      "title": "Node",
+      "type": "object"
+    },
+    "RevisionEntry": {
+      "additionalProperties": false,
+      "description": "One recorded change made to a graph after generation.",
+      "properties": {
+        "action": {
+          "enum": [
+            "merge",
+            "split",
+            "add_edge",
+            "remove_edge",
+            "add_node",
+            "other"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "nodes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Nodes",
+          "type": "array"
+        },
+        "into": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Into"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "nodes",
+        "reason"
+      ],
+      "title": "RevisionEntry",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A complete task graph for one request.",
+  "properties": {
+    "request_id": {
+      "title": "Request Id",
+      "type": "string"
+    },
+    "request": {
+      "title": "Request",
+      "type": "string"
+    },
+    "repo": {
+      "title": "Repo",
+      "type": "string"
+    },
+    "base_commit": {
+      "title": "Base Commit",
+      "type": "string"
+    },
+    "final_checks": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Final Checks",
+      "type": "array"
+    },
+    "generator": {
+      "$ref": "#/$defs/Generator"
+    },
+    "nodes": {
+      "items": {
+        "$ref": "#/$defs/Node"
+      },
+      "minItems": 1,
+      "title": "Nodes",
+      "type": "array"
+    },
+    "edges": {
+      "items": {
+        "$ref": "#/$defs/Edge"
+      },
+      "title": "Edges",
+      "type": "array"
+    },
+    "revision_log": {
+      "items": {
+        "$ref": "#/$defs/RevisionEntry"
+      },
+      "title": "Revision Log",
+      "type": "array"
+    }
+  },
+  "required": [
+    "request_id",
+    "request",
+    "repo",
+    "base_commit",
+    "generator",
+    "nodes"
+  ],
+  "title": "Graph",
+  "type": "object"
+}

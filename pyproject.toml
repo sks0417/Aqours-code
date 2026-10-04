@@ -10,11 +10,14 @@ license = {file = "LICENSE"}
 requires-python = ">=3.11,<3.12"
 dependencies = ["anthropic>=0.34", "python-dotenv>=1.0", "pyyaml>=6.0"]
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+taskgraph = ["pydantic>=2.6,<3"]
+dev = ["pytest>=8", "pydantic>=2.6,<3"]
 [project.scripts]
 Aqours_code = "aqours_code.main:main"
 [tool.setuptools.packages.find]
 include = ["aqours_code*"]
+[tool.setuptools.package-data]
+"aqours_code.taskgraph" = ["README.md", "schemas/*.json", "examples/*.json"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

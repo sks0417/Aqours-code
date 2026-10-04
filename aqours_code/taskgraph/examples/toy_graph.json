@@ -1,0 +1,107 @@
+{
+  "request_id": "toy-001",
+  "request": "Mark a job as FAILED once it has been attempted MAX_ATTEMPTS times, and cover the behavior with a test.",
+  "repo": "toy",
+  "base_commit": "48e0476cbc3aac7a8ed14cde30fde8165053b4b5",
+  "final_checks": [
+    "python -m pytest -q"
+  ],
+  "generator": {
+    "kind": "manual",
+    "revision_mode": "none"
+  },
+  "nodes": [
+    {
+      "id": "status-failed",
+      "title": "Add FAILED status",
+      "kind": "contract",
+      "goal": "Add a FAILED member to models.py::JobStatus without changing existing members.",
+      "edit_set": {
+        "modify": ["models.py"],
+        "create": [],
+        "symbols": ["models.py::JobStatus"]
+      },
+      "provides": ["models.py::JobStatus.FAILED"],
+      "check": {
+        "commands": ["python -c \"from models import JobStatus; JobStatus.FAILED\""],
+        "timeout_s": 60
+      },
+      "size": "medium"
+    },
+    {
+      "id": "store-mark-failed",
+      "title": "Add JobStore.mark_failed",
+      "kind": "implement",
+      "goal": "Add JobStore.mark_failed(job_id) that sets the job status to JobStatus.FAILED and bumps version.",
+      "edit_set": {
+        "modify": ["store.py"],
+        "create": [],
+        "symbols": ["store.py::JobStore.mark_failed"]
+      },
+      "requires": ["models.py::JobStatus.FAILED", "store.py::JobStore.jobs"],
+      "provides": ["store.py::JobStore.mark_failed"],
+      "check": {
+        "commands": ["python -m pytest -q tests/test_basic.py"]
+      },
+      "context_files": ["models.py"],
+      "size": "medium"
+    },
+    {
+      "id": "runner-retry-limit",
+      "title": "Enforce MAX_ATTEMPTS in run_loop",
+      "kind": "implement",
+      "goal": "In run_loop, call store.mark_failed for jobs whose attempts reach MAX_ATTEMPTS.",
+      "edit_set": {
+        "modify": ["runner.py"],
+        "create": [],
+        "symbols": ["runner.py::run_loop"]
+      },
+      "requires": ["store.py::JobStore.mark_failed", "runner.py::MAX_ATTEMPTS"],
+      "provides": ["runner.py::run_loop"],
+      "check": {
+        "commands": ["python -m pytest -q tests/test_basic.py"]
+      },
+      "context_files": ["store.py"],
+      "size": "medium"
+    },
+    {
+      "id": "retry-tests",
+      "title": "Test the retry limit",
+      "kind": "implement",
+      "goal": "Add tests/test_retry.py asserting that a job becomes FAILED after MAX_ATTEMPTS iterations of run_loop.",
+      "edit_set": {
+        "modify": [],
+        "create": ["tests/test_retry.py"]
+      },
+      "requires": ["runner.py::run_loop", "store.py::JobStore.mark_failed"],
+      "check": {
+        "commands": ["python -m pytest -q tests/test_retry.py"]
+      },
+      "context_files": ["tests/test_basic.py"],
+      "size": "medium"
+    }
+  ],
+  "edges": [
+    {
+      "from": "status-failed",
+      "to": "store-mark-failed",
+      "type": "interface",
+      "source": "manual",
+      "reason": "store-mark-failed requires models.py::JobStatus.FAILED"
+    },
+    {
+      "from": "store-mark-failed",
+      "to": "runner-retry-limit",
+      "type": "full",
+      "source": "manual",
+      "reason": "runner-retry-limit calls store.py::JobStore.mark_failed"
+    },
+    {
+      "from": "runner-retry-limit",
+      "to": "retry-tests",
+      "type": "order",
+      "source": "manual",
+      "reason": "write the tests after the retry behavior exists"
+    }
+  ]
+}
