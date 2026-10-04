@@ -80,8 +80,27 @@ def _unresolved_provider_entries(graph: Graph,
     ]
 
 
-def _ordered_pair(first: Node, second: Node) -> tuple[Node, Node]:
-    """Contract nodes go first; otherwise keep list order (``first`` precedes)."""
+def _creates_what_other_modifies(creator: Node, modifier: Node,
+                                 overlap: set[str]) -> list[str]:
+    return sorted(path for path in overlap
+                  if path in creator.edit_set.create and path in modifier.edit_set.modify)
+
+
+def _ordered_pair(first: Node, second: Node,
+                  overlap: set[str]) -> tuple[Node, Node] | None:
+    """Return ``(upstream, downstream)`` for an order edge, or None on conflict.
+
+    Priority: the node that creates a file the other modifies goes first;
+    otherwise a contract node goes first; otherwise ``first`` (list order).
+    """
+    first_creates = _creates_what_other_modifies(first, second, overlap)
+    second_creates = _creates_what_other_modifies(second, first, overlap)
+    if first_creates and second_creates:
+        return None
+    if first_creates:
+        return first, second
+    if second_creates:
+        return second, first
     if second.kind == "contract" and first.kind != "contract":
         return second, first
     return first, second
@@ -98,7 +117,22 @@ def _derive_order_edges(graph: Graph, entries: list[RevisionEntry]) -> None:
             if (first.id in ancestor_map[second.id]
                     or second.id in ancestor_map[first.id]):
                 continue
-            upstream, downstream = _ordered_pair(first, second)
+            pair = _ordered_pair(first, second, overlap)
+            if pair is None:
+                entries.append(RevisionEntry(
+                    action="other",
+                    nodes=[first.id, second.id],
+                    reason=(
+                        f"order edge between {first.id} and {second.id} not derived: "
+                        "conflicting creation direction ("
+                        f"{first.id} creates "
+                        f"{', '.join(_creates_what_other_modifies(first, second, overlap))}"
+                        f" modified by {second.id}; {second.id} creates "
+                        f"{', '.join(_creates_what_other_modifies(second, first, overlap))}"
+                        f" modified by {first.id})"),
+                ))
+                continue
+            upstream, downstream = pair
             description = (f"{upstream.id} and {downstream.id} both edit "
                            f"{', '.join(sorted(overlap))}")
             _try_add_edge(graph, Edge(
@@ -111,8 +145,12 @@ def derive_edges(graph: Graph, index: RepoIndex) -> tuple[Graph, list[RevisionEn
     """Return a copy of ``graph`` with derived edges, plus the revision entries.
 
     Dependency edges are added first, then ordering edges; ancestry is
-    recomputed after every added edge. Entries for added edges and for edges
-    skipped because of a cycle come first, in the order they happened. A
+    recomputed after every added edge. An ordering edge goes from the node
+    that creates a file the other node modifies; otherwise from a contract
+    node; otherwise from the node listed first. When each node creates a
+    file the other modifies, no edge is added and an ``other`` entry explains
+    the conflict. Entries for added edges, for edges skipped because of a
+    cycle, and for creation conflicts come first, in the order they happened. A
     symbol with several providers gets no edge; once all edges are added, an
     ``other`` entry is recorded for it only if, in the final graph, none of
     its providers is an ancestor of the requiring node. Those entries come

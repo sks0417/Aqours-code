@@ -1,4 +1,4 @@
-"""Validation rules V1-V10 and warnings W1-W4 for task graphs."""
+"""Validation rules V1-V11 and warnings W1-W4 for task graphs."""
 from __future__ import annotations
 
 from collections import Counter, deque
@@ -181,11 +181,25 @@ def _check_acyclic(graph: Graph, report: ValidationReport) -> None:
         report.errors.append(Issue("V2", cycle, f"dependency cycle: {path}"))
 
 
-def _check_files(graph: Graph, index: RepoIndex, report: ValidationReport) -> None:
+def _check_files(graph: Graph, index: RepoIndex, ancestor_map: dict[str, set[str]],
+                 report: ValidationReport) -> None:
     created = {path for node in graph.nodes for path in node.edit_set.create}
     for node in graph.nodes:
         for path in node.edit_set.modify:
-            if not index.has_file(path):
+            if index.has_file(path):
+                continue
+            creators = [other.id for other in unique_nodes(graph)
+                        if other.id != node.id and path in other.edit_set.create]
+            if any(creator in ancestor_map[node.id] for creator in creators):
+                continue
+            if creators:
+                names = ", ".join(creators)
+                verb = "is" if len(creators) == 1 else "are"
+                report.errors.append(Issue(
+                    "V3", [node.id, *creators],
+                    f"modifies {path}, which is created by {names}, but {names} "
+                    f"{verb} not an ancestor of {node.id} (missing edge?)"))
+            else:
                 report.errors.append(Issue(
                     "V3", [node.id],
                     f"modifies {path}, which does not exist at the base commit"))
@@ -298,6 +312,19 @@ def _check_symbol_files(graph: Graph, report: ValidationReport) -> None:
                     "edit_set.modify or edit_set.create"))
 
 
+def _check_single_creator(graph: Graph, report: ValidationReport) -> None:
+    creators: dict[str, list[str]] = {}
+    for node in unique_nodes(graph):
+        for path in node.edit_set.create:
+            creators.setdefault(path, []).append(node.id)
+    for path, node_ids in creators.items():
+        if len(node_ids) > 1:
+            report.errors.append(Issue(
+                "V11", node_ids,
+                f"{path} is created by {len(node_ids)} nodes; each new file "
+                "must have exactly one creator"))
+
+
 def _warn_order_edge_for_required_symbols(graph: Graph,
                                           report: ValidationReport) -> None:
     edge_types: dict[tuple[str, str], set[str]] = {}
@@ -340,7 +367,7 @@ def _warn_unused_provides(graph: Graph, report: ValidationReport) -> None:
 
 
 def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
-    """Check ``graph`` against rules V1-V10 and warnings W1-W4.
+    """Check ``graph`` against rules V1-V11 and warnings W1-W4.
 
     Rules that need repository information (V3, V6) are skipped, with a
     warning, when ``index`` is None.
@@ -350,7 +377,7 @@ def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
     _check_structure(graph, report)
     _check_acyclic(graph, report)
     if index is not None:
-        _check_files(graph, index, report)
+        _check_files(graph, index, ancestor_map, report)
     _check_commands(graph, report)
     _check_edit_conflicts(graph, ancestor_map, report)
     if index is not None:
@@ -359,6 +386,7 @@ def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
     _check_symbol_format(graph, report)
     _check_interface_sources(graph, report)
     _check_symbol_files(graph, report)
+    _check_single_creator(graph, report)
 
     if index is None:
         for code in ("V3", "V6"):

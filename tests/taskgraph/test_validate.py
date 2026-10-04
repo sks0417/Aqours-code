@@ -115,6 +115,76 @@ def test_v3_failures(toy_index):
     assert "context file nowhere.md" in messages[2]
 
 
+def test_v3_modify_file_created_by_ancestor(toy_index):
+    graph = make_graph([
+        make_node("A", create=("util.py",)),
+        make_node("B", modify=("util.py", "store.py")),
+    ], [make_edge("A", "B")])
+    report = validate(graph, toy_index)
+    assert report.ok, report.format()
+
+
+def test_v3_modify_file_created_by_transitive_ancestor(toy_index):
+    graph = make_graph([
+        make_node("A", create=("util.py",)),
+        make_node("M", modify=("store.py",)),
+        make_node("B", modify=("util.py",)),
+    ], [make_edge("A", "M", "order"), make_edge("M", "B", "order")])
+    assert not errors_with(validate(graph, toy_index), "V3")
+
+
+def test_v3_modify_file_created_by_non_ancestor(toy_index):
+    graph = make_graph([
+        make_node("A", create=("util.py",)),
+        make_node("B", modify=("util.py",)),
+    ])
+    issues = errors_with(validate(graph, toy_index), "V3")
+    assert len(issues) == 1
+    assert issues[0].nodes == ["B", "A"]
+    assert issues[0].message == (
+        "modifies util.py, which is created by A, but A is not an ancestor of B "
+        "(missing edge?)")
+
+
+def test_v3_modify_file_created_by_descendant(toy_index):
+    graph = make_graph([
+        make_node("B", modify=("util.py",)),
+        make_node("A", create=("util.py",)),
+    ], [make_edge("B", "A")])
+    issues = errors_with(validate(graph, toy_index), "V3")
+    assert [issue.nodes for issue in issues] == [["B", "A"]]
+
+
+# ── V11 single creator ──
+
+def test_v11_passes_for_distinct_new_files():
+    graph = make_graph([make_node("A", create=("a_new.py",)),
+                        make_node("B", create=("b_new.py",))])
+    assert not errors_with(validate(graph), "V11")
+
+
+def test_v11_same_file_created_twice_without_edge_and_without_index():
+    graph = make_graph([
+        make_node("A", create=("util.py",)),
+        make_node("B", modify=("store.py",)),
+        make_node("C", create=("util.py", "other.py")),
+        make_node("D", create=("util.py",)),
+    ])
+    issues = errors_with(validate(graph), "V11")
+    assert len(issues) == 1
+    assert issues[0].nodes == ["A", "C", "D"]
+    assert "util.py" in issues[0].message
+
+
+def test_v11_same_file_created_twice_with_edge(toy_index):
+    graph = make_graph([
+        make_node("A", create=("util.py",)),
+        make_node("B", create=("util.py",)),
+    ], [make_edge("A", "B")])
+    issues = errors_with(validate(graph, toy_index), "V11")
+    assert [issue.nodes for issue in issues] == [["A", "B"]]
+
+
 # ── V4 check commands ──
 
 def test_v4_failures():

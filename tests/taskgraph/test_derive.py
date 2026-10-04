@@ -45,6 +45,42 @@ def test_adds_missing_order_edge_in_list_order(toy_index):
     assert validate(derived, toy_index).ok
 
 
+def test_creator_is_ordered_before_modifier_listed_first(toy_index):
+    graph = make_graph([
+        make_node("B", modify=("util.py",)),
+        make_node("A", create=("util.py",)),
+    ])
+    assert "V3" in validate(graph, toy_index).codes()
+    derived, entries = derive_edges(graph, toy_index)
+    assert edge_tuples(derived) == [("A", "B", "order", "derived")]
+    assert [entry.action for entry in entries] == ["add_edge"]
+    assert validate(derived, toy_index).ok
+
+
+def test_creator_rule_takes_priority_over_contract_rule(toy_index):
+    graph = make_graph([
+        make_node("I", create=("util.py",)),
+        make_node("C", kind="contract", modify=("util.py",)),
+    ])
+    derived, _ = derive_edges(graph, toy_index)
+    assert edge_tuples(derived) == [("I", "C", "order", "derived")]
+    assert validate(derived, toy_index).ok
+
+
+def test_conflicting_creation_direction_adds_no_edge(toy_index):
+    graph = make_graph([
+        make_node("A", create=("x_new.py",), modify=("y_new.py",)),
+        make_node("B", create=("y_new.py",), modify=("x_new.py",)),
+    ])
+    derived, entries = derive_edges(graph, toy_index)
+    assert derived.edges == []
+    assert len(entries) == 1 and entries[0].action == "other"
+    assert entries[0].nodes == ["A", "B"]
+    assert "conflicting creation direction" in entries[0].reason
+    assert "x_new.py" in entries[0].reason and "y_new.py" in entries[0].reason
+    assert not validate(derived, toy_index).ok
+
+
 def test_contract_node_is_ordered_first(toy_index):
     graph = make_graph([
         make_node("impl", modify=("models.py",)),
