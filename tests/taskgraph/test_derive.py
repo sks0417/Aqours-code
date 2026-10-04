@@ -102,8 +102,25 @@ def test_multiple_providers_are_left_to_the_validator(toy_index):
         make_node("P2", modify=("models.py",), provides=("store.py::JobStore.purge",)),
     ])
     derived, entries = derive_edges(graph, toy_index)
-    assert derived.edges == [] and entries == []
+    assert derived.edges == []
+    assert len(entries) == 1
+    assert entries[0].action == "other"
+    assert entries[0].nodes == ["X", "P1", "P2"]
+    assert "store.py::JobStore.purge" in entries[0].reason
+    assert "multiple providers, edge not derived" in entries[0].reason
+    assert derived.revision_log == entries
     assert "V6" in validate(derived, toy_index).codes()
+
+
+def test_multiple_providers_with_one_ancestor_need_no_entry(toy_index):
+    graph = make_graph([
+        make_node("X", modify=("store.py",), requires=("store.py::JobStore.purge",)),
+        make_node("P1", modify=("runner.py",), provides=("store.py::JobStore.purge",)),
+        make_node("P2", modify=("models.py",), provides=("store.py::JobStore.purge",)),
+    ], [make_edge("P1", "X")])
+    derived, entries = derive_edges(graph, toy_index)
+    assert entries == []
+    assert validate(derived, toy_index).ok
 
 
 def test_symbols_in_repo_need_no_edge(toy_index):

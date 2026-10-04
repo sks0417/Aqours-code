@@ -1,4 +1,4 @@
-"""Validation rules V1-V8 and warnings W1-W3 for task graphs."""
+"""Validation rules V1-V10 and warnings W1-W4 for task graphs."""
 from __future__ import annotations
 
 from collections import Counter, deque
@@ -271,6 +271,53 @@ def _check_symbol_format(graph: Graph, report: ValidationReport) -> None:
                         "V8", [node.id], f"invalid symbol in {field_name}: {exc}"))
 
 
+def _check_interface_sources(graph: Graph, report: ValidationReport) -> None:
+    by_id = {node.id: node for node in unique_nodes(graph)}
+    for edge in usable_edges(graph):
+        upstream = by_id[edge.from_]
+        if edge.type == "interface" and upstream.kind != "contract":
+            report.errors.append(Issue(
+                "V9", [edge.from_, edge.to],
+                f"interface edge {edge.from_} -> {edge.to} starts at a "
+                f"{upstream.kind} node; interface edges must start at a "
+                "contract node"))
+
+
+def _check_symbol_files(graph: Graph, report: ValidationReport) -> None:
+    for node in graph.nodes:
+        files = edit_files(node)
+        for symbol in node.edit_set.symbols:
+            try:
+                path = parse_symbol(symbol).path
+            except ValueError:
+                continue  # reported by V8
+            if path not in files:
+                report.errors.append(Issue(
+                    "V10", [node.id],
+                    f"edit_set.symbols lists {symbol}, but {path} is not in "
+                    "edit_set.modify or edit_set.create"))
+
+
+def _warn_order_edge_for_required_symbols(graph: Graph,
+                                          report: ValidationReport) -> None:
+    edge_types: dict[tuple[str, str], set[str]] = {}
+    for edge in usable_edges(graph):
+        edge_types.setdefault((edge.from_, edge.to), set()).add(edge.type)
+    by_id = {node.id: node for node in unique_nodes(graph)}
+    for (upstream_id, downstream_id), types in edge_types.items():
+        if types != {"order"}:
+            continue
+        upstream, downstream = by_id[upstream_id], by_id[downstream_id]
+        shared = [symbol for symbol in downstream.requires
+                  if symbol in upstream.provides]
+        if shared:
+            report.warnings.append(Issue(
+                "W4", [upstream_id, downstream_id],
+                f"{downstream_id} requires {', '.join(shared)} from "
+                f"{upstream_id}, but {upstream_id} -> {downstream_id} is only an "
+                "order edge; use interface or full"))
+
+
 def _warn_small_single_successor(graph: Graph, report: ValidationReport) -> None:
     adjacency = successors(graph)
     for node in unique_nodes(graph):
@@ -293,7 +340,7 @@ def _warn_unused_provides(graph: Graph, report: ValidationReport) -> None:
 
 
 def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
-    """Check ``graph`` against rules V1-V8 and warnings W1-W3.
+    """Check ``graph`` against rules V1-V10 and warnings W1-W4.
 
     Rules that need repository information (V3, V6) are skipped, with a
     warning, when ``index`` is None.
@@ -310,6 +357,8 @@ def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
         _check_requires(graph, index, ancestor_map, report)
     _check_edit_set_nonempty(graph, report)
     _check_symbol_format(graph, report)
+    _check_interface_sources(graph, report)
+    _check_symbol_files(graph, report)
 
     if index is None:
         for code in ("V3", "V6"):
@@ -319,4 +368,5 @@ def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
     _warn_unused_provides(graph, report)
     if not any(command.strip() for command in graph.final_checks):
         report.warnings.append(Issue("W3", [], "final_checks is empty"))
+    _warn_order_edge_for_required_symbols(graph, report)
     return report

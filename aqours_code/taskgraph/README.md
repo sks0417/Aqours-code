@@ -27,7 +27,7 @@ Unknown fields are rejected everywhere.
 | `Graph` | `request_id`, `request`, `repo`, `base_commit`, `final_checks` (default `[]`), `generator`, `nodes` (≥ 1), `edges` (default `[]`), `revision_log` (default `[]`) |
 | `Generator` | `kind`: `manual` \| `planner`; optional `planner_version`, `model`, `revision_mode`: `llm` \| `rule_assisted` \| `none` |
 | `Node` | `id` (`[A-Za-z0-9_-]+`), `title`, `kind`: `contract` \| `implement`, `goal` (non-empty), `edit_set`, `requires`, `provides`, `check`, `context_files`, optional `size`: `small` \| `medium` \| `large` |
-| `EditSet` | `modify` (existing files), `create` (new files), optional `symbols` (format-checked only) |
+| `EditSet` | `modify` (existing files), `create` (new files), optional `symbols` (functions/methods the node changes; not used for scheduling) |
 | `Check` | `commands`, `timeout_s` (integer > 0, default 300) |
 | `Edge` | `from`, `to`, `type`: `interface` \| `full` \| `order`, `source`: `manual` \| `llm` \| `derived`, `reason` |
 | `RevisionEntry` | `action`: `merge` \| `split` \| `add_edge` \| `remove_edge` \| `add_node` \| `other`, `nodes`, optional `into`, `reason` |
@@ -35,13 +35,32 @@ Unknown fields are rejected everywhere.
 In Python, `Edge.from` is `Edge.from_`; it is always serialized as `from`.
 Use `load_graph(path)` and `dump_graph(graph, path)` for JSON I/O.
 
+Within one node, `modify`, `create` and `context_files` must not repeat a
+path, and no path may appear in both `modify` and `create`. These are schema
+errors.
+
+### Execution semantics
+
+Every edge, whatever its `type`, means that the downstream node starts only
+after the upstream node has **finished and been merged**. The Coordinator must
+follow this rule; the validator relies on it when it accepts a symbol provided
+by any ancestor (V6) and when it accepts an edit conflict ordered by any edge
+(V5). The edge type records *why* the order exists:
+
+- `interface`: the downstream node uses an interface defined by a `contract`
+  node (V9);
+- `full`: the downstream node depends on the upstream implementation;
+- `order`: only the order matters, for example two nodes editing the same
+  file. If the downstream node requires a symbol the upstream node provides,
+  the edge should be `interface` or `full` instead (W4).
+
 ### Paths and symbols
 
 All paths are repository-relative POSIX paths: `/` separators, no leading `/`,
 no drive letter, and no empty, `.` or `..` segments.
 
-A symbol is `path::Qualified.name`, where the qualified name is one or more
-Python identifiers joined by `.`:
+A symbol is `path::Qualified.name`, where the path is a `.py` file and the
+qualified name is one or more Python identifiers joined by `.`:
 
 ```text
 models.py::JobStatus.CANCELLED
@@ -49,7 +68,8 @@ store.py::JobStore.list_unfinished
 runner.py::run_loop
 ```
 
-`parse_symbol()` parses and checks a symbol string.
+`parse_symbol()` parses and checks a symbol string. Restricting symbols to
+`.py` files is a v0 limitation: only Python files are indexed.
 
 ## Repository index
 
@@ -81,12 +101,15 @@ skipped and listed in `index.warnings`.
 | V6 | Every `requires` symbol exists at the base commit or is provided by an ancestor. A node's own `provides` does not count. *Needs an index.* |
 | V7 | Every node edits at least one file. |
 | V8 | `requires`, `provides` and `edit_set.symbols` are well-formed symbols. |
+| V9 | An `interface` edge starts at a `contract` node. |
+| V10 | Every `edit_set.symbols` entry belongs to a file in the same node's `modify` or `create`. |
 | W1 | A `small` node has exactly one distinct direct successor (consider merging). |
 | W2 | A provided symbol is not required by any other node. |
 | W3 | `final_checks` is empty. |
+| W4 | A node requires a symbol provided by a node whose only direct edge to it is an `order` edge. |
 
 Without an index, V3 and V6 are skipped and reported as warnings. A single
-node graph is the fallback plan and passes when V3, V4, V7 and V8 hold.
+node graph is the fallback plan and passes when V3, V4, V7, V8 and V10 hold.
 
 ## Edge derivation
 
@@ -95,7 +118,10 @@ appended to `revision_log`:
 
 1. For each `requires` symbol that is not in the repository and has exactly one
    provider that is not yet an ancestor, add `provider -> node`
-   (`interface` from a `contract` provider, otherwise `full`).
+   (`interface` from a `contract` provider, otherwise `full`). When several
+   providers exist and none is an ancestor, no edge is added; an `other`
+   revision lists the node and every candidate provider with the reason
+   "multiple providers, edge not derived".
 2. For each pair of nodes that edit a common file and are not ordered, add an
    `order` edge: a `contract` node goes first, otherwise the earlier node in
    `nodes` goes first.

@@ -1,6 +1,6 @@
 {
   "request_id": "toy-001",
-  "request": "Mark a job as FAILED once it has been attempted MAX_ATTEMPTS times, and cover the behavior with a test.",
+  "request": "Mark a job as FAILED once it has been attempted MAX_ATTEMPTS times, and document the retry limit in the README.",
   "repo": "toy",
   "base_commit": "48e0476cbc3aac7a8ed14cde30fde8165053b4b5",
   "final_checks": [
@@ -57,7 +57,6 @@
         "symbols": ["runner.py::run_loop"]
       },
       "requires": ["store.py::JobStore.mark_failed", "runner.py::MAX_ATTEMPTS"],
-      "provides": ["runner.py::run_loop"],
       "check": {
         "commands": ["python -m pytest -q tests/test_basic.py"]
       },
@@ -65,19 +64,18 @@
       "size": "medium"
     },
     {
-      "id": "retry-tests",
-      "title": "Test the retry limit",
+      "id": "readme-retry-limit",
+      "title": "Document the retry limit",
       "kind": "implement",
-      "goal": "Add tests/test_retry.py asserting that a job becomes FAILED after MAX_ATTEMPTS iterations of run_loop.",
+      "goal": "Describe the FAILED status and the MAX_ATTEMPTS retry limit in README.md.",
       "edit_set": {
-        "modify": [],
-        "create": ["tests/test_retry.py"]
+        "modify": ["README.md"],
+        "create": []
       },
-      "requires": ["runner.py::run_loop", "store.py::JobStore.mark_failed"],
       "check": {
-        "commands": ["python -m pytest -q tests/test_retry.py"]
+        "commands": ["python -c \"text = open('README.md').read(); assert 'FAILED' in text and 'MAX_ATTEMPTS' in text\""]
       },
-      "context_files": ["tests/test_basic.py"],
+      "context_files": ["runner.py"],
       "size": "medium"
     }
   ],
@@ -98,10 +96,10 @@
     },
     {
       "from": "runner-retry-limit",
-      "to": "retry-tests",
+      "to": "readme-retry-limit",
       "type": "order",
       "source": "manual",
-      "reason": "write the tests after the retry behavior exists"
+      "reason": "document the retry limit after it is implemented"
     }
   ]
 }

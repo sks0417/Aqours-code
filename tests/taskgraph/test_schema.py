@@ -193,6 +193,32 @@ def test_round_trip_preserves_example_content(example_data):
     assert dumped["edges"] == example_data["edges"]
 
 
+@pytest.mark.parametrize("edit_set,context_files", [
+    ({"modify": ["models.py", "models.py"], "create": []}, []),
+    ({"modify": [], "create": ["new.py", "new.py"]}, []),
+    ({"modify": ["models.py"], "create": []}, ["README.md", "README.md"]),
+    ({"modify": ["models.py"], "create": ["models.py"]}, []),
+])
+def test_duplicate_or_overlapping_paths_are_rejected(example_data, edit_set, context_files):
+    data = copy.deepcopy(example_data)
+    data["nodes"][0]["edit_set"] = edit_set
+    data["nodes"][0]["context_files"] = context_files
+    _invalid(data)
+
+
+def test_distinct_paths_are_accepted(example_data):
+    data = copy.deepcopy(example_data)
+    data["nodes"][0]["edit_set"] = {"modify": ["models.py", "store.py"], "create": ["new.py"]}
+    data["nodes"][0]["context_files"] = ["README.md", "runner.py"]
+    Graph.model_validate(data)
+
+
+@pytest.mark.parametrize("bad", ["README.md::Section", "pkg/module::func", "setup.pyc::x"])
+def test_symbol_file_must_be_python(bad):
+    with pytest.raises(ValueError, match=r"\.py file"):
+        parse_symbol(bad)
+
+
 def test_committed_json_schema_is_up_to_date():
     committed = json.loads(DEFAULT_SCHEMA_PATH.read_text(encoding="utf-8"))
     assert committed == graph_json_schema()

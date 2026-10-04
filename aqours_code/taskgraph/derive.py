@@ -42,7 +42,15 @@ def _derive_dependency_edges(graph: Graph, index: RepoIndex,
                 continue
             providers = [other for other in nodes
                          if other.id != node.id and symbol in other.provides]
-            if len(providers) != 1:
+            if len(providers) > 1:
+                entries.append(RevisionEntry(
+                    action="other",
+                    nodes=[node.id, *(other.id for other in providers)],
+                    reason=(f"{node.id} requires {symbol}: multiple providers, "
+                            "edge not derived"),
+                ))
+                continue
+            if not providers:
                 continue
             provider = providers[0]
             edge_type: Literal["interface", "full"] = (

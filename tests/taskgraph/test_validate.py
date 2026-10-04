@@ -218,6 +218,52 @@ def test_v8_catches_symbols_that_bypassed_the_schema():
     assert "edit_set.symbols" in issues[2].message
 
 
+# ── V9 interface edges start at contract nodes ──
+
+def test_v9_passes_for_interface_from_contract_and_other_types_from_implement():
+    graph = make_graph(
+        [make_node("C", kind="contract", modify=("models.py",)),
+         make_node("I", modify=("store.py",)), make_node("J", modify=("runner.py",))],
+        [make_edge("C", "I", "interface"), make_edge("I", "J", "full"),
+         make_edge("C", "J", "order")],
+    )
+    assert not errors_with(validate(graph), "V9")
+
+
+def test_v9_interface_edge_from_implement_node():
+    graph = make_graph(
+        [make_node("I", modify=("store.py",)), make_node("J", modify=("runner.py",))],
+        [make_edge("I", "J", "interface")],
+    )
+    issues = errors_with(validate(graph), "V9")
+    assert len(issues) == 1 and issues[0].nodes == ["I", "J"]
+    assert "must start at a contract node" in issues[0].message
+
+
+# ── V10 edit_set.symbols belong to edited files ──
+
+def test_v10_passes_for_symbols_in_modified_or_created_files():
+    graph = make_graph([make_node(
+        "A", modify=("store.py",), create=("new_mod.py",),
+        symbols=("store.py::JobStore.add", "new_mod.py::helper"))])
+    assert not errors_with(validate(graph), "V10")
+
+
+def test_v10_symbol_outside_edit_set():
+    graph = make_graph([make_node(
+        "A", modify=("store.py",), symbols=("store.py::JobStore.add", "runner.py::run_loop"))])
+    issues = errors_with(validate(graph), "V10")
+    assert len(issues) == 1 and issues[0].nodes == ["A"]
+    assert "runner.py::run_loop" in issues[0].message
+
+
+def test_v10_leaves_malformed_symbols_to_v8():
+    graph = make_graph([make_node("A", modify=("store.py",))])
+    graph.nodes[0].edit_set.symbols.append("store.py:add")
+    report = validate(graph)
+    assert errors_with(report, "V8") and not errors_with(report, "V10")
+
+
 # ── warnings ──
 
 def test_w1_small_node_with_single_downstream():
@@ -246,6 +292,31 @@ def test_w3_missing_final_checks():
     report = validate(graph)
     assert report.ok
     assert "W3" in report.warning_codes()
+
+
+def test_w4_order_edge_carrying_a_required_symbol():
+    graph = make_graph([
+        make_node("P", modify=("store.py",), provides=("store.py::JobStore.purge",)),
+        make_node("X", modify=("runner.py",), requires=("store.py::JobStore.purge",)),
+    ], [make_edge("P", "X", "order")])
+    report = validate(graph)
+    assert report.ok
+    issues = [issue for issue in report.warnings if issue.code == "W4"]
+    assert len(issues) == 1 and issues[0].nodes == ["P", "X"]
+    assert "store.py::JobStore.purge" in issues[0].message
+    assert "use interface or full" in issues[0].message
+
+
+def test_w4_not_raised_for_full_or_mixed_edges_or_unrelated_order_edges():
+    graph = make_graph([
+        make_node("P", modify=("store.py",), provides=("store.py::JobStore.purge",)),
+        make_node("X", modify=("runner.py",), requires=("store.py::JobStore.purge",)),
+        make_node("Y", modify=("models.py",), requires=("store.py::JobStore.purge",)),
+        make_node("Z", modify=("README.md",)),
+    ], [make_edge("P", "X", "full"),
+        make_edge("P", "Y", "order"), make_edge("P", "Y", "full"),
+        make_edge("X", "Z", "order")])
+    assert "W4" not in validate(graph).warning_codes()
 
 
 # ── report and CLI ──

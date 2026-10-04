@@ -11,7 +11,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 NODE_ID_PATTERN = r"^[A-Za-z0-9_-]+$"
 SYMBOL_SEPARATOR = "::"
@@ -64,6 +72,10 @@ def parse_symbol(text: str) -> SymbolRef:
         validate_repo_path(path)
     except ValueError as exc:
         raise ValueError(f"invalid file path in symbol {text!r}: {exc}") from None
+    if not path.endswith(".py"):
+        # v0 limitation: only Python files are indexed, so only they can
+        # define symbols.
+        raise ValueError(f"symbol file must be a .py file: {text!r}")
     names = qualname.split(".")
     if not all(name.isidentifier() for name in names):
         raise ValueError(
@@ -78,7 +90,16 @@ def validate_symbol(text: str) -> str:
     return text
 
 
+def _reject_duplicates(paths: list[str]) -> list[str]:
+    """Return ``paths`` unless a path appears more than once."""
+    duplicates = sorted({path for path in paths if paths.count(path) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate paths: {', '.join(duplicates)}")
+    return paths
+
+
 RepoPath = Annotated[str, AfterValidator(validate_repo_path)]
+UniquePaths = Annotated[list[RepoPath], AfterValidator(_reject_duplicates)]
 Symbol = Annotated[str, AfterValidator(validate_symbol)]
 
 
@@ -107,9 +128,17 @@ class RevisionEntry(_Model):
 class EditSet(_Model):
     """Files a node may change, plus optional informational symbols."""
 
-    modify: list[RepoPath]
-    create: list[RepoPath]
+    modify: UniquePaths
+    create: UniquePaths
     symbols: list[Symbol] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _modify_and_create_disjoint(self) -> "EditSet":
+        both = sorted(set(self.modify) & set(self.create))
+        if both:
+            raise ValueError(
+                f"paths listed in both modify and create: {', '.join(both)}")
+        return self
 
 
 class Check(_Model):
@@ -130,7 +159,7 @@ class Node(_Model):
     requires: list[Symbol] = Field(default_factory=list)
     provides: list[Symbol] = Field(default_factory=list)
     check: Check
-    context_files: list[RepoPath] = Field(default_factory=list)
+    context_files: UniquePaths = Field(default_factory=list)
     size: Literal["small", "medium", "large"] | None = None
 
     @field_validator("goal")
