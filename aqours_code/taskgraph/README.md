@@ -209,7 +209,7 @@ warnings (0):
 python -m aqours_code.taskgraph run <graph.json> --repo <path>
     [--out runs] [--workers 2] [--max-attempts 2]
     [--worker aqours|command] [--command-map <json>]
-    [--max-model-calls 40] [--worker-timeout 1800]
+    [--worker-timeout 1800]
     [--hidden-tests <dir>]
 ```
 
@@ -231,8 +231,10 @@ All schemes use the same worker: `AqoursWorker` runs
 (`python -m aqours_code.taskgraph.worker_entry --config <file>`) with one fixed
 tool policy (`bash`, `read_file`, `write_file`, `edit_file`, `glob`,
 `todo_write`, `compact`; no MCP, memory, skills, teammates, or background
-tasks) and a model-call budget of `--max-model-calls` per attempt. The model
-comes from the Aqours `.env` and environment. `--worker command` runs a fixed
+tasks). A worker has no model-call limit: it runs exactly like an ordinary
+Aqours single-agent run and is bounded only by `--worker-timeout`. Its model
+calls and tokens are counted for the cost data. The model comes from the
+Aqours `.env` and environment. `--worker command` runs a fixed
 shell command per node instead (tests and debugging only).
 
 ### Flow
@@ -251,7 +253,7 @@ shell command per node instead (tests and debugging only).
 3. **Each node**, up to `--max-attempts` times (default 2): create
    `tg/node/<id>` and worktree `wt/<id>` from the integration HEAD, write the
    prompt, run the worker, and commit `attempt <n>`. The attempt fails on a
-   worker error, timeout or exhausted budget, on no change since the start
+   worker error or timeout, on no change since the start
    commit (`no_changes`), or on a failing check command run in the worktree
    (`check_failed`). A retry continues in the same worktree with the failure
    reason and the last 4000 characters of output in the prompt.

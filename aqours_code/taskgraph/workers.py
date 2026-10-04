@@ -17,7 +17,6 @@ from typing import Protocol
 from .process import run_process, run_shell
 
 WORKER_ENTRY_MODULE = "aqours_code.taskgraph.worker_entry"
-DEFAULT_MAX_MODEL_CALLS = 40
 DEFAULT_WORKER_TIMEOUT_S = 1800.0
 # Extra time the parent waits beyond the worker's own deadline before killing
 # the process tree, so the worker can stop and write its result itself.
@@ -41,7 +40,7 @@ class WorkerResult:
     """What a worker reports back."""
 
     ok: bool
-    reason: str = ""  # "", "worker_error", "worker_timeout", "budget_exhausted"
+    reason: str = ""  # "", "worker_error", "worker_timeout"
     exit_code: int | None = None
     duration_s: float = 0.0
     model_calls: int = 0
@@ -109,17 +108,15 @@ def write_json_atomic(path: Path, data: dict) -> None:
 class AqoursWorker:
     """Run the Aqours single-agent path in a child process."""
 
-    def __init__(self, *, max_model_calls: int = DEFAULT_MAX_MODEL_CALLS,
-                 entry_command: Sequence[str] | None = None,
+    def __init__(self, *, entry_command: Sequence[str] | None = None,
                  kill_grace_s: float = DEFAULT_KILL_GRACE_S):
-        self.max_model_calls = max_model_calls
         self.entry_command = list(entry_command or
                                   [sys.executable, "-m", WORKER_ENTRY_MODULE])
         self.kill_grace_s = kill_grace_s
 
     def describe(self) -> dict:
         """Ask the worker entry which provider and model it would use."""
-        info = {"worker": "aqours", "max_model_calls": self.max_model_calls}
+        info = {"worker": "aqours"}
         result = run_process([*self.entry_command, "--describe"], cwd=Path.cwd(),
                              timeout=60)
         try:
@@ -142,7 +139,6 @@ class AqoursWorker:
             "result_path": str(log_dir / f"worker_{n}.json"),
             "trace_storage_root": str(log_dir / f"aqours_{n}" / "trace"),
             "runtime_root": str(log_dir / f"aqours_{n}" / "state"),
-            "max_model_calls": self.max_model_calls,
             "timeout_s": request.timeout_s,
         }
 

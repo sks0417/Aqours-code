@@ -29,10 +29,6 @@ WORKER_TOOL_POLICY: dict = {
     "background_tasks": False,
 }
 
-class BudgetExhausted(RuntimeError):
-    """Raised when a worker asks for more model calls than it was given."""
-
-
 def _usage_value(usage, *names: str) -> int:
     for name in names:
         value = (usage.get(name) if isinstance(usage, dict)
@@ -42,27 +38,22 @@ def _usage_value(usage, *names: str) -> int:
     return 0
 
 
-class BudgetedClient:
-    """Wrap a model client: count calls and tokens, and enforce a call budget.
+class CountingClient:
+    """Wrap a model client to count calls and tokens without limiting them.
 
-    ``budget_snapshot()`` lets the Aqours loop reserve its last calls for
-    finishing (see ``aqours_code/model_budget.py``).
+    It exposes no budget information, so the Aqours loop runs exactly as an
+    ordinary single-agent run would.
     """
 
-    def __init__(self, inner, max_calls: int):
+    def __init__(self, inner):
         self.inner = inner
-        self.max_calls = int(max_calls)
         self.call_count = 0
         self.input_tokens = 0
         self.output_tokens = 0
-        self.over_budget = False
         self.messages = self
 
     def create(self, **kwargs):
         """Forward one ``messages.create`` call, counting it first."""
-        if self.call_count >= self.max_calls:
-            self.over_budget = True
-            raise BudgetExhausted(f"model call budget of {self.max_calls} exhausted")
         self.call_count += 1
         response = self.inner.messages.create(**kwargs)
         usage = getattr(response, "usage", None)
@@ -71,16 +62,6 @@ class BudgetedClient:
             self.input_tokens += _usage_value(usage, "input_tokens", "prompt_tokens")
             self.output_tokens += _usage_value(usage, "output_tokens", "completion_tokens")
         return response
-
-    def budget_snapshot(self) -> dict:
-        """Report the live call budget to the Aqours loop."""
-        return {"max_calls": self.max_calls, "call_count": self.call_count,
-                "source": "taskgraph"}
-
-    @property
-    def exhausted(self) -> bool:
-        """True when the worker used, or tried to exceed, its whole budget."""
-        return self.over_budget or self.call_count >= self.max_calls
 
 
 def describe() -> dict:
@@ -116,7 +97,7 @@ def run_worker(config: dict, model_client=None) -> WorkerResult:
         provider = config.get("model_provider", "scripted")
         model = config.get("model", "scripted")
 
-    budgeted = BudgetedClient(inner, int(config["max_model_calls"]))
+    counting = CountingClient(inner)
     timeout_s = float(config["timeout_s"])
     for key in ("trace_storage_root", "runtime_root"):
         Path(config[key]).mkdir(parents=True, exist_ok=True)
@@ -126,7 +107,7 @@ def run_worker(config: dict, model_client=None) -> WorkerResult:
             config["task"],
             config["workspace"],
             config["trace_path"],
-            model_client=budgeted,
+            model_client=counting,
             model_provider=provider,
             model=model,
             command_executor=LocalCommandExecutor(),
@@ -145,16 +126,12 @@ def run_worker(config: dict, model_client=None) -> WorkerResult:
                               error=f"{type(exc).__name__}: {exc}")
 
     answer = result.final_answer.lstrip()
-    if result.ok and budgeted.exhausted:
-        result.ok, result.reason = False, "budget_exhausted"
-    elif result.ok and (answer.startswith("[Error]")
-                        or answer.lower().startswith("permission denied")):
+    if result.ok and (answer.startswith("[Error]")
+                      or answer.lower().startswith("permission denied")):
         result.ok, result.reason, result.error = False, "worker_error", answer[:2000]
-    elif not result.ok and budgeted.over_budget:
-        result.reason = "budget_exhausted"
-    result.model_calls = budgeted.call_count
-    result.input_tokens = budgeted.input_tokens
-    result.output_tokens = budgeted.output_tokens
+    result.model_calls = counting.call_count
+    result.input_tokens = counting.input_tokens
+    result.output_tokens = counting.output_tokens
     result.duration_s = time.monotonic() - started
     return result
 

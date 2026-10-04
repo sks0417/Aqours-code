@@ -110,8 +110,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     graph = _load(args.graph)
     if graph is None:
         return EXIT_INPUT_ERROR
-    if args.workers < 1 or args.max_attempts < 1 or args.max_model_calls < 1:
-        return _error("--workers, --max-attempts and --max-model-calls must be >= 1")
+    if args.workers < 1 or args.max_attempts < 1:
+        return _error("--workers and --max-attempts must be >= 1")
     if args.worker == "command":
         if not args.command_map:
             return _error("--worker command needs --command-map")
@@ -121,7 +121,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return _error(f"cannot read command map {args.command_map}: {exc}")
         worker = CommandWorker(commands)
     else:
-        worker = AqoursWorker(max_model_calls=args.max_model_calls)
+        worker = AqoursWorker()
     hidden = Path(args.hidden_tests) if args.hidden_tests else None
     if hidden is not None and not hidden.is_dir():
         return _error(f"hidden tests directory not found: {hidden}")
@@ -185,7 +185,6 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--worker", choices=("aqours", "command"), default="aqours")
     run_cmd.add_argument("--command-map",
                          help="JSON file mapping node id to a shell command (--worker command)")
-    run_cmd.add_argument("--max-model-calls", type=int, default=40)
     run_cmd.add_argument("--worker-timeout", type=float, default=1800.0)
     run_cmd.add_argument("--hidden-tests")
     run_cmd.set_defaults(func=_cmd_run)

@@ -23,8 +23,9 @@ from taskgraph_support import make_edge, make_graph, make_node
 # ── worker_entry with a fake model client ──
 
 
-def tool_use(name: str, **arguments):
-    return SimpleNamespace(content=[SimpleNamespace(type="tool_use", id=f"call_{name}",
+def tool_use(name: str, call_id: str = "", **arguments):
+    return SimpleNamespace(content=[SimpleNamespace(type="tool_use",
+                                                    id=call_id or f"call_{name}",
                                                     name=name, input=arguments)],
                            stop_reason="tool_use",
                            usage=SimpleNamespace(input_tokens=11, output_tokens=3))
@@ -48,7 +49,7 @@ class FakeClient:
         return self.responses.pop(0) if self.responses else final("done")
 
 
-def worker_config(workspace: Path, log_dir: Path, max_calls: int) -> dict:
+def worker_config(workspace: Path, log_dir: Path) -> dict:
     return {
         "node_id": "N", "attempt": 1, "task": "Write hello.txt.",
         "workspace": str(workspace), "log_dir": str(log_dir),
@@ -56,7 +57,7 @@ def worker_config(workspace: Path, log_dir: Path, max_calls: int) -> dict:
         "result_path": str(log_dir / "worker_1.json"),
         "trace_storage_root": str(log_dir / "aqours_1" / "trace"),
         "runtime_root": str(log_dir / "aqours_1" / "state"),
-        "max_model_calls": max_calls, "timeout_s": 60,
+        "timeout_s": 60,
         "model_provider": "scripted", "model": "scripted-model",
     }
 
@@ -67,7 +68,7 @@ def test_run_worker_writes_file_and_keeps_runtime_records_out_of_workspace(toy_r
     log_dir = tmp_path / "log"
     client = FakeClient([tool_use("write_file", path="hello.txt", content="hi\n"),
                          final("done")])
-    result = run_worker(worker_config(toy_repo.path, log_dir, 5), model_client=client)
+    result = run_worker(worker_config(toy_repo.path, log_dir), model_client=client)
     assert result.ok, result
     assert (result.model_calls, result.input_tokens, result.output_tokens) == (2, 18, 5)
     assert (toy_repo.path / "hello.txt").read_text() == "hi\n"
@@ -77,15 +78,29 @@ def test_run_worker_writes_file_and_keeps_runtime_records_out_of_workspace(toy_r
     assert any((log_dir / "aqours_1" / "trace").rglob("trace.jsonl"))
 
 
-def test_run_worker_reports_budget_exhausted(toy_repo, tmp_path):
+def test_run_worker_counts_every_call_without_a_limit(toy_repo, tmp_path):
     from aqours_code.taskgraph.worker_entry import run_worker
 
-    client = FakeClient([tool_use("write_file", path="hello.txt", content="hi\n")])
-    result = run_worker(worker_config(toy_repo.path, tmp_path / "log", 1),
-                        model_client=client)
-    assert not result.ok and result.reason == "budget_exhausted"
-    assert result.model_calls == 1 and client.calls == 1
-    assert not (toy_repo.path / "hello.txt").exists()
+    client = FakeClient([
+        tool_use("write_file", call_id="call_1", path="one.txt", content="1\n"),
+        tool_use("write_file", call_id="call_2", path="two.txt", content="2\n"),
+        final("done"),
+    ])
+    result = run_worker(worker_config(toy_repo.path, tmp_path / "log"), model_client=client)
+    assert result.ok and result.reason == "", result
+    assert result.model_calls == 3 and client.calls == 3
+    assert (result.input_tokens, result.output_tokens) == (11 + 11 + 7, 3 + 3 + 2)
+    assert (toy_repo.path / "one.txt").is_file() and (toy_repo.path / "two.txt").is_file()
+
+
+def test_counting_client_exposes_no_budget():
+    from aqours_code.taskgraph.worker_entry import CountingClient
+
+    client = CountingClient(FakeClient([final("done")]))
+    assert not hasattr(client, "budget_snapshot")
+    response = client.messages.create(model="m", messages=[])
+    assert response.stop_reason == "end_turn"
+    assert (client.call_count, client.input_tokens, client.output_tokens) == (1, 7, 2)
 
 
 def test_worker_tool_policy_is_minimal():
@@ -123,7 +138,7 @@ pathlib.Path(config["result_path"]).write_text(json.dumps(
 def fake_worker(tmp_path: Path, **kwargs) -> AqoursWorker:
     script = tmp_path / "fake_entry.py"
     script.write_text(FAKE_ENTRY, encoding="utf-8")
-    return AqoursWorker(max_model_calls=7, entry_command=[sys.executable, str(script)],
+    return AqoursWorker(entry_command=[sys.executable, str(script)],
                         **kwargs)
 
 
@@ -144,12 +159,12 @@ def test_aqours_worker_config_env_cwd_and_result(tmp_path):
     assert Path(seen["cwd"]).resolve() == req.log_dir.resolve()
     assert Path(seen["workdir"]).resolve() == req.workspace.resolve()
     config = json.loads((req.log_dir / "worker_1_config.json").read_text(encoding="utf-8"))
-    assert config["task"] == "do it" and config["max_model_calls"] == 7
+    assert config["task"] == "do it" and "max_model_calls" not in config
     assert config["timeout_s"] == 30
     for key in ("trace_path", "result_path", "trace_storage_root", "runtime_root"):
         assert Path(config[key]).resolve().is_relative_to(req.log_dir.resolve())
-    assert worker.describe() == {"worker": "aqours", "max_model_calls": 7,
-                                 "model_provider": "fake", "model": "fake-model"}
+    assert worker.describe() == {"worker": "aqours", "model_provider": "fake",
+                                 "model": "fake-model"}
 
 
 def _pid_alive(pid: int) -> bool:
