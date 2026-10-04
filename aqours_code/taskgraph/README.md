@@ -218,6 +218,12 @@ Run experiments on Linux or WSL2. Check commands, `final_checks`, and the
 POSIX shell. The process exits with `0` for `success`, `1` for any other
 status or an invalid graph, and `2` for input or git errors.
 
+Each run puts a full clone of the target repository under `--out` (default
+`runs/` in the current directory; `runs/` is git-ignored in the Aqours
+repository). Pass `--out` to keep run directories outside the repository,
+for example `--out /tmp/tg-runs`; this also keeps the hidden-test run from
+picking up the Aqours pytest configuration.
+
 ### Three schemes, one pipeline
 
 | Scheme | How to run it |

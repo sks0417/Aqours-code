@@ -38,3 +38,6 @@ yosoro.txt
 trace_*.jsonl
 timeline_*.jsonl
 timeline_dump.txt
+
+# Task graph run directories (python -m aqours_code.taskgraph run)
+runs/
