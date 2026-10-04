@@ -29,7 +29,8 @@ SYMBOL_JSON_PATTERN = (
 )
 PATH_DESCRIPTION = (
     "Repository-relative POSIX path: '/' separators, no leading '/', no drive "
-    "letter, and no empty, '.' or '..' segments."
+    "letter, no empty, '.' or '..' segments, no segment starting or ending with "
+    "whitespace, and no control characters."
 )
 SYMBOL_DESCRIPTION = (
     "Symbol 'path/to/file.py::Qualified.name': a repository-relative path to a "
@@ -46,10 +47,16 @@ def validate_repo_path(value: str) -> str:
         raise ValueError(f"path must use '/' separators: {value!r}")
     if value.startswith("/") or _DRIVE_PREFIX.match(value):
         raise ValueError(f"path must be relative to the repository root: {value!r}")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"path must not contain control characters: {value!r}")
     for part in value.split("/"):
         if part in ("", ".", ".."):
             raise ValueError(
                 f"path must not contain empty, '.' or '..' segments: {value!r}"
+            )
+        if part != part.strip():
+            raise ValueError(
+                f"path segments must not start or end with whitespace: {value!r}"
             )
     return value
 
@@ -102,12 +109,20 @@ def validate_symbol(text: str) -> str:
     return text
 
 
-def _reject_duplicates(paths: list[str]) -> list[str]:
-    """Return ``paths`` unless a path appears more than once."""
-    duplicates = sorted({path for path in paths if paths.count(path) > 1})
+def _reject_duplicates(values: list[str], kind: str) -> list[str]:
+    """Return ``values`` unless an entry appears more than once."""
+    duplicates = sorted({value for value in values if values.count(value) > 1})
     if duplicates:
-        raise ValueError(f"duplicate paths: {', '.join(duplicates)}")
-    return paths
+        raise ValueError(f"duplicate {kind}: {', '.join(duplicates)}")
+    return values
+
+
+def _reject_duplicate_paths(paths: list[str]) -> list[str]:
+    return _reject_duplicates(paths, "paths")
+
+
+def _reject_duplicate_symbols(symbols: list[str]) -> list[str]:
+    return _reject_duplicates(symbols, "symbols")
 
 
 RepoPath = Annotated[
@@ -117,7 +132,7 @@ RepoPath = Annotated[
 ]
 UniquePaths = Annotated[
     list[RepoPath],
-    AfterValidator(_reject_duplicates),
+    AfterValidator(_reject_duplicate_paths),
     Field(json_schema_extra={"uniqueItems": True}),
 ]
 Symbol = Annotated[
@@ -125,6 +140,11 @@ Symbol = Annotated[
     AfterValidator(validate_symbol),
     Field(description=SYMBOL_DESCRIPTION,
           json_schema_extra={"pattern": SYMBOL_JSON_PATTERN}),
+]
+UniqueSymbols = Annotated[
+    list[Symbol],
+    AfterValidator(_reject_duplicate_symbols),
+    Field(json_schema_extra={"uniqueItems": True}),
 ]
 
 
@@ -166,7 +186,7 @@ class EditSet(_Model):
     create: UniquePaths = Field(
         description=("New files this node creates. They must not exist at the base "
                      "commit, and each new file is created by exactly one node."))
-    symbols: list[Symbol] = Field(
+    symbols: UniqueSymbols = Field(
         default_factory=list,
         description=("Informational only: functions or methods this node changes. "
                      "Each symbol's file must be in this node's modify or create."))
@@ -202,11 +222,11 @@ class Node(_Model):
                      "'implement' implements behavior."))
     goal: str = Field(description="Concrete, non-empty goal handed to the worker.")
     edit_set: EditSet = Field(description="Files the node may change.")
-    requires: list[Symbol] = Field(
+    requires: UniqueSymbols = Field(
         default_factory=list,
         description=("Symbols this node uses. Each must exist at the base commit or "
                      "be provided by an ancestor node."))
-    provides: list[Symbol] = Field(
+    provides: UniqueSymbols = Field(
         default_factory=list,
         description="Symbols this node adds or changes for other nodes to use.")
     check: Check = Field(description="How to verify that the node is complete.")

@@ -83,7 +83,7 @@
         "modify": {
           "description": "Files this node changes. Each must exist at the base commit or be created by an ancestor node.",
           "items": {
-            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, and no empty, '.' or '..' segments.",
+            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, no empty, '.' or '..' segments, no segment starting or ending with whitespace, and no control characters.",
             "type": "string"
           },
           "title": "Modify",
@@ -93,7 +93,7 @@
         "create": {
           "description": "New files this node creates. They must not exist at the base commit, and each new file is created by exactly one node.",
           "items": {
-            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, and no empty, '.' or '..' segments.",
+            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, no empty, '.' or '..' segments, no segment starting or ending with whitespace, and no control characters.",
             "type": "string"
           },
           "title": "Create",
@@ -108,7 +108,8 @@
             "type": "string"
           },
           "title": "Symbols",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [
@@ -223,7 +224,8 @@
             "type": "string"
           },
           "title": "Requires",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "provides": {
           "description": "Symbols this node adds or changes for other nodes to use.",
@@ -233,7 +235,8 @@
             "type": "string"
           },
           "title": "Provides",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "check": {
           "$ref": "#/$defs/Check",
@@ -242,7 +245,7 @@
         "context_files": {
           "description": "Files the worker should read first. Each must exist at the base commit or be created by some node.",
           "items": {
-            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, and no empty, '.' or '..' segments.",
+            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, no empty, '.' or '..' segments, no segment starting or ending with whitespace, and no control characters.",
             "type": "string"
           },
           "title": "Context Files",

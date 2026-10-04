@@ -110,6 +110,46 @@ def test_invalid_paths_are_rejected(example_data, bad, field):
     _invalid(data)
 
 
+@pytest.mark.parametrize("bad", [
+    " models.py", "models.py ", "src/ models.py", "src /models.py", "src/\tmodels.py",
+    "models\t.py", "models\n.py", "models\x7f.py", "models\x00.py", "　models.py",
+])
+def test_paths_with_edge_whitespace_or_control_characters_are_rejected(bad):
+    with pytest.raises(ValueError):
+        validate_repo_path(bad)
+    with pytest.raises(ValueError):
+        parse_symbol(f"{bad}::x" if bad.endswith(".py") else f"{bad}/a.py::x")
+
+
+@pytest.mark.parametrize("field", ["modify", "create", "context_files"])
+def test_whitespace_paths_are_rejected_by_the_schema(example_data, field):
+    data = copy.deepcopy(example_data)
+    node = data["nodes"][0]
+    if field == "context_files":
+        node["context_files"] = ["models.py "]
+    else:
+        node["edit_set"] = {"modify": [], "create": [], field: ["src/ new.py"]}
+    _invalid(data)
+
+
+def test_inner_spaces_in_paths_are_allowed():
+    assert validate_repo_path("docs/user guide.md") == "docs/user guide.md"
+    assert parse_symbol("my pkg/job runner.py::run").path == "my pkg/job runner.py"
+
+
+@pytest.mark.parametrize("field", ["requires", "provides", "symbols"])
+def test_duplicate_symbols_are_rejected(example_data, field):
+    data = copy.deepcopy(example_data)
+    node = data["nodes"][1]
+    duplicate = ["store.py::JobStore.mark_failed", "store.py::JobStore.mark_failed"]
+    if field == "symbols":
+        node["edit_set"]["symbols"] = duplicate
+    else:
+        node[field] = duplicate
+    with pytest.raises(ValidationError, match="duplicate symbols"):
+        Graph.model_validate(data)
+
+
 @pytest.mark.parametrize("good", ["models.py", "src/pkg/mod.py", "tests/test_x.py", ".github/ci.yml"])
 def test_valid_paths_are_accepted(good):
     assert validate_repo_path(good) == good

@@ -17,11 +17,20 @@ EXIT_INVALID = 1
 EXIT_INPUT_ERROR = 2
 
 
+def _error(message: str) -> int:
+    print(f"error: {message}", file=sys.stderr)
+    return EXIT_INPUT_ERROR
+
+
 def _load(path: str) -> Graph | None:
     try:
         return load_graph(path)
     except FileNotFoundError:
-        print(f"error: graph file not found: {path}", file=sys.stderr)
+        _error(f"graph file not found: {path}")
+    except OSError as exc:
+        _error(f"cannot read graph file {path}: {exc.strerror or exc}")
+    except UnicodeDecodeError:
+        _error(f"graph file {path} is not valid UTF-8")
     except ValidationError as exc:
         print(f"error: {path} does not match the task graph schema:\n{exc}",
               file=sys.stderr)
@@ -32,7 +41,7 @@ def _index(repo: str, commit: str) -> RepoIndex | None:
     try:
         index = build_index(Path(repo), commit)
     except RuntimeError as exc:
-        print(f"error: cannot index {repo} at {commit}: {exc}", file=sys.stderr)
+        _error(f"cannot index {repo} at {commit}: {exc}")
         return None
     for warning in index.warnings:
         print(f"index warning: {warning}", file=sys.stderr)
@@ -61,7 +70,10 @@ def _cmd_derive(args: argparse.Namespace) -> int:
     if index is None:
         return EXIT_INPUT_ERROR
     derived, entries = derive_edges(graph, index)
-    dump_graph(derived, args.out)
+    try:
+        dump_graph(derived, args.out)
+    except OSError as exc:
+        return _error(f"cannot write {args.out}: {exc.strerror or exc}")
     print(f"revisions ({len(entries)}):")
     for entry in entries:
         print(f"[{entry.action}] {entry.reason}")
@@ -81,7 +93,11 @@ def _cmd_index(args: argparse.Namespace) -> int:
 
 
 def _cmd_export_schema(args: argparse.Namespace) -> int:
-    print(f"wrote {export_json_schema(args.out)}")
+    try:
+        target = export_json_schema(args.out)
+    except OSError as exc:
+        return _error(f"cannot write {args.out}: {exc.strerror or exc}")
+    print(f"wrote {target}")
     return EXIT_OK
 
 

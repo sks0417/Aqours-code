@@ -437,6 +437,62 @@ def test_issue_format_without_nodes():
     assert Issue("W3", [], "final_checks is empty").format() == "[W3] final_checks is empty"
 
 
+def _single_error_line(capsys) -> str:
+    lines = capsys.readouterr().err.strip().splitlines()
+    errors = [line for line in lines if not line.startswith("index warning: ")]
+    assert len(errors) == 1 and errors[0].startswith("error: ")
+    return errors[0]
+
+
+def test_cli_unreadable_graph_path_exits_2(tmp_path, capsys):
+    assert main(["validate", str(tmp_path)]) == 2
+    assert str(tmp_path) in _single_error_line(capsys)
+
+
+def test_cli_non_utf8_graph_exits_2(tmp_path, capsys):
+    graph = tmp_path / "graph.json"
+    graph.write_bytes(b"\xff\xfe\x00{")
+    assert main(["validate", str(graph)]) == 2
+    _single_error_line(capsys)
+
+
+def test_cli_unwritable_out_exits_2(tmp_path, toy_repo, capsys):
+    from aqours_code.taskgraph import dump_graph
+
+    graph = make_graph([make_node("A", modify=("runner.py",))]).model_copy(
+        update={"base_commit": toy_repo.commit})
+    source = tmp_path / "graph.json"
+    dump_graph(graph, source)
+    out_dir = tmp_path / "out_is_a_directory"
+    out_dir.mkdir()
+    assert main(["derive", str(source), "--repo", str(toy_repo.path),
+                 "--out", str(out_dir)]) == 2
+    assert "cannot write" in _single_error_line(capsys)
+    assert main(["export-schema", "--out", str(out_dir)]) == 2
+    assert "cannot write" in _single_error_line(capsys)
+
+
+def test_cli_missing_git_executable_exits_2(tmp_path, monkeypatch, capsys):
+    import subprocess
+
+    from aqours_code.taskgraph import repo_index
+
+    def missing_git(*_args, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "git")
+
+    monkeypatch.setattr(repo_index.subprocess, "run", missing_git)
+    assert repo_index.subprocess is subprocess
+    assert main(["index", "--repo", str(tmp_path), "--commit", "HEAD"]) == 2
+    assert "cannot run git" in _single_error_line(capsys)
+
+
+def test_cli_unknown_commit_names_the_commit(toy_repo, capsys):
+    assert main(["index", "--repo", str(toy_repo.path), "--commit", "no-such-ref"]) == 2
+    line = _single_error_line(capsys)
+    assert "cannot resolve commit 'no-such-ref'" in line
+    assert not line.rstrip().endswith("failed:")
+
+
 def test_cli_validate_exit_codes(tmp_path, toy_repo, capsys):
     good = tmp_path / "good.json"
     good.write_text(EXAMPLE_GRAPH.read_text(encoding="utf-8").replace(

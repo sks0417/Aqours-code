@@ -35,14 +35,18 @@ class RepoIndex:
 
 
 def _git(repo_path: Path, *args: str) -> bytes:
-    proc = subprocess.run(
-        ["git", "-C", str(repo_path), *args],
-        capture_output=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_path), *args],
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"cannot run git: {exc}") from exc
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+        raise RuntimeError(
+            f"git {' '.join(args)} failed: {detail or f'exit code {proc.returncode}'}")
     return proc.stdout
 
 
@@ -133,8 +137,12 @@ def extract_symbols(source: bytes | str, path: str) -> set[str]:
 def build_index(repo_path: Path, commit: str) -> RepoIndex:
     """Index all files and Python symbols of ``repo_path`` at ``commit``."""
     repo_path = Path(repo_path)
-    sha = _git(repo_path, "rev-parse", "--verify", "--quiet",
-               f"{commit}^{{commit}}").decode().strip()
+    try:
+        sha = _git(repo_path, "rev-parse", "--verify", "--quiet",
+                   f"{commit}^{{commit}}").decode().strip()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"cannot resolve commit {commit!r} in {repo_path}: {exc}") from exc
     listing = _git(repo_path, "-c", "core.quotepath=off", "ls-tree", "-r", "-z",
                    "--name-only", sha)
     files = {name for name in listing.decode("utf-8").split("\0") if name}
