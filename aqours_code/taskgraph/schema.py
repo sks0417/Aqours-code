@@ -23,6 +23,18 @@ from pydantic import (
 
 NODE_ID_PATTERN = r"^[A-Za-z0-9_-]+$"
 SYMBOL_SEPARATOR = "::"
+# Exported to the JSON Schema only; parse_symbol() remains the validator.
+SYMBOL_JSON_PATTERN = (
+    r"^[^:\\]+\.py::[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$"
+)
+PATH_DESCRIPTION = (
+    "Repository-relative POSIX path: '/' separators, no leading '/', no drive "
+    "letter, and no empty, '.' or '..' segments."
+)
+SYMBOL_DESCRIPTION = (
+    "Symbol 'path/to/file.py::Qualified.name': a repository-relative path to a "
+    ".py file, '::', then Python identifiers joined by '.'."
+)
 _DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 
 
@@ -98,9 +110,22 @@ def _reject_duplicates(paths: list[str]) -> list[str]:
     return paths
 
 
-RepoPath = Annotated[str, AfterValidator(validate_repo_path)]
-UniquePaths = Annotated[list[RepoPath], AfterValidator(_reject_duplicates)]
-Symbol = Annotated[str, AfterValidator(validate_symbol)]
+RepoPath = Annotated[
+    str,
+    AfterValidator(validate_repo_path),
+    Field(description=PATH_DESCRIPTION),
+]
+UniquePaths = Annotated[
+    list[RepoPath],
+    AfterValidator(_reject_duplicates),
+    Field(json_schema_extra={"uniqueItems": True}),
+]
+Symbol = Annotated[
+    str,
+    AfterValidator(validate_symbol),
+    Field(description=SYMBOL_DESCRIPTION,
+          json_schema_extra={"pattern": SYMBOL_JSON_PATTERN}),
+]
 
 
 class _Model(BaseModel):
@@ -110,27 +135,41 @@ class _Model(BaseModel):
 class Generator(_Model):
     """Where a graph came from."""
 
-    kind: Literal["manual", "planner"]
-    planner_version: str | None = None
-    model: str | None = None
-    revision_mode: Literal["llm", "rule_assisted", "none"] | None = None
+    kind: Literal["manual", "planner"] = Field(
+        description="'manual' for a hand-written graph, 'planner' for a generated one.")
+    planner_version: str | None = Field(
+        default=None, description="Version of the planner that produced the graph.")
+    model: str | None = Field(default=None, description="Model used by the planner.")
+    revision_mode: Literal["llm", "rule_assisted", "none"] | None = Field(
+        default=None,
+        description=("How the draft graph was revised: by an LLM ('llm'), by program "
+                     "rules plus an LLM ('rule_assisted'), or not at all ('none')."))
 
 
 class RevisionEntry(_Model):
     """One recorded change made to a graph after generation."""
 
-    action: Literal["merge", "split", "add_edge", "remove_edge", "add_node", "other"]
-    nodes: list[str]
-    into: str | None = None
-    reason: str
+    action: Literal["merge", "split", "add_edge", "remove_edge", "add_node", "other"] = Field(
+        description="Kind of change.")
+    nodes: list[str] = Field(description="Ids of the nodes involved.")
+    into: str | None = Field(
+        default=None, description="Id of the resulting node, for merge and split.")
+    reason: str = Field(description="Why the change was made.")
 
 
 class EditSet(_Model):
     """Files a node may change, plus optional informational symbols."""
 
-    modify: UniquePaths
-    create: UniquePaths
-    symbols: list[Symbol] = Field(default_factory=list)
+    modify: UniquePaths = Field(
+        description=("Files this node changes. Each must exist at the base commit or "
+                     "be created by an ancestor node."))
+    create: UniquePaths = Field(
+        description=("New files this node creates. They must not exist at the base "
+                     "commit, and each new file is created by exactly one node."))
+    symbols: list[Symbol] = Field(
+        default_factory=list,
+        description=("Informational only: functions or methods this node changes. "
+                     "Each symbol's file must be in this node's modify or create."))
 
     @model_validator(mode="after")
     def _modify_and_create_disjoint(self) -> "EditSet":
@@ -144,23 +183,39 @@ class EditSet(_Model):
 class Check(_Model):
     """Commands that verify one node."""
 
-    commands: list[str]
-    timeout_s: StrictInt = Field(default=300, gt=0)
+    commands: list[str] = Field(
+        description=("Shell commands, run from the repository root, that verify the "
+                     "node; at least one must be non-empty."))
+    timeout_s: StrictInt = Field(
+        default=300, gt=0, description="Timeout in seconds for the check commands.")
 
 
 class Node(_Model):
     """One sub-task handed to a worker."""
 
-    id: str = Field(pattern=NODE_ID_PATTERN)
-    title: str
-    kind: Literal["contract", "implement"]
-    goal: str
-    edit_set: EditSet
-    requires: list[Symbol] = Field(default_factory=list)
-    provides: list[Symbol] = Field(default_factory=list)
-    check: Check
-    context_files: UniquePaths = Field(default_factory=list)
-    size: Literal["small", "medium", "large"] | None = None
+    id: str = Field(pattern=NODE_ID_PATTERN,
+                    description="Unique node id: letters, digits, '_' and '-'.")
+    title: str = Field(description="Short name of the sub-task.")
+    kind: Literal["contract", "implement"] = Field(
+        description=("'contract' defines shared interfaces (new states, fields, "
+                     "signatures, API formats) that other nodes build on; "
+                     "'implement' implements behavior."))
+    goal: str = Field(description="Concrete, non-empty goal handed to the worker.")
+    edit_set: EditSet = Field(description="Files the node may change.")
+    requires: list[Symbol] = Field(
+        default_factory=list,
+        description=("Symbols this node uses. Each must exist at the base commit or "
+                     "be provided by an ancestor node."))
+    provides: list[Symbol] = Field(
+        default_factory=list,
+        description="Symbols this node adds or changes for other nodes to use.")
+    check: Check = Field(description="How to verify that the node is complete.")
+    context_files: UniquePaths = Field(
+        default_factory=list,
+        description=("Files the worker should read first. Each must exist at the base "
+                     "commit or be created by some node."))
+    size: Literal["small", "medium", "large"] | None = Field(
+        default=None, description="Expected size of the change.")
 
     @field_validator("goal")
     @classmethod
@@ -175,25 +230,35 @@ class Edge(_Model):
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    from_: str = Field(alias="from")
-    to: str
-    type: Literal["interface", "full", "order"]
-    source: Literal["manual", "llm", "derived"]
-    reason: str
+    from_: str = Field(alias="from", description="Id of the upstream node.")
+    to: str = Field(description="Id of the downstream node.")
+    type: Literal["interface", "full", "order"] = Field(
+        description=("Every edge means the downstream node starts only after the "
+                     "upstream node has finished and been merged. 'interface': the "
+                     "downstream node uses an interface defined by the upstream "
+                     "contract node; 'full': it depends on the upstream "
+                     "implementation; 'order': only the order matters, for example "
+                     "both nodes edit the same file."))
+    source: Literal["manual", "llm", "derived"] = Field(
+        description="Who added the edge: a person, an LLM, or a program rule.")
+    reason: str = Field(description="Why the edge exists.")
 
 
 class Graph(_Model):
     """A complete task graph for one request."""
 
-    request_id: str
-    request: str
-    repo: str
-    base_commit: str
-    final_checks: list[str] = Field(default_factory=list)
-    generator: Generator
-    nodes: list[Node] = Field(min_length=1)
-    edges: list[Edge] = Field(default_factory=list)
-    revision_log: list[RevisionEntry] = Field(default_factory=list)
+    request_id: str = Field(description="Identifier of the request.")
+    request: str = Field(description="Original request text.")
+    repo: str = Field(description="Name or path of the target repository.")
+    base_commit: str = Field(description="Commit the plan is based on.")
+    final_checks: list[str] = Field(
+        default_factory=list, description="Commands to run after all nodes are merged.")
+    generator: Generator = Field(description="Where this graph came from.")
+    nodes: list[Node] = Field(min_length=1, description="Sub-tasks; at least one.")
+    edges: list[Edge] = Field(
+        default_factory=list, description="Dependency and ordering constraints.")
+    revision_log: list[RevisionEntry] = Field(
+        default_factory=list, description="Changes made to the graph after generation.")
 
 
 def graph_to_json(graph: Graph) -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 
 import pytest
 from pydantic import ValidationError
@@ -9,6 +10,7 @@ from pydantic import ValidationError
 from aqours_code.taskgraph import Graph, dump_graph, load_graph, parse_symbol
 from aqours_code.taskgraph.schema import (
     DEFAULT_SCHEMA_PATH,
+    SYMBOL_JSON_PATTERN,
     Edge,
     graph_json_schema,
     graph_to_json,
@@ -217,6 +219,60 @@ def test_distinct_paths_are_accepted(example_data):
 def test_symbol_file_must_be_python(bad):
     with pytest.raises(ValueError, match=r"\.py file"):
         parse_symbol(bad)
+
+
+@pytest.mark.parametrize("model,field", [
+    ("Graph", "nodes"), ("Graph", "edges"), ("Graph", "final_checks"),
+    ("Node", "id"), ("Node", "kind"), ("Node", "goal"), ("Node", "edit_set"),
+    ("Node", "requires"), ("Node", "provides"), ("Node", "check"),
+    ("Node", "context_files"), ("Node", "size"),
+    ("EditSet", "modify"), ("EditSet", "create"), ("EditSet", "symbols"),
+    ("Check", "commands"), ("Check", "timeout_s"),
+    ("Edge", "from"), ("Edge", "to"), ("Edge", "type"), ("Edge", "source"),
+    ("Generator", "kind"), ("Generator", "revision_mode"),
+    ("RevisionEntry", "action"), ("RevisionEntry", "reason"),
+])
+def test_schema_fields_have_descriptions(model, field):
+    schema = graph_json_schema()
+    properties = schema["properties"] if model == "Graph" else schema["$defs"][model]["properties"]
+    assert properties[field].get("description", "").strip()
+
+
+def test_schema_describes_key_semantics():
+    defs = graph_json_schema()["$defs"]
+    edit_set = defs["EditSet"]["properties"]
+    assert "ancestor" in edit_set["modify"]["description"]
+    assert "exactly one node" in edit_set["create"]["description"]
+    assert "modify or create" in edit_set["symbols"]["description"]
+    assert "finished and been merged" in defs["Edge"]["properties"]["type"]["description"]
+    assert "non-empty" in defs["Check"]["properties"]["commands"]["description"]
+    kind = defs["Node"]["properties"]["kind"]["description"]
+    assert "contract" in kind and "implement" in kind
+
+
+def test_schema_exports_symbol_pattern_and_unique_path_lists():
+    defs = graph_json_schema()["$defs"]
+    for field in ("requires", "provides"):
+        items = defs["Node"]["properties"][field]["items"]
+        assert items["pattern"] == SYMBOL_JSON_PATTERN and items["description"]
+    assert defs["EditSet"]["properties"]["symbols"]["items"]["pattern"] == SYMBOL_JSON_PATTERN
+    for owner, field in (("EditSet", "modify"), ("EditSet", "create"), ("Node", "context_files")):
+        prop = defs[owner]["properties"][field]
+        assert prop["uniqueItems"] is True
+        assert "POSIX" in prop["items"]["description"]
+
+
+@pytest.mark.parametrize("symbol,matches", [
+    ("models.py::JobStatus.CANCELLED", True), ("pkg/runner.py::run_loop", True),
+    ("README.md::x", False), ("a.py:x", False), ("a.py::1x", False),
+])
+def test_exported_symbol_pattern_agrees_with_parse_symbol(symbol, matches):
+    assert bool(re.match(SYMBOL_JSON_PATTERN, symbol)) is matches
+    if matches:
+        parse_symbol(symbol)
+    else:
+        with pytest.raises(ValueError):
+            parse_symbol(symbol)
 
 
 def test_committed_json_schema_is_up_to_date():

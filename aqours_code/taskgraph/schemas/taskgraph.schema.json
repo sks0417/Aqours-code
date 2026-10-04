@@ -5,6 +5,7 @@
       "description": "Commands that verify one node.",
       "properties": {
         "commands": {
+          "description": "Shell commands, run from the repository root, that verify the node; at least one must be non-empty.",
           "items": {
             "type": "string"
           },
@@ -13,6 +14,7 @@
         },
         "timeout_s": {
           "default": 300,
+          "description": "Timeout in seconds for the check commands.",
           "exclusiveMinimum": 0,
           "title": "Timeout S",
           "type": "integer"
@@ -29,14 +31,17 @@
       "description": "A dependency or ordering constraint between two nodes.",
       "properties": {
         "from": {
+          "description": "Id of the upstream node.",
           "title": "From",
           "type": "string"
         },
         "to": {
+          "description": "Id of the downstream node.",
           "title": "To",
           "type": "string"
         },
         "type": {
+          "description": "Every edge means the downstream node starts only after the upstream node has finished and been merged. 'interface': the downstream node uses an interface defined by the upstream contract node; 'full': it depends on the upstream implementation; 'order': only the order matters, for example both nodes edit the same file.",
           "enum": [
             "interface",
             "full",
@@ -46,6 +51,7 @@
           "type": "string"
         },
         "source": {
+          "description": "Who added the edge: a person, an LLM, or a program rule.",
           "enum": [
             "manual",
             "llm",
@@ -55,6 +61,7 @@
           "type": "string"
         },
         "reason": {
+          "description": "Why the edge exists.",
           "title": "Reason",
           "type": "string"
         }
@@ -74,21 +81,30 @@
       "description": "Files a node may change, plus optional informational symbols.",
       "properties": {
         "modify": {
+          "description": "Files this node changes. Each must exist at the base commit or be created by an ancestor node.",
           "items": {
+            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, and no empty, '.' or '..' segments.",
             "type": "string"
           },
           "title": "Modify",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "create": {
+          "description": "New files this node creates. They must not exist at the base commit, and each new file is created by exactly one node.",
           "items": {
+            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, and no empty, '.' or '..' segments.",
             "type": "string"
           },
           "title": "Create",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "symbols": {
+          "description": "Informational only: functions or methods this node changes. Each symbol's file must be in this node's modify or create.",
           "items": {
+            "description": "Symbol 'path/to/file.py::Qualified.name': a repository-relative path to a .py file, '::', then Python identifiers joined by '.'.",
+            "pattern": "^[^:\\\\]+\\.py::[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$",
             "type": "string"
           },
           "title": "Symbols",
@@ -107,6 +123,7 @@
       "description": "Where a graph came from.",
       "properties": {
         "kind": {
+          "description": "'manual' for a hand-written graph, 'planner' for a generated one.",
           "enum": [
             "manual",
             "planner"
@@ -124,6 +141,7 @@
             }
           ],
           "default": null,
+          "description": "Version of the planner that produced the graph.",
           "title": "Planner Version"
         },
         "model": {
@@ -136,6 +154,7 @@
             }
           ],
           "default": null,
+          "description": "Model used by the planner.",
           "title": "Model"
         },
         "revision_mode": {
@@ -153,6 +172,7 @@
             }
           ],
           "default": null,
+          "description": "How the draft graph was revised: by an LLM ('llm'), by program rules plus an LLM ('rule_assisted'), or not at all ('none').",
           "title": "Revision Mode"
         }
       },
@@ -167,15 +187,18 @@
       "description": "One sub-task handed to a worker.",
       "properties": {
         "id": {
+          "description": "Unique node id: letters, digits, '_' and '-'.",
           "pattern": "^[A-Za-z0-9_-]+$",
           "title": "Id",
           "type": "string"
         },
         "title": {
+          "description": "Short name of the sub-task.",
           "title": "Title",
           "type": "string"
         },
         "kind": {
+          "description": "'contract' defines shared interfaces (new states, fields, signatures, API formats) that other nodes build on; 'implement' implements behavior.",
           "enum": [
             "contract",
             "implement"
@@ -184,35 +207,47 @@
           "type": "string"
         },
         "goal": {
+          "description": "Concrete, non-empty goal handed to the worker.",
           "title": "Goal",
           "type": "string"
         },
         "edit_set": {
-          "$ref": "#/$defs/EditSet"
+          "$ref": "#/$defs/EditSet",
+          "description": "Files the node may change."
         },
         "requires": {
+          "description": "Symbols this node uses. Each must exist at the base commit or be provided by an ancestor node.",
           "items": {
+            "description": "Symbol 'path/to/file.py::Qualified.name': a repository-relative path to a .py file, '::', then Python identifiers joined by '.'.",
+            "pattern": "^[^:\\\\]+\\.py::[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$",
             "type": "string"
           },
           "title": "Requires",
           "type": "array"
         },
         "provides": {
+          "description": "Symbols this node adds or changes for other nodes to use.",
           "items": {
+            "description": "Symbol 'path/to/file.py::Qualified.name': a repository-relative path to a .py file, '::', then Python identifiers joined by '.'.",
+            "pattern": "^[^:\\\\]+\\.py::[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$",
             "type": "string"
           },
           "title": "Provides",
           "type": "array"
         },
         "check": {
-          "$ref": "#/$defs/Check"
+          "$ref": "#/$defs/Check",
+          "description": "How to verify that the node is complete."
         },
         "context_files": {
+          "description": "Files the worker should read first. Each must exist at the base commit or be created by some node.",
           "items": {
+            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, and no empty, '.' or '..' segments.",
             "type": "string"
           },
           "title": "Context Files",
-          "type": "array"
+          "type": "array",
+          "uniqueItems": true
         },
         "size": {
           "anyOf": [
@@ -229,6 +264,7 @@
             }
           ],
           "default": null,
+          "description": "Expected size of the change.",
           "title": "Size"
         }
       },
@@ -248,6 +284,7 @@
       "description": "One recorded change made to a graph after generation.",
       "properties": {
         "action": {
+          "description": "Kind of change.",
           "enum": [
             "merge",
             "split",
@@ -260,6 +297,7 @@
           "type": "string"
         },
         "nodes": {
+          "description": "Ids of the nodes involved.",
           "items": {
             "type": "string"
           },
@@ -276,9 +314,11 @@
             }
           ],
           "default": null,
+          "description": "Id of the resulting node, for merge and split.",
           "title": "Into"
         },
         "reason": {
+          "description": "Why the change was made.",
           "title": "Reason",
           "type": "string"
         }
@@ -296,22 +336,27 @@
   "description": "A complete task graph for one request.",
   "properties": {
     "request_id": {
+      "description": "Identifier of the request.",
       "title": "Request Id",
       "type": "string"
     },
     "request": {
+      "description": "Original request text.",
       "title": "Request",
       "type": "string"
     },
     "repo": {
+      "description": "Name or path of the target repository.",
       "title": "Repo",
       "type": "string"
     },
     "base_commit": {
+      "description": "Commit the plan is based on.",
       "title": "Base Commit",
       "type": "string"
     },
     "final_checks": {
+      "description": "Commands to run after all nodes are merged.",
       "items": {
         "type": "string"
       },
@@ -319,9 +364,11 @@
       "type": "array"
     },
     "generator": {
-      "$ref": "#/$defs/Generator"
+      "$ref": "#/$defs/Generator",
+      "description": "Where this graph came from."
     },
     "nodes": {
+      "description": "Sub-tasks; at least one.",
       "items": {
         "$ref": "#/$defs/Node"
       },
@@ -330,6 +377,7 @@
       "type": "array"
     },
     "edges": {
+      "description": "Dependency and ordering constraints.",
       "items": {
         "$ref": "#/$defs/Edge"
       },
@@ -337,6 +385,7 @@
       "type": "array"
     },
     "revision_log": {
+      "description": "Changes made to the graph after generation.",
       "items": {
         "$ref": "#/$defs/RevisionEntry"
       },
