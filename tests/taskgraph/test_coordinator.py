@@ -133,6 +133,7 @@ def test_failure_skips_downstream_only(toy_repo, tmp_path):
     nodes = result.summary["nodes"]
     assert nodes["B"]["status"] == "failed" and nodes["B"]["reason"] == "worker_error"
     assert nodes["B"]["attempts"] == 2
+    assert nodes["B"]["worker_reasons"] == ["worker_error", "worker_error"]
     assert nodes["D"]["status"] == "skipped" and nodes["D"]["reason"] == "upstream_failed"
     assert nodes["C"]["status"] == "merged" and nodes["A"]["status"] == "merged"
     assert result.summary["status"] == "partial"
@@ -148,11 +149,32 @@ def test_retry_succeeds_and_prompt_carries_check_output(toy_repo, tmp_path):
     result = run(toy_repo, tmp_path, graph, {"R": command})
     record = result.summary["nodes"]["R"]
     assert record["status"] == "merged" and record["attempts"] == 2
+    assert record["worker_reasons"] == ["", ""]
     prompt = (result.run_dir / "nodes" / "R" / "prompt_2.md").read_text(encoding="utf-8")
     assert "check_failed" in prompt and "CHECK-SAW bad" in prompt
     assert "CHECK-SAW bad" not in (result.run_dir / "nodes/R/prompt_1.md").read_text(
         encoding="utf-8")
     assert integration_subjects(result) == ["[taskgraph] R: R"]
+
+
+def test_worker_timeout_with_finished_work_is_checked_and_merged(toy_repo, tmp_path):
+    graph = graph_for(toy_repo, [node("T", create=("t.txt",))])
+    command = py("import pathlib, time; pathlib.Path('t.txt').write_text('T'); "
+                 "time.sleep(30)")
+    result = run(toy_repo, tmp_path, graph, {"T": command}, worker_timeout_s=1)
+    record = result.summary["nodes"]["T"]
+    assert record["status"] == "merged", record
+    assert record["attempts"] == 1 and record["worker_reasons"] == ["worker_timeout"]
+    assert integration_subjects(result) == ["[taskgraph] T: T"]
+
+
+def test_worker_timeout_without_changes_fails(toy_repo, tmp_path):
+    graph = graph_for(toy_repo, [node("T", create=("t.txt",))])
+    result = run(toy_repo, tmp_path, graph, {"T": py("import time; time.sleep(30)")},
+                 worker_timeout_s=1, max_attempts=1)
+    record = result.summary["nodes"]["T"]
+    assert record["status"] == "failed" and record["reason"] == "worker_timeout"
+    assert record["worker_reasons"] == ["worker_timeout"]
 
 
 def test_no_changes_fails(toy_repo, tmp_path):

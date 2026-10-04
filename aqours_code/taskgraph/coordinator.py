@@ -61,6 +61,7 @@ class NodeRecord:
     status: str = "pending"  # pending, running, merged, failed, skipped
     reason: str = ""
     attempts: int = 0
+    worker_reasons: list[str] = field(default_factory=list)
     start_t: float | None = None
     end_t: float | None = None
     worker_time_s: float = 0.0
@@ -282,8 +283,12 @@ class Coordinator:
             with self.git_lock:
                 gitops.commit_all(worktree, f"attempt {attempt}")
                 changed = gitops.changed_files(worktree, start)
-            if not result.ok:
-                record.reason = result.reason or "worker_error"
+            worker_reason = "" if result.ok else (result.reason or "worker_error")
+            record.worker_reasons.append(worker_reason)
+            # A worker that timed out may still have finished the work: if it
+            # changed files, its checks decide. Other worker failures are final.
+            if worker_reason and not (worker_reason == "worker_timeout" and changed):
+                record.reason = worker_reason
                 failure = AttemptFailure(record.reason, result.error or result.final_answer)
                 continue
             if not changed:

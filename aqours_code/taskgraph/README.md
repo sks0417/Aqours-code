@@ -253,10 +253,14 @@ shell command per node instead (tests and debugging only).
 3. **Each node**, up to `--max-attempts` times (default 2): create
    `tg/node/<id>` and worktree `wt/<id>` from the integration HEAD, write the
    prompt, run the worker, and commit `attempt <n>`. The attempt fails on a
-   worker error or timeout, on no change since the start
+   worker error (`worker_error`), on a timeout without changes
+   (`worker_timeout`), on no change since the start
    commit (`no_changes`), or on a failing check command run in the worktree
    (`check_failed`). A retry continues in the same worktree with the failure
-   reason and the last 4000 characters of output in the prompt.
+   reason and the last 4000 characters of output in the prompt. A worker that
+   times out after changing files may have finished its work, so its checks
+   still run and decide the attempt. Each attempt's worker outcome is kept in
+   `worker_reasons` (`""` when the worker ended normally).
 4. **Merge.** Squash-merge the node branch into `tg/integration` as one commit
    `[taskgraph] <id>: <title>`. A conflict resets the branch and fails the node
    (`merge_conflict`); the node's checks then run again on the integration
@@ -308,7 +312,7 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
 ### summary.json
 
 - `run_id`, `status`, `wall_time_s`, `config`, `integration_commit`;
-- `nodes.<id>`: `status`, `reason`, `attempts`, `start_t`, `end_t`,
+- `nodes.<id>`: `status`, `reason`, `attempts`, `worker_reasons`, `start_t`, `end_t`,
   `worker_time_s`, `check_time_s` (node and post-merge checks),
   `model_calls`, `input_tokens`, `output_tokens`, `changed_files`,
   `out_of_scope_files`, `merge_commit`, `error`;
