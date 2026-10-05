@@ -1,0 +1,1 @@
+Extend this job runner into a small job platform: add job priorities with fair scheduling across tenants, delayed and recurring jobs, dependencies between jobs, per-kind rate limits, webhook notifications for job state changes, and an audit log with a statistics API. Expose all of them through the REST API and the web dashboard. Follow SPEC.md.
