@@ -1,0 +1,51 @@
+{
+  "request_id": "job-platform-coupled-single",
+  "request": "Extend this job runner into a small job platform: add job priorities with fair scheduling across tenants, delayed and recurring jobs, dependencies between jobs, per-kind rate limits, webhook notifications for job state changes, and an audit log with a statistics API. Expose all of them through the REST API and the web dashboard. Follow SPEC.md.",
+  "repo": "job_platform/coupled",
+  "base_commit": "07dd348acbc2016a6ccc8983476950d970b1ec51",
+  "final_checks": [
+    "python -m pytest -q tests"
+  ],
+  "generator": {
+    "kind": "manual",
+    "revision_mode": "none"
+  },
+  "nodes": [
+    {
+      "id": "solve",
+      "title": "Implement the whole request",
+      "kind": "implement",
+      "goal": "Extend this job runner into a small job platform: add job priorities with fair scheduling across tenants, delayed and recurring jobs, dependencies between jobs, per-kind rate limits, webhook notifications for job state changes, and an audit log with a statistics API. Expose all of them through the REST API and the web dashboard. Follow SPEC.md.\nFollow SPEC.md. Keep the public interface listed in SPEC.md and keep the existing tests passing; add tests for the new behaviour in tests/test_platform.py.",
+      "edit_set": {
+        "modify": [
+          "jobrunner/models.py",
+          "jobrunner/errors.py",
+          "jobrunner/store.py",
+          "jobrunner/runner.py",
+          "jobrunner/api.py",
+          "jobrunner/dashboard.py"
+        ],
+        "create": [
+          "tests/test_platform.py"
+        ],
+        "symbols": []
+      },
+      "requires": [],
+      "requires_impl": [],
+      "provides": [],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "SPEC.md",
+        "README.md"
+      ],
+      "size": "large"
+    }
+  ],
+  "edges": [],
+  "revision_log": []
+}
