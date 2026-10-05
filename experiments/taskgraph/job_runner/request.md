@@ -1,0 +1,1 @@
+Add job cancellation, automatic retries for failed jobs, and recovery after a process restart to this job runner. Expose cancellation and retry status through the REST API and show them on the web dashboard. Follow the behaviour specified in SPEC.md.

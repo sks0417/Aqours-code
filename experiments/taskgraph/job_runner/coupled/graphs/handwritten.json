@@ -1,0 +1,380 @@
+{
+  "request_id": "job-runner-coupled-handwritten",
+  "request": "Add job cancellation, automatic retries for failed jobs, and recovery after a process restart to this job runner. Expose cancellation and retry status through the REST API and show them on the web dashboard. Follow the behaviour specified in SPEC.md.",
+  "repo": "job_runner/coupled",
+  "base_commit": "c5f6bdac5fbfeceb17f26598b2ed7b7ad5e677eb",
+  "final_checks": [
+    "python -m pytest -q tests"
+  ],
+  "generator": {
+    "kind": "manual",
+    "revision_mode": "none"
+  },
+  "nodes": [
+    {
+      "id": "A",
+      "title": "Contract: states, job fields, errors, cancel signature",
+      "kind": "contract",
+      "goal": "This is the contract every other sub-task builds on; follow SPEC.md for names, types, and defaults. Give each new name a docstring. In jobrunner/models.py add JobStatus.CANCELLED (final) and the Job fields attempts=0, max_attempts=3, next_run_at=0.0, last_error=None, cancel_requested=False, and include them in Job.to_dict. In jobrunner/errors.py add TransientError and InvalidTransition. In jobrunner/store.py keep the new fields of saved jobs in an in-memory dict so get/list return them within one JobStore object (persistence comes later). In jobrunner/runner.py make submit set max_attempts and next_run_at, and add Runner.cancel(job_id) -> Job: PENDING becomes CANCELLED, RUNNING gets cancel_requested=True, a final job raises InvalidTransition, an unknown id raises JobNotFound. Do not implement retries, recovery, or the handling of cancel_requested after a run. Write tests/test_contract.py for these names and defaults.",
+      "edit_set": {
+        "modify": [
+          "jobrunner/models.py",
+          "jobrunner/errors.py",
+          "jobrunner/store.py",
+          "jobrunner/runner.py"
+        ],
+        "create": [
+          "tests/test_contract.py"
+        ],
+        "symbols": [
+          "jobrunner/models.py::Job",
+          "jobrunner/models.py::Job.to_dict",
+          "jobrunner/runner.py::Runner.submit"
+        ]
+      },
+      "requires": [],
+      "requires_impl": [],
+      "provides": [
+        "jobrunner/models.py::JobStatus.CANCELLED",
+        "jobrunner/models.py::Job.attempts",
+        "jobrunner/models.py::Job.max_attempts",
+        "jobrunner/models.py::Job.next_run_at",
+        "jobrunner/models.py::Job.last_error",
+        "jobrunner/models.py::Job.cancel_requested",
+        "jobrunner/models.py::Job.to_dict",
+        "jobrunner/errors.py::TransientError",
+        "jobrunner/errors.py::InvalidTransition",
+        "jobrunner/runner.py::Runner.cancel"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_contract.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "SPEC.md",
+        "README.md",
+        "jobrunner/models.py",
+        "jobrunner/store.py",
+        "jobrunner/runner.py"
+      ],
+      "size": "medium"
+    },
+    {
+      "id": "B",
+      "title": "Persist job progress in SQLite",
+      "kind": "implement",
+      "goal": "Make jobrunner/store.py persist attempts, max_attempts, next_run_at, last_error, and cancel_requested in the jobs table (add the columns, migrating an existing table) and read them back in get and list, replacing the in-memory fields from the contract. A new JobStore on the same file must see every field (SPEC.md 'Restart recovery'). Write tests/test_persistence.py.",
+      "edit_set": {
+        "modify": [
+          "jobrunner/store.py"
+        ],
+        "create": [
+          "tests/test_persistence.py"
+        ],
+        "symbols": [
+          "jobrunner/store.py::JobStore.save",
+          "jobrunner/store.py::JobStore.get"
+        ]
+      },
+      "requires": [
+        "jobrunner/models.py::Job.attempts",
+        "jobrunner/models.py::Job.max_attempts",
+        "jobrunner/models.py::Job.next_run_at",
+        "jobrunner/models.py::Job.last_error",
+        "jobrunner/models.py::Job.cancel_requested"
+      ],
+      "requires_impl": [],
+      "provides": [
+        "jobrunner/store.py::JobStore.save",
+        "jobrunner/store.py::JobStore.get"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_persistence.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "SPEC.md",
+        "jobrunner/store.py",
+        "jobrunner/models.py"
+      ],
+      "size": "medium"
+    },
+    {
+      "id": "C",
+      "title": "Retries and restart recovery in the runner queue",
+      "kind": "implement",
+      "goal": "Retries and restart recovery share the runner's re-queue logic, so implement both in jobrunner/runner.py. Count an attempt when a job starts; order the queue by next_run_at then id and only run due jobs; on TransientError apply SPEC.md 'Retries' (back to PENDING with next_run_at = now + base_delay * 2 ** (n - 1), or FAILED); any other Exception fails at once; record last_error. In Runner.__init__ recover RUNNING jobs per SPEC.md 'Restart recovery' (CANCELLED if cancel_requested, otherwise one failure) and re-queue pending jobs. Change _enqueue and run_once for this. Write tests/test_retry_recovery.py; within one JobStore object the progress fields are available before persistence lands.",
+      "edit_set": {
+        "modify": [
+          "jobrunner/runner.py"
+        ],
+        "create": [
+          "tests/test_retry_recovery.py"
+        ],
+        "symbols": [
+          "jobrunner/runner.py::Runner.run_once",
+          "jobrunner/runner.py::Runner._enqueue",
+          "jobrunner/runner.py::Runner.__init__"
+        ]
+      },
+      "requires": [
+        "jobrunner/models.py::Job.attempts",
+        "jobrunner/models.py::Job.max_attempts",
+        "jobrunner/models.py::Job.next_run_at",
+        "jobrunner/models.py::Job.last_error",
+        "jobrunner/models.py::Job.cancel_requested",
+        "jobrunner/errors.py::TransientError"
+      ],
+      "requires_impl": [],
+      "provides": [
+        "jobrunner/runner.py::Runner.run_once"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_retry_recovery.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "SPEC.md",
+        "README.md",
+        "jobrunner/runner.py"
+      ],
+      "size": "large"
+    },
+    {
+      "id": "D",
+      "title": "Cancellation of running jobs",
+      "kind": "implement",
+      "goal": "Complete cancellation in jobrunner/runner.py per SPEC.md 'Cancellation': after a handler finishes, if the job's stored cancel_requested is set (it may have been set while the handler ran), the job becomes CANCELLED, its result is discarded, and it is not retried even after a TransientError. Pending jobs that were cancelled, including ones waiting for a retry, must never run. Write tests/test_cancel.py.",
+      "edit_set": {
+        "modify": [
+          "jobrunner/runner.py"
+        ],
+        "create": [
+          "tests/test_cancel.py"
+        ],
+        "symbols": [
+          "jobrunner/runner.py::Runner.cancel",
+          "jobrunner/runner.py::Runner.run_once"
+        ]
+      },
+      "requires": [
+        "jobrunner/models.py::JobStatus.CANCELLED",
+        "jobrunner/models.py::Job.cancel_requested",
+        "jobrunner/errors.py::InvalidTransition"
+      ],
+      "requires_impl": [],
+      "provides": [
+        "jobrunner/runner.py::Runner.cancel",
+        "jobrunner/runner.py::Runner.run_once"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_cancel.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "SPEC.md",
+        "jobrunner/runner.py"
+      ],
+      "size": "medium"
+    },
+    {
+      "id": "E",
+      "title": "REST API for cancellation and retry status",
+      "kind": "implement",
+      "goal": "Extend jobrunner/api.py as SPEC.md 'REST API' requires: add POST /jobs/<id>/cancel (200 with the job, 404 for an unknown id, 409 when Runner.cancel raises InvalidTransition) and make sure job JSON (Job.to_dict) includes attempts, max_attempts, next_run_at, last_error, and cancel_requested. Keep the existing routes and error format. Write tests/test_api_status.py covering the new route and fields.",
+      "edit_set": {
+        "modify": [
+          "jobrunner/api.py"
+        ],
+        "create": [
+          "tests/test_api_status.py"
+        ],
+        "symbols": [
+          "jobrunner/api.py::handle"
+        ]
+      },
+      "requires": [
+        "jobrunner/models.py::Job.to_dict",
+        "jobrunner/models.py::Job.last_error",
+        "jobrunner/models.py::Job.next_run_at",
+        "jobrunner/runner.py::Runner.cancel",
+        "jobrunner/errors.py::InvalidTransition"
+      ],
+      "requires_impl": [],
+      "provides": [
+        "jobrunner/api.py::handle"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_api_status.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "SPEC.md",
+        "jobrunner/api.py",
+        "jobrunner/runner.py"
+      ],
+      "size": "medium"
+    },
+    {
+      "id": "F",
+      "title": "Dashboard columns and cancel form",
+      "kind": "implement",
+      "goal": "Change jobrunner/dashboard.py render_jobs as SPEC.md 'Dashboard' requires: columns ID, Kind, Status, Attempts (attempts/max_attempts), Next retry (next_run_at with one decimal for a PENDING job with attempts > 0, otherwise '-'), and Actions (the cancel form for PENDING and RUNNING jobs, empty otherwise). Keep HTML escaping. Write tests/test_dashboard_status.py.",
+      "edit_set": {
+        "modify": [
+          "jobrunner/dashboard.py"
+        ],
+        "create": [
+          "tests/test_dashboard_status.py"
+        ],
+        "symbols": [
+          "jobrunner/dashboard.py::render_jobs"
+        ]
+      },
+      "requires": [
+        "jobrunner/models.py::JobStatus.CANCELLED",
+        "jobrunner/models.py::Job.attempts",
+        "jobrunner/models.py::Job.max_attempts",
+        "jobrunner/models.py::Job.next_run_at"
+      ],
+      "requires_impl": [],
+      "provides": [
+        "jobrunner/dashboard.py::render_jobs"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_dashboard_status.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "SPEC.md",
+        "jobrunner/dashboard.py",
+        "jobrunner/models.py"
+      ],
+      "size": "medium"
+    },
+    {
+      "id": "G",
+      "title": "Integration and end-to-end tests",
+      "kind": "implement",
+      "goal": "Write tests/test_end_to_end.py exercising SPEC.md end to end through the REST API and the dashboard: flaky jobs retried to success, cancellation of pending and running jobs, and a restart (a new JobStore and Runner on the same database file) recovering waiting and interrupted jobs. Fix any mismatch between modules that these tests reveal.",
+      "edit_set": {
+        "modify": [
+          "jobrunner/store.py",
+          "jobrunner/runner.py",
+          "jobrunner/api.py",
+          "jobrunner/dashboard.py"
+        ],
+        "create": [
+          "tests/test_end_to_end.py"
+        ],
+        "symbols": []
+      },
+      "requires": [],
+      "requires_impl": [
+        "jobrunner/store.py::JobStore.save",
+        "jobrunner/store.py::JobStore.get",
+        "jobrunner/runner.py::Runner.run_once",
+        "jobrunner/runner.py::Runner.cancel",
+        "jobrunner/api.py::handle",
+        "jobrunner/dashboard.py::render_jobs"
+      ],
+      "provides": [],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_end_to_end.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "SPEC.md",
+        "README.md"
+      ],
+      "size": "medium"
+    }
+  ],
+  "edges": [
+    {
+      "from": "A",
+      "to": "B",
+      "type": "interface",
+      "source": "manual",
+      "reason": "B persists the job fields defined by A"
+    },
+    {
+      "from": "A",
+      "to": "C",
+      "type": "interface",
+      "source": "manual",
+      "reason": "C uses A's job fields and TransientError"
+    },
+    {
+      "from": "A",
+      "to": "E",
+      "type": "interface",
+      "source": "manual",
+      "reason": "E calls Runner.cancel and serializes A's fields"
+    },
+    {
+      "from": "A",
+      "to": "F",
+      "type": "interface",
+      "source": "manual",
+      "reason": "F renders A's job fields"
+    },
+    {
+      "from": "C",
+      "to": "D",
+      "type": "order",
+      "source": "manual",
+      "reason": "C and D both change Runner.run_once in runner.py"
+    },
+    {
+      "from": "B",
+      "to": "G",
+      "type": "full",
+      "source": "manual",
+      "reason": "end-to-end restart tests need real persistence"
+    },
+    {
+      "from": "D",
+      "to": "G",
+      "type": "full",
+      "source": "manual",
+      "reason": "end-to-end tests need retries, recovery, and cancellation"
+    },
+    {
+      "from": "E",
+      "to": "G",
+      "type": "full",
+      "source": "manual",
+      "reason": "end-to-end tests use the cancel endpoint"
+    },
+    {
+      "from": "F",
+      "to": "G",
+      "type": "full",
+      "source": "manual",
+      "reason": "end-to-end tests check the dashboard"
+    }
+  ],
+  "revision_log": []
+}
