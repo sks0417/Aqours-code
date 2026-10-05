@@ -255,3 +255,68 @@ def test_non_deepseek_provider_retains_existing_tool_choice(monkeypatch):
     assert payload["tool_choice"] == "auto"
     assert "thinking" not in payload
     assert "reasoning_effort" not in payload
+
+
+def test_deepseek_flash_gets_the_128k_output_limit():
+    assert effective_initial_max_tokens(
+        "deepseek",
+        "deepseek-flash",
+        configured_default_max_tokens=8_000,
+    ) == 128_000
+    assert effective_escalated_max_tokens(
+        "DeepSeek",
+        "deepseek-flash",
+        current_max_tokens=8_000,
+        configured_escalated_max_tokens=16_000,
+    ) == 128_000
+    assert effective_initial_max_tokens(
+        "openai",
+        "deepseek-flash",
+        configured_default_max_tokens=8_000,
+    ) == 8_000
+
+
+def test_deepseek_flash_payload_keeps_tool_choice_without_thinking(monkeypatch):
+    captured = {}
+
+    class FakeHttpResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "choices": [{
+                    "message": {"content": "done"},
+                    "finish_reason": "stop",
+                }],
+            }).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeHttpResponse()
+
+    monkeypatch.setattr(
+        "aqours_code.model_api.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    messages = OpenAICompatibleMessages(
+        "sk-test",
+        "https://api.deepseek.com",
+        provider_name="DeepSeek",
+    )
+
+    messages.create(
+        model="deepseek-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"name": "read_file", "input_schema": {}}],
+        max_tokens=128_000,
+    )
+
+    payload = captured["payload"]
+    assert payload["max_tokens"] == 128_000
+    assert payload["tool_choice"] == "auto"
+    assert "thinking" not in payload
+    assert "reasoning_effort" not in payload

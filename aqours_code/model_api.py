@@ -11,6 +11,9 @@ from types import SimpleNamespace
 DEEPSEEK_V4_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
 DEEPSEEK_REASONING_EFFORT = "high"
 DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS = 128_000
+# DeepSeek models that get the 128K output limit. Only the output limit:
+# thinking, reasoning_effort, and tool_choice still follow DEEPSEEK_V4_MODELS.
+DEEPSEEK_128K_OUTPUT_MODELS = DEEPSEEK_V4_MODELS | {"deepseek-flash"}
 
 
 def uses_deepseek_thinking(provider_name: str, model: str) -> bool:
@@ -20,13 +23,20 @@ def uses_deepseek_thinking(provider_name: str, model: str) -> bool:
     )
 
 
+def uses_deepseek_128k_output(provider_name: str, model: str) -> bool:
+    return (
+        str(provider_name).casefold() == "deepseek"
+        and str(model).casefold() in DEEPSEEK_128K_OUTPUT_MODELS
+    )
+
+
 def effective_initial_max_tokens(
     provider_name: str,
     model: str,
     *,
     configured_default_max_tokens: int,
 ) -> int:
-    if uses_deepseek_thinking(provider_name, model):
+    if uses_deepseek_128k_output(provider_name, model):
         return max(
             int(configured_default_max_tokens),
             DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS,
@@ -43,7 +53,7 @@ def effective_escalated_max_tokens(
 ) -> int:
     provider_escalation = (
         DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS
-        if uses_deepseek_thinking(provider_name, model)
+        if uses_deepseek_128k_output(provider_name, model)
         else configured_escalated_max_tokens
     )
     return max(
