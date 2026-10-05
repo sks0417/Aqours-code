@@ -180,18 +180,47 @@ derived". These entries come after all edge entries. Run
 `validate()` on the result to decide whether it is usable. W5 situations get
 no derived edge.
 
+## Flattening
+
+`flatten_graph(graph)` turns a graph into a one-node graph that carries the
+whole plan, for a "single agent with the same plan" baseline:
+
+- one `implement` node, id `planned`;
+- its goal is the request, the line "Work through the following steps in
+  order; each step lists its goal and files.", and one step per original
+  node in topological order (ties keep the `nodes` order): title and id,
+  goal, files to modify and create, and test files to write (paths under a
+  `tests` directory or named `test_*`);
+- `edit_set`: the union of every node's `modify`, `create` and `symbols`,
+  without repeats; a file created by one node and modified by another is only
+  in `create`;
+- `requires` and `requires_impl`: dependencies between nodes of the graph are
+  dropped; only symbols that no node lists in `provides` or `edit_set.symbols`
+  are kept (in a valid graph, these exist at the base commit);
+- `provides`: the union; `context_files`: the union without files the graph
+  creates; `check.commands`: merged in topological order without repeats,
+  with the largest `timeout_s`; `size`: the largest;
+- graph-level fields are kept, `edges` is empty, and an `other` revision
+  records which graph was flattened.
+
+The result passes `validate()` with no errors on the repository of the
+original graph. It does get one W2 warning per provided symbol, because no
+other node is left to require it. A cyclic graph raises `ValueError`.
+
 ## CLI
 
 ```bash
 python -m aqours_code.taskgraph validate <graph.json> [--repo <path>]
 python -m aqours_code.taskgraph derive <graph.json> --repo <path> --out <new_graph.json>
+python -m aqours_code.taskgraph flatten <graph.json> --out <single_planned.json> [--repo <path>]
 python -m aqours_code.taskgraph index --repo <path> --commit <sha>
 python -m aqours_code.taskgraph export-schema [--out <path>]
 ```
 
-`--repo` indexes the repository at the graph's `base_commit`. Exit codes:
-`0` valid, `1` validation errors (for `derive`: the derived graph is still
-invalid), `2` unreadable input, schema mismatch, an unwritable `--out`, or a
+`--repo` indexes the repository at the graph's `base_commit`; `flatten`
+only uses it to validate its result. Exit codes:
+`0` valid, `1` validation errors (for `derive` and `flatten`: the written
+graph is invalid), `2` unreadable input, schema mismatch, an unwritable `--out`, or a
 git failure (including a missing `git` executable or an unknown commit). Exit
 code `2` errors go to stderr as one `error:` line; a schema mismatch is
 followed by pydantic's error details. Output lines
@@ -224,13 +253,17 @@ repository). Pass `--out` to keep run directories outside the repository,
 for example `--out /tmp/tg-runs`; this also keeps the hidden-test run from
 picking up the Aqours pytest configuration.
 
-### Three schemes, one pipeline
+### Four schemes, one pipeline
 
 | Scheme | How to run it |
 | --- | --- |
-| Single-agent baseline | A graph with one node that edits every file |
-| Sequential | `--workers 1` |
-| Parallel | `--workers N` |
+| Single-agent baseline | A graph with one node that edits every file, goal = the request |
+| Single agent with the plan | `flatten` of the hand-written graph, `--workers 1` |
+| Sequential | the hand-written graph, `--workers 1` |
+| Parallel | the hand-written graph, `--workers N` |
+
+The planned single agent separates the effect of the detailed plan from the
+effect of splitting the work across workers.
 
 All schemes use the same worker: `AqoursWorker` runs
 `aqours_code.agent_loop.run_agent_task()` in a child process

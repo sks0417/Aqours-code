@@ -6,8 +6,9 @@ priorities with fair scheduling across tenants, delayed and recurring jobs,
 dependencies between jobs, per-kind rate limits, webhook notifications, and an
 audit log with statistics, each exposed through the REST API and the
 dashboard. It is applied to two repositories with the same public interface
-and different internal structure, to compare a single agent, a hand-written
-graph run sequentially, and the same graph run in parallel.
+and different internal structure, to compare a single agent, a single agent
+given the hand-written plan, a hand-written graph run sequentially, and the
+same graph run in parallel.
 
 Everything here is data: neither Aqours nor `aqours_code.taskgraph` imports it.
 The two tasks are independent; `job_runner/` is unchanged.
@@ -35,8 +36,9 @@ coupled/  modular/
   base/             repository content: jobrunner/, tests/, SPEC.md, README.md, pyproject.toml
   reference/        reference solution: only new or changed files, copied over base/
   graphs/
-    single.json       one-node graph (single-agent baseline)
-    handwritten.json  hand-written task graph
+    single.json          one-node graph (single-agent baseline)
+    single_planned.json  handwritten.json flattened into one node with the whole plan
+    handwritten.json     hand-written task graph
 ```
 
 `SPEC.md` (identical in both variants) states the required behaviour of every
@@ -166,10 +168,24 @@ How it differs from coupled, and why:
   modules, and the `Runner` delegations, against about 300 in coupled), which is the price of making the six nodes
   independent.
 
+### The planned single-node graph
+
+`single_planned.json` is `handwritten.json` flattened by
+`python -m aqours_code.taskgraph flatten` (see the
+[task graph README](../../../aqours_code/taskgraph/README.md#flattening)): one
+node whose goal is the request followed by every hand-written node as a step,
+in topological order (about 8,100 characters in coupled and 9,200 in modular,
+against about 500 in `single.json`), with the union of their files and checks.
+It gives a single agent the same detailed plan as the graph, so a difference
+between `single` and `single_planned` measures the plan, and a difference
+between `single_planned` and `seq`/`par` measures splitting the work. It
+validates with no errors; its W2 warnings (a provided symbol that no other
+node requires) are inherent to a one-node graph.
+
 ### Validation
 
-All four graphs pass `validate()` on their generated repository with no errors
-and **no warnings**, and `derive_edges()` adds no edge to either hand-written
+The single and hand-written graphs of both variants pass `validate()` on their
+generated repository with no errors and **no warnings**, and `derive_edges()` adds no edge to either hand-written
 graph. `requires` holds interface dependencies (satisfied by the contract
 node); `requires_impl` holds implementation dependencies (R on S's
 `JobStore.add` in coupled; G on every feature in both).
@@ -181,6 +197,9 @@ the hidden test results below, and the graph shapes.
 - **Single agent**: one context for about 1,250 changed lines in six (coupled)
   or fourteen (modular) files. Expect long runs, context compaction, and
   missed details in the strict SPEC formats.
+- **Single agent with the plan**: the same context load, but the design
+  decisions (module split, stubs, field names) are already made; compare with
+  `single` to see what the plan alone is worth.
 - **Graph, sequential (`--workers 1`)**: the same total work as the single agent
   plus per-node overhead; worth it only if smaller contexts make nodes more
   accurate.
@@ -228,7 +247,7 @@ every platform (LF files, `core.autocrlf=false`, fixed author, date, and
 message). `--with-reference` copies the reference solution over the working
 tree after the commit, without committing it.
 
-## Running the three schemes
+## Running the four configurations
 
 Workers make long model calls on this task. Set the request timeout in `.env`
 before running, or requests time out mid-node:
@@ -245,13 +264,26 @@ python experiments/taskgraph/job_platform/make_repo.py coupled /tmp/jp-coupled
 H=experiments/taskgraph/job_platform/hidden_tests
 G=experiments/taskgraph/job_platform/coupled/graphs
 
-# single agent
+# single: single agent, request only
 python -m aqours_code.taskgraph run $G/single.json --repo /tmp/jp-coupled --workers 1 --hidden-tests $H --out /tmp/jp-runs
-# hand-written graph, sequential
+# single_planned: single agent, the whole plan
+python -m aqours_code.taskgraph run $G/single_planned.json --repo /tmp/jp-coupled --workers 1 --hidden-tests $H --out /tmp/jp-runs
+# seq: hand-written graph, sequential
 python -m aqours_code.taskgraph run $G/handwritten.json --repo /tmp/jp-coupled --workers 1 --hidden-tests $H --out /tmp/jp-runs
-# hand-written graph, parallel
+# par: hand-written graph, parallel
 python -m aqours_code.taskgraph run $G/handwritten.json --repo /tmp/jp-coupled --workers 4 --hidden-tests $H --out /tmp/jp-runs
 ```
+
+| Configuration | Graph | `--workers` |
+| --- | --- | --- |
+| `single` | `single.json` | 1 |
+| `single_planned` | `single_planned.json` | 1 |
+| `seq` | `handwritten.json` | 1 |
+| `par` | `handwritten.json` | 4 |
+
+After changing `handwritten.json`, regenerate `single_planned.json` with
+`python -m aqours_code.taskgraph flatten $G/handwritten.json --out $G/single_planned.json`;
+`tests/taskgraph/test_flatten.py` fails while the committed file is stale.
 
 Replace `coupled` with `modular` for the other variant. Each run clones the
 repository, so one generated repository serves every run. The default

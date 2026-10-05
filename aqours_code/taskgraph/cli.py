@@ -9,6 +9,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from .derive import derive_edges
+from .flatten import flatten_graph
 from .repo_index import RepoIndex, build_index
 from .schema import DEFAULT_SCHEMA_PATH, Graph, dump_graph, export_json_schema, load_graph
 from .validate import validate
@@ -79,6 +80,29 @@ def _cmd_derive(args: argparse.Namespace) -> int:
     for entry in entries:
         print(f"[{entry.action}] {entry.reason}")
     report = validate(derived, index)
+    print(report.format())
+    print(f"wrote {args.out}")
+    return EXIT_OK if report.ok else EXIT_INVALID
+
+
+def _cmd_flatten(args: argparse.Namespace) -> int:
+    graph = _load(args.graph)
+    if graph is None:
+        return EXIT_INPUT_ERROR
+    index = None
+    if args.repo:
+        index = _index(args.repo, graph.base_commit)
+        if index is None:
+            return EXIT_INPUT_ERROR
+    try:
+        flat = flatten_graph(graph)
+    except ValueError as exc:
+        return _error(f"cannot flatten {args.graph}: {exc}")
+    try:
+        dump_graph(flat, args.out)
+    except OSError as exc:
+        return _error(f"cannot write {args.out}: {exc.strerror or exc}")
+    report = validate(flat, index)
     print(report.format())
     print(f"wrote {args.out}")
     return EXIT_OK if report.ok else EXIT_INVALID
@@ -166,6 +190,13 @@ def build_parser() -> argparse.ArgumentParser:
     derive_cmd.add_argument("--repo", required=True)
     derive_cmd.add_argument("--out", required=True)
     derive_cmd.set_defaults(func=_cmd_derive)
+
+    flatten_cmd = commands.add_parser(
+        "flatten", help="turn a graph into one node that carries the whole plan")
+    flatten_cmd.add_argument("graph")
+    flatten_cmd.add_argument("--out", required=True)
+    flatten_cmd.add_argument("--repo", help="validate the result against this repository")
+    flatten_cmd.set_defaults(func=_cmd_flatten)
 
     index_cmd = commands.add_parser("index", help="print the symbols of a commit")
     index_cmd.add_argument("--repo", required=True)

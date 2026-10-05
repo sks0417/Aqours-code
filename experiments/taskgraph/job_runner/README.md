@@ -4,8 +4,9 @@ The main example task of the task graph project. One request
 ([`request.md`](request.md)) is applied to two repositories that offer the
 same public interface but differ in internal structure:
 
-- the same task runs as a single agent, as a hand-written graph executed
-  sequentially, and as the same graph executed in parallel;
+- the same task runs as a single agent, as a single agent given the
+  hand-written plan, as a hand-written graph executed sequentially, and as the
+  same graph executed in parallel;
 - the two variants show that **the same request on differently structured code
   leads to different task graphs**.
 
@@ -19,8 +20,9 @@ coupled/  modular/
   base/             repository content: jobrunner/, tests/, SPEC.md, README.md, pyproject.toml
   reference/        reference solution: only new or changed files, copied over base/
   graphs/
-    single.json       one-node graph (single-agent baseline)
-    handwritten.json  hand-written task graph
+    single.json          one-node graph (single-agent baseline)
+    single_planned.json  handwritten.json flattened into one node with the whole plan
+    handwritten.json     hand-written task graph
 ```
 
 `SPEC.md` (identical in both variants) states the required behaviour of
@@ -101,10 +103,21 @@ How it differs from coupled, and why:
 SPEC.md", whose edit set is every file the reference solution touches, and
 whose check is `python -m pytest -q tests`.
 
+`single_planned.json` is `handwritten.json` flattened by
+`python -m aqours_code.taskgraph flatten` (see the
+[task graph README](../../../aqours_code/taskgraph/README.md#flattening)): one
+node whose goal is the request followed by every hand-written node as a step,
+in topological order, with the union of their files and checks. It gives a
+single agent the same detailed plan as the graph, so a difference between
+`single` and `single_planned` measures the plan, and a difference between
+`single_planned` and `seq`/`par` measures splitting the work. It validates
+with no errors; its W2 warnings (a provided symbol that no other node
+requires) are inherent to a one-node graph.
+
 ### Validation
 
-All four graphs pass `validate()` on their generated repository with no
-errors and **no warnings**, and `derive_edges()` adds no edge to either
+The single and hand-written graphs of both variants pass `validate()` on
+their generated repository with no errors and **no warnings**, and `derive_edges()` adds no edge to either
 hand-written graph. `tests/taskgraph/test_job_runner_task.py` checks this.
 
 ## Hidden tests
@@ -137,7 +150,7 @@ every platform (files are written with LF, git runs with `core.autocrlf=false`
 and a fixed author, date, and message). `--with-reference` copies the reference
 solution over the working tree after the commit, without committing it.
 
-## Running the three schemes
+## Running the four configurations
 
 With the Coordinator (task 2) on `main`, on Linux or WSL2, from the Aqours
 repository root (use an `--out` directory outside the repository):
@@ -147,13 +160,26 @@ python experiments/taskgraph/job_runner/make_repo.py coupled /tmp/jr-coupled
 H=experiments/taskgraph/job_runner/hidden_tests
 G=experiments/taskgraph/job_runner/coupled/graphs
 
-# single agent
+# single: single agent, request only
 python -m aqours_code.taskgraph run $G/single.json --repo /tmp/jr-coupled --workers 1 --hidden-tests $H --out /tmp/jr-runs
-# hand-written graph, sequential
+# single_planned: single agent, the whole plan
+python -m aqours_code.taskgraph run $G/single_planned.json --repo /tmp/jr-coupled --workers 1 --hidden-tests $H --out /tmp/jr-runs
+# seq: hand-written graph, sequential
 python -m aqours_code.taskgraph run $G/handwritten.json --repo /tmp/jr-coupled --workers 1 --hidden-tests $H --out /tmp/jr-runs
-# hand-written graph, parallel
+# par: hand-written graph, parallel
 python -m aqours_code.taskgraph run $G/handwritten.json --repo /tmp/jr-coupled --workers 4 --hidden-tests $H --out /tmp/jr-runs
 ```
+
+| Configuration | Graph | `--workers` |
+| --- | --- | --- |
+| `single` | `single.json` | 1 |
+| `single_planned` | `single_planned.json` | 1 |
+| `seq` | `handwritten.json` | 1 |
+| `par` | `handwritten.json` | 4 |
+
+After changing `handwritten.json`, regenerate `single_planned.json` with
+`python -m aqours_code.taskgraph flatten $G/handwritten.json --out $G/single_planned.json`;
+`tests/taskgraph/test_flatten.py` fails while the committed file is stale.
 
 Replace `coupled` with `modular` for the other variant. Each run clones the
 repository, so one generated repository serves every run.
