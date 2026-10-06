@@ -464,11 +464,23 @@ Draft format (fields as in the graph schema; missing lists are empty, and
 `check` becomes `check.commands` with the default timeout):
 
 ```json
-{"nodes": [{"id": "A", "title": "...", "kind": "contract | implement", "goal": "...",
+{"conventions": ["..."],
+ "nodes": [{"id": "A", "title": "...", "kind": "contract | implement", "goal": "...",
             "modify": [], "create": [], "provides": [], "requires": [],
             "requires_impl": [], "check": ["python -m pytest -q tests"],
             "context_files": []}]}
 ```
+
+`conventions` (optional, default empty) lists the repository's rules that
+every node must follow, for example "the current time comes only from the
+injected clock: functions that need it take a `now` argument". The program
+appends them to every node's goal as a `Repository conventions:` section, so
+every worker sees them; without conventions the goals are unchanged. The
+prompt asks the planner to find these rules first, to design the contract's
+interfaces so they can be kept (a module gets what it needs, such as `now`,
+from its caller), and not to add an integration node: the final checks
+verify the merged result, and a part that must be written against another
+part's implementation uses `requires_impl` and connects to it itself.
 
 Planner-only checks (`planner_checks()`, errors like V1-V12, applied only to
 planner graphs and not part of `validate()`, so hand-written graphs are not
@@ -480,8 +492,9 @@ held to them):
 | `P2` | every file a node modifies or creates is under `tests/` (a test-only node: remove it or fold its work into the related nodes) |
 | `P3` | a contract node creates or modifies a file under `tests/` (a contract's check only runs the existing tests) |
 
-Output: `--out` (the graph), `<out>.report.json` (every round's draft text,
-errors and warnings, the agent's calls, tokens and time; the number of
+Output: `--out` (the graph), `<out>.report.json` (every round's answer,
+draft JSON, conventions, errors and warnings; the draft and conventions of
+the written graph; the agent's calls, tokens and time; the number of
 revision rounds, success, totals, and wall time), and `<out>.logs/` (the
 planner agent's config, trace and stdout per round). `--timeout` applies to
 each round. Exit codes: `0` success, `1` errors remained, `2` input or git

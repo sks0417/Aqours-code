@@ -8,8 +8,8 @@ draft task graph in the JSON format at the end of this prompt.
 Read before you split. Read the request, then the repository: its README,
 any specification it points to, the modules the request touches, and the
 existing tests. Find out which files must change, which new files are
-needed, and which parts of the work are independent of each other. Only then
-decide the split.
+needed, which parts of the work are independent of each other, and which
+conventions the code follows. Only then decide the split.
 
 You have read-only tools (read_file, glob). Do not try to change any file.
 
@@ -47,6 +47,16 @@ So the shape of the plan follows from the files and symbols you list. Each
 node starts from the merged result of the nodes it depends on and sees
 nothing else.
 
+**Repository conventions.** Most repositories have rules that all their
+code follows, stated in the README or the specification or visible in the
+existing code. Examples: "the current time comes only from the injected
+clock; a module function that needs it takes a `now` argument from its
+caller and never reads the system time", "all database access goes through
+the storage class", "argument checks use the helpers in the validation
+module". Find these rules before you split and list them in `conventions`.
+The program appends them to every node's goal, so every worker sees them;
+a worker that misses one breaks code that other nodes rely on.
+
 ## Splitting rules
 
 First decide whether to split at all. **You do not have to split, and you
@@ -74,22 +84,26 @@ When you do split:
    provides, make them one contract. A contract writes no test files
    (nothing under `tests/` in its `modify` or `create`); its `check` only
    runs the existing tests.
+
+   Design the contract's interfaces so that the conventions can be kept.
+   Whatever a module needs from the outside is passed in by its caller as
+   a parameter: if a function needs the current time, give it a `now`
+   argument and let the caller that owns the clock fill it in, instead of
+   letting the module read the time itself. Check every signature against
+   `conventions` before you finish.
 3. **Same file, same node, or accept the order.** Work that must edit the same
    file either goes into one node, or will be run one node after another.
    Prefer merging closely related work that edits the same lines (for
    example several features that all change one central function) into one
    node over a long chain of nodes that rewrite the same code in turn.
-4. **No test-only nodes; no integration node by default.** Do not add a node
-   that only writes tests. After all nodes are merged the final checks run
-   the whole test suite, so general end-to-end verification needs no node of
-   its own. Add an integration node only in one of these two cases:
-   - some node was written against another node's empty implementation, and
-     after the merge it must be connected to the real implementation;
-   - the request names a concrete cross-feature behaviour that no node is
-     responsible for testing.
-
-   If you add one, its `goal` must list, one by one, the concrete behaviours
-   to check and fix. "Write end-to-end tests" is not a goal.
+4. **No test-only nodes and no integration node.** Do not add a node that
+   only writes tests, and do not add a node whose purpose is to verify or
+   connect the other nodes after they are merged: the final checks run the
+   whole test suite on the merged result. If one part must be written
+   against another part's real implementation (not just its interface),
+   list that symbol in the later part's `requires_impl`: the later node then
+   runs after the implementation is merged and connects to it itself, as
+   part of its own work and its own tests.
 5. **Every node tests itself.** Each node writes the tests for its own work
    (in its own new test file, listed in `create`) and has `check` commands
    that run on their own from the repository root. Including the existing
@@ -110,6 +124,7 @@ read.
 
 ```json
 {
+  "conventions": ["A rule every node must follow."],
   "nodes": [
     {
       "id": "A",
@@ -130,6 +145,9 @@ read.
 
 Field rules:
 
+- `conventions`: the repository's rules that every node must follow (see
+  "Repository conventions"), one short sentence each. Leave the list empty
+  if there are none.
 - `id`: unique; letters, digits, `_` and `-`.
 - `kind`: `contract` or `implement`.
 - `modify`: existing files the node changes. A file that another node
@@ -156,24 +174,32 @@ Field rules:
 A toy example, unrelated to your request. Request: "Add star ratings and a
 shopping-list export to the recipe book." The repository has
 `recipes/models.py`, `recipes/book.py` (the `RecipeBook` facade), and tests
-in `tests/`.
+in `tests/`. Its README says that recipes are saved and loaded only through
+`RecipeBook`, and `RecipeBook` takes an injected `clock`.
 
 Both features need a new field on `Recipe` and a new method on
 `RecipeBook`, so a thin contract adds both and creates the two feature
 modules as stubs; then each feature fills in its own module in parallel.
+The rating records when it was given, so the contract passes `now` to
+`rate()` instead of letting it read the clock.
 
 ```json
 {
+  "conventions": [
+    "Recipes are saved and loaded only through RecipeBook; no module reads or writes the storage files directly.",
+    "The current time comes only from RecipeBook's injected clock: a function that needs it takes a `now` argument from its caller and never reads the system time."
+  ],
   "nodes": [
     {
       "id": "C",
       "title": "Contract: rating field, facade methods, feature stubs",
       "kind": "contract",
-      "goal": "Add the field `rating: int | None = None` to Recipe in recipes/models.py. Create recipes/ratings.py with `rate(book, recipe_id, stars)` and recipes/shopping.py with `shopping_list(book, recipe_ids)`, each with its signature, a docstring and a body that raises NotImplementedError. In recipes/book.py add RecipeBook.rate and RecipeBook.shopping_list as one-line delegations to those functions. No feature logic.",
+      "goal": "Add the fields `rating: int | None = None` and `rated_at: float | None = None` to Recipe in recipes/models.py. Create recipes/ratings.py with `rate(book, recipe_id, stars, *, now)` and recipes/shopping.py with `shopping_list(book, recipe_ids)`, each with its signature, a docstring and a body that raises NotImplementedError. In recipes/book.py add RecipeBook.rate(recipe_id, stars), which passes `now=self.clock()`, and RecipeBook.shopping_list, both one-line delegations to those functions. No feature logic.",
       "modify": ["recipes/models.py", "recipes/book.py"],
       "create": ["recipes/ratings.py", "recipes/shopping.py"],
       "provides": [
         "recipes/models.py::Recipe.rating",
+        "recipes/models.py::Recipe.rated_at",
         "recipes/ratings.py::rate",
         "recipes/shopping.py::shopping_list",
         "recipes/book.py::RecipeBook.rate",
@@ -186,11 +212,12 @@ modules as stubs; then each feature fills in its own module in parallel.
       "id": "R",
       "title": "Star ratings",
       "kind": "implement",
-      "goal": "Implement rate() in recipes/ratings.py: accept 1 to 5 stars, raise ValueError otherwise, store the rating on the recipe. Edit no other module. Write tests/test_ratings.py.",
+      "goal": "Implement rate() in recipes/ratings.py: accept 1 to 5 stars, raise ValueError otherwise, store the rating and `rated_at = now` on the recipe. Edit no other module. Write tests/test_ratings.py.",
       "modify": ["recipes/ratings.py"],
       "create": ["tests/test_ratings.py"],
       "provides": ["recipes/ratings.py::rate"],
-      "requires": ["recipes/models.py::Recipe.rating", "recipes/book.py::RecipeBook.rate"],
+      "requires": ["recipes/models.py::Recipe.rating", "recipes/models.py::Recipe.rated_at",
+                   "recipes/book.py::RecipeBook.rate"],
       "check": ["python -m pytest -q tests"],
       "context_files": ["recipes/ratings.py", "recipes/book.py"]
     },
@@ -221,10 +248,11 @@ servings." The printout lives in `recipes/printing.py`, and `Recipe` in
 The work is one small change to one module plus its tests. No other node
 would share a new interface, so there is no contract, and splitting it
 would only add overhead: the draft is a single implement node, and the
-program derives no edges.
+program derives no edges. The repository has no special rule to list.
 
 ```json
 {
+  "conventions": [],
   "nodes": [
     {
       "id": "P",

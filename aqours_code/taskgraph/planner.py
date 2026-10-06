@@ -79,9 +79,26 @@ class DraftNode(_Draft):
 
 
 class Draft(_Draft):
-    """The planner's answer."""
+    """The planner's answer.
 
+    ``conventions`` are repository rules every node must follow; drafts
+    written before the field existed simply have none.
+    """
+
+    conventions: list[str] = Field(default_factory=list)
     nodes: list[DraftNode] = Field(min_length=1)
+
+
+CONVENTIONS_HEADING = "Repository conventions:"
+
+
+def goal_with_conventions(goal: str, conventions: list[str]) -> str:
+    """``goal`` followed by a ``Repository conventions:`` section, if there are any."""
+    items = [" ".join(item.split()) for item in conventions if item.strip()]
+    if not items:
+        return goal
+    lines = "\n".join(f"- {item}" for item in items)
+    return f"{goal.rstrip()}\n\n{CONVENTIONS_HEADING}\n{lines}"
 
 
 def extract_json_block(text: str) -> str:
@@ -152,12 +169,15 @@ class GraphInfo:
 
 
 def draft_to_graph(draft: Draft, info: GraphInfo, *, revised: bool) -> Graph:
-    """Complete ``draft`` into a graph without edges; schema errors raise DraftError."""
+    """Complete ``draft`` into a graph without edges; schema errors raise DraftError.
+
+    The draft's ``conventions`` are appended to every node's goal.
+    """
     nodes = [{
         "id": node.id,
         "title": node.title,
         "kind": node.kind,
-        "goal": node.goal,
+        "goal": goal_with_conventions(node.goal, draft.conventions),
         "edit_set": {"modify": node.modify, "create": node.create},
         "requires": node.requires,
         "requires_impl": node.requires_impl,
@@ -339,17 +359,30 @@ def remove_tree(path: Path) -> None:
     shutil.rmtree(path, onerror=_make_writable)
 
 
-def _evaluate_answer(answer: str, info: GraphInfo, index: RepoIndex, revised: bool
-                     ) -> tuple[Graph | None, str, list[Issue], list[Issue]]:
-    """Return (derived graph, draft text, errors, warnings) for one answer."""
+@dataclass
+class Evaluation:
+    """One planner answer, completed and checked."""
+
+    graph: Graph | None
+    draft_text: str
+    conventions: list[str]
+    errors: list[Issue]
+    warnings: list[Issue]
+
+
+def _evaluate_answer(answer: str, info: GraphInfo, index: RepoIndex,
+                     revised: bool) -> Evaluation:
+    """Complete, derive, validate and check one answer."""
     try:
         draft_text = extract_json_block(answer)
-        graph = draft_to_graph(parse_draft(answer), info, revised=revised)
+        draft = parse_draft(answer)
+        graph = draft_to_graph(draft, info, revised=revised)
     except DraftError as exc:
-        return None, answer, exc.issues, []
+        return Evaluation(None, answer, [], exc.issues, [])
     derived, _entries = derive_edges(graph, index)
     report = validate(derived, index)
-    return derived, draft_text, [*report.errors, *planner_checks(derived)], report.warnings
+    return Evaluation(derived, draft_text, list(draft.conventions),
+                      [*report.errors, *planner_checks(derived)], report.warnings)
 
 
 def run_plan(options: PlanOptions, worker: Worker) -> PlanResult:
@@ -369,6 +402,8 @@ def run_plan(options: PlanOptions, worker: Worker) -> PlanResult:
     rounds: list[dict] = []
     graph: Graph | None = None
     graph_round: int | None = None
+    graph_draft: str | None = None
+    conventions: list[str] = []
     errors: list[Issue] = []
     revision: Revision | None = None
     tmp = Path(tempfile.mkdtemp(prefix="tg-plan-"))
@@ -381,23 +416,28 @@ def run_plan(options: PlanOptions, worker: Worker) -> PlanResult:
             result = worker.run(WorkerRequest(
                 node_id="planner", attempt=number + 1, prompt=prompt, workspace=clone,
                 log_dir=log_dir, timeout_s=options.timeout_s))
-            candidate, draft_text, errors, warnings = _evaluate_answer(
-                result.final_answer, info, index, revised=number > 0)
+            evaluation = _evaluate_answer(result.final_answer, info, index,
+                                          revised=number > 0)
+            errors, warnings = evaluation.errors, evaluation.warnings
             if not result.ok:
                 errors = [Issue("AGENT", [], f"planner agent failed ({result.reason}): "
                                 f"{result.error[-2000:]}"), *errors]
-            if candidate is not None:
-                graph, graph_round = candidate, number + 1
+            if evaluation.graph is not None:
+                graph, graph_round = evaluation.graph, number + 1
+                graph_draft, conventions = evaluation.draft_text, evaluation.conventions
             rounds.append({
                 "round": number + 1,
                 "draft": result.final_answer,
+                "draft_json": evaluation.draft_text,
+                "conventions": evaluation.conventions,
                 "errors": [_issue_dict(issue) for issue in errors],
                 "warnings": [_issue_dict(issue) for issue in warnings],
                 "agent": _agent_dict(result),
             })
             if not errors:
                 break
-            revision = Revision(number=number + 1, draft=draft_text, errors=errors)
+            revision = Revision(number=number + 1, draft=evaluation.draft_text,
+                                errors=errors)
     finally:
         remove_tree(tmp)
     success = not errors and graph is not None
@@ -416,6 +456,8 @@ def run_plan(options: PlanOptions, worker: Worker) -> PlanResult:
         "revision_rounds": len(rounds) - 1,
         "graph_written": graph is not None,
         "graph_round": graph_round,
+        "draft": graph_draft,
+        "conventions": conventions,
         "nodes": len(graph.nodes) if graph is not None else 0,
         "edges": len(graph.edges) if graph is not None else 0,
         "rounds": rounds,
