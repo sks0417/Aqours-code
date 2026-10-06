@@ -71,8 +71,12 @@ def describe() -> dict:
     return {"model_provider": MODEL_PROVIDER, "model": MODEL}
 
 
-def run_worker(config: dict, model_client=None) -> WorkerResult:
-    """Run one node attempt with ``run_agent_task`` and return its result."""
+def run_worker(config: dict, model_client=None,
+               tool_policy: dict | None = None) -> WorkerResult:
+    """Run one node attempt with ``run_agent_task`` and return its result.
+
+    ``tool_policy`` defaults to :data:`WORKER_TOOL_POLICY`.
+    """
     from aqours_code.agent_loop import run_agent_task  # noqa: PLC0415
     from aqours_code.command_executor import (  # noqa: PLC0415
         CaseTimeoutError,
@@ -111,7 +115,7 @@ def run_worker(config: dict, model_client=None) -> WorkerResult:
             model_provider=provider,
             model=model,
             command_executor=LocalCommandExecutor(),
-            tool_policy=WORKER_TOOL_POLICY,
+            tool_policy=tool_policy or WORKER_TOOL_POLICY,
             case_deadline=time.monotonic() + timeout_s,
             trace_storage_root=config["trace_storage_root"],
             runtime_root=config["runtime_root"],
