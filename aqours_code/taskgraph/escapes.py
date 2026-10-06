@@ -195,18 +195,31 @@ class NodeEscapes:
         return [attempt.to_dict() for attempt in self.attempts[:limit]]
 
 
-_TRACE_NAME = re.compile(r"^trace_(\d+)\.jsonl$")
+_ATTEMPT_FILE = re.compile(r"^(?:trace_(\d+)\.jsonl|worker_(\d+)_config\.json)$")
+
+
+def attempt_traces(node_dir: Path, attempt: int) -> list[Path]:
+    """The trace files of one attempt.
+
+    ``trace_<n>.jsonl`` is written when the worker finishes. A worker killed at
+    its timeout never writes it, so then the Aqours run trace under
+    ``aqours_<n>/trace/`` is used instead.
+    """
+    final = node_dir / f"trace_{attempt}.jsonl"
+    if final.is_file():
+        return [final]
+    return sorted((node_dir / f"aqours_{attempt}" / "trace").rglob("trace.jsonl"))
 
 
 def scan_node(node_dir: Path) -> NodeEscapes:
-    """Scan ``trace_<n>.jsonl`` of every attempt in a node log directory."""
+    """Scan the traces of every attempt in a node log directory."""
     result = NodeEscapes()
-    traces = []
-    for trace in node_dir.glob("trace_*.jsonl"):
-        match = _TRACE_NAME.match(trace.name)
+    attempts = set()
+    for path in node_dir.iterdir() if node_dir.is_dir() else []:
+        match = _ATTEMPT_FILE.match(path.name)
         if match:
-            traces.append((int(match.group(1)), trace))
-    for attempt, trace in sorted(traces):
+            attempts.add(int(match.group(1) or match.group(2)))
+    for attempt in sorted(attempts):
         workspace = None
         try:
             config = json.loads((node_dir / f"worker_{attempt}_config.json")
@@ -214,7 +227,8 @@ def scan_node(node_dir: Path) -> NodeEscapes:
             workspace = config.get("workspace")
         except (OSError, json.JSONDecodeError, AttributeError):
             pass
-        result.attempts += scan_trace(trace, workspace, attempt)
+        for trace in attempt_traces(node_dir, attempt):
+            result.attempts += scan_trace(trace, workspace, attempt)
     return result
 
 

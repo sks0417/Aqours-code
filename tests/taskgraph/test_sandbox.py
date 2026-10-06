@@ -409,3 +409,16 @@ def test_docker_sandbox_sees_only_the_workspace(tmp_path):
     assert "secret.txt" not in outside["stdout"]
     assert network["exit_code"] != 0
     assert sandbox_module.remove_containers(name) == []
+
+
+def test_a_killed_worker_is_audited_from_its_run_trace(tmp_path):
+    node_dir = tmp_path / "run" / "nodes" / "A"
+    live = node_dir / "aqours_1" / "trace" / ".aqours_code" / "runs" / "r1"
+    live.mkdir(parents=True)
+    write_trace(live / "trace.jsonl", tool_call("1", "bash", {"command": "ls /home/x"}))
+    (node_dir / "worker_1_config.json").write_text(json.dumps({"workspace": WORKSPACE}),
+                                                   encoding="utf-8")
+    write_trace(node_dir / "trace_2.jsonl", tool_call("1", "bash", {"command": "cd .."}))
+    escapes = scan_run(tmp_path / "run")["A"]
+    assert [(a.attempt, a.detail) for a in escapes.attempts] == [(1, "ls /home/x"),
+                                                                 (2, "cd ..")]
