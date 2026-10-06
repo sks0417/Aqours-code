@@ -102,7 +102,8 @@ def _derive_context_file_edges(graph: Graph, index: RepoIndex,
     """Order the single creator of a new context file before its reader."""
     nodes = unique_nodes(graph)
     for node in nodes:
-        for path in node.context_files:
+        for ref in node.context_files:
+            path = ref.split("#", 1)[0]
             if index.has_file(path):
                 continue
             creators = [other for other in nodes if path in other.edit_set.create]

@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+
+from .context_pack import ContextPack, build_context_pack
 
 from .repo_index import RepoIndex
 from .schema import Graph, Node
@@ -39,9 +42,16 @@ Do not modify, create, or delete any other file.
 
 {requires}
 
-# Read these files first
+# Context
 
-{context_files}
+Everything your sub-task needs is below: your own files in full, the
+interfaces you use (signatures and docstrings only), the parts of the
+specification that concern you, and the test fixtures. Start working from
+this. Do not read the other feature modules of the repository. Read another
+file only if something you need is missing here, and say in your final
+answer what was missing.
+
+{context_pack}
 
 # Done when
 
@@ -123,11 +133,15 @@ def requirement_status(graph: Graph, node: Node, index: RepoIndex,
 
 
 def build_node_prompt(graph: Graph, node: Node, index: RepoIndex, attempt: int,
-                      failure: AttemptFailure | None, *, sandbox: str = "none") -> str:
+                      failure: AttemptFailure | None, *, sandbox: str = "none",
+                      context_pack: ContextPack | None = None,
+                      workspace: Path | None = None) -> str:
     """Return the English worker prompt for one attempt of ``node``.
 
     ``sandbox="docker"`` adds a note that bash runs in a Linux container.
     """
+    if context_pack is None and workspace is not None:
+        context_pack = build_context_pack(node, workspace)
     requires = [f"- `{symbol}`: {requirement_status(graph, node, index, symbol)}"
                 for symbol in node.requires]
     requires += [f"- `{symbol}`: {IMPLEMENTED_UPSTREAM}" for symbol in node.requires_impl]
@@ -145,7 +159,7 @@ def build_node_prompt(graph: Graph, node: Node, index: RepoIndex, attempt: int,
         provides=_bullets(node.provides),
         contract_note=CONTRACT_NOTE if node.kind == "contract" else "",
         requires="\n".join(requires) if requires else "- (none)",
-        context_files=_bullets(node.context_files),
+        context_pack=context_pack.text if context_pack is not None else "(context unavailable)",
         checks=_bullets(node.check.commands),
         sandbox=SANDBOX_NOTE if sandbox == "docker" else "",
         retry=retry,

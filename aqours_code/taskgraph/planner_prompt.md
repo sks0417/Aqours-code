@@ -165,8 +165,13 @@ Field rules:
 - `requires` / `requires_impl`: each symbol must exist in the repository or
   be provided by another node. A symbol may not be in both lists.
 - `check`: shell commands run from the repository root; at least one.
-- `context_files`: files the worker should read first; each must exist or be
-  created by a node that comes earlier.
+- `context_files`: context provided in the worker prompt; each path must exist or
+  be created by a node that comes earlier. Use `SPEC.md#Exact heading` to include
+  only the sections needed by this node (multiple headings from one file are
+  allowed). Headings must exist and match exactly, without the Markdown `#`
+  prefix or surrounding whitespace. Python files outside the node's own edit
+  set are provided only as signatures and docstrings, not implementations.
+  Own existing files and tests/conftest.py are included in full automatically.
 - Optional fields may be left out; lists default to empty.
 
 ## Examples
