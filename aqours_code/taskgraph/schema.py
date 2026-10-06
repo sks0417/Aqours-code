@@ -103,6 +103,23 @@ def parse_symbol(text: str) -> SymbolRef:
     return SymbolRef(path=path, qualname=qualname)
 
 
+def split_context_ref(value: str) -> tuple[str, str | None]:
+    """Validate a context path and optional exact Markdown heading."""
+    path, separator, title = value.partition("#")
+    validate_repo_path(path)
+    if separator:
+        if not path.lower().endswith((".md", ".markdown")):
+            raise ValueError("heading references require a Markdown file")
+        if not title or title != title.strip() or any(ord(c) < 32 for c in title):
+            raise ValueError("context heading must be non-empty without surrounding whitespace")
+    return path, title if separator else None
+
+
+def validate_context_ref(value: str) -> str:
+    split_context_ref(value)
+    return value
+
+
 def validate_symbol(text: str) -> str:
     """Return ``text`` if it is a well-formed symbol string."""
     parse_symbol(text)
@@ -240,9 +257,15 @@ class Node(_Model):
         description=("Symbols this node adds or changes for other nodes to use. Each "
                      "symbol's file must be in this node's modify or create."))
     check: Check = Field(description="How to verify that the node is complete.")
-    context_files: UniquePaths = Field(
+    context_files: Annotated[
+        list[Annotated[str, AfterValidator(validate_context_ref),
+                       Field(description=PATH_DESCRIPTION + " Optional Markdown #heading.")]],
+        AfterValidator(_reject_duplicate_paths),
+        Field(json_schema_extra={"uniqueItems": True}),
+    ] = Field(
         default_factory=list,
-        description=("Files the worker should read first. Each must exist at the base "
+        description=("Context files or Markdown path#heading references. Other Python files "
+                     "are provided as signatures and docstrings. Each must exist at the base "
                      "commit or be created by an ancestor node."))
     size: Literal["small", "medium", "large"] | None = Field(
         default=None, description="Expected size of the change.")

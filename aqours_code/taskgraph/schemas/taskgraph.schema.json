@@ -254,9 +254,9 @@
           "description": "How to verify that the node is complete."
         },
         "context_files": {
-          "description": "Files the worker should read first. Each must exist at the base commit or be created by an ancestor node.",
+          "description": "Context files or Markdown path#heading references. Other Python files are provided as signatures and docstrings. Each must exist at the base commit or be created by an ancestor node.",
           "items": {
-            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, no empty, '.' or '..' segments, no segment starting or ending with whitespace, and no control characters.",
+            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, no empty, '.' or '..' segments, no segment starting or ending with whitespace, and no control characters. Optional Markdown #heading.",
             "type": "string"
           },
           "title": "Context Files",

@@ -161,6 +161,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(f"status: {summary['status']}  wall_time: {summary['wall_time_s']:.1f}s  "
           f"model_calls: {totals['model_calls']}  tokens: "
           f"{totals['input_tokens']} in / {totals['output_tokens']} out")
+    print(f"context_chars: {totals['context_chars']}  "
+          f"reads_outside_pack: {totals['reads_outside_pack']}  "
+          f"calls_before_first_write: {totals['calls_before_first_write']}")
     if summary["hidden_tests"] is not None:
         hidden_stats = summary["hidden_tests"]
         print(f"hidden tests: {hidden_stats['passed']} passed, {hidden_stats['failed']} "

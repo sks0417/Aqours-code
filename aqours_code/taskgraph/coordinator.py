@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import gitops
+from .context_pack import build_context_pack
+from .context_metrics import node_context_metrics
 from .escapes import scan_run
 from .process import run_process, run_shell
 from .prompting import AttemptFailure, build_node_prompt
@@ -83,6 +85,10 @@ class NodeRecord:
     error: str = ""
     escape_attempts: int = 0
     escape_samples: list[dict] = field(default_factory=list)
+    context_chars: int = 0  # total across attempts; individual counts below
+    context_packs: list[dict] = field(default_factory=list)
+    reads_outside_pack: int = 0
+    calls_before_first_write: int = 0
 
 
 @dataclass
@@ -294,8 +300,14 @@ class Coordinator:
         failure: AttemptFailure | None = None
         for attempt in range(1, self.options.max_attempts + 1):
             record.attempts = attempt
+            pack = build_context_pack(node, worktree)
+            (log_dir / f"context_{attempt}.md").write_text(pack.text, encoding="utf-8")
+            metadata = {"attempt": attempt, "workspace": str(worktree), **pack.report()}
+            write_json_atomic(log_dir / f"context_{attempt}.json", metadata)
+            record.context_packs.append(metadata)
+            record.context_chars += len(pack.text)
             prompt = build_node_prompt(self.graph, node, self.index, attempt, failure,
-                                       sandbox=self.sandbox.kind)
+                                       sandbox=self.sandbox.kind, context_pack=pack)
             (log_dir / f"prompt_{attempt}.md").write_text(prompt, encoding="utf-8")
             self.events.emit("worker_start", node=node.id, attempt=attempt)
             request = WorkerRequest(node_id=node.id, attempt=attempt, prompt=prompt,
@@ -411,6 +423,14 @@ class Coordinator:
         self.events.emit("escape_audit_end", total=total)
         return total
 
+    def audit_context(self) -> None:
+        """Record reads beyond full context and calls before each node's first write."""
+        for node_id, record in self.records.items():
+            metrics = node_context_metrics(self.run_dir / "nodes" / node_id,
+                                           record.context_packs)
+            record.reads_outside_pack = metrics["reads_outside_pack"]
+            record.calls_before_first_write = metrics["calls_before_first_write"]
+
     def remove_answers(self) -> None:
         """Delete what a later worker must not find: hidden tests and worktrees.
 
@@ -501,6 +521,7 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
     hidden = (coordinator.hidden_tests(Path(options.hidden_tests))
               if options.hidden_tests else None)
     escapes_total = coordinator.audit_escapes()
+    coordinator.audit_context()
     coordinator.remove_answers()
     status = run_status(coordinator.records, final_results)
     wall_time = events.elapsed()
@@ -517,6 +538,9 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
             "model_calls": sum(r.model_calls for r in records.values()),
             "input_tokens": sum(r.input_tokens for r in records.values()),
             "output_tokens": sum(r.output_tokens for r in records.values()),
+            "context_chars": sum(r.context_chars for r in records.values()),
+            "reads_outside_pack": sum(r.reads_outside_pack for r in records.values()),
+            "calls_before_first_write": sum(r.calls_before_first_write for r in records.values()),
         },
         "integration_commit": gitops.head(run_dir / "repo"),
         "final_checks": final_results,

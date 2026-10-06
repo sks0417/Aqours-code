@@ -73,7 +73,20 @@
         "timeout_s": 300
       },
       "context_files": [
-        "SPEC.md",
+        "SPEC.md#Public interface",
+        "SPEC.md#Jobs",
+        "SPEC.md#Running jobs",
+        "SPEC.md#Retries",
+        "SPEC.md#Cancellation",
+        "SPEC.md#Restart recovery",
+        "SPEC.md#Priorities and fair scheduling (new)",
+        "SPEC.md#Delayed and recurring jobs (new)",
+        "SPEC.md#Dependencies (new)",
+        "SPEC.md#Rate limits (new)",
+        "SPEC.md#Webhook notifications (new)",
+        "SPEC.md#Audit log and statistics (new)",
+        "SPEC.md#REST API",
+        "SPEC.md#Dashboard",
         "README.md",
         "jobrunner/models.py",
         "jobrunner/store.py",
@@ -124,7 +137,14 @@
         "timeout_s": 300
       },
       "context_files": [
-        "SPEC.md",
+        "SPEC.md#Priorities and fair scheduling (new)",
+        "SPEC.md#Dependencies (new)",
+        "SPEC.md#Rate limits (new)",
+        "SPEC.md#Public interface",
+        "SPEC.md#Jobs",
+        "SPEC.md#Running jobs",
+        "SPEC.md#Cancellation",
+        "SPEC.md#Restart recovery",
         "README.md",
         "jobrunner/runner.py",
         "jobrunner/store.py",
@@ -173,7 +193,10 @@
         "timeout_s": 300
       },
       "context_files": [
-        "SPEC.md",
+        "SPEC.md#Delayed and recurring jobs (new)",
+        "SPEC.md#Public interface",
+        "SPEC.md#Jobs",
+        "SPEC.md#Running jobs",
         "jobrunner/runner.py",
         "jobrunner/store.py"
       ],
@@ -217,7 +240,12 @@
         "timeout_s": 300
       },
       "context_files": [
-        "SPEC.md",
+        "SPEC.md#Webhook notifications (new)",
+        "SPEC.md#Public interface",
+        "SPEC.md#Running jobs",
+        "SPEC.md#Retries",
+        "SPEC.md#Cancellation",
+        "SPEC.md#Restart recovery",
         "jobrunner/runner.py",
         "jobrunner/store.py"
       ],
@@ -256,7 +284,12 @@
         "timeout_s": 300
       },
       "context_files": [
-        "SPEC.md",
+        "SPEC.md#Audit log and statistics (new)",
+        "SPEC.md#Public interface",
+        "SPEC.md#Running jobs",
+        "SPEC.md#Retries",
+        "SPEC.md#Cancellation",
+        "SPEC.md#Restart recovery",
         "jobrunner/runner.py",
         "jobrunner/store.py"
       ],
@@ -320,7 +353,14 @@
         "timeout_s": 300
       },
       "context_files": [
-        "SPEC.md",
+        "SPEC.md#Priorities and fair scheduling (new)",
+        "SPEC.md#Delayed and recurring jobs (new)",
+        "SPEC.md#Dependencies (new)",
+        "SPEC.md#Rate limits (new)",
+        "SPEC.md#Webhook notifications (new)",
+        "SPEC.md#Audit log and statistics (new)",
+        "SPEC.md#Public interface",
+        "SPEC.md#REST API",
         "jobrunner/api.py",
         "jobrunner/runner.py",
         "jobrunner/models.py"
@@ -384,7 +424,14 @@
         "timeout_s": 300
       },
       "context_files": [
-        "SPEC.md",
+        "SPEC.md#Priorities and fair scheduling (new)",
+        "SPEC.md#Delayed and recurring jobs (new)",
+        "SPEC.md#Dependencies (new)",
+        "SPEC.md#Rate limits (new)",
+        "SPEC.md#Webhook notifications (new)",
+        "SPEC.md#Audit log and statistics (new)",
+        "SPEC.md#Public interface",
+        "SPEC.md#Dashboard",
         "jobrunner/dashboard.py",
         "jobrunner/runner.py",
         "jobrunner/models.py"
@@ -447,7 +494,20 @@
         "timeout_s": 300
       },
       "context_files": [
-        "SPEC.md",
+        "SPEC.md#Public interface",
+        "SPEC.md#Jobs",
+        "SPEC.md#Running jobs",
+        "SPEC.md#Retries",
+        "SPEC.md#Cancellation",
+        "SPEC.md#Restart recovery",
+        "SPEC.md#Priorities and fair scheduling (new)",
+        "SPEC.md#Delayed and recurring jobs (new)",
+        "SPEC.md#Dependencies (new)",
+        "SPEC.md#Rate limits (new)",
+        "SPEC.md#Webhook notifications (new)",
+        "SPEC.md#Audit log and statistics (new)",
+        "SPEC.md#REST API",
+        "SPEC.md#Dashboard",
         "README.md"
       ],
       "size": "large"

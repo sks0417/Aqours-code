@@ -5,7 +5,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 
 from .repo_index import RepoIndex
-from .schema import Edge, Graph, Node, parse_symbol
+from .schema import Edge, Graph, Node, parse_symbol, split_context_ref
 
 
 @dataclass
@@ -232,7 +232,11 @@ def _check_files(graph: Graph, index: RepoIndex, ancestor_map: dict[str, set[str
                 report.errors.append(Issue(
                     "V3", [node.id],
                     f"creates {path}, which already exists at the base commit"))
-        for path in node.context_files:
+        for ref in node.context_files:
+            path, title = split_context_ref(ref)
+            if title is not None and title not in index.markdown_titles.get(path, []):
+                report.errors.append(Issue(
+                    "V3", [node.id], f"context heading {ref} does not exist at the base commit"))
             if index.has_file(path):
                 continue
             if path not in created:

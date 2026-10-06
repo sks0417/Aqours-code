@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .schema import SYMBOL_SEPARATOR
+from .context_pack import markdown_headings
 
 _FUNCTION_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
 # Compound statements whose bodies still define names in the enclosing
@@ -24,6 +25,7 @@ class RepoIndex:
     files: set[str] = field(default_factory=set)
     symbols: set[str] = field(default_factory=set)
     warnings: list[str] = field(default_factory=list)
+    markdown_titles: dict[str, list[str]] = field(default_factory=dict)
 
     def has_file(self, path: str) -> bool:
         """Return whether ``path`` exists at the indexed commit."""
@@ -148,6 +150,9 @@ def build_index(repo_path: Path, commit: str) -> RepoIndex:
     files = {name for name in listing.decode("utf-8").split("\0") if name}
     index = RepoIndex(commit=sha, files=files)
     for path in sorted(files):
+        if path.lower().endswith((".md", ".markdown")):
+            source = _git(repo_path, "show", f"{sha}:{path}").decode("utf-8", errors="replace")
+            index.markdown_titles[path] = [h.title for h in markdown_headings(source)]
         if not path.endswith(".py"):
             continue
         source = _git(repo_path, "show", f"{sha}:{path}")

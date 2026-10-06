@@ -305,3 +305,57 @@ Replace `coupled` with `modular` for the other variant. Each run clones the
 repository, so one generated repository serves every run. The default
 `--worker-timeout` is 1800 s per node; the single-agent node may need more, so
 the commands above pass `--worker-timeout 3600` to every run.
+
+### Per-node context packs (task 12)
+
+The hand-written graphs now select exact `SPEC.md#Heading` sections. Only
+`context_files` changed: nodes, edit sets, dependency edges, and checks are the
+same as before. Feature nodes receive their own feature section, shared public
+interface/API/dashboard sections where needed, and the existing lifecycle
+sections their feature depends on (for example, priority selection is specified
+under `Running jobs`). Contract and integration nodes select all relevant
+sections explicitly.
+
+Before each worker attempt, the coordinator reads that node's current worktree,
+including merged upstream changes. `nodes/<id>/context_<attempt>.md` contains:
+
+1. Existing files in the node's modify/create sets, in full.
+2. AST signatures, decorators, docstrings, annotated class fields, and simple
+   one-line assignments from other Python context/required-symbol files.
+3. The requested Markdown sections (or full documents without a fragment).
+4. `tests/conftest.py`, in full when present.
+
+The limit is 80 KiB of UTF-8 including Markdown wrappers. Own files are never
+cut, even when they alone exceed the limit. Remaining content fills the budget
+in the order above; once a block is truncated, later blocks are omitted.
+`context_<attempt>.json` and each node's `summary.json` entry report byte/character
+counts, full files, parse fallbacks, missing files and truncations. Syntax errors
+fall back to full source. Retry packs are regenerated from the current worktree.
+`context_chars` is the sum across attempts; `context_packs[].chars` gives each
+attempt separately.
+
+The summary and terminal totals include `reads_outside_pack` (one per
+`read_file` tool invocation for a file not provided in full, excluding the
+node's own files) and `calls_before_first_write` (`llm_request` events through
+the request producing the first `write_file`/`edit_file` invocation). Reading
+an interface-only file or an excerpted SPEC counts as outside the full pack.
+Repeated reads count repeatedly. Attempts are processed in order, so a retry
+does not reset the first-write boundary; if there is no write, all requests
+count. These are trace tool-invocation metrics; arbitrary Bash program file IO
+is not inferred. Timed-out workers use their retained live traces when the
+final trace copy is absent.
+
+A deterministic size sample can be reproduced without a model:
+
+```bash
+python tests/taskgraph/context_pack_fixture.py /tmp/jp-context-sample
+```
+
+This generates modular's base repository, applies A's shared files from the
+reference solution, and supplies signature/docstring stubs for A's six feature
+modules. It is an offline stand-in for a merged A, not a measured model-produced
+contract. P's `nodes/P/context_1.md` is **37,851 characters / 37,857 UTF-8 bytes**.
+The same fixture's complete Python source (including tests) plus `SPEC.md` is
+**97,548 bytes**: the pack is **61.19% smaller**, with no truncation, parse
+fallback, or missing requested file. An actual A implementation can change
+these sizes; each run records its own exact pack.
