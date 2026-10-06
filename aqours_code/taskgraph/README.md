@@ -188,9 +188,10 @@ python -m aqours_code.taskgraph derive <graph.json> --repo <path> --out <new_gra
 python -m aqours_code.taskgraph index --repo <path> --commit <sha>
 python -m aqours_code.taskgraph export-schema [--out <path>]
 python -m aqours_code.taskgraph compare <planner_graph.json> <handwritten_graph.json> --repo <path> [--json <file>]
+python -m aqours_code.taskgraph audit <runs_dir | run_dir> [...]
 ```
 
-`plan` and `run` are described in their own sections below. `compare` prints
+`plan`, `run` and `audit` are described in their own sections below. `compare` prints
 a Markdown table of both graphs' structure: validation (error count, warning
 codes), node counts by kind, files edited by contract nodes, critical path
 (nodes on the longest chain), maximum parallel width (largest layer when
@@ -222,6 +223,7 @@ python -m aqours_code.taskgraph run <graph.json> --repo <path>
     [--worker aqours|command] [--command-map <json>]
     [--worker-timeout 1800]
     [--hidden-tests <dir>]
+    [--sandbox docker|none] [--sandbox-image aqours-code-eval:py311]
 ```
 
 Run experiments on Linux or WSL2. Check commands, `final_checks`, and the
@@ -253,6 +255,69 @@ Aqours single-agent run and is bounded only by `--worker-timeout`. Its model
 calls and tokens are counted for the cost data. The model comes from the
 Aqours `.env` and environment. `--worker command` runs a fixed
 shell command per node instead (tests and debugging only).
+
+### Worker sandbox
+
+A worker must see only its own worktree. Its file tools (`read_file`,
+`write_file`, `edit_file`, `glob`) already refuse paths outside it; its
+`bash` commands run, with `--sandbox docker` (the default), in a Docker
+container started from `--sandbox-image` that mounts only the worktree at
+`/workspace`, with no network, a read-only root file system, no capabilities,
+a non-root user, 2 CPUs, 2 GiB of memory and 256 processes. A command may run
+up to 600 s (and never past the worker's deadline); a command that times out
+gets a fresh container on the same worktree for the next command. The
+container is removed when the worker ends, and the coordinator removes any
+leftover after the worker process exits, however it ended. The worker prompt
+tells the agent that bash runs in a Linux container at `/workspace`.
+
+Inside the container git commands fail (the worktree's `.git` file points to
+a host path). Workers must not change repository state anyway; the
+coordinator commits on the host. Checks, post-merge checks, final checks and
+hidden tests also run on the host, as before.
+
+Before a run starts, `run` checks that Docker runs and that the image exists.
+If not, it exits with code 2 and explains how to build the image:
+
+```bash
+docker build -f evals/docker/Dockerfile -t aqours-code-eval:py311 .
+```
+
+It never falls back to `--sandbox none`. `--sandbox none` runs worker
+commands on the host and is only for unit tests and `--worker command`
+(which always runs on the host); it prints a warning. `config.json` and
+`summary.json` record `sandbox` (`docker` or `none`) and `sandbox_image`. The
+planner needs no sandbox: it has no `bash`.
+
+### Escape audit
+
+After the hidden tests, the coordinator scans every attempt's
+`trace_<n>.jsonl` for attempts to reach outside the workspace
+(`aqours_code.taskgraph.escapes`):
+
+- a file tool whose path is a host absolute path, an absolute path, or
+  leaves the workspace through `..`, or that was refused with "Path escapes
+  workspace";
+- a `bash` command naming a host absolute path (`C:\`, `D:/`, `\\server\`,
+  `/c/`), `/mnt/`, `/home/`, `/Users/`, or leaving the workspace (`cd ..`,
+  `../` above the workspace root, `~`);
+- file content written by `write_file` or `edit_file` naming a host absolute
+  path, `/mnt/`, `/home/` or `/Users/`.
+
+Absolute paths inside the node's own worktree and `/workspace` (the
+container's mount) are allowed. Each node gets `escape_attempts` and
+`escape_samples` (the first five: attempt, tool, the truncated command or
+path, reasons) in `summary.json`, and the run gets `escape_attempts_total`.
+`run` prints `escape attempts: N`; with `--sandbox none` and N > 0 it prints
+a banner saying the run's results are invalid.
+
+```bash
+python -m aqours_code.taskgraph audit <runs_dir | run_dir> [...]
+```
+
+applies the same rules to finished runs, also those made before the audit
+existed, and prints one row per node (run id, graph, node, escape attempts,
+first sample) and a total. It exits with `1` when any escape attempt is
+found, `0` when none is, and `2` when no run directory is found.
 
 ### Flow
 
@@ -293,6 +358,10 @@ shell command per node instead (tests and debugging only).
    integration HEAD into `final/`, copy `DIR` to `final/_hidden_tests/`, and
    run `python -m pytest -q _hidden_tests -p no:cacheprovider --junitxml=...`.
    Workers never see these tests.
+6. **Audit and clean up.** Scan the traces for escape attempts (see
+   [Escape audit](#escape-audit)), then delete `final/_hidden_tests/` and
+   `wt/`, so that no later worker can find this run's answers. `final/`
+   keeps the final code; `nodes/` keeps the diffs, logs and traces.
 
 The run status is `success` when every node is merged and every final check
 passes, `partial` when some node is merged, and `failed` otherwise. Hidden
@@ -313,9 +382,9 @@ runs/<run_id>/            run_id = UTC timestamp + 4 random hex characters
   events.jsonl            event stream (for Gantt charts)
   summary.json            results
   final_checks.txt        output of final_checks
-  hidden_tests.xml/.txt   hidden test results, if any
+  hidden_tests.xml/.txt   hidden test results, if any (the tests themselves are deleted)
   repo/                   clone; tg/integration is checked out here
-  wt/<node_id>/           node worktrees (removed when the node ends)
+  wt/<node_id>/           node worktrees (removed when the node ends; wt/ when the run ends)
   nodes/<node_id>/        prompt_<n>.md, worker_<n>.json, worker_<n>_config.json,
                           worker_<n>_stdout.txt, trace_<n>.jsonl, aqours_<n>/,
                           check_<n>.txt, post_merge_check.txt, diff.patch
@@ -330,7 +399,8 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
 `reason`, `duration_s`, `model_calls`, `input_tokens`, `output_tokens`),
 `check_start`, `check_end`, `merge_start`, `merge_end`,
 `post_merge_check_end`, `node_merged`, `node_failed`, `node_skipped`,
-`final_checks_end`, `hidden_tests_end`, `run_end`.
+`final_checks_end`, `hidden_tests_end`, `escape_audit_end` (with `total`),
+`run_end`.
 
 ### summary.json
 
@@ -338,12 +408,14 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
 - `nodes.<id>`: `status`, `reason`, `attempts`, `worker_reasons`, `start_t`, `end_t`,
   `worker_time_s`, `check_time_s` (node and post-merge checks),
   `model_calls`, `input_tokens`, `output_tokens`, `changed_files`,
-  `out_of_scope_files`, `merge_commit`, `error`;
+  `out_of_scope_files`, `merge_commit`, `error`, `escape_attempts`,
+  `escape_samples`;
 - `totals`: `model_calls`, `input_tokens`, `output_tokens`;
 - `final_checks`: one entry per command (`command`, `ok`, `exit_code`,
   `timed_out`, `duration_s`);
 - `hidden_tests`: `passed`, `failed`, `errors`, `skipped`, `exit_code`,
-  `timed_out`, `duration_s`, or `null`.
+  `timed_out`, `duration_s`, or `null`;
+- `sandbox`, `sandbox_image`, `escape_attempts_total`.
 
 ### Smoke test on the toy repository
 

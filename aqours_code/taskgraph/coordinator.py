@@ -9,9 +9,11 @@ a merge, its post-merge check, and a possible undo run as one unit under
 from __future__ import annotations
 
 import json
+import os
 import platform
 import secrets
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -22,14 +24,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import gitops
+from .escapes import scan_run
 from .process import run_process, run_shell
 from .prompting import AttemptFailure, build_node_prompt
 from .repo_index import RepoIndex, build_index
+from .sandbox import NO_SANDBOX, SandboxConfig
 from .schema import Graph, Node, dump_graph
 from .validate import ValidationReport, edit_files, unique_nodes, usable_edges, validate
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
-TASKGRAPH_VERSION = "coordinator-v0.2"
+TASKGRAPH_VERSION = "coordinator-v0.3"
 AQOURS_SOURCE = Path(__file__).resolve().parents[2]
 DEFAULT_WORKERS = 2
 DEFAULT_MAX_ATTEMPTS = 2
@@ -77,6 +81,8 @@ class NodeRecord:
     out_of_scope_files: list[str] = field(default_factory=list)
     merge_commit: str | None = None
     error: str = ""
+    escape_attempts: int = 0
+    escape_samples: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -85,6 +91,23 @@ class RunResult:
 
     run_dir: Path
     summary: dict
+
+
+def worker_sandbox(worker: Worker) -> SandboxConfig:
+    """Where the worker runs shell commands (``none`` if it does not say)."""
+    sandbox = getattr(worker, "sandbox", None)
+    return sandbox if isinstance(sandbox, SandboxConfig) else NO_SANDBOX
+
+
+def _make_writable(func, path, _exc_info) -> None:
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def remove_tree(path: Path) -> None:
+    """Delete ``path`` if it exists, including read-only git files on Windows."""
+    if path.exists():
+        shutil.rmtree(path, onerror=_make_writable)
 
 
 def new_run_id() -> str:
@@ -166,6 +189,7 @@ class Coordinator:
         # start here, never from a merge still being checked, so an undone
         # merge cannot leak into another node's branch.
         self.integration_head = base_commit
+        self.sandbox = worker_sandbox(worker)
         self.nodes = unique_nodes(graph)
         self.by_id = {node.id: node for node in self.nodes}
         self.records = {node.id: NodeRecord() for node in self.nodes}
@@ -270,7 +294,8 @@ class Coordinator:
         failure: AttemptFailure | None = None
         for attempt in range(1, self.options.max_attempts + 1):
             record.attempts = attempt
-            prompt = build_node_prompt(self.graph, node, self.index, attempt, failure)
+            prompt = build_node_prompt(self.graph, node, self.index, attempt, failure,
+                                       sandbox=self.sandbox.kind)
             (log_dir / f"prompt_{attempt}.md").write_text(prompt, encoding="utf-8")
             self.events.emit("worker_start", node=node.id, attempt=attempt)
             request = WorkerRequest(node_id=node.id, attempt=attempt, prompt=prompt,
@@ -376,6 +401,26 @@ class Coordinator:
         self.events.emit("hidden_tests_end", **stats)
         return stats
 
+    def audit_escapes(self) -> int:
+        """Record each node's escape attempts from its traces; return the total."""
+        for node_id, escapes in scan_run(self.run_dir).items():
+            if node_id in self.records:
+                self.records[node_id].escape_attempts = escapes.count
+                self.records[node_id].escape_samples = escapes.samples()
+        total = sum(record.escape_attempts for record in self.records.values())
+        self.events.emit("escape_audit_end", total=total)
+        return total
+
+    def remove_answers(self) -> None:
+        """Delete what a later worker must not find: hidden tests and worktrees.
+
+        ``final/`` keeps the final code; ``nodes/`` keeps diffs, logs, traces.
+        """
+        remove_tree(self.run_dir / "final" / HIDDEN_TESTS_DIR)
+        remove_tree(self.run_dir / "wt")
+        with self.git_lock:
+            gitops.git(self.repo, "worktree", "prune", check=False)
+
 
 def parse_junit(path: Path) -> dict:
     """Count passed, failed, errors and skipped tests in a JUnit XML file."""
@@ -418,6 +463,10 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
     report = validate(graph, index)
     if not report.ok:
         raise GraphInvalid(report)
+    preflight = getattr(worker, "preflight", None)
+    if preflight is not None:
+        preflight()  # SandboxUnavailable (a RuntimeError) stops the run here
+    sandbox = worker_sandbox(worker)
 
     run_id = new_run_id()
     run_dir = Path(options.out_dir).resolve() / run_id
@@ -433,6 +482,7 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "worker_timeout_s": options.worker_timeout_s,
         "hidden_tests": str(options.hidden_tests) if options.hidden_tests else None,
         "worker": worker.describe(),
+        **sandbox.to_dict(),
         "taskgraph_version": TASKGRAPH_VERSION,
         "aqours_commit": gitops.source_state(AQOURS_SOURCE),
         "validation_warnings": [issue.format() for issue in report.warnings],
@@ -450,6 +500,8 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
     final_results = coordinator.final_checks()
     hidden = (coordinator.hidden_tests(Path(options.hidden_tests))
               if options.hidden_tests else None)
+    escapes_total = coordinator.audit_escapes()
+    coordinator.remove_answers()
     status = run_status(coordinator.records, final_results)
     wall_time = events.elapsed()
     events.emit("run_end", status=status, wall_time_s=wall_time)
@@ -469,6 +521,8 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "integration_commit": gitops.head(run_dir / "repo"),
         "final_checks": final_results,
         "hidden_tests": hidden,
+        **sandbox.to_dict(),
+        "escape_attempts_total": escapes_total,
     }
     write_json_atomic(run_dir / "summary.json", summary)
     return RunResult(run_dir=run_dir, summary=summary)

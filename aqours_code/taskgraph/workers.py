@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .process import run_process, run_shell
+from .sandbox import NO_SANDBOX, SandboxConfig, check_docker, container_name, remove_containers
 
 WORKER_ENTRY_MODULE = "aqours_code.taskgraph.worker_entry"
 DEFAULT_WORKER_TIMEOUT_S = 1800.0
@@ -67,9 +69,16 @@ class Worker(Protocol):
 
     def describe(self) -> dict: ...
 
+    def preflight(self) -> None: ...
+
 
 class CommandWorker:
-    """Run a fixed shell command per node; for tests and debugging only."""
+    """Run a fixed shell command per node; for tests and debugging only.
+
+    Its commands always run on the host (sandbox ``none``).
+    """
+
+    sandbox = NO_SANDBOX
 
     def __init__(self, commands: Mapping[str, str]):
         self.commands = dict(commands)
@@ -77,6 +86,9 @@ class CommandWorker:
     def describe(self) -> dict:
         """Return a description for config.json."""
         return {"worker": "command"}
+
+    def preflight(self) -> None:
+        """Nothing to check."""
 
     def run(self, request: WorkerRequest) -> WorkerResult:
         """Run the node's command in its workspace."""
@@ -106,13 +118,25 @@ def write_json_atomic(path: Path, data: dict) -> None:
 
 
 class AqoursWorker:
-    """Run the Aqours single-agent path in a child process."""
+    """Run the Aqours single-agent path in a child process.
+
+    With a Docker ``sandbox``, the child runs the agent's ``bash`` commands in
+    a container that sees only the node's worktree; the parent removes the
+    container after the child exits, whatever happened to it.
+    """
 
     def __init__(self, *, entry_command: Sequence[str] | None = None,
-                 kill_grace_s: float = DEFAULT_KILL_GRACE_S):
+                 kill_grace_s: float = DEFAULT_KILL_GRACE_S,
+                 sandbox: SandboxConfig = NO_SANDBOX):
         self.entry_command = list(entry_command or
                                   [sys.executable, "-m", WORKER_ENTRY_MODULE])
         self.kill_grace_s = kill_grace_s
+        self.sandbox = sandbox
+
+    def preflight(self) -> None:
+        """Raise ``SandboxUnavailable`` if the Docker sandbox cannot run."""
+        if self.sandbox.kind == "docker":
+            check_docker(self.sandbox.image)
 
     def describe(self) -> dict:
         """Ask the worker entry which provider and model it would use."""
@@ -140,7 +164,15 @@ class AqoursWorker:
             "trace_storage_root": str(log_dir / f"aqours_{n}" / "trace"),
             "runtime_root": str(log_dir / f"aqours_{n}" / "state"),
             "timeout_s": request.timeout_s,
+            "sandbox": self._sandbox_config(request),
         }
+
+    def _sandbox_config(self, request: WorkerRequest) -> dict:
+        if self.sandbox.kind != "docker":
+            return {"kind": "none"}
+        return {"kind": "docker", "image": self.sandbox.image,
+                "container": container_name(request.node_id, request.attempt,
+                                            secrets.token_hex(4))}
 
     def run(self, request: WorkerRequest) -> WorkerResult:
         """Run one attempt in a child process and read its result file."""
@@ -153,9 +185,13 @@ class AqoursWorker:
         result_path.unlink(missing_ok=True)
         env = {**os.environ, "AQOURS_CODE_WORKDIR": config["workspace"]}
         started = time.monotonic()
-        proc = run_process([*self.entry_command, "--config", str(config_path)],
-                           cwd=log_dir, env=env,
-                           timeout=request.timeout_s + self.kill_grace_s)
+        try:
+            proc = run_process([*self.entry_command, "--config", str(config_path)],
+                               cwd=log_dir, env=env,
+                               timeout=request.timeout_s + self.kill_grace_s)
+        finally:
+            if config["sandbox"]["kind"] == "docker":
+                remove_containers(config["sandbox"]["container"])
         duration = time.monotonic() - started
         (log_dir / f"worker_{request.attempt}_stdout.txt").write_text(
             proc.output, encoding="utf-8")

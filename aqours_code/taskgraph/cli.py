@@ -102,9 +102,21 @@ def _cmd_export_schema(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+NO_SANDBOX_WARNING = (
+    "WARNING: --sandbox none: worker shell commands run on this machine and can read "
+    "any file on it. Use this only for tests; such a run is not a valid experiment.")
+
+
+def _banner(lines: list[str]) -> str:
+    width = max(len(line) for line in lines)
+    rule = "!" * (width + 4)
+    return "\n".join([rule, *(f"! {line.ljust(width)} !" for line in lines), rule])
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     from .coordinator import GraphInvalid, RunOptions, run_graph
     from .gitops import GitError
+    from .sandbox import SandboxConfig, SandboxUnavailable
     from .workers import AqoursWorker, CommandWorker
 
     graph = _load(args.graph)
@@ -119,9 +131,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
             commands = json.loads(Path(args.command_map).read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             return _error(f"cannot read command map {args.command_map}: {exc}")
-        worker = CommandWorker(commands)
+        worker = CommandWorker(commands)  # runs on the host whatever --sandbox says
     else:
-        worker = AqoursWorker()
+        worker = AqoursWorker(sandbox=SandboxConfig(kind=args.sandbox,
+                                                    image=args.sandbox_image))
+    if worker.sandbox.kind == "none":
+        print(NO_SANDBOX_WARNING, file=sys.stderr)
     hidden = Path(args.hidden_tests) if args.hidden_tests else None
     if hidden is not None and not hidden.is_dir():
         return _error(f"hidden tests directory not found: {hidden}")
@@ -133,6 +148,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except GraphInvalid as exc:
         print(exc.report.format())
         return EXIT_INVALID
+    except SandboxUnavailable as exc:
+        return _error(f"{exc} (the run did not start; it never falls back to "
+                      "--sandbox none)")
     except (GitError, RuntimeError, OSError) as exc:
         return _error(str(exc))
     summary = result.summary
@@ -147,8 +165,27 @@ def _cmd_run(args: argparse.Namespace) -> int:
         hidden_stats = summary["hidden_tests"]
         print(f"hidden tests: {hidden_stats['passed']} passed, {hidden_stats['failed']} "
               f"failed, {hidden_stats['errors']} errors, {hidden_stats['skipped']} skipped")
+    escapes = summary["escape_attempts_total"]
+    print(f"sandbox: {summary['sandbox']}  escape attempts: {escapes}")
+    if escapes and summary["sandbox"] == "none":
+        print(_banner([f"{escapes} escape attempt(s) without a sandbox: workers may have "
+                       "read files outside their workspace.",
+                       "THE RESULTS OF THIS RUN ARE INVALID. See escape_samples in "
+                       "summary.json."]))
     print(f"run directory: {result.run_dir}")
     return EXIT_OK if summary["status"] == "success" else EXIT_INVALID
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    from .escapes import audit_runs, format_audit, run_dirs
+
+    paths = [Path(path) for path in args.runs]
+    missing = [str(path) for path in paths if not run_dirs(path)]
+    if missing:
+        return _error(f"no run directory found in: {', '.join(missing)}")
+    rows = audit_runs(paths)
+    print(format_audit(rows))
+    return EXIT_INVALID if any(row.escapes for row in rows) else EXIT_OK
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
@@ -246,7 +283,17 @@ def build_parser() -> argparse.ArgumentParser:
                          help="JSON file mapping node id to a shell command (--worker command)")
     run_cmd.add_argument("--worker-timeout", type=float, default=1800.0)
     run_cmd.add_argument("--hidden-tests")
+    run_cmd.add_argument("--sandbox", choices=("docker", "none"), default="docker",
+                         help="where worker shell commands run (none: tests only)")
+    run_cmd.add_argument("--sandbox-image", default="aqours-code-eval:py311",
+                         help="Docker image for --sandbox docker")
     run_cmd.set_defaults(func=_cmd_run)
+
+    audit_cmd = commands.add_parser(
+        "audit", help="find workers that reached outside their workspace in past runs")
+    audit_cmd.add_argument("runs", nargs="+",
+                           help="a run directory, or a directory of run directories")
+    audit_cmd.set_defaults(func=_cmd_audit)
 
     plan_cmd = commands.add_parser("plan", help="generate a task graph with the planner")
     plan_cmd.add_argument("request", help="request text (Markdown)")

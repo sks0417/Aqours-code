@@ -58,7 +58,18 @@ work after you finish.
 Change existing files with edit_file, only where your sub-task needs it;
 never rewrite a whole existing file with write_file. Use write_file only
 for files you create.
-{retry}"""
+
+Work only inside your workspace. Files outside it are not available to you.
+If you need something that is not in the workspace or in the interfaces your
+sub-task can rely on, do not look for it elsewhere: do the best you can with
+what you have, and state clearly in your final answer what was missing.
+{sandbox}{retry}"""
+
+SANDBOX_NOTE = """
+Your bash commands run in a Linux container (POSIX sh, no network) whose
+working directory, /workspace, is your workspace. Use relative paths and
+POSIX shell syntax in commands.
+"""
 
 CONTRACT_NOTE = """
 This is a contract sub-task. For each symbol, write the signature with a
@@ -112,8 +123,11 @@ def requirement_status(graph: Graph, node: Node, index: RepoIndex,
 
 
 def build_node_prompt(graph: Graph, node: Node, index: RepoIndex, attempt: int,
-                      failure: AttemptFailure | None) -> str:
-    """Return the English worker prompt for one attempt of ``node``."""
+                      failure: AttemptFailure | None, *, sandbox: str = "none") -> str:
+    """Return the English worker prompt for one attempt of ``node``.
+
+    ``sandbox="docker"`` adds a note that bash runs in a Linux container.
+    """
     requires = [f"- `{symbol}`: {requirement_status(graph, node, index, symbol)}"
                 for symbol in node.requires]
     requires += [f"- `{symbol}`: {IMPLEMENTED_UPSTREAM}" for symbol in node.requires_impl]
@@ -133,5 +147,6 @@ def build_node_prompt(graph: Graph, node: Node, index: RepoIndex, attempt: int,
         requires="\n".join(requires) if requires else "- (none)",
         context_files=_bullets(node.context_files),
         checks=_bullets(node.check.commands),
+        sandbox=SANDBOX_NOTE if sandbox == "docker" else "",
         retry=retry,
     )

@@ -71,6 +71,24 @@ def describe() -> dict:
     return {"model_provider": MODEL_PROVIDER, "model": MODEL}
 
 
+def command_executor_for(config: dict, deadline: float):
+    """The executor for the worker's ``bash`` tool.
+
+    ``config["sandbox"]`` of ``{"kind": "docker", "image": ..., "container": ...}``
+    gives a Docker container that sees only ``config["workspace"]``; anything
+    else runs commands on the host (``--sandbox none``).
+    """
+    sandbox = config.get("sandbox") or {}
+    if sandbox.get("kind") == "docker":
+        from .sandbox import docker_executor  # noqa: PLC0415
+
+        return docker_executor(config["workspace"], sandbox["image"],
+                               sandbox["container"], deadline=deadline)
+    from aqours_code.command_executor import LocalCommandExecutor  # noqa: PLC0415
+
+    return LocalCommandExecutor()
+
+
 def run_worker(config: dict, model_client=None,
                tool_policy: dict | None = None) -> WorkerResult:
     """Run one node attempt with ``run_agent_task`` and return its result.
@@ -78,10 +96,7 @@ def run_worker(config: dict, model_client=None,
     ``tool_policy`` defaults to :data:`WORKER_TOOL_POLICY`.
     """
     from aqours_code.agent_loop import run_agent_task  # noqa: PLC0415
-    from aqours_code.command_executor import (  # noqa: PLC0415
-        CaseTimeoutError,
-        LocalCommandExecutor,
-    )
+    from aqours_code.command_executor import CaseTimeoutError  # noqa: PLC0415
 
     started = time.monotonic()
     if model_client is None:
@@ -106,6 +121,7 @@ def run_worker(config: dict, model_client=None,
     for key in ("trace_storage_root", "runtime_root"):
         Path(config[key]).mkdir(parents=True, exist_ok=True)
     result = WorkerResult(ok=True)
+    deadline = time.monotonic() + timeout_s
     try:
         info = run_agent_task(
             config["task"],
@@ -114,9 +130,9 @@ def run_worker(config: dict, model_client=None,
             model_client=counting,
             model_provider=provider,
             model=model,
-            command_executor=LocalCommandExecutor(),
+            command_executor=command_executor_for(config, deadline),
             tool_policy=tool_policy or WORKER_TOOL_POLICY,
-            case_deadline=time.monotonic() + timeout_s,
+            case_deadline=deadline,
             trace_storage_root=config["trace_storage_root"],
             runtime_root=config["runtime_root"],
             manage_lifecycle=True,
