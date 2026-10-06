@@ -107,19 +107,19 @@ the new job fields and one-line `Runner` delegations.
               ┌──► E (api.py) ──────────────────────────────┐
               ├──► F (dashboard.py) ────────────────────────┤
   A ──────────┴──► S ──► R ──► N ──► H ─────────────────────┴──► G
-contract     selection recurring notify audit                   integration
+contract     selection recurring notify audit                   fix mismatches
 ```
 
 | Node | Kind | Edits | Why |
 | --- | --- | --- | --- |
-| A | contract | `models.py`, `errors.py`, `store.py`, `runner.py` | new job fields and record classes, `NotFound`, the complete `JobStore.transaction()` helper, and every new `Runner` method as a signature with a runnable default (readers return empty results, writers raise `NotImplementedError`) |
+| A | contract | `models.py`, `errors.py`, `store.py`, `runner.py` | new job fields and record classes, `NotFound`, the complete `JobStore.transaction()` helper, and every new `Runner` method as a signature with a runnable default (readers return empty results, writers raise `NotImplementedError`); writes no test file |
 | S | implement | `runner.py`, `store.py` | **priorities, tenant rotation, dependencies, and rate limits merged**: all three change how `run_once` picks a job, which means replacing the heap with a selection over stored jobs. Splitting them would give three nodes rewriting the same twenty lines one after the other (property 1). Dependency cascades are here too, since they hook into the same failure and cancellation paths |
 | R | implement | `runner.py`, `store.py` | recurring jobs: another change at the start of `run_once`, plus job creation through S's `JobStore.add`; queued after S (same files, and it needs S's job columns: `full` edge) |
 | N | implement | `runner.py`, `store.py` | notifications: an outbox write at **every** state change, scattered over `runner.py`, so queued after S and R, which add state changes (`order` edge, property 3) |
 | H | implement | `runner.py`, `store.py` | the audit log: an entry at the same state changes as N; queued after N (`order` edge, property 3) |
 | E | implement | `api.py` | every new REST route; only needs A's method signatures, so it runs in parallel with the chain |
 | F | implement | `dashboard.py` | every new dashboard page; same reason |
-| G | implement | `tests/test_platform.py` (+ glue in any module) | end-to-end tests |
+| G | implement | `runner.py`, `store.py`, `api.py`, `dashboard.py`; `tests/test_platform.py` | a light fix-up node: E and F were written against `Runner` stubs, so G checks the REST API and the dashboard against the real `Runner` and fixes mismatches in the smallest way, adding at most a few end-to-end tests |
 
 Edges: `A→S`, `A→E`, `A→F` (interface); `S→R` (full); `R→N`, `N→H` (order);
 `H→G`, `E→G`, `F→G` (full). Critical path: A → S → R → N → H → G (6 nodes).
@@ -129,28 +129,28 @@ done the rest is sequential.
 ### modular
 
 ```text
-          ┌──► P priority.py ──────┐
-          ├──► R recurring.py ─────┤
-          ├──► D dependencies.py ──┤
-  A ──────┼──► L ratelimit.py ─────┼──► G
-contract  ├──► N notifications.py ─┤  integration
-          └──► H audit.py ─────────┘
+          ┌──► P priority.py
+          ├──► R recurring.py
+          ├──► D dependencies.py
+  A ──────┼──► L ratelimit.py
+contract  ├──► N notifications.py
+          └──► H audit.py
 ```
 
 | Node | Kind | Edits | Why |
 | --- | --- | --- | --- |
-| A | contract | `models.py`, `errors.py`, `store.py`, `transitions.py`, `web.py`, `runner.py`, `api.py`; creates `validation.py` and the six feature modules | new job fields and records, `NotFound`, complete shared helpers (`validation.py`, `web.fields/number/time/heading`), the six feature modules as stubs with their final signatures, and complete one-line `Runner` delegations to them; `submit` takes the new arguments and `run_once` calls `recurring.create_due` |
+| A | contract | `models.py`, `errors.py`, `store.py`, `transitions.py`, `web.py`, `runner.py`, `api.py`; creates `validation.py` and the six feature modules | new job fields and records, `NotFound`, complete shared helpers (`validation.py`, `web.fields/number/time/heading`), the six feature modules as stubs with their final signatures, and complete one-line `Runner` delegations to them; `submit` takes the new arguments and `run_once` calls `recurring.create_due`; writes no test file |
 | P | implement | `priority.py` | two orderings, a turn-recording subscriber, `set_priority`, `queue`, `tenants`, their routes and page |
 | R | implement | `recurring.py` | definitions, `create_due`, routes, page |
 | D | implement | `dependencies.py` | a filter, a cascade subscriber, routes, page |
 | L | implement | `ratelimit.py` | a filter, a start-recording subscriber, routes, page |
 | N | implement | `notifications.py` | an outbox subscriber, delivery, routes, page |
 | H | implement | `audit.py` | an audit subscriber, history and stats, routes, pages |
-| G | implement | `tests/test_platform.py` (+ glue) | end-to-end tests |
 
-Edges: `A→P/R/D/L/N/H` (interface); `P/R/D/L/N/H→G` (full). The six feature
-nodes have no path between them and edit disjoint files, each owning its own
-API routes and dashboard pages. Critical path: A → (any feature) → G (3 nodes).
+Edges: `A→P/R/D/L/N/H` (interface). The six feature nodes have no path
+between them and edit disjoint files, each owning its own API routes and
+dashboard pages. There is no integration node: `final_checks` runs the public
+tests on the merged result. Critical path: A → (any feature) (2 nodes).
 
 How it differs from coupled, and why:
 
@@ -168,11 +168,14 @@ How it differs from coupled, and why:
 
 ### Validation
 
-All four graphs pass `validate()` on their generated repository with no errors
-and **no warnings**, and `derive_edges()` adds no edge to either hand-written
-graph. `requires` holds interface dependencies (satisfied by the contract
-node); `requires_impl` holds implementation dependencies (R on S's
-`JobStore.add` in coupled; G on every feature in both).
+All four graphs pass `validate()` on their generated repository with no
+errors, and `derive_edges()` adds no edge to either hand-written graph. Three
+graphs have no warnings; the modular hand-written graph has only W2 warnings
+(a symbol that no other node requires), because without G nothing in the graph
+consumes the feature modules: `final_checks` and the hidden tests do.
+`requires` holds interface dependencies (satisfied by the contract node);
+`requires_impl` holds implementation dependencies (R on S's `JobStore.add` and
+G on every part, in coupled).
 `tests/taskgraph/test_job_platform_task.py` checks this, the commit hashes,
 the hidden test results below, and the graph shapes.
 
@@ -185,12 +188,57 @@ the hidden test results below, and the graph shapes.
   plus per-node overhead; worth it only if smaller contexts make nodes more
   accurate.
 - **Graph, parallel**: modular can run six features at once (with
-  `--workers 4`, two rounds), so wall time is about A + two feature nodes + G.
+  `--workers 6`, one round), so wall time is about A + the slowest feature node.
   Coupled gains only the overlap of E and F with the chain; its wall time stays
   close to the sequential run. Comparing the two variants under the same
   scheme isolates the effect of code structure on the graph.
 - In coupled, E and F work against stub `Runner` methods, and N and H must find
   every state change that S and R wrote, so mismatches surface late, in G.
+
+### Tuning log
+
+The graphs above were tuned **after looking at one run's results**, so the
+next runs are not blind to this task: keep that in mind when comparing them
+with the single agent, whose graph is unchanged.
+
+The run, on modular:
+
+| Scheme | Hidden tests | Wall time | Input / output tokens |
+| --- | --- | --- | --- |
+| single | 131/141 | 465 s | 0.98M / 108K |
+| hand-written, `--workers 6` | 132/141 | 886 s | 5.80M / 281K |
+
+Timeline of the graph run: A 278 s → six feature nodes in parallel 191 s →
+G 363 s. The parallel part worked; the time went into the two serial nodes at
+either end.
+
+- **A** wrote no feature code (the six modules stayed stubs) but did needless
+  work: it rewrote existing files whole (`store.py` −162 / +177, `web.py`
+  −148 / +189) where a few edits were needed, and wrote a 225-line
+  `tests/test_contract.py`.
+- **G** started with all 139 public tests passing, changed no feature code,
+  and spent 363 s and 1.5M input tokens on a 533-line `tests/test_platform.py`
+  that did not move the hidden test score.
+
+Changes:
+
+1. **Every worker prompt** (`aqours_code/taskgraph/prompting.py`) now says to
+   change existing files with `edit_file`, only where the sub-task needs it,
+   and never to rewrite a whole existing file with `write_file`. The single
+   agent rewrote `store.py` whole too (−162 / +177), so the rule goes to every
+   node, the single-node graph included, to keep the comparison fair.
+2. **A, both variants**: no `tests/test_contract.py` (removed from
+   `edit_set.create`, from the checks, and from the goal); A's only check is
+   `python -m pytest -q tests`.
+3. **G, modular**: removed with its six edges. The features are independent
+   modules and `final_checks` already verifies the merged result. Critical
+   path: 3 → 2 nodes.
+4. **G, coupled**: kept but made light. E and F are written against `Runner`
+   stubs and can disagree with the real `Runner` once merged, so G still has
+   work to do; its goal now is to run the tests, check the REST API and the
+   dashboard against the real `Runner`, fix mismatches in the smallest way, and
+   add at most a few end-to-end tests. Its edits, edges, and `requires_impl` are
+   unchanged.
 
 ## Hidden tests
 
@@ -246,14 +294,14 @@ H=experiments/taskgraph/job_platform/hidden_tests
 G=experiments/taskgraph/job_platform/coupled/graphs
 
 # single agent
-python -m aqours_code.taskgraph run $G/single.json --repo /tmp/jp-coupled --workers 1 --hidden-tests $H --out /tmp/jp-runs
+python -m aqours_code.taskgraph run $G/single.json --repo /tmp/jp-coupled --workers 1 --worker-timeout 3600 --hidden-tests $H --out /tmp/jp-runs
 # hand-written graph, sequential
-python -m aqours_code.taskgraph run $G/handwritten.json --repo /tmp/jp-coupled --workers 1 --hidden-tests $H --out /tmp/jp-runs
+python -m aqours_code.taskgraph run $G/handwritten.json --repo /tmp/jp-coupled --workers 1 --worker-timeout 3600 --hidden-tests $H --out /tmp/jp-runs
 # hand-written graph, parallel
-python -m aqours_code.taskgraph run $G/handwritten.json --repo /tmp/jp-coupled --workers 4 --hidden-tests $H --out /tmp/jp-runs
+python -m aqours_code.taskgraph run $G/handwritten.json --repo /tmp/jp-coupled --workers 6 --worker-timeout 3600 --hidden-tests $H --out /tmp/jp-runs
 ```
 
 Replace `coupled` with `modular` for the other variant. Each run clones the
 repository, so one generated repository serves every run. The default
-`--worker-timeout` is 1800 s per node; the single-agent node may need more
-(`--worker-timeout 3600`).
+`--worker-timeout` is 1800 s per node; the single-agent node may need more, so
+the commands above pass `--worker-timeout 3600` to every run.

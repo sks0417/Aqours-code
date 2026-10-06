@@ -54,6 +54,10 @@ they all pass:
 Do not run git commands that change repository state (commit, checkout,
 branch, reset, stash, merge, rebase, and so on). The coordinator commits your
 work after you finish.
+
+Change existing files with edit_file, only where your sub-task needs it;
+never rewrite a whole existing file with write_file. Use write_file only
+for files you create.
 {retry}"""
 
 CONTRACT_NOTE = """

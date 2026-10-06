@@ -131,11 +131,24 @@ def test_graphs_validate_and_handwritten_needs_no_derived_edges(repos, variant):
         graph = load_graph(TASK / variant / "graphs" / f"{name}.json")
         report = validate(graph, index)
         assert report.ok, report.format()
-        assert not report.warnings, report.format()
+        # Without G, nothing in modular requires the feature modules' symbols;
+        # final_checks and the hidden tests use them (W2, unused provides).
+        allowed = {"W2"} if (variant, name) == ("modular", "handwritten") else set()
+        assert {issue.code for issue in report.warnings} <= allowed, report.format()
     handwritten = load_graph(TASK / variant / "graphs" / "handwritten.json")
     derived, entries = derive_edges(handwritten, index)
     assert entries == []
     assert derived.edges == handwritten.edges
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_contract_writes_no_test_file(variant):
+    graph = load_graph(TASK / variant / "graphs" / "handwritten.json")
+    contract = next(node for node in graph.nodes if node.id == "A")
+    assert contract.edit_set.create == [path for path in contract.edit_set.create
+                                        if not path.startswith("tests/")]
+    assert contract.check.commands == ["python -m pytest -q tests"]
+    assert "test_contract" not in contract.goal
 
 
 def critical_path_nodes(graph) -> int:
@@ -158,14 +171,13 @@ def test_modular_graph_structure():
             if first != second:
                 assert first not in ancestor[second], (first, second)
         assert ancestor[first] == {"A"}
-    assert set(MODULAR_FEATURES) | {"A"} <= ancestor["G"]
     kinds = {node.id: node.kind for node in graph.nodes}
-    assert kinds["A"] == "contract" and len(graph.nodes) == 8
+    assert kinds == {"A": "contract", **{node: "implement" for node in MODULAR_FEATURES}}
     edited = [set(node.edit_set.modify) | set(node.edit_set.create)
               for node in graph.nodes if node.id in MODULAR_FEATURES]
     for files in edited:
         assert not files & {"jobrunner/runner.py", "jobrunner/api.py", "jobrunner/dashboard.py"}
-    assert critical_path_nodes(graph) == 3
+    assert critical_path_nodes(graph) == 2
 
 
 def test_coupled_graph_structure():
@@ -177,6 +189,8 @@ def test_coupled_graph_structure():
     for parallel in ("E", "F"):
         assert ancestor[parallel] == {"A"}
     assert {"H", "E", "F"} <= ancestor["G"]
+    assert "tests/test_platform.py" in next(node for node in graph.nodes
+                                           if node.id == "G").edit_set.create
     modular = load_graph(TASK / "modular" / "graphs" / "handwritten.json")
     assert critical_path_nodes(graph) > critical_path_nodes(modular)
     assert critical_path_nodes(graph) == 6
