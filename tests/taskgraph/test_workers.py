@@ -230,6 +230,25 @@ def test_retry_prompt_includes_reason_and_output_tail(toy_index):
     assert "TAIL-MARKER" in prompt and "x" * 4100 not in prompt
 
 
+EDIT_RULE = ("Change existing files with edit_file, only where your sub-task needs it; "
+             "never rewrite a whole existing file with write_file. Use write_file only "
+             "for files you create.")
+
+
+def test_every_worker_prompt_forbids_rewriting_existing_files(toy_index):
+    graph = make_graph([
+        make_node("C", kind="contract", modify=("models.py",),
+                  provides=("models.py::JobStatus.FAILED",)),
+        make_node("I", modify=("runner.py",), requires=("models.py::JobStatus.FAILED",)),
+    ], [make_edge("C", "I", "interface")])
+    single = make_graph([make_node("S", modify=("runner.py",))])
+    nodes = [(graph, graph.nodes[0]), (graph, graph.nodes[1]), (single, single.nodes[0])]
+    for owner, node in nodes:
+        prompt = build_node_prompt(owner, node, toy_index, 1, None)
+        rules = prompt[prompt.index("# Rules"):]
+        assert EDIT_RULE in " ".join(rules.split()), node.id
+
+
 # ── isolation ──
 
 def test_coordinator_does_not_import_the_aqours_runtime():

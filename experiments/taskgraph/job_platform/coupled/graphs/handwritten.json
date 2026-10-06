@@ -15,7 +15,7 @@
       "id": "A",
       "title": "Contract: job fields, records, errors, transactions, Runner method stubs",
       "kind": "contract",
-      "goal": "This is the contract every other sub-task builds on; follow SPEC.md for names, types, and defaults, and give each new name a docstring. In jobrunner/models.py add the Job fields priority=0, tenant='default', depends_on=[] (a list of ints), definition_id=None and cancel_reason=None, all in Job.to_dict, and the dataclasses RecurringJob, RateLimit, Subscription, Notification and AuditEntry with the fields of SPEC.md and a to_dict each. In jobrunner/errors.py add NotFound(JobRunnerError) and make JobNotFound a subclass of it. In jobrunner/store.py add the complete helper JobStore.transaction(), a context manager that commits every write inside it at once at the end of the outermost block (and rolls back on an exception); every existing write method must commit only outside a transaction. In jobrunner/runner.py give Runner.submit the keyword arguments priority, tenant, run_at and depends_on with the checks of SPEC.md 'Jobs' (it may ignore their effect for now), and add every new Runner method of SPEC.md 'Public interface' with its signature, a docstring, and a runnable default: readers return empty results ([] or the stats dict with zeros), lookups of an id raise NotFound or JobNotFound, deliver_notifications returns 0, and methods that create or change records raise NotImplementedError. Do not change run_once. Write tests/test_contract.py; it checks only what stays true once the features are implemented (fields, records, to_dict, transactions, signatures), never the default bodies.",
+      "goal": "This is the contract every other sub-task builds on; follow SPEC.md for names, types, and defaults, and give each new name a docstring. In jobrunner/models.py add the Job fields priority=0, tenant='default', depends_on=[] (a list of ints), definition_id=None and cancel_reason=None, all in Job.to_dict, and the dataclasses RecurringJob, RateLimit, Subscription, Notification and AuditEntry with the fields of SPEC.md and a to_dict each. In jobrunner/errors.py add NotFound(JobRunnerError) and make JobNotFound a subclass of it. In jobrunner/store.py add the complete helper JobStore.transaction(), a context manager that commits every write inside it at once at the end of the outermost block (and rolls back on an exception); every existing write method must commit only outside a transaction. In jobrunner/runner.py give Runner.submit the keyword arguments priority, tenant, run_at and depends_on with the checks of SPEC.md 'Jobs' (it may ignore their effect for now), and add every new Runner method of SPEC.md 'Public interface' with its signature, a docstring, and a runnable default: readers return empty results ([] or the stats dict with zeros), lookups of an id raise NotFound or JobNotFound, deliver_notifications returns 0, and methods that create or change records raise NotImplementedError. Do not change run_once.",
       "edit_set": {
         "modify": [
           "jobrunner/models.py",
@@ -23,9 +23,7 @@
           "jobrunner/store.py",
           "jobrunner/runner.py"
         ],
-        "create": [
-          "tests/test_contract.py"
-        ],
+        "create": [],
         "symbols": []
       },
       "requires": [],
@@ -70,8 +68,7 @@
       ],
       "check": {
         "commands": [
-          "python -m pytest -q tests",
-          "python -m pytest -q tests/test_contract.py"
+          "python -m pytest -q tests"
         ],
         "timeout_s": 300
       },
@@ -398,7 +395,7 @@
       "id": "G",
       "title": "Integration and end-to-end tests",
       "kind": "implement",
-      "goal": "Write tests/test_platform.py exercising SPEC.md end to end through the REST API and the dashboard: a pipeline with tenants, priorities and dependencies, a rate limit next to a recurring job, webhook delivery with retries, the audit log and statistics, and a restart (a new JobStore and Runner on the same database file) that keeps every record. Fix any mismatch between the parts that these tests reveal.",
+      "goal": "First run python -m pytest -q tests. All parts are merged now: E and F were written against Runner stubs. Check that the REST API and the dashboard work with the real Runner, and fix any mismatch between the parts in the smallest way. Do not write a large test file; add at most a few end-to-end tests to tests/test_platform.py.",
       "edit_set": {
         "modify": [
           "jobrunner/runner.py",
