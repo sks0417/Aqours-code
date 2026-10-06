@@ -409,3 +409,54 @@ def test_planner_prompt_mentions_nothing_of_the_experiment_tasks():
                  "ratelimit", "audit", "notification", "priorit", "dashboard",
                  "cancel", "retry", "retries", "scheduler"):
         assert word not in text, word
+
+
+# ── repository conventions ──
+
+CONVENTIONS = ["The current time comes only from the injected clock: functions that need "
+               "it take a `now` argument.",
+               "All storage access goes through JobStore."]
+
+
+def test_conventions_are_appended_to_every_goal(toy_repo, tmp_path):
+    draft = {"conventions": CONVENTIONS, **VALID_DRAFT}
+    result, _, options = plan(toy_repo, tmp_path, [answer(draft)])
+    assert result.success
+    graph = load_graph(options.out)
+    for node in graph.nodes:
+        original = f"goal {node.id}"
+        assert node.goal.startswith(original + "\n\nRepository conventions:\n")
+        section = node.goal[node.goal.index("Repository conventions:"):]
+        assert section.splitlines()[1:] == [f"- {item}" for item in CONVENTIONS]
+    report = json.loads(report_path_for(options.out).read_text(encoding="utf-8"))
+    assert report["conventions"] == CONVENTIONS
+    assert json.loads(report["draft"]) == draft
+    assert report["rounds"][0]["conventions"] == CONVENTIONS
+    assert json.loads(report["rounds"][0]["draft_json"]) == draft
+
+
+def test_without_conventions_goals_are_unchanged(toy_repo, tmp_path):
+    for draft in (VALID_DRAFT, {"conventions": [], **VALID_DRAFT}):
+        out_dir = tmp_path / ("old" if "conventions" not in draft else "empty")
+        out_dir.mkdir()
+        result, _, options = plan(toy_repo, out_dir, [answer(draft)])
+        assert result.success
+        goals = {node.id: node.goal for node in load_graph(options.out).nodes}
+        assert goals == {"C": "goal C", "S": "goal S", "R": "goal R"}
+        report = json.loads(report_path_for(options.out).read_text(encoding="utf-8"))
+        assert report["conventions"] == []
+
+
+def test_old_drafts_without_conventions_still_parse():
+    draft = parse_draft(answer(VALID_DRAFT))
+    assert draft.conventions == [] and [node.id for node in draft.nodes] == ["C", "S", "R"]
+    with pytest.raises(DraftError):
+        parse_draft(answer({"conventions": "not a list", **VALID_DRAFT}))
+
+
+def test_prompt_asks_for_conventions_and_no_integration_node():
+    text = PROMPT_PATH.read_text(encoding="utf-8")
+    assert "**Repository conventions.**" in text and '"conventions"' in text
+    assert "No test-only nodes and no integration node" in text
+    assert "requires_impl" in text[text.index("4. **No test-only"):]
+    assert "`now` argument" in text
