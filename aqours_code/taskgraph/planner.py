@@ -2,9 +2,10 @@
 
 The agent reads the request and a clone of the repository with read-only
 tools and answers with a draft (nodes only, see ``planner_prompt.md``). The
-program completes the draft into a :class:`Graph`, derives its edges, and
-validates it; when the graph has errors, the agent gets the draft and the
-errors back for up to ``max_revisions`` more rounds.
+program completes the draft into a :class:`Graph`, derives its edges,
+validates it, and applies the planner-only checks P1-P3; when the graph has
+errors, the agent gets the draft and the errors back for up to
+``max_revisions`` more rounds.
 """
 from __future__ import annotations
 
@@ -23,10 +24,11 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import gitops
+from .compare import is_test_only, is_test_path
 from .derive import derive_edges
 from .repo_index import RepoIndex, build_index
 from .schema import Graph, dump_graph
-from .validate import Issue, validate
+from .validate import Issue, ancestors, edit_files, unique_nodes, validate
 from .workers import AqoursWorker, Worker, WorkerRequest, WorkerResult, write_json_atomic
 
 PLANNER_VERSION = "planner-v0"
@@ -180,6 +182,55 @@ def draft_to_graph(draft: Draft, info: GraphInfo, *, revised: bool) -> Graph:
         raise DraftError(_pydantic_issues(exc, [node.id for node in draft.nodes])) from None
 
 
+# ── Planner-only checks ──
+
+def _check_contract_order(graph: Graph) -> list[Issue]:
+    """P1: no contract node may be an ancestor of another contract node."""
+    contracts = [node.id for node in unique_nodes(graph) if node.kind == "contract"]
+    ancestor_map = ancestors(graph)
+    return [Issue("P1", [first, second],
+                  f"contract {first} comes before contract {second} (after deriving the "
+                  f"edges, {second} depends on {first}). Contracts must not be ordered: "
+                  f"merge {first} and {second} into one contract node that makes all "
+                  "their interface changes")
+            for second in contracts for first in contracts
+            if first != second and first in ancestor_map[second]]
+
+
+def _check_test_only(graph: Graph) -> list[Issue]:
+    """P2: no node may edit only files under ``tests/``."""
+    return [Issue("P2", [node.id],
+                  f"{node.id} only writes tests ({', '.join(sorted(edit_files(node)))}). "
+                  "Remove this node, or move its work into the nodes it tests: each node "
+                  "writes the tests for its own work, and the final checks run all tests "
+                  "after the merge")
+            for node in unique_nodes(graph) if is_test_only(node)]
+
+
+def _check_contract_tests(graph: Graph) -> list[Issue]:
+    """P3: contract nodes neither create nor modify files under ``tests/``."""
+    issues = []
+    for node in unique_nodes(graph):
+        tests = sorted(path for path in edit_files(node) if is_test_path(path))
+        if node.kind == "contract" and tests:
+            issues.append(Issue(
+                "P3", [node.id],
+                f"contract {node.id} edits test files ({', '.join(tests)}). A contract "
+                "writes no test files: remove them from its modify/create (the implement "
+                "nodes write the tests for their behaviour); its check only runs the "
+                "existing tests"))
+    return issues
+
+
+def planner_checks(graph: Graph) -> list[Issue]:
+    """Errors P1-P3 for a planner graph whose edges are derived.
+
+    Not part of :func:`validate`: hand-written graphs are not held to them.
+    """
+    return [*_check_contract_order(graph), *_check_test_only(graph),
+            *_check_contract_tests(graph)]
+
+
 # ── Prompt ──
 
 def load_prompt() -> str:
@@ -222,8 +273,8 @@ def build_prompt(request: str, index: RepoIndex, final_checks: list[str],
         parts.append(
             f"# Fix your previous draft (revision {revision.number} of {MAX_REVISIONS})\n\n"
             "You already planned this request once; your draft is below, followed by "
-            "the problems the program found after deriving the edges and validating "
-            "the graph. Fix every problem and answer with the complete corrected draft "
+            "the problems the program found after deriving the edges, validating "
+            "the graph and applying the planner checks (P1-P3). Fix every problem and answer with the complete corrected draft "
             "(all nodes, not only the changed ones) as the last ```json block. Keep "
             "the parts that were fine.\n\n"
             f"## Previous draft\n\n```json\n{draft}\n```\n\n"
@@ -297,7 +348,7 @@ def _evaluate_answer(answer: str, info: GraphInfo, index: RepoIndex, revised: bo
         return None, answer, exc.issues, []
     derived, _entries = derive_edges(graph, index)
     report = validate(derived, index)
-    return derived, draft_text, report.errors, report.warnings
+    return derived, draft_text, [*report.errors, *planner_checks(derived)], report.warnings
 
 
 def run_plan(options: PlanOptions, worker: Worker) -> PlanResult:

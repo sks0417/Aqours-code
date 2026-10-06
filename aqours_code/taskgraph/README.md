@@ -196,7 +196,8 @@ codes), node counts by kind, files edited by contract nodes, critical path
 (nodes on the longest chain), maximum parallel width (largest layer when
 nodes are layered by longest-chain depth), test-only nodes (every edited file
 under `tests/`), and, for each node of the second graph, the node of the first
-with the highest Jaccard similarity of `modify ∪ create` outside `tests/`.
+with the highest Jaccard similarity of `modify ∪ create` outside `tests/`
+(`no match` when no node shares a file with it; the mean counts it as 0).
 Each graph is validated against `--repo` at its own `base_commit`.
 
 `--repo` indexes the repository at the graph's `base_commit`. Exit codes:
@@ -379,9 +380,9 @@ deciding whether to split or estimating cost.
    `repo` the repository path, `final_checks` the `--final-check` commands,
    `generator` `{"kind": "planner", "planner_version": "planner-v0", "model":
    ...}`, and no edges.
-4. `derive_edges()`, then `validate()`.
+4. `derive_edges()`, then `validate()`, then the planner-only checks below.
 5. If the draft does not parse, does not match the draft format, or the graph
-   has validation errors, run the agent again with the previous draft and the
+   has validation or planner-check errors, run the agent again with the previous draft and the
    errors (a fresh agent; the prompt repeats the request), at most twice.
    A revised graph has `generator.revision_mode = "llm"`, otherwise `"none"`.
    If errors remain after two revisions, the run fails: the last graph that
@@ -397,12 +398,22 @@ Draft format (fields as in the graph schema; missing lists are empty, and
             "context_files": []}]}
 ```
 
+Planner-only checks (`planner_checks()`, errors like V1-V12, applied only to
+planner graphs and not part of `validate()`, so hand-written graphs are not
+held to them):
+
+| Code | Error |
+| --- | --- |
+| `P1` | a contract node is an ancestor of another contract node (contracts are not ordered: merge them) |
+| `P2` | every file a node modifies or creates is under `tests/` (a test-only node: remove it or fold its work into the related nodes) |
+| `P3` | a contract node creates or modifies a file under `tests/` (a contract's check only runs the existing tests) |
+
 Output: `--out` (the graph), `<out>.report.json` (every round's draft text,
 errors and warnings, the agent's calls, tokens and time; the number of
 revision rounds, success, totals, and wall time), and `<out>.logs/` (the
 planner agent's config, trace and stdout per round). `--timeout` applies to
 each round. Exit codes: `0` success, `1` errors remained, `2` input or git
-errors. Error codes in the report besides V1-V12: `FORMAT` (no JSON block,
+errors. Error codes in the report besides V1-V12 and P1-P3: `FORMAT` (no JSON block,
 invalid JSON, or a draft or schema mismatch) and `AGENT` (the planner agent
 failed or timed out).
 

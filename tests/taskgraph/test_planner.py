@@ -19,12 +19,14 @@ from aqours_code.taskgraph.planner import (
     build_prompt,
     extract_json_block,
     parse_draft,
+    planner_checks,
     report_path_for,
     run_plan,
 )
 from aqours_code.taskgraph.planner_entry import PLANNER_TOOL_POLICY, run_planner
+from aqours_code.taskgraph.validate import validate
 from aqours_code.taskgraph.workers import AqoursWorker, WorkerRequest, WorkerResult
-from taskgraph_support import commit_files, git
+from taskgraph_support import commit_files, git, make_graph, make_node
 
 REQUEST = "Add job cancellation to the toy queue.\n"
 
@@ -48,6 +50,26 @@ VALID_DRAFT = {"nodes": [
 INVALID_DRAFT = {"nodes": [
     _node("C", "contract", modify=["models.py"]),
     _node("R", modify=["runner.py"], requires=["store.py::JobStore.nope"]),
+]}
+
+# P1: C2 requires a symbol C1 provides, so the derived edge C1 -> C2 orders them.
+SERIAL_CONTRACTS_DRAFT = {"nodes": [
+    _node("C1", "contract", modify=["models.py"],
+          provides=["models.py::JobStatus.CANCELLED"]),
+    _node("C2", "contract", modify=["store.py"], provides=["store.py::JobStore.cancel"],
+          requires=["models.py::JobStatus.CANCELLED"]),
+    _node("R", modify=["runner.py"], create=["tests/test_runner_cancel.py"],
+          requires=["store.py::JobStore.cancel"]),
+]}
+INDEPENDENT_CONTRACTS_DRAFT = {"nodes": [
+    _node("C1", "contract", modify=["models.py"],
+          provides=["models.py::JobStatus.CANCELLED"]),
+    _node("C2", "contract", modify=["store.py"], provides=["store.py::JobStore.cancel"]),
+    _node("R", modify=["runner.py"], create=["tests/test_runner_cancel.py"],
+          requires=["store.py::JobStore.cancel", "models.py::JobStatus.CANCELLED"]),
+]}
+SINGLE_NODE_DRAFT = {"nodes": [
+    _node("A", modify=["runner.py"], create=["tests/test_runner_cancel.py"]),
 ]}
 
 
@@ -216,6 +238,77 @@ def test_persistent_errors_fail_after_two_revisions_but_still_write_outputs(
     output = capsys.readouterr().out
     assert "revision rounds: 2" in output and "success: no" in output
     assert "model calls: 3" in output
+
+
+# ── planner-only checks P1-P3 ──
+
+def _round_codes(report: dict) -> list[list[str]]:
+    return [[issue["code"] for issue in r["errors"]] for r in report["rounds"]]
+
+
+def test_p1_serial_contracts_are_an_error(toy_repo, tmp_path):
+    result, _, _ = plan(toy_repo, tmp_path, [answer(SERIAL_CONTRACTS_DRAFT)] * 3)
+    assert not result.success
+    assert _round_codes(result.report) == [["P1"]] * 3
+    issue = result.report["rounds"][0]["errors"][0]
+    assert issue["nodes"] == ["C1", "C2"]
+    assert "merge C1 and C2 into one contract" in issue["message"]
+
+
+def test_p1_independent_contracts_are_fine(toy_repo, tmp_path):
+    result, _, _ = plan(toy_repo, tmp_path, [answer(INDEPENDENT_CONTRACTS_DRAFT)])
+    assert result.success and _round_codes(result.report) == [[]]
+
+
+def test_p2_test_only_node_is_an_error(toy_repo, tmp_path):
+    draft = {"nodes": [*VALID_DRAFT["nodes"], _node("T", create=["tests/test_x.py"])]}
+    result, _, _ = plan(toy_repo, tmp_path, [answer(draft)] * 3)
+    assert not result.success
+    errors = result.report["rounds"][0]["errors"]
+    assert [(issue["code"], issue["nodes"]) for issue in errors] == [("P2", ["T"])]
+    assert "tests/test_x.py" in errors[0]["message"]
+    assert "Remove this node" in errors[0]["message"]
+
+
+def test_p3_contract_writing_tests_is_an_error(toy_repo, tmp_path):
+    contract = {**VALID_DRAFT["nodes"][0], "create": ["tests/test_contract.py"]}
+    draft = {"nodes": [contract, *VALID_DRAFT["nodes"][1:]]}
+    result, _, _ = plan(toy_repo, tmp_path, [answer(draft)] * 3)
+    assert not result.success
+    errors = result.report["rounds"][0]["errors"]
+    assert [(issue["code"], issue["nodes"]) for issue in errors] == [("P3", ["C"])]
+    assert "tests/test_contract.py" in errors[0]["message"]
+
+
+def test_revision_fixes_a_p1_error(toy_repo, tmp_path):
+    result, worker, options = plan(toy_repo, tmp_path,
+                                   [answer(SERIAL_CONTRACTS_DRAFT), answer(VALID_DRAFT)])
+    assert result.success
+    assert result.report["revision_rounds"] == 1
+    assert _round_codes(result.report) == [["P1"], []]
+    assert "[P1] C1, C2: contract C1 comes before contract C2" in worker.requests[1].prompt
+    assert load_graph(options.out).generator.revision_mode == "llm"
+
+
+def test_single_node_draft_succeeds(toy_repo, tmp_path):
+    result, worker, options = plan(toy_repo, tmp_path, [answer(SINGLE_NODE_DRAFT)])
+    assert result.success and len(worker.requests) == 1
+    graph = load_graph(options.out)
+    assert [node.id for node in graph.nodes] == ["A"] and graph.edges == []
+    assert result.report["nodes"] == 1 and result.report["edges"] == 0
+
+
+def test_planner_checks_stay_out_of_validate():
+    # A hand-written-style graph that breaks P1, P2 and P3 at once.
+    graph = make_graph([
+        make_node("C1", kind="contract", modify=("models.py",)),
+        make_node("C2", kind="contract", modify=("store.py",), create=("tests/test_c.py",)),
+        make_node("T", create=("tests/test_all.py",)),
+    ], [{"from": "C1", "to": "C2", "type": "interface", "source": "manual",
+         "reason": "test"}])
+    assert sorted(issue.code for issue in planner_checks(graph)) == ["P1", "P2", "P3"]
+    report = validate(graph)
+    assert not {"P1", "P2", "P3"} & set(report.codes() + report.warning_codes())
 
 
 def test_agent_failure_is_a_round_error(toy_repo, tmp_path):

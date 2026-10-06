@@ -100,20 +100,21 @@ def match_nodes(planner: Graph, handwritten: Graph) -> list[dict]:
     """For each hand-written node, the planner node with the most similar files.
 
     Similarity is the Jaccard index of ``modify ∪ create`` without ``tests/``
-    files; ties go to the planner node listed first.
+    files; ties go to the planner node listed first. A node that shares no
+    file with any planner node has no match (``planner`` is None, similarity 0).
     """
     candidates = unique_nodes(planner)
     matches = []
     for node in unique_nodes(handwritten):
         files = code_files(node)
-        best, best_score = None, -1.0
+        best, best_score = None, 0.0
         for other in candidates:
             score = jaccard(files, code_files(other))
             if score > best_score:
                 best, best_score = other, score
         matches.append({"handwritten": node.id,
                         "planner": best.id if best is not None else None,
-                        "similarity": round(max(best_score, 0.0), 4)})
+                        "similarity": round(best_score, 4)})
     return matches
 
 
@@ -167,6 +168,7 @@ def format_comparison(result: dict, planner_name: str = "planner",
     """Render :func:`compare_graphs` output as a Markdown table."""
     planner, handwritten = result["planner"], result["handwritten"]
     match_lines = [f"{match['handwritten']} -> {match['planner']} ({match['similarity']:.2f})"
+                   if match["planner"] is not None else f"{match['handwritten']}: no match"
                    for match in result["matches"]]
     match_lines.append(f"mean {result['mean_similarity']:.2f}")
     rows = [
