@@ -67,8 +67,22 @@ def test_match_nodes_ignores_test_files():
     assert by_node["A"] == ("P1", pytest.approx(2 / 3, abs=1e-4))
     assert by_node["B"] == ("P1", pytest.approx(1 / 3, abs=1e-4))
     assert by_node["E"] == ("P2", 1.0)
-    assert by_node["D"] == ("P1", 0.0)  # no code files: nothing matches, first wins
+    assert by_node["D"] == (None, 0.0)  # no code files: shares no file, no match
     assert jaccard(set(), set()) == 1.0
+
+
+def test_zero_similarity_shows_no_match(toy_repo):
+    commit = {"base_commit": toy_repo.commit}
+    planner = make_graph([make_node("P1", modify=("models.py",))]).model_copy(update=commit)
+    handwritten = make_graph([make_node("H1", modify=("models.py",)),
+                              make_node("H2", modify=("runner.py",))]).model_copy(update=commit)
+    result = compare_graphs(planner, handwritten, toy_repo.path)
+    assert result["matches"][1] == {"handwritten": "H2", "planner": None, "similarity": 0.0}
+    assert result["mean_similarity"] == 0.5  # the unmatched node counts as 0
+    match_row = next(line for line in format_comparison(result).splitlines()
+                     if line.startswith("| Node match"))
+    assert "H1 -> P1 (1.00)<br>H2: no match<br>mean 0.50" in match_row
+    assert "(0.00)" not in match_row
 
 
 @pytest.mark.parametrize(("task", "variant"), HANDWRITTEN)
@@ -85,6 +99,8 @@ def test_handwritten_graph_matches_itself(task, variant, tmp_path):
     assert result["planner"] == result["handwritten"]
     assert result["planner"]["errors"] == 0
     assert result["planner"]["test_only_nodes"] == []
+    # The planner-only checks P1-P3 are not part of the general validation.
+    assert not {"P1", "P2", "P3"} & set(result["planner"]["error_codes"])
 
 
 def test_format_and_cli(toy_repo, tmp_path, capsys):

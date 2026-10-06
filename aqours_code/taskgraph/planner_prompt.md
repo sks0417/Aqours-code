@@ -2,8 +2,8 @@
 
 You are planning, not implementing. Split the request below into sub-tasks
 that several coding agents can complete, each in its own copy of the
-repository, and output them as a draft task graph in the JSON format at the
-end of this prompt.
+repository (or keep it as one task when it is small), and output them as a
+draft task graph in the JSON format at the end of this prompt.
 
 Read before you split. Read the request, then the repository: its README,
 any specification it points to, the modules the request touches, and the
@@ -49,6 +49,16 @@ nothing else.
 
 ## Splitting rules
 
+First decide whether to split at all. **You do not have to split, and you
+do not have to use a contract.**
+
+- For a small task, or when the work is concentrated in a few closely
+  related files, output a single `implement` node.
+- Add a contract only when several nodes really need to share a new
+  interface (a new field, a new function signature, and so on).
+
+When you do split:
+
 1. **Split along files.** Make work blocks that can be finished on their own
    and whose edited files do not overlap. A good block is a feature or
    concern that lives in its own files.
@@ -59,16 +69,27 @@ nothing else.
    signatures, docstrings, and runnable empty bodies, plus any small helper
    that every block needs complete. No feature logic. Create here the new
    files that blocks will fill in, so that each block only modifies its own
-   file.
+   file. There is usually only one contract. Contracts must never be
+   ordered one after another: if one contract would need what another
+   provides, make them one contract. A contract writes no test files
+   (nothing under `tests/` in its `modify` or `create`); its `check` only
+   runs the existing tests.
 3. **Same file, same node, or accept the order.** Work that must edit the same
    file either goes into one node, or will be run one node after another.
    Prefer merging closely related work that edits the same lines (for
    example several features that all change one central function) into one
    node over a long chain of nodes that rewrite the same code in turn.
-4. **No test-only nodes.** Do not add a node that only writes tests. Add a
-   light integration node only when some parts are written against stubs and
-   may not fit together once merged; its task is to fix what does not fit, in
-   the smallest way, not to write many tests.
+4. **No test-only nodes; no integration node by default.** Do not add a node
+   that only writes tests. After all nodes are merged the final checks run
+   the whole test suite, so general end-to-end verification needs no node of
+   its own. Add an integration node only in one of these two cases:
+   - some node was written against another node's empty implementation, and
+     after the merge it must be connected to the real implementation;
+   - the request names a concrete cross-feature behaviour that no node is
+     responsible for testing.
+
+   If you add one, its `goal` must list, one by one, the concrete behaviours
+   to check and fix. "Write end-to-end tests" is not a goal.
 5. **Every node tests itself.** Each node writes the tests for its own work
    (in its own new test file, listed in `create`) and has `check` commands
    that run on their own from the repository root. Including the existing
@@ -130,7 +151,7 @@ Field rules:
   created by a node that comes earlier.
 - Optional fields may be left out; lists default to empty.
 
-## Example
+## Examples
 
 A toy example, unrelated to your request. Request: "Add star ratings and a
 shopping-list export to the recipe book." The repository has
@@ -191,3 +212,31 @@ modules as stubs; then each feature fills in its own module in parallel.
 
 The program turns R's and S's `requires` into edges from C, so R and S run
 in parallel after C.
+
+A second toy example, also unrelated to your request. Request: "Let the
+recipe printout scale ingredient quantities to a chosen number of
+servings." The printout lives in `recipes/printing.py`, and `Recipe` in
+`recipes/models.py` already has a `servings` field.
+
+The work is one small change to one module plus its tests. No other node
+would share a new interface, so there is no contract, and splitting it
+would only add overhead: the draft is a single implement node, and the
+program derives no edges.
+
+```json
+{
+  "nodes": [
+    {
+      "id": "P",
+      "title": "Scale quantities in the printout",
+      "kind": "implement",
+      "goal": "In recipes/printing.py add an optional `servings: int | None = None` argument to print_recipe(). When given, multiply every ingredient quantity by servings / recipe.servings and print the chosen number of servings in the header; without it, print as before. Raise ValueError for servings < 1. Edit no other module. Write tests/test_printing_scale.py.",
+      "modify": ["recipes/printing.py"],
+      "create": ["tests/test_printing_scale.py"],
+      "provides": ["recipes/printing.py::print_recipe"],
+      "check": ["python -m pytest -q tests"],
+      "context_files": ["recipes/printing.py", "recipes/models.py"]
+    }
+  ]
+}
+```
