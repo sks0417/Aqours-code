@@ -274,9 +274,10 @@ def build_prompt(request: str, index: RepoIndex, final_checks: list[str],
             f"# Fix your previous draft (revision {revision.number} of {MAX_REVISIONS})\n\n"
             "You already planned this request once; your draft is below, followed by "
             "the problems the program found after deriving the edges, validating "
-            "the graph and applying the planner checks (P1-P3). Fix every problem and answer with the complete corrected draft "
-            "(all nodes, not only the changed ones) as the last ```json block. Keep "
-            "the parts that were fine.\n\n"
+            "the graph and applying the planner checks (P1-P3). Fix every problem "
+            "and answer with the complete corrected draft (all nodes, not only the "
+            "changed ones) as the last ```json block. Keep the parts that were "
+            "fine.\n\n"
             f"## Previous draft\n\n```json\n{draft}\n```\n\n"
             f"## Problems\n\n{problems}")
     return "\n\n".join(parts) + "\n"
