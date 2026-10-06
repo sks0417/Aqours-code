@@ -151,6 +151,65 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return EXIT_OK if summary["status"] == "success" else EXIT_INVALID
 
 
+def _cmd_plan(args: argparse.Namespace) -> int:
+    from .gitops import GitError
+    from .planner import PlanOptions, planner_worker, run_plan
+
+    request_path = Path(args.request)
+    if not request_path.is_file():
+        return _error(f"request file not found: {request_path}")
+    if not Path(args.repo).is_dir():
+        return _error(f"repository not found: {args.repo}")
+    if args.timeout <= 0:
+        return _error("--timeout must be > 0")
+    options = PlanOptions(request_path=request_path, repo=Path(args.repo),
+                          out=Path(args.out), final_checks=list(args.final_check),
+                          timeout_s=args.timeout, request_id=args.request_id)
+    try:
+        result = run_plan(options, planner_worker())
+    except (GitError, RuntimeError, OSError, UnicodeDecodeError) as exc:
+        return _error(str(exc))
+    report = result.report
+    totals = report["totals"]
+    print(f"nodes: {report['nodes']}  edges: {report['edges']}  "
+          f"revision rounds: {report['revision_rounds']}  "
+          f"success: {'yes' if result.success else 'no'}")
+    print(f"model calls: {totals['model_calls']}  tokens: {totals['input_tokens']} in / "
+          f"{totals['output_tokens']} out  time: {report['duration_s']:.1f}s")
+    if not result.success:
+        last = report["rounds"][-1] if report["rounds"] else {"errors": []}
+        print(f"errors in the last round ({len(last['errors'])}):")
+        for issue in last["errors"]:
+            nodes = f" {', '.join(issue['nodes'])}:" if issue["nodes"] else ""
+            print(f"[{issue['code']}]{nodes} {issue['message']}")
+    if report["graph_written"]:
+        print(f"wrote {args.out}")
+    print(f"wrote {result.report_path}")
+    return EXIT_OK if result.success else EXIT_INVALID
+
+
+def _cmd_compare(args: argparse.Namespace) -> int:
+    from .compare import compare_graphs, format_comparison
+
+    planner = _load(args.planner_graph)
+    handwritten = _load(args.handwritten_graph)
+    if planner is None or handwritten is None:
+        return EXIT_INPUT_ERROR
+    if not Path(args.repo).is_dir():
+        return _error(f"repository not found: {args.repo}")
+    result = compare_graphs(planner, handwritten, Path(args.repo))
+    text = format_comparison(result, Path(args.planner_graph).name,
+                             Path(args.handwritten_graph).name)
+    print(text, end="")
+    if args.json:
+        try:
+            Path(args.json).write_text(json.dumps(result, indent=2) + "\n",
+                                       encoding="utf-8")
+        except OSError as exc:
+            return _error(f"cannot write {args.json}: {exc.strerror or exc}")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for all subcommands."""
     parser = argparse.ArgumentParser(prog="python -m aqours_code.taskgraph")
@@ -188,6 +247,25 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--worker-timeout", type=float, default=1800.0)
     run_cmd.add_argument("--hidden-tests")
     run_cmd.set_defaults(func=_cmd_run)
+
+    plan_cmd = commands.add_parser("plan", help="generate a task graph with the planner")
+    plan_cmd.add_argument("request", help="request text (Markdown)")
+    plan_cmd.add_argument("--repo", required=True)
+    plan_cmd.add_argument("--out", required=True)
+    plan_cmd.add_argument("--final-check", action="append", default=[],
+                          help="command for the graph's final_checks (repeatable)")
+    plan_cmd.add_argument("--timeout", type=float, default=1800.0,
+                          help="timeout in seconds of each planner round")
+    plan_cmd.add_argument("--request-id", help="request_id of the graph "
+                          "(default: the --out file name without extension)")
+    plan_cmd.set_defaults(func=_cmd_plan)
+
+    compare_cmd = commands.add_parser("compare", help="compare two graphs' structure")
+    compare_cmd.add_argument("planner_graph")
+    compare_cmd.add_argument("handwritten_graph")
+    compare_cmd.add_argument("--repo", required=True)
+    compare_cmd.add_argument("--json", help="also write the comparison as JSON")
+    compare_cmd.set_defaults(func=_cmd_compare)
     return parser
 
 

@@ -187,7 +187,17 @@ python -m aqours_code.taskgraph validate <graph.json> [--repo <path>]
 python -m aqours_code.taskgraph derive <graph.json> --repo <path> --out <new_graph.json>
 python -m aqours_code.taskgraph index --repo <path> --commit <sha>
 python -m aqours_code.taskgraph export-schema [--out <path>]
+python -m aqours_code.taskgraph compare <planner_graph.json> <handwritten_graph.json> --repo <path> [--json <file>]
 ```
+
+`plan` and `run` are described in their own sections below. `compare` prints
+a Markdown table of both graphs' structure: validation (error count, warning
+codes), node counts by kind, files edited by contract nodes, critical path
+(nodes on the longest chain), maximum parallel width (largest layer when
+nodes are layered by longest-chain depth), test-only nodes (every edited file
+under `tests/`), and, for each node of the second graph, the node of the first
+with the highest Jaccard similarity of `modify ∪ create` outside `tests/`.
+Each graph is validated against `--repo` at its own `base_commit`.
 
 `--repo` indexes the repository at the graph's `base_commit`. Exit codes:
 `0` valid, `1` validation errors (for `derive`: the derived graph is still
@@ -343,3 +353,58 @@ With a model configured in the Aqours `.env`, recreate the toy repository
 python -c "import sys; sys.path.insert(0, 'tests/taskgraph'); from pathlib import Path; from taskgraph_support import TOY_FILES, commit_files, git; repo = Path('toy-repo'); repo.mkdir(); git(repo, 'init', '-q'); print(commit_files(repo, TOY_FILES, 'toy repository'))"
 python -m aqours_code.taskgraph run aqours_code/taskgraph/examples/toy_graph.json --repo toy-repo --workers 2
 ```
+
+## Planner
+
+```bash
+python -m aqours_code.taskgraph plan <request.md> --repo <path> --out <graph.json>
+    [--final-check "python -m pytest -q tests"] [--timeout 1800] [--request-id <id>]
+```
+
+Planner v0 only splits: it always outputs the split it thinks best, without
+deciding whether to split or estimating cost.
+
+1. Clone the HEAD of `--repo` into a temporary directory (uncommitted changes
+   are not seen; the original repository is not touched). `base_commit` is
+   that HEAD.
+2. Run one planner agent: the worker's child-process runner
+   (`python -m aqours_code.taskgraph.planner_entry`, `CountingClient`, the
+   same model configuration) on the clone, with read-only tools
+   (`read_file`, `glob`, `compact`). The prompt is
+   [`planner_prompt.md`](planner_prompt.md) plus the request, the
+   repository's file list and the final checks. The agent answers with a
+   draft: only nodes, no edges. The last ```` ```json ```` block of the final
+   answer is the draft.
+3. Complete the draft into a graph: `request` is the request file's text,
+   `repo` the repository path, `final_checks` the `--final-check` commands,
+   `generator` `{"kind": "planner", "planner_version": "planner-v0", "model":
+   ...}`, and no edges.
+4. `derive_edges()`, then `validate()`.
+5. If the draft does not parse, does not match the draft format, or the graph
+   has validation errors, run the agent again with the previous draft and the
+   errors (a fresh agent; the prompt repeats the request), at most twice.
+   A revised graph has `generator.revision_mode = "llm"`, otherwise `"none"`.
+   If errors remain after two revisions, the run fails: the last graph that
+   could be built and the report are still written, and the exit code is 1.
+
+Draft format (fields as in the graph schema; missing lists are empty, and
+`check` becomes `check.commands` with the default timeout):
+
+```json
+{"nodes": [{"id": "A", "title": "...", "kind": "contract | implement", "goal": "...",
+            "modify": [], "create": [], "provides": [], "requires": [],
+            "requires_impl": [], "check": ["python -m pytest -q tests"],
+            "context_files": []}]}
+```
+
+Output: `--out` (the graph), `<out>.report.json` (every round's draft text,
+errors and warnings, the agent's calls, tokens and time; the number of
+revision rounds, success, totals, and wall time), and `<out>.logs/` (the
+planner agent's config, trace and stdout per round). `--timeout` applies to
+each round. Exit codes: `0` success, `1` errors remained, `2` input or git
+errors. Error codes in the report besides V1-V12: `FORMAT` (no JSON block,
+invalid JSON, or a draft or schema mismatch) and `AGENT` (the planner agent
+failed or timed out).
+
+`experiments/taskgraph/planner_eval/` runs the planner on the experiment
+repositories and compares the result with the hand-written graphs.
