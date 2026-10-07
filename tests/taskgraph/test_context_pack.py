@@ -211,7 +211,15 @@ def event(tool, path):
 
 def write_trace(path, events):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('\n'.join(json.dumps(e) for e in events) + '\n{partial', encoding='utf-8')
+    completed = []
+    for number, event in enumerate(events):
+        if event.get('type') == 'tool_use':
+            event = {**event, 'tool_use_id': f'call-{number}'}
+        completed.append(event)
+        if event.get('type') == 'tool_use':
+            completed.append({'type': 'tool_result', 'tool': event['tool'],
+                              'tool_use_id': event['tool_use_id'], 'content': 'fixture content'})
+    path.write_text('\n'.join(json.dumps(e) for e in completed) + '\n{partial', encoding='utf-8')
 
 
 def test_trace_counts_repeated_reads_and_first_write(tmp_path):
@@ -238,7 +246,8 @@ def test_trace_no_write_retries_and_timeout_fallback(tmp_path):
         {'type': 'llm_request'}, event('write_file', 'own.py'), {'type': 'llm_request'}])
     write_trace(tmp_path / 'trace_3.jsonl', [{'type': 'llm_request'}, event('read_file', 'README.md')])
     result = node_context_metrics(tmp_path, metadata)
-    assert result == {'reads_outside_pack': 1, 'calls_before_first_write': 2}
+    assert result == {'reads_outside_pack': 1, 'calls_before_first_write': 2,
+                      'soft_wall_blocked': 0, 'confirmed_reads': []}
     assert trace_metrics([], set(), set())['calls_before_first_write'] == 0
 
 
@@ -263,7 +272,7 @@ def test_coordinator_packages_merged_worktree_refreshes_retry_and_records_metric
             raw = (request.log_dir / f'context_{request.attempt}.md').read_text()
             assert raw in request.prompt and '# Context' in request.prompt
             assert '# Read these files first' not in request.prompt
-            assert 'Do not read the other feature modules' in request.prompt
+            assert 'Treat it as already read.' in request.prompt
             if request.node_id == 'A':
                 put(request.workspace, 'shared.py', 'def shared():\n    """MERGED_DOC"""\n    return "HIDDEN_BODY"\n')
                 return WorkerResult(ok=True)

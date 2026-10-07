@@ -11,7 +11,7 @@ import secrets
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Protocol
 
@@ -35,6 +35,9 @@ class WorkerRequest:
     workspace: Path
     log_dir: Path
     timeout_s: float
+    soft_wall_enabled: bool = False
+    own_files: list[str] = field(default_factory=list)
+    full_files: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -165,6 +168,12 @@ class AqoursWorker:
             "runtime_root": str(log_dir / f"aqours_{n}" / "state"),
             "timeout_s": request.timeout_s,
             "sandbox": self._sandbox_config(request),
+            "soft_wall": {
+                "enabled": request.soft_wall_enabled,
+                "own_files": request.own_files,
+                "full_files": request.full_files,
+                "log_path": str(log_dir / f"soft_wall_{n}.jsonl"),
+            },
         }
 
     def _sandbox_config(self, request: WorkerRequest) -> dict:

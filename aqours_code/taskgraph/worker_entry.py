@@ -89,6 +89,43 @@ def command_executor_for(config: dict, deadline: float):
     return LocalCommandExecutor()
 
 
+class ObservedExecutor:
+    """Delegate the public executor interface and retain Bash success for the wall."""
+
+    def __init__(self, inner, wall):
+        self.inner, self.wall = inner, wall
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def execute(self, command, cwd, timeout):
+        result = self.inner.execute(command, cwd, timeout)
+        self.wall.bash_results[command] = (result["exit_code"] == 0 and not result["timed_out"])
+        return result
+
+
+def register_soft_wall(config: dict):
+    """Register only for multi-node worker attempts, using public Aqours APIs.
+
+    bootstrap is idempotent; run_agent_task's isolated collections exclude
+    hooks.HOOKS. Calling bootstrap before registration also completes initial
+    runtime wiring before our callbacks are appended. No global hook is removed.
+    """
+    settings = config.get("soft_wall") or {}
+    if not settings.get("enabled"):
+        return None
+    from aqours_code import bootstrap  # noqa: PLC0415
+    bootstrap()
+    from aqours_code.hooks import register_hook, recoverable_tool_rejection  # noqa: PLC0415
+    from .soft_wall import SoftWall  # noqa: PLC0415
+
+    wall = SoftWall(Path(config["workspace"]), settings["own_files"],
+                    settings["full_files"], Path(settings["log_path"]))
+    register_hook("PreToolUse", lambda block: wall.pre_tool(block, recoverable_tool_rejection))
+    register_hook("PostToolUse", wall.post_tool)
+    return wall
+
+
 def run_worker(config: dict, model_client=None,
                tool_policy: dict | None = None) -> WorkerResult:
     """Run one node attempt with ``run_agent_task`` and return its result.
@@ -122,7 +159,11 @@ def run_worker(config: dict, model_client=None,
         Path(config[key]).mkdir(parents=True, exist_ok=True)
     result = WorkerResult(ok=True)
     deadline = time.monotonic() + timeout_s
+    wall = register_soft_wall(config)
     try:
+        executor = command_executor_for(config, deadline)
+        if wall is not None:
+            executor = ObservedExecutor(executor, wall)
         info = run_agent_task(
             config["task"],
             config["workspace"],
@@ -130,7 +171,7 @@ def run_worker(config: dict, model_client=None,
             model_client=counting,
             model_provider=provider,
             model=model,
-            command_executor=command_executor_for(config, deadline),
+            command_executor=executor,
             tool_policy=tool_policy or WORKER_TOOL_POLICY,
             case_deadline=deadline,
             trace_storage_root=config["trace_storage_root"],
@@ -144,6 +185,12 @@ def run_worker(config: dict, model_client=None,
     except Exception as exc:  # noqa: BLE001 - reported to the coordinator
         result = WorkerResult(ok=False, reason="worker_error",
                               error=f"{type(exc).__name__}: {exc}")
+
+    finally:
+        if wall is not None:
+            # Production workers exit; in-process scripted tests must not leave
+            # active callbacks affecting later workers or planner runs.
+            wall.active = False
 
     answer = result.final_answer.lstrip()
     if result.ok and (answer.startswith("[Error]")
