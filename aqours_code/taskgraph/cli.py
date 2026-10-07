@@ -193,9 +193,25 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     return EXIT_INVALID if any(row.escapes for row in rows) else EXIT_OK
 
 
+def _cmd_single(args: argparse.Namespace) -> int:
+    from .single import single_graph
+    from .gitops import GitError
+
+    try:
+        request = Path(args.request).read_text(encoding="utf-8")
+        graph = single_graph(request, Path(args.repo), list(args.final_check))
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        dump_graph(graph, out)
+    except (GitError, OSError, UnicodeDecodeError, ValueError) as exc:
+        return _error(str(exc))
+    print(f"wrote {out}")
+    return EXIT_OK
+
+
 def _cmd_plan(args: argparse.Namespace) -> int:
     from .gitops import GitError
-    from .planner import PlanOptions, planner_worker, run_plan
+    from .planner import LONG_GOAL_CHARS, PlanOptions, planner_worker, run_plan
 
     request_path = Path(args.request)
     if not request_path.is_file():
@@ -218,6 +234,10 @@ def _cmd_plan(args: argparse.Namespace) -> int:
           f"success: {'yes' if result.success else 'no'}")
     print(f"model calls: {totals['model_calls']}  tokens: {totals['input_tokens']} in / "
           f"{totals['output_tokens']} out  time: {report['duration_s']:.1f}s")
+    for node_id, chars in report["goal_chars"].items():
+        if chars > LONG_GOAL_CHARS:
+            print(f"note: node {node_id} goal has {chars} characters (over {LONG_GOAL_CHARS}); "
+                  "prefer concise implementation scope and SPEC.md#heading references.")
     if not result.success:
         last = report["rounds"][-1] if report["rounds"] else {"errors": []}
         print(f"errors in the last round ({len(last['errors'])}):")
@@ -299,6 +319,14 @@ def build_parser() -> argparse.ArgumentParser:
     audit_cmd.add_argument("runs", nargs="+",
                            help="a run directory, or a directory of run directories")
     audit_cmd.set_defaults(func=_cmd_audit)
+
+    single_cmd = commands.add_parser("single", help="generate an unrestricted single-agent control")
+    single_cmd.add_argument("request", help="original request text (Markdown)")
+    single_cmd.add_argument("--repo", required=True)
+    single_cmd.add_argument("--out", required=True)
+    single_cmd.add_argument("--final-check", action="append", default=[],
+                            help="test command for the node and final_checks (repeatable)")
+    single_cmd.set_defaults(func=_cmd_single)
 
     plan_cmd = commands.add_parser("plan", help="generate a task graph with the planner")
     plan_cmd.add_argument("request", help="request text (Markdown)")

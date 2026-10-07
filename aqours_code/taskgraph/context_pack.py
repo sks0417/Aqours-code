@@ -126,6 +126,9 @@ class ContextPack:
 def build_context_pack(node: Node, workspace: Path, *,
                        max_bytes: int = MAX_PACK_BYTES) -> ContextPack:
     """Read the current merged worktree; keep own files whole, then fill in order."""
+    if node.edit_set.any_file:
+        # The single-agent control discovers the repository itself, including fixtures.
+        return ContextPack(limit_bytes=max_bytes)
     root = workspace.resolve()
     pack = ContextPack(limit_bytes=max_bytes, own_files=list(dict.fromkeys(
         [*node.edit_set.modify, *node.edit_set.create])))

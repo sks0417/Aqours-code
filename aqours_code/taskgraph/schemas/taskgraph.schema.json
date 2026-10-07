@@ -80,6 +80,12 @@
       "additionalProperties": false,
       "description": "Files a node may change, plus optional informational symbols.",
       "properties": {
+        "any_file": {
+          "default": false,
+          "description": "May modify or create any repository file; allowed only in a single-node graph.",
+          "title": "Any File",
+          "type": "boolean"
+        },
         "modify": {
           "description": "Files this node changes. Each must exist at the base commit or be created by an ancestor node.",
           "items": {
