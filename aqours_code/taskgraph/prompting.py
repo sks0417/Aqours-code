@@ -17,8 +17,7 @@ NODE_PROMPT_TEMPLATE = """\
 
 {request}
 
-This is one sub-task of the request above. Other sub-tasks are handled by
-other workers; do only this one.
+{task_scope}
 
 # Your sub-task: {title}
 
@@ -26,13 +25,7 @@ other workers; do only this one.
 
 # Files you may change
 
-Modify these existing files:
-{modify}
-
-Create these new files:
-{create}
-
-Do not modify, create, or delete any other file.
+{file_scope}
 
 # Symbols you must provide
 
@@ -42,19 +35,16 @@ Do not modify, create, or delete any other file.
 
 {requires}
 
-# Context
-
-{context_intro}
-
-{context_pack}
-
-# Done when
+{context_section}# Done when
 
 Before you finish, run these commands from the repository root and make sure
 they all pass:
 {checks}
 
 # Rules
+
+If your goal and the specification disagree, follow the specification, and
+say in your final answer where they disagree.
 
 Do not run git commands that change repository state (commit, checkout,
 branch, reset, stash, merge, rebase, and so on). The coordinator commits your
@@ -167,18 +157,29 @@ def build_node_prompt(graph: Graph, node: Node, index: RepoIndex, attempt: int,
         retry = RETRY_TEMPLATE.format(
             attempt=attempt, reason=failure.reason,
             output=failure.output[-FAILURE_EXCERPT_CHARS:].strip() or "(no output)")
+    if node.edit_set.any_file:
+        file_scope = "You may modify or create any file in the repository."
+        context_text = ""
+    else:
+        file_scope = (f"Modify these existing files:\n{_bullets(node.edit_set.modify)}\n\n"
+                      f"Create these new files:\n{_bullets(node.edit_set.create)}\n\n"
+                      "Do not modify, create, or delete any other file.")
+        context_text = context_pack.text if context_pack is not None else "(context unavailable)"
+    context_intro = CONTEXT_INSPECTION if len(graph.nodes) > 1 else SINGLE_NODE_CONTEXT
+    context_section = f"# Context\n\n{context_intro}\n\n{context_text}\n\n" if context_text else ""
     return NODE_PROMPT_TEMPLATE.format(
         request=graph.request.strip(),
+        task_scope=("This is one sub-task of the request above. Other sub-tasks are handled by\n"
+                    "other workers; do only this one." if len(graph.nodes) > 1 else
+                    "Complete the request in this repository."),
         title=node.title,
         goal=node.goal.strip(),
-        modify=_bullets(node.edit_set.modify),
-        create=_bullets(node.edit_set.create),
+        file_scope=file_scope,
         provides=_bullets(node.provides),
         contract_note=CONTRACT_NOTE if node.kind == "contract" else "",
         requires="\n".join(requires) if requires else "- (none)",
-        context_intro=CONTEXT_INSPECTION if len(graph.nodes) > 1 else SINGLE_NODE_CONTEXT,
+        context_section=context_section,
         before_start=BEFORE_START if len(graph.nodes) > 1 else "",
-        context_pack=context_pack.text if context_pack is not None else "(context unavailable)",
         checks=_bullets(node.check.commands),
         sandbox=SANDBOX_NOTE if sandbox == "docker" else "",
         retry=retry,

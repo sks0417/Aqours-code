@@ -270,9 +270,10 @@ def test_coordinator_packages_merged_worktree_refreshes_retry_and_records_metric
 
         def run(self, request):
             raw = (request.log_dir / f'context_{request.attempt}.md').read_text()
-            assert raw in request.prompt and '# Context' in request.prompt
+            assert raw in request.prompt
+            assert ('# Context' in request.prompt) == bool(raw)
             assert '# Read these files first' not in request.prompt
-            assert 'Treat it as already read.' in request.prompt
+            assert ('Treat it as already read.' in request.prompt) == bool(raw)
             if request.node_id == 'A':
                 put(request.workspace, 'shared.py', 'def shared():\n    """MERGED_DOC"""\n    return "HIDDEN_BODY"\n')
                 return WorkerResult(ok=True)

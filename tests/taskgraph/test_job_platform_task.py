@@ -94,7 +94,7 @@ def test_graph_base_commits_match_generated_repo(repos, variant):
     for name in ("single", "handwritten"):
         graph = load_graph(TASK / variant / "graphs" / f"{name}.json")
         assert graph.base_commit == commit
-        assert graph.request == request
+        assert graph.request.strip() == request
 
 
 @pytest.mark.parametrize("variant", VARIANTS)

@@ -1,4 +1,4 @@
-"""Validation rules V1-V12 and warnings W1-W5 for task graphs."""
+"""Validation rules V1-V13 and warnings W1-W5 for task graphs."""
 from __future__ import annotations
 
 from collections import Counter, deque
@@ -317,7 +317,10 @@ def _check_requires(graph: Graph, index: RepoIndex,
 
 def _check_edit_set_nonempty(graph: Graph, report: ValidationReport) -> None:
     for node in graph.nodes:
-        if not edit_files(node):
+        if node.edit_set.any_file and len(graph.nodes) != 1:
+            report.errors.append(Issue(
+                "V13", [node.id], "edit_set.any_file is allowed only in a single-node graph"))
+        if not node.edit_set.any_file and not edit_files(node):
             report.errors.append(Issue(
                 "V7", [node.id], "edit_set.modify and edit_set.create are both empty"))
 
@@ -350,6 +353,8 @@ def _check_interface_sources(graph: Graph, report: ValidationReport) -> None:
 
 def _check_symbol_files(graph: Graph, report: ValidationReport) -> None:
     for node in graph.nodes:
+        if node.edit_set.any_file:
+            continue
         files = edit_files(node)
         for label, symbols in (("edit_set.symbols lists", node.edit_set.symbols),
                                ("provides", node.provides)):
@@ -482,7 +487,7 @@ def _warn_unused_provides(graph: Graph, report: ValidationReport) -> None:
 
 
 def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
-    """Check ``graph`` against rules V1-V12 and warnings W1-W5.
+    """Check ``graph`` against rules V1-V13 and warnings W1-W5.
 
     Checks that need repository information (V3, V6, V12, W5) are skipped,
     with a warning, when ``index`` is None.

@@ -32,6 +32,7 @@ from .validate import Issue, ancestors, edit_files, unique_nodes, validate
 from .workers import AqoursWorker, Worker, WorkerRequest, WorkerResult, write_json_atomic
 
 PLANNER_VERSION = "planner-v0"
+LONG_GOAL_CHARS = 1200
 PLANNER_ENTRY_MODULE = "aqours_code.taskgraph.planner_entry"
 PROMPT_PATH = Path(__file__).resolve().parent / "planner_prompt.md"
 DEFAULT_PLANNER_TIMEOUT_S = 1800.0
@@ -460,6 +461,7 @@ def run_plan(options: PlanOptions, worker: Worker) -> PlanResult:
         "conventions": conventions,
         "nodes": len(graph.nodes) if graph is not None else 0,
         "edges": len(graph.edges) if graph is not None else 0,
+        "goal_chars": {node.id: len(node.goal) for node in graph.nodes} if graph is not None else {},
         "rounds": rounds,
         "totals": {key: sum(entry["agent"][key] for entry in rounds)
                    for key in ("model_calls", "input_tokens", "output_tokens")},

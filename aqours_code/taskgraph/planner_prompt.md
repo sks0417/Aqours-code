@@ -108,10 +108,15 @@ When you do split:
    (in its own new test file, listed in `create`) and has `check` commands
    that run on their own from the repository root. Including the existing
    test suite in `check` is a good default.
-6. **Concrete goals.** A worker sees only its own node: its `goal`, files,
-   symbols, and the original request. Say exactly what to implement, in
-   which files and functions, which existing code to hook into, and what
-   not to touch. Name the parts of any specification the node must follow.
+6. **Concrete scope, not a specification retelling.** State what feature this
+   node implements, in which files and functions, which existing code it hooks
+   into, and what it must not touch. Do not restate specification details in
+   `goal`: field types or meanings, validation rules, defaults, return formats,
+   error codes, or similar requirements. Point to the original sections using
+   `SPEC.md#Heading` in `context_files`; the worker receives those sections in
+   its context pack. Only include decisions absent from the specification that
+   nodes must agree on, such as a contract's function signatures or which caller
+   supplies `now`. Keep each goal generally within 600 characters.
 7. **Do not over-split.** Each node adds overhead (reading context, running
    checks, merging). A node should be a meaningful piece of work, not a
    single small function.
@@ -180,7 +185,9 @@ A toy example, unrelated to your request. Request: "Add star ratings and a
 shopping-list export to the recipe book." The repository has
 `recipes/models.py`, `recipes/book.py` (the `RecipeBook` facade), and tests
 in `tests/`. Its README says that recipes are saved and loaded only through
-`RecipeBook`, and `RecipeBook` takes an injected `clock`.
+`RecipeBook`, and `RecipeBook` takes an injected `clock`. SPEC.md defines
+`Star ratings` and `Shopping-list export`; it does not prescribe the internal
+feature-function signatures or how the facade passes the time.
 
 Both features need a new field on `Recipe` and a new method on
 `RecipeBook`, so a thin contract adds both and creates the two feature
@@ -199,7 +206,7 @@ The rating records when it was given, so the contract passes `now` to
       "id": "C",
       "title": "Contract: rating field, facade methods, feature stubs",
       "kind": "contract",
-      "goal": "Add the fields `rating: int | None = None` and `rated_at: float | None = None` to Recipe in recipes/models.py. Create recipes/ratings.py with `rate(book, recipe_id, stars, *, now)` and recipes/shopping.py with `shopping_list(book, recipe_ids)`, each with its signature, a docstring and a body that raises NotImplementedError. In recipes/book.py add RecipeBook.rate(recipe_id, stars), which passes `now=self.clock()`, and RecipeBook.shopping_list, both one-line delegations to those functions. No feature logic.",
+      "goal": "Add the shared Recipe fields in recipes/models.py and facade methods in recipes/book.py for the referenced features. Create runnable stubs in recipes/ratings.py and recipes/shopping.py; no feature logic or test-file edits. Internal contract: rate(book, recipe_id, stars, *, now) and shopping_list(book, recipe_ids); RecipeBook.rate supplies now=self.clock() and the facade delegates to these functions.",
       "modify": ["recipes/models.py", "recipes/book.py"],
       "create": ["recipes/ratings.py", "recipes/shopping.py"],
       "provides": [
@@ -211,32 +218,32 @@ The rating records when it was given, so the contract passes `now` to
         "recipes/book.py::RecipeBook.shopping_list"
       ],
       "check": ["python -m pytest -q tests"],
-      "context_files": ["README.md", "recipes/models.py", "recipes/book.py"]
+      "context_files": ["SPEC.md#Star ratings", "SPEC.md#Shopping-list export", "README.md", "recipes/models.py", "recipes/book.py"]
     },
     {
       "id": "R",
       "title": "Star ratings",
       "kind": "implement",
-      "goal": "Implement rate() in recipes/ratings.py: accept 1 to 5 stars, raise ValueError otherwise, store the rating and `rated_at = now` on the recipe. Edit no other module. Write tests/test_ratings.py.",
+      "goal": "Implement star ratings in recipes/ratings.py::rate through the RecipeBook facade and the contract fields. Use the supplied now argument; do not edit other modules. Add tests/test_ratings.py.",
       "modify": ["recipes/ratings.py"],
       "create": ["tests/test_ratings.py"],
       "provides": ["recipes/ratings.py::rate"],
       "requires": ["recipes/models.py::Recipe.rating", "recipes/models.py::Recipe.rated_at",
                    "recipes/book.py::RecipeBook.rate"],
       "check": ["python -m pytest -q tests"],
-      "context_files": ["recipes/ratings.py", "recipes/book.py"]
+      "context_files": ["SPEC.md#Star ratings", "recipes/ratings.py", "recipes/book.py"]
     },
     {
       "id": "S",
       "title": "Shopping-list export",
       "kind": "implement",
-      "goal": "Implement shopping_list() in recipes/shopping.py: merge the ingredients of the given recipes, summing equal units, sorted by name. Edit no other module. Write tests/test_shopping.py.",
+      "goal": "Implement shopping-list export in recipes/shopping.py::shopping_list through RecipeBook.shopping_list. Do not edit other modules. Add tests/test_shopping.py.",
       "modify": ["recipes/shopping.py"],
       "create": ["tests/test_shopping.py"],
       "provides": ["recipes/shopping.py::shopping_list"],
       "requires": ["recipes/book.py::RecipeBook.shopping_list"],
       "check": ["python -m pytest -q tests"],
-      "context_files": ["recipes/shopping.py", "recipes/book.py"]
+      "context_files": ["SPEC.md#Shopping-list export", "recipes/shopping.py", "recipes/book.py"]
     }
   ]
 }
@@ -248,7 +255,8 @@ in parallel after C.
 A second toy example, also unrelated to your request. Request: "Let the
 recipe printout scale ingredient quantities to a chosen number of
 servings." The printout lives in `recipes/printing.py`, and `Recipe` in
-`recipes/models.py` already has a `servings` field.
+`recipes/models.py` already has a `servings` field. SPEC.md defines the
+behaviour under `Scaled printout`.
 
 The work is one small change to one module plus its tests. No other node
 would share a new interface, so there is no contract, and splitting it
@@ -263,12 +271,12 @@ program derives no edges. The repository has no special rule to list.
       "id": "P",
       "title": "Scale quantities in the printout",
       "kind": "implement",
-      "goal": "In recipes/printing.py add an optional `servings: int | None = None` argument to print_recipe(). When given, multiply every ingredient quantity by servings / recipe.servings and print the chosen number of servings in the header; without it, print as before. Raise ValueError for servings < 1. Edit no other module. Write tests/test_printing_scale.py.",
+      "goal": "Implement serving-count scaling in recipes/printing.py::print_recipe using the existing Recipe model and printout flow. Do not edit other modules. Add tests/test_printing_scale.py.",
       "modify": ["recipes/printing.py"],
       "create": ["tests/test_printing_scale.py"],
       "provides": ["recipes/printing.py::print_recipe"],
       "check": ["python -m pytest -q tests"],
-      "context_files": ["recipes/printing.py", "recipes/models.py"]
+      "context_files": ["SPEC.md#Scaled printout", "recipes/printing.py", "recipes/models.py"]
     }
   ]
 }

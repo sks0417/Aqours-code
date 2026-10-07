@@ -27,7 +27,7 @@ Unknown fields are rejected everywhere.
 | `Graph` | `request_id`, `request`, `repo`, `base_commit`, `final_checks` (default `[]`), `generator`, `nodes` (≥ 1), `edges` (default `[]`), `revision_log` (default `[]`) |
 | `Generator` | `kind`: `manual` \| `planner`; optional `planner_version`, `model`, `revision_mode`: `llm` \| `rule_assisted` \| `none` |
 | `Node` | `id` (`[A-Za-z0-9_-]+`), `title`, `kind`: `contract` \| `implement`, `goal` (non-empty), `edit_set`, `requires`, `requires_impl`, `provides`, `check`, `context_files`, optional `size`: `small` \| `medium` \| `large` |
-| `EditSet` | `modify` (existing files), `create` (new files), optional `symbols` (functions/methods the node changes; an implement node listing a symbol here counts as its implementer for `requires_impl`, V12 and W5) |
+| `EditSet` | `any_file` (default `false`; unrestricted files, single-node graphs only), `modify` (existing files), `create` (new files), optional `symbols` (functions/methods the node changes; an implement node listing a symbol here counts as its implementer for `requires_impl`, V12 and W5) |
 | `Check` | `commands`, `timeout_s` (integer > 0, default 300) |
 | `Edge` | `from`, `to`, `type`: `interface` \| `full` \| `order`, `source`: `manual` \| `llm` \| `derived`, `reason` |
 | `RevisionEntry` | `action`: `merge` \| `split` \| `add_edge` \| `remove_edge` \| `add_node` \| `other`, `nodes`, optional `into`, `reason` |
@@ -124,12 +124,13 @@ skipped and listed in `index.warnings`.
 | V4 | Every node has at least one non-empty check command. |
 | V5 | Two nodes that edit a common file (`modify ∪ create`) must be ordered: one is an ancestor of the other. |
 | V6 | Every `requires` symbol exists at the base commit or is provided by an ancestor (contract or implement). A node's own `provides` does not count. *Needs an index.* |
-| V7 | Every node edits at least one file. |
+| V7 | Every node lists at least one file to edit, unless `any_file` is true. |
 | V8 | `requires`, `requires_impl`, `provides` and `edit_set.symbols` are well-formed symbols. |
 | V9 | An `interface` edge starts at a `contract` node. |
-| V10 | Every `edit_set.symbols` and `provides` entry belongs to a file in the same node's `modify` or `create` (a node cannot provide a symbol in a file it does not edit). |
+| V10 | Unless `any_file` is true, every `edit_set.symbols` and `provides` entry belongs to a file in the same node's `modify` or `create` (a node cannot provide a symbol in a file it does not edit). |
 | V11 | Each new file is created by exactly one node. |
 | V12 | For every `requires_impl` symbol, every implementer is an ancestor (the others are reported together: missing edge?). With no implementer, the symbol must exist at the base commit; a symbol only declared by contract nodes, or not defined anywhere, is an error. *Needs an index.* |
+| V13 | `edit_set.any_file: true` is allowed only in a graph with exactly one node. |
 | W1 | A `small` node has exactly one distinct direct successor (consider merging). |
 | W2 | A provided symbol is not in any other node's `requires` or `requires_impl`. |
 | W3 | `final_checks` is empty. |
@@ -215,6 +216,28 @@ errors (1):
 warnings (0):
 ```
 
+## Generating a single-agent control
+
+```bash
+python -m aqours_code.taskgraph single <request.md> --repo <path> --out <graph.json>
+    [--final-check "python -m pytest -q tests"]
+```
+
+This command uses only the original request and repository HEAD, without a
+planner or reference solution. The single node has `any_file: true` and empty
+file, symbol and context lists. Its goal preserves the full request and appends
+"Keep the existing tests passing and add tests for the new behaviour."
+The worker discovers the repository itself: it receives no context pack,
+file restrictions or reading soft wall. Its `out_of_scope_files` is always empty.
+Every worker, including this control, is instructed to follow the specification
+when it disagrees with the goal and report the disagreement in its final answer.
+
+Repeat `--final-check` for multiple commands; these become both the node checks
+and `final_checks`. Without the option, `final_checks` is empty and the node has
+the generic `git diff --check` check; the goal still asks the worker to run tests.
+The graph records a manual generator and a revision-log entry for `single`.
+The repository basename is stored as portable metadata.
+
 ## Running a graph
 
 ```bash
@@ -241,7 +264,7 @@ picking up the Aqours pytest configuration.
 
 | Scheme | How to run it |
 | --- | --- |
-| Single-agent baseline | A graph with one node that edits every file |
+| Single-agent baseline | Generate a one-node unrestricted graph with `single` |
 | Sequential | `--workers 1` |
 | Parallel | `--workers N` |
 
@@ -352,7 +375,8 @@ found, `0` when none is, and `2` when no run directory is found.
    (`merge_conflict`); the node's checks then run again on the integration
    branch, and a failure undoes the merge (`post_merge_check_failed`). Neither
    is retried. Changed files outside `modify ∪ create` are recorded as
-   `out_of_scope_files` but do not fail the node.
+   `out_of_scope_files` but do not fail the node. For `any_file` nodes, the list
+   stays empty.
 5. **Final stage.** Run every `final_checks` command on the integration branch
    and record each result. With `--hidden-tests DIR`, check out the
    integration HEAD into `final/`, copy `DIR` to `final/_hidden_tests/`, and
@@ -482,7 +506,7 @@ from its caller), and not to add an integration node: the final checks
 verify the merged result, and a part that must be written against another
 part's implementation uses `requires_impl` and connects to it itself.
 
-Planner-only checks (`planner_checks()`, errors like V1-V12, applied only to
+Planner-only checks (`planner_checks()`, errors like V1-V13, applied only to
 planner graphs and not part of `validate()`, so hand-written graphs are not
 held to them):
 
@@ -492,13 +516,20 @@ held to them):
 | `P2` | every file a node modifies or creates is under `tests/` (a test-only node: remove it or fold its work into the related nodes) |
 | `P3` | a contract node creates or modifies a file under `tests/` (a contract's check only runs the existing tests) |
 
+Goals describe implementation scope and integration points, generally within
+600 characters; specification details belong in `SPEC.md#Heading` context
+references, not in paraphrased goals. Only cross-node decisions absent from the
+specification belong in goals. The report's `goal_chars` maps node IDs to final
+goal character counts, including appended conventions. A goal longer than
+1200 characters produces a terminal note, without failing planning.
+
 Output: `--out` (the graph), `<out>.report.json` (every round's answer,
 draft JSON, conventions, errors and warnings; the draft and conventions of
 the written graph; the agent's calls, tokens and time; the number of
 revision rounds, success, totals, and wall time), and `<out>.logs/` (the
 planner agent's config, trace and stdout per round). `--timeout` applies to
 each round. Exit codes: `0` success, `1` errors remained, `2` input or git
-errors. Error codes in the report besides V1-V12 and P1-P3: `FORMAT` (no JSON block,
+errors. Error codes in the report besides V1-V13 and P1-P3: `FORMAT` (no JSON block,
 invalid JSON, or a draft or schema mismatch) and `AGENT` (the planner agent
 failed or timed out).
 
@@ -510,7 +541,8 @@ repositories and compares the result with the hand-written graphs.
 For graphs with more than one node, the context intro says that the supplied
 pack already performs the requested source/contract inspection. A final
 `# Before you start` reminder follows the rules and any retry details. Single
-node graphs retain their previous prompt and register no soft wall.
+node graphs omit these reminders and register no soft wall. Unrestricted
+single-agent controls also omit the context section entirely.
 
 The coordinator passes `soft_wall.enabled`, `own_files`, `full_files`, and the
 per-attempt log path through `WorkerRequest` and `AqoursWorker.config_for()`.

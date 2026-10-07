@@ -460,3 +460,47 @@ def test_prompt_asks_for_conventions_and_no_integration_node():
     assert "No test-only nodes and no integration node" in text
     assert "requires_impl" in text[text.index("4. **No test-only"):]
     assert "`now` argument" in text
+
+
+def test_prompt_examples_have_short_scope_goals_and_spec_references():
+    import re
+    text = PROMPT_PATH.read_text(encoding='utf-8')
+    examples = [json.loads(block) for block in re.findall(r'```json\n(.*?)\n```', text, re.S)]
+    assert len(examples) == 3
+    for example in examples:
+        for node in example['nodes']:
+            assert len(node['goal']) <= 600, node['id']
+    for example in examples[1:]:
+        for node in example['nodes']:
+            assert any(ref.startswith('SPEC.md#') for ref in node['context_files'])
+            assert 'raise ValueError' not in node['goal']
+            assert 'int | None = None' not in node['goal']
+    rule = text[text.index('6. **'):text.index('7. **')]
+    assert 'Do not restate specification details' in rule
+    assert '600 characters' in rule
+
+
+@pytest.mark.parametrize('length', [1200, 1201])
+def test_long_goal_is_reported_without_failing_plan(toy_repo, tmp_path, monkeypatch, capsys, length):
+    from aqours_code.taskgraph import planner as planner_module
+    request = tmp_path / 'request.md'
+    request.write_text(REQUEST, encoding='utf-8')
+    draft = {'nodes': [_node('A', goal='x' * length, modify=['runner.py'])]}
+    worker = ScriptedPlanner([answer(draft)])
+    monkeypatch.setattr(planner_module, 'planner_worker', lambda: worker)
+    out = tmp_path / 'graph.json'
+    assert main(['plan', str(request), '--repo', str(toy_repo.path), '--out', str(out)]) == 0
+    report = json.loads(report_path_for(out).read_text(encoding='utf-8'))
+    assert report['success'] and report['goal_chars'] == {'A': length}
+    assert report['rounds'][0]['errors'] == []
+    assert load_graph(out).nodes[0].goal == 'x' * length
+    terminal = capsys.readouterr().out
+    assert (f'node A goal has {length} characters' in terminal) == (length > 1200)
+
+
+def test_goal_character_report_includes_appended_conventions(toy_repo, tmp_path):
+    draft = {'conventions': ['Use the injected clock.'], 'nodes': SINGLE_NODE_DRAFT['nodes']}
+    result, _, _ = plan(toy_repo, tmp_path, [answer(draft)])
+    assert result.success
+    assert result.report['goal_chars'] == {n.id: len(n.goal) for n in result.graph.nodes}
+    assert result.report['goal_chars']['A'] > len(draft['nodes'][0]['goal'])

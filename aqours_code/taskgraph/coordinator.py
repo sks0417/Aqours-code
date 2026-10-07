@@ -293,8 +293,8 @@ class Coordinator:
                     gitops.diff_patch(self.repo, start, branch), encoding="utf-8")
                 gitops.remove_worktree(self.repo, worktree)
             allowed = edit_files(node)
-            record.out_of_scope_files = [path for path in record.changed_files
-                                         if path not in allowed]
+            record.out_of_scope_files = ([] if node.edit_set.any_file else
+                                         [path for path in record.changed_files if path not in allowed])
             record.end_t = self.events.elapsed()
 
     def _attempt_until_checked(self, node: Node, record: NodeRecord, log_dir: Path,

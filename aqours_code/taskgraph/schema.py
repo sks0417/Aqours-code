@@ -16,6 +16,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     field_validator,
     model_validator,
@@ -197,6 +198,9 @@ class RevisionEntry(_Model):
 class EditSet(_Model):
     """Files a node may change, plus optional informational symbols."""
 
+    any_file: StrictBool = Field(
+        default=False,
+        description="May modify or create any repository file; allowed only in a single-node graph.")
     modify: UniquePaths = Field(
         description=("Files this node changes. Each must exist at the base commit or "
                      "be created by an ancestor node."))
