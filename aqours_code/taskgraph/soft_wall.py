@@ -62,14 +62,27 @@ def python_read_arguments(code: str) -> list[str]:
             and isinstance(n.value, str)]
 
 
+def _strip_harmless_redirects(command: str) -> str:
+    """Remove only known discard/merge redirects, preserving quoted arguments."""
+    pattern = re.compile(
+        r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
+        r'|(?<![\w<>])2\s*>\s*&\s*1(?=\s|[;&|]|$)'
+        r'|(?<![\w<>])2\s*>\s*(?:/dev/null|(?i:nul))(?=\s|[;&|]|$)'
+        r'|(?<![0-9<>])>\s*(?:/dev/null|(?i:nul))(?=\s|[;&|]|$)',
+    )
+    return pattern.sub(lambda match: match[1] if match[1] is not None else ' ', command)
+
+
 def bash_read_paths(command: str, workspace: Path) -> list[str]:
     """Existing files named by conservative content-reader commands/globs.
 
     Listings, pytest, redirects, in-place sed and write-capable Python are
-    allowed. Unknown shell constructs (including cd) are not interpreted.
+    allowed. Root cd and harmless redirects are ignored; other cd targets
+    and unknown shell constructs are not interpreted.
     """
     if re.match(r'^\s*(?:python\s+-m\s+pytest|pytest)(?:\s|$)', command):
         return []
+    command = _strip_harmless_redirects(command)
     # A redirect or substitution may write; prefer a false negative to blocking
     # code edits. This also lets here-docs and mixed read/write pipelines pass.
     if any(marker in command for marker in ('>', '<', '`', '$(')):
@@ -88,18 +101,24 @@ def bash_read_paths(command: str, workspace: Path) -> list[str]:
             segments.append([])
         else:
             segments[-1].append(token)
-    if any(segment and segment[0].lower() in {'cd', 'pushd', 'popd'} for segment in segments):
-        return []
-    arguments: list[str] = []
+    arguments: list[tuple[str, bool]] = []
     for args in segments:
         if not args:
             continue
         name = args[0].lower()
+        if name == 'cd':
+            targets = args[2:] if len(args) > 1 and args[1].lower() == '/d' else args[1:]
+            if len(targets) != 1:
+                return []
+            target = targets[0].replace('\\', '/')
+            if target.rstrip('/') == '/workspace' or repository_path(target, workspace) == '.':
+                continue
+            return []
         if name in {'python', 'python3', 'python.exe'} and len(args) >= 3 and args[1] == '-c':
             paths = python_read_arguments(args[2])
             if not paths:
                 return []
-            arguments += paths
+            arguments += [(path, False) for path in paths]
         elif name in READ_COMMANDS:
             if name == 'sed' and any(a.startswith('-i') or a == '--in-place' or
                                       a.startswith('--in-place=') for a in args[1:]):
@@ -109,18 +128,30 @@ def bash_read_paths(command: str, workspace: Path) -> list[str]:
                 return []
             if name == 'awk' and any('|' in a or re.search(r'\b(?:system|getline)\b', a) for a in args[1:]):
                 return []
-            arguments += args[1:]
+            recursive = (
+                name == 'grep' and any(
+                    (a.startswith('-') and not a.startswith('--') and any(c in a[1:] for c in 'rR'))
+                    or a in {'--recursive', '--dereference-recursive'} for a in args[1:])
+                or name == 'findstr' and any(a.lower() == '/s' for a in args[1:])
+            )
+            arguments += [(arg, recursive) for arg in args[1:]]
         elif name not in {'ls', 'dir', 'pwd', 'pytest'}:
             return []  # A mixed command with unknown effects may be writing.
     result: set[str] = set()
-    for value in arguments:
+    for value, recursive in arguments:
         relative = repository_path(value, workspace)
         if relative is None:
             continue
         for match in glob.glob(str(workspace.resolve() / relative), recursive=True):
             path = repository_path(match, workspace)
-            if path is not None and (workspace / path).is_file():
-                result.add(path)
+            if path is None:
+                continue
+            file = workspace / path
+            candidates = file.rglob('*') if recursive and file.is_dir() else [file]
+            for candidate in candidates:
+                relative_file = repository_path(str(candidate), workspace)
+                if relative_file is not None and candidate.is_file():
+                    result.add(relative_file)
     return sorted(result)
 
 

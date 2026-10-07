@@ -252,3 +252,87 @@ def test_wall_logs_aggregate_confirmed_bash_reads_across_attempts(tmp_path):
     assert result['soft_wall_blocked'] == 2
     assert result['confirmed_reads'] == ['store.py', 'web.py']
     assert result['reads_outside_pack'] == 4
+
+
+@pytest.fixture
+def reader_wall(wall):
+    for name in ['api.py', 'dashboard.py', 'runner.py', 'nested/helpers.py']:
+        file = wall.workspace / 'jobrunner' / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text('register = True\n')
+    return wall
+
+
+@pytest.mark.parametrize(('command', 'expected'), [
+    ('cd /workspace && cat jobrunner/api.py jobrunner/dashboard.py',
+     ['jobrunner/api.py', 'jobrunner/dashboard.py']),
+    ('cat jobrunner/store.py 2>/dev/null', ['jobrunner/store.py']),
+    ('head -50 jobrunner/runner.py 2>&1', ['jobrunner/runner.py']),
+    ('cd /workspace && grep -rn "register" jobrunner/',
+     ['jobrunner/api.py', 'jobrunner/dashboard.py', 'jobrunner/nested/helpers.py',
+      'jobrunner/other.py', 'jobrunner/runner.py', 'jobrunner/store.py']),
+])
+def test_common_bash_read_forms_block_then_confirm(reader_wall, command, expected):
+    assert bash_read_paths(command, reader_wall.workspace) == expected
+    first = reader_wall.decide('bash', {'command': command})
+    assert first.decision == 'blocked' and list(first.paths) == expected
+    assert reader_wall.decide('bash', {'command': command}).decision == 'allowed'
+
+
+@pytest.mark.parametrize('prefix', [
+    'cd /workspace', 'cd /workspace/', 'cd .', 'cd "{root}"',
+    'cd /d "{root}"', 'cd /D /workspace', 'cd /d "{windows_root}"',
+])
+def test_cd_to_workspace_is_noop(reader_wall, prefix):
+    command = prefix.format(root=reader_wall.workspace,
+                            windows_root=str(reader_wall.workspace).replace('/', '\\'))
+    command += ' && cat jobrunner/store.py'
+    assert bash_read_paths(command, reader_wall.workspace) == ['jobrunner/store.py']
+
+
+@pytest.mark.parametrize('redirect', [
+    '2>&1', '2 > & 1', '2>/dev/null', '2 > /dev/null', '>/dev/null', '> /dev/null',
+    '2>nul', '2 > nul', '>nul', '> nul', '2>NUL', '>NUL',
+    '2>/dev/null >/dev/null',
+])
+def test_harmless_redirects_do_not_bypass_reader_detection(reader_wall, redirect):
+    command = f'cat jobrunner/store.py {redirect}'
+    assert bash_read_paths(command, reader_wall.workspace) == ['jobrunner/store.py']
+
+
+@pytest.mark.parametrize('reader', ['grep -r', 'grep -R', 'grep -rn', 'grep -Rn',
+                                     'grep --recursive', 'findstr /s', 'findstr /S'])
+def test_recursive_directory_read_expands_and_filters_allowed_files(reader_wall, reader):
+    reader_wall.allowed.update({'jobrunner/store.py', 'jobrunner/nested/helpers.py'})
+    command = f'{reader} register jobrunner/'
+    expected = sorted(str(p.relative_to(reader_wall.workspace)).replace('\\', '/')
+                      for p in (reader_wall.workspace / 'jobrunner').rglob('*') if p.is_file())
+    assert bash_read_paths(command, reader_wall.workspace) == expected
+    decision = reader_wall.decide('bash', {'command': command})
+    assert list(decision.paths) == [p for p in expected if p not in reader_wall.allowed]
+    reader_wall.allowed.update(expected)
+    assert reader_wall.decide('bash', {'command': command}) is None
+
+
+@pytest.mark.parametrize('command', [
+    'cd /tmp && cat x', 'cat jobrunner/store.py > copy.py',
+    'python -m pytest -q tests 2>&1 | tail -5',
+    'ls -la jobrunner tests 2>/dev/null',
+    'cat jobrunner/store.py > copy.py 2>/dev/null',
+    'cat jobrunner/store.py 2>&1 > copy.py',
+    'cat jobrunner/store.py >/dev/null.copy',
+    'cat jobrunner/store.py >>nul',
+    'cat jobrunner/store.py 12>/dev/null',
+    'grep -n register jobrunner/',  # no recursive flag: directories aren't read
+    'findstr register jobrunner/',
+])
+def test_unsafe_redirects_other_cd_tests_and_listings_still_pass(reader_wall, command):
+    assert bash_read_paths(command, reader_wall.workspace) == []
+    assert reader_wall.decide('bash', {'command': command}) is None
+
+
+def test_redirect_like_text_in_quotes_is_not_removed(reader_wall):
+    # This is a file name, not a discard redirect; preserve the conservative
+    # handling of remaining shell metacharacters instead of changing its name.
+    (reader_wall.workspace / 'jobrunner/store.py >nul').write_text('content')
+    assert bash_read_paths('cat "jobrunner/store.py >nul"', reader_wall.workspace) == []
