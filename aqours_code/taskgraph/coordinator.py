@@ -89,6 +89,8 @@ class NodeRecord:
     context_packs: list[dict] = field(default_factory=list)
     reads_outside_pack: int = 0
     calls_before_first_write: int = 0
+    soft_wall_blocked: int = 0
+    confirmed_reads: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -312,7 +314,9 @@ class Coordinator:
             self.events.emit("worker_start", node=node.id, attempt=attempt)
             request = WorkerRequest(node_id=node.id, attempt=attempt, prompt=prompt,
                                     workspace=worktree, log_dir=log_dir,
-                                    timeout_s=self.options.worker_timeout_s)
+                                    timeout_s=self.options.worker_timeout_s,
+                                    soft_wall_enabled=len(self.graph.nodes) > 1,
+                                    own_files=pack.own_files, full_files=pack.full_files)
             try:
                 result = self.worker.run(request)
             except Exception as exc:  # noqa: BLE001 - a broken worker fails the attempt
@@ -430,6 +434,8 @@ class Coordinator:
                                            record.context_packs)
             record.reads_outside_pack = metrics["reads_outside_pack"]
             record.calls_before_first_write = metrics["calls_before_first_write"]
+            record.soft_wall_blocked = metrics["soft_wall_blocked"]
+            record.confirmed_reads = metrics["confirmed_reads"]
 
     def remove_answers(self) -> None:
         """Delete what a later worker must not find: hidden tests and worktrees.
@@ -539,6 +545,8 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
             "input_tokens": sum(r.input_tokens for r in records.values()),
             "output_tokens": sum(r.output_tokens for r in records.values()),
             "context_chars": sum(r.context_chars for r in records.values()),
+            "soft_wall_blocked": sum(r.soft_wall_blocked for r in records.values()),
+            "confirmed_reads": sum(len(r.confirmed_reads) for r in records.values()),
             "reads_outside_pack": sum(r.reads_outside_pack for r in records.values()),
             "calls_before_first_write": sum(r.calls_before_first_write for r in records.values()),
         },

@@ -44,12 +44,7 @@ Do not modify, create, or delete any other file.
 
 # Context
 
-Everything your sub-task needs is below: your own files in full, the
-interfaces you use (signatures and docstrings only), the parts of the
-specification that concern you, and the test fixtures. Start working from
-this. Do not read the other feature modules of the repository. Read another
-file only if something you need is missing here, and say in your final
-answer what was missing.
+{context_intro}
 
 {context_pack}
 
@@ -73,7 +68,29 @@ Work only inside your workspace. Files outside it are not available to you.
 If you need something that is not in the workspace or in the interfaces your
 sub-task can rely on, do not look for it elsewhere: do the best you can with
 what you have, and state clearly in your final answer what was missing.
-{sandbox}{retry}"""
+{sandbox}{retry}{before_start}"""
+
+SINGLE_NODE_CONTEXT = """Everything your sub-task needs is below: your own files in full, the
+interfaces you use (signatures and docstrings only), the parts of the
+specification that concern you, and the test fixtures. Start working from
+this. Do not read the other feature modules of the repository. Read another
+file only if something you need is missing here, and say in your final
+answer what was missing."""
+
+CONTEXT_INSPECTION = """The inspection of contracts and source that your instructions ask for has
+already been done for this sub-task: the context below IS that inspection.
+It contains your own files in full, the interfaces you use (signatures and
+docstrings), the parts of the specification that concern you, and the test
+fixtures. Treat it as already read. Do not read these files again, and do
+not read other modules of the repository."""
+
+BEFORE_START = """
+# Before you start
+
+Start from the context above and write code. Reading other files of the
+repository is blocked the first time; read one only if your sub-task
+cannot be done without it, and say why in your final answer.
+"""
 
 SANDBOX_NOTE = """
 Your bash commands run in a Linux container (POSIX sh, no network) whose
@@ -159,6 +176,8 @@ def build_node_prompt(graph: Graph, node: Node, index: RepoIndex, attempt: int,
         provides=_bullets(node.provides),
         contract_note=CONTRACT_NOTE if node.kind == "contract" else "",
         requires="\n".join(requires) if requires else "- (none)",
+        context_intro=CONTEXT_INSPECTION if len(graph.nodes) > 1 else SINGLE_NODE_CONTEXT,
+        before_start=BEFORE_START if len(graph.nodes) > 1 else "",
         context_pack=context_pack.text if context_pack is not None else "(context unavailable)",
         checks=_bullets(node.check.commands),
         sandbox=SANDBOX_NOTE if sandbox == "docker" else "",

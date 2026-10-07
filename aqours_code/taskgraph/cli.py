@@ -164,6 +164,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(f"context_chars: {totals['context_chars']}  "
           f"reads_outside_pack: {totals['reads_outside_pack']}  "
           f"calls_before_first_write: {totals['calls_before_first_write']}")
+    print(f"soft_wall_blocked: {totals['soft_wall_blocked']}  "
+          f"confirmed_reads: {totals['confirmed_reads']}")
     if summary["hidden_tests"] is not None:
         hidden_stats = summary["hidden_tests"]
         print(f"hidden tests: {hidden_stats['passed']} passed, {hidden_stats['failed']} "

@@ -504,3 +504,49 @@ failed or timed out).
 
 `experiments/taskgraph/planner_eval/` runs the planner on the experiment
 repositories and compares the result with the hand-written graphs.
+
+### Worker reading soft wall
+
+For graphs with more than one node, the context intro says that the supplied
+pack already performs the requested source/contract inspection. A final
+`# Before you start` reminder follows the rules and any retry details. Single
+node graphs retain their previous prompt and register no soft wall.
+
+The coordinator passes `soft_wall.enabled`, `own_files`, `full_files`, and the
+per-attempt log path through `WorkerRequest` and `AqoursWorker.config_for()`.
+Only `worker_entry.register_soft_wall()` imports and uses the public Aqours
+`register_hook` and `recoverable_tool_rejection` APIs. It calls `bootstrap()`
+first: that function is idempotent (`aqours_code.__init__._BOOTSTRAPPED`), and
+`run_agent_task()`'s runtime state/isolated collection lists do not include
+`hooks.HOOKS`. Registrations therefore survive the task. A real subprocess
+integration test verifies the rejection reaches the model; a lifetime test
+also verifies the callbacks remain registered. They become inactive in
+`run_worker()`'s `finally` block, so in-process scripted tests cannot leave an
+active wall affecting subsequent worker or planner runs. Production workers
+exit after one attempt. There is no import-time registration or planner hook.
+
+`SoftWall.decide()` blocks the first `read_file` request per canonical existing
+repository path, then permits subsequent requests. Own files, full-pack files,
+and files successfully written during this attempt pass immediately. Host and
+Docker workspace paths and Windows separators normalize to the same identity.
+`bash_read_paths()` handles explicit readers and path globs conservatively;
+exact command strings have independent confirmation state. Listings, pytest,
+redirections, in-place edits, and commands with uncertain write effects pass.
+This is a reading nudge, not a security sandbox; arbitrary shell programs are
+not fully interpreted. Existing Aqours permissions still apply.
+
+A `PostToolUse` callback records successful confirmations and tracks file-tool
+writes. For Bash, metadata snapshots recognize created/changed files without
+reading their contents; `ObservedExecutor` delegates the public executor
+interface and supplies exit/timeout status for confirmation accounting.
+
+`nodes/<id>/soft_wall_<attempt>.jsonl` records UTC time, tool-call id, tool,
+path/command, canonical paths, and `blocked`/`allowed` decisions. Allowed events
+are written only after successful tool completion. Each node's summary has
+`soft_wall_blocked` and an ordered, unique `confirmed_reads` path list; totals
+sum blocked calls and the lengths of those per-node lists. `reads_outside_pack`
+counts successful confirmed file reads, including paths in recognized Bash
+commands, with repeated reads counted again. Blocked, failed, and unfinished
+reads do not count. With no soft-wall log, trace accounting requires a
+successful `tool_result` paired with its `read_file` call. First-write model
+call counting retains its existing semantics.
