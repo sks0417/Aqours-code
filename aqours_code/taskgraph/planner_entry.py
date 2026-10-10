@@ -1,10 +1,12 @@
-"""Planner child process: run the planner agent with read-only tools.
+"""Planner child process: run one planner agent.
 
-    python -m aqours_code.taskgraph.planner_entry --config <worker_N_config.json>
+    python -m aqours_code.taskgraph.planner_entry [--stage draft|ground] --config <config.json>
 
 The same child-process runner as ``worker_entry`` (``CountingClient``, model
 configuration, result file), with a tool policy that cannot change files or
-run commands.
+run commands. ``--stage ground`` (the default, Step 2) may read files;
+``--stage draft`` (Step 1) has no file tools at all, so it works from the
+request alone.
 """
 from __future__ import annotations
 
@@ -28,9 +30,14 @@ PLANNER_TOOL_POLICY: dict = {
 }
 
 
-def run_planner(config: dict, model_client=None) -> WorkerResult:
-    """Run one planner round with :data:`PLANNER_TOOL_POLICY`."""
-    return run_worker(config, model_client=model_client, tool_policy=PLANNER_TOOL_POLICY)
+DRAFT_TOOL_POLICY: dict = {**PLANNER_TOOL_POLICY, "name": "taskgraph_planner_draft",
+                           "allowed_tools": ["compact"]}
+STAGE_POLICIES = {"ground": PLANNER_TOOL_POLICY, "draft": DRAFT_TOOL_POLICY}
+
+
+def run_planner(config: dict, model_client=None, stage: str = "ground") -> WorkerResult:
+    """Run one planner round with the tool policy of ``stage``."""
+    return run_worker(config, model_client=model_client, tool_policy=STAGE_POLICIES[stage])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--config")
     group.add_argument("--describe", action="store_true")
+    parser.add_argument("--stage", choices=sorted(STAGE_POLICIES), default="ground")
     args = parser.parse_args(argv)
     if args.describe:
         print(json.dumps(describe()))
@@ -46,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
     os.environ["AQOURS_CODE_WORKDIR"] = config["workspace"]
     try:
-        result = run_planner(config)
+        result = run_planner(config, stage=args.stage)
     except Exception as exc:  # noqa: BLE001 - always leave a result file
         result = WorkerResult(ok=False, reason="worker_error",
                               error=f"{type(exc).__name__}: {exc}")
