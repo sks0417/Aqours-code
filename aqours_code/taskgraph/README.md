@@ -546,7 +546,7 @@ code and answers with a draft graph: only nodes, no edges; the last
 The program completes the draft into a graph (`generator` `{"kind":
 "planner", "planner_version": "planner-v1", "model": ...}`), runs
 `derive_edges()` and `validate()`, and applies the planner-only checks
-(`planner_checks()` and `item_checks()`; errors like V1-V13, not part of
+(`planner_checks()`, `item_checks()` and `implementation_checks()`; errors like V1-V13, not part of
 `validate()`, so hand-written graphs are not held to them):
 
 | Code | Error |
@@ -556,6 +556,14 @@ The program completes the draft into a graph (`generator` `{"kind":
 | `P3` | a contract node creates or modifies a file under `tests/` (a contract's check only runs the existing tests) |
 | `P4` | a draft item has no `implement` node; an `implement` node has no `item` or one that is not a draft item; a `contract` node has an `item` |
 | `P5` | an item is split into several nodes, or there is a `contract` node, without a `reason` |
+| `P6` | an `implement` node's `requires_impl` makes it wait for implement nodes of two or more other draft items (it has become an integration node) |
+
+P6 keeps a node that only exposes other features (REST routes, pages, a CLI)
+parallel with them: it depends on the contract's interfaces (`requires`) and
+tests itself against a fake, as E and F do in the proposal's example. Waiting
+for the implementation of one other item (statistics built on an audit log,
+say) is allowed, and so is waiting for another node of the same item. P6 is
+not checked again after Step 3, where merged nodes have no item.
 
 On any error the agent runs again with its previous draft and the errors (a
 fresh agent; the prompt repeats the request and the draft items), at most
@@ -638,7 +646,7 @@ The terminal summary shows the number of draft items and the estimate,
 whether the fast path was taken, the node count before and after merging,
 and the members of each merge. `--timeout` applies to each model round. Exit
 codes: `0` success, `1` errors remained, `2` input or git errors. Error codes
-in the report besides V1-V13 and P1-P5: `FORMAT` (no JSON block, invalid
+in the report besides V1-V13 and P1-P6: `FORMAT` (no JSON block, invalid
 JSON, or a draft or schema mismatch), `AGENT` (a planner agent failed or
 timed out) and `REVISE`.
 
