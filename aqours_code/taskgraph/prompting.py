@@ -107,6 +107,25 @@ Output excerpt:
 ```
 """
 
+MERGE_REPAIR_TEMPLATE = """
+# Your work broke after merging
+
+Your sub-task passed its own checks, but after it was merged with the work
+that other sub-tasks finished in the meantime, the checks failed. Your
+workspace now holds your work together with theirs. The failing output is
+below.
+
+Fix the failure by changing only your own files (listed above). The other
+sub-tasks' code is finished and must stay as it is. If the failure cannot
+be fixed from your own files, change nothing and say why in your final
+answer.
+
+Output excerpt:
+```
+{output}
+```
+"""
+
 IMPLEMENTED = "implemented"
 INTERFACE_ONLY = ("interface only: the full implementation may not exist yet; "
                   "do not rely on its behaviour in your checks")
@@ -115,10 +134,15 @@ IMPLEMENTED_UPSTREAM = "implemented by an upstream sub-task"
 
 @dataclass
 class AttemptFailure:
-    """Why the previous attempt of a node failed."""
+    """Why the previous attempt of a node failed.
+
+    ``after_merge`` marks a merge repair: the node's own checks passed, and the
+    checks failed once its work was merged with other nodes' work.
+    """
 
     reason: str
     output: str = ""
+    after_merge: bool = False
 
 
 def _bullets(items: list[str]) -> str:
@@ -154,9 +178,12 @@ def build_node_prompt(graph: Graph, node: Node, index: RepoIndex, attempt: int,
     requires += [f"- `{symbol}`: {IMPLEMENTED_UPSTREAM}" for symbol in node.requires_impl]
     retry = ""
     if failure is not None:
-        retry = RETRY_TEMPLATE.format(
-            attempt=attempt, reason=failure.reason,
-            output=failure.output[-FAILURE_EXCERPT_CHARS:].strip() or "(no output)")
+        output = failure.output[-FAILURE_EXCERPT_CHARS:].strip() or "(no output)"
+        if failure.after_merge:
+            retry = MERGE_REPAIR_TEMPLATE.format(output=output)
+        else:
+            retry = RETRY_TEMPLATE.format(attempt=attempt, reason=failure.reason,
+                                          output=output)
     if node.edit_set.any_file:
         file_scope = "You may modify or create any file in the repository."
         context_text = ""

@@ -113,6 +113,21 @@ def squash_merge(repo: Path, branch: str, message: str) -> str | None:
     return head(repo)
 
 
+def merge_commit_into(worktree: Path, commit: str, message: str) -> bool:
+    """Merge ``commit`` into the branch checked out in ``worktree``.
+
+    Returns False after a conflict; the worktree is then restored to its
+    state before the merge.
+    """
+    proc = git(worktree, "merge", "-q", "--no-ff", "--no-verify", "-m", message, commit,
+               check=False)
+    if proc.returncode != 0:
+        git(worktree, "merge", "--abort", check=False)
+        git(worktree, "reset", "-q", "--hard", "HEAD")
+        return False
+    return True
+
+
 def undo_last_commit(repo: Path) -> None:
     """Drop the last commit of the checked-out branch and its changes."""
     git(repo, "reset", "-q", "--hard", "HEAD~1")

@@ -246,6 +246,7 @@ python -m aqours_code.taskgraph run <graph.json> --repo <path>
     [--worker aqours|command] [--command-map <json>]
     [--worker-timeout 1800]
     [--hidden-tests <dir>]
+    [--merge-repairs 1]
     [--sandbox docker|none] [--sandbox-image aqours-code-eval:py311]
 ```
 
@@ -373,10 +374,37 @@ found, `0` when none is, and `2` when no run directory is found.
 4. **Merge.** Squash-merge the node branch into `tg/integration` as one commit
    `[taskgraph] <id>: <title>`. A conflict resets the branch and fails the node
    (`merge_conflict`); the node's checks then run again on the integration
-   branch, and a failure undoes the merge (`post_merge_check_failed`). Neither
-   is retried. Changed files outside `modify ∪ create` are recorded as
+   branch, and a failure undoes the merge, so the integration branch stays
+   clean. A conflict is not retried; a failed post-merge check gets a repair
+   round (below). Changed files outside `modify ∪ create` are recorded as
    `out_of_scope_files` but do not fail the node. For `any_file` nodes, the list
    stays empty.
+
+   **Merge repair.** Two nodes can each be correct and still break together,
+   on files that do not overlap, so no plan can foresee it (one registers a
+   global listener, and the other's tests do not set up what the listener
+   needs). When a node's post-merge check fails, the merge is undone and, if
+   the node has a repair left (`--merge-repairs`, default 1; 0 fails the node
+   at once with `post_merge_check_failed`):
+   - the current integration branch is merged into the node's branch, so its
+     worktree holds the other nodes' finished work plus its own: the state
+     whose check just failed. A conflict here fails the node
+     (`merge_conflict`);
+   - the worker runs once more (the attempt number continues) with the
+     post-merge check output under `# Your work broke after merging`: fix it
+     in your own files, leave the other sub-tasks' code alone. The context
+     pack is rebuilt from the new worktree; the soft wall applies as usual;
+   - the node's own check runs in the worktree. If it fails, the node fails
+     with `repair_check_failed`. If it passes, the node is squash-merged and
+     checked again; another failure is `post_merge_check_failed`.
+
+   The repair runs outside the merge lock, so other nodes keep merging; the
+   node stays `running` and keeps its files. Repairs are separate from
+   `--max-attempts`, which only covers failures of the node's own check. A
+   repair happens only when it is needed, unlike an integration node, which
+   would run every time and sit on the critical path. After a repair the
+   node's `changed_files` and `diff.patch` are measured against the
+   integration commit that was merged into its branch.
 5. **Final stage.** Run every `final_checks` command on the integration branch
    and record each result. With `--hidden-tests DIR`, check out the
    integration HEAD into `final/`, copy `DIR` to `final/_hidden_tests/`, and
@@ -411,7 +439,8 @@ runs/<run_id>/            run_id = UTC timestamp + 4 random hex characters
   wt/<node_id>/           node worktrees (removed when the node ends; wt/ when the run ends)
   nodes/<node_id>/        prompt_<n>.md, worker_<n>.json, worker_<n>_config.json,
                           worker_<n>_stdout.txt, trace_<n>.jsonl, aqours_<n>/,
-                          check_<n>.txt, post_merge_check.txt, diff.patch
+                          check_<n>.txt, post_merge_check.txt,
+                          post_merge_check_repair_<k>.txt, diff.patch
   final/                  clean checkout of the integration HEAD for hidden tests
 ```
 
@@ -422,7 +451,9 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
 `node_ready`, `node_start`, `worker_start`, `worker_end` (with `ok`,
 `reason`, `duration_s`, `model_calls`, `input_tokens`, `output_tokens`),
 `check_start`, `check_end`, `merge_start`, `merge_end`,
-`post_merge_check_end`, `node_merged`, `node_failed`, `node_skipped`,
+`post_merge_check_end`, `merge_repair_start` (with `attempt`),
+`merge_repair_end` (with `ok`: whether the node was merged after the repair),
+`node_merged`, `node_failed`, `node_skipped`,
 `final_checks_end`, `hidden_tests_end`, `escape_audit_end` (with `total`),
 `run_end`.
 
@@ -433,13 +464,15 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
   `worker_time_s`, `check_time_s` (node and post-merge checks),
   `model_calls`, `input_tokens`, `output_tokens`, `changed_files`,
   `out_of_scope_files`, `merge_commit`, `error`, `escape_attempts`,
-  `escape_samples`;
+  `escape_samples`, `merge_repairs` (repair rounds that ran), `merge_repair_ok`
+  (`true` if the node was merged after a repair, `false` if it still failed,
+  `null` without a repair);
 - `totals`: `model_calls`, `input_tokens`, `output_tokens`;
 - `final_checks`: one entry per command (`command`, `ok`, `exit_code`,
   `timed_out`, `duration_s`);
 - `hidden_tests`: `passed`, `failed`, `errors`, `skipped`, `exit_code`,
   `timed_out`, `duration_s`, or `null`;
-- `sandbox`, `sandbox_image`, `escape_attempts_total`.
+- `sandbox`, `sandbox_image`, `escape_attempts_total`, `merge_repairs_total`.
 
 ### Smoke test on the toy repository
 
