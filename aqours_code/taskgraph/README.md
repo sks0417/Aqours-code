@@ -456,82 +456,191 @@ python -m aqours_code.taskgraph run aqours_code/taskgraph/examples/toy_graph.jso
 ```bash
 python -m aqours_code.taskgraph plan <request.md> --repo <path> --out <graph.json>
     [--final-check "python -m pytest -q tests"] [--timeout 1800] [--request-id <id>]
+    [--fast-path-lines 500] [--no-fast-path] [--no-merge]
 ```
 
-Planner v0 only splits: it always outputs the split it thinks best, without
-deciding whether to split or estimating cost.
+Planner v1 builds the graph in the three steps of the project proposal: a
+draft from the request alone, grounding in the code, and a rule-based
+revision. The model makes the decisions that need reading (what the request
+asks for, which files each piece touches, whether a piece must be split,
+whether an interface is missing); the program makes the decisions that follow
+from the files (which nodes are ordered, which nodes are merged).
 
-1. Clone the HEAD of `--repo` into a temporary directory (uncommitted changes
-   are not seen; the original repository is not touched). `base_commit` is
-   that HEAD.
-2. Run one planner agent: the worker's child-process runner
-   (`python -m aqours_code.taskgraph.planner_entry`, `CountingClient`, the
-   same model configuration) on the clone, with read-only tools
-   (`read_file`, `glob`, `compact`). The prompt is
-   [`planner_prompt.md`](planner_prompt.md) plus the request, the
-   repository's file list and the final checks. The agent answers with a
-   draft: only nodes, no edges. The last ```` ```json ```` block of the final
-   answer is the draft.
-3. Complete the draft into a graph: `request` is the request file's text,
-   `repo` the repository path, `final_checks` the `--final-check` commands,
-   `generator` `{"kind": "planner", "planner_version": "planner-v0", "model":
-   ...}`, and no edges.
-4. `derive_edges()`, then `validate()`, then the planner-only checks below.
-5. If the draft does not parse, does not match the draft format, or the graph
-   has validation or planner-check errors, run the agent again with the previous draft and the
-   errors (a fresh agent; the prompt repeats the request), at most twice.
-   A revised graph has `generator.revision_mode = "llm"`, otherwise `"none"`.
-   If errors remain after two revisions, the run fails: the last graph that
-   could be built and the report are still written, and the exit code is 1.
+| Proposal property | Where it is decided |
+| --- | --- |
+| Property 1, split: independent work is separate | Step 1 (one item per feature) and Step 2 (split an item the code shows to be two independent pieces) |
+| Property 1, merge: coupled work is one node | Step 3, rule M1 (never by the model) |
+| Property 2: a missing shared interface gets a contract | Step 2 (the model adds a contract node, with a `reason`) |
+| Property 3: work on the same code is ordered | `derive_edges()` (order edges), then Step 3 merges what can only queue |
 
-Draft format (fields as in the graph schema; missing lists are empty, and
-`check` becomes `check.commands` with the default timeout):
+`plan` clones the HEAD of `--repo` into a temporary directory (uncommitted
+changes are not seen; the original repository is not touched); `base_commit`
+is that HEAD. Both model steps use the worker's child-process runner
+(`python -m aqours_code.taskgraph.planner_entry`, `CountingClient`, the same
+model configuration) on the clone.
+
+### Step 1: draft (model, request only)
+
+One agent with no file tools (`planner_entry --stage draft`; only `compact`
+is allowed) gets [`planner_draft_prompt.md`](planner_draft_prompt.md), the
+request, and the list of repository files with their line counts, never
+their content. It answers with the pieces of work the request names and an
+estimate of the lines the whole request will add or change:
+
+```json
+{"estimated_changed_lines": 1200,
+ "items": [{"id": "1", "title": "Short name", "description": "What it must achieve."}]}
+```
+
+(The prompt itself shows `<number>` instead of a figure, so that the model
+does not copy an example value near the fast-path threshold.)
+
+`estimated_changed_lines` must be a non-negative integer and `items` must
+have unique ids. An answer that cannot be read is retried once with the
+errors; a second failure fails the whole `plan` (exit code 1, the report is
+written, no graph).
+
+**Fast path.** When the estimate is below `--fast-path-lines` (default 500),
+`plan` skips Steps 2 and 3 and writes the single-agent graph: the same graph
+as the `single` command (goal = the request plus the generic sentence,
+`any_file: true`, no context pack), built by the same function. Only the
+metadata differ: `generator` is `{"kind": "planner", "planner_version":
+"planner-v1", ...}` and `revision_log` has one `other` entry `fast path:
+estimated N changed lines < threshold T`. The reason: every node costs about
+60 s of fixed overhead (context reading, checks, merge) and planning itself
+about 2 minutes, so splitting a change of a few hundred lines cannot beat one
+agent. `--no-fast-path` turns it off. This estimate is the only one the
+planner makes; nodes carry no size or cost estimates.
+
+### Step 2: grounding (model, read-only tools)
+
+A second agent (`read_file`, `glob`, `compact`) gets
+[`planner_prompt.md`](planner_prompt.md), the request, the draft items (a
+`# Draft items` section), the file list and the final checks. It reads the
+code and answers with a draft graph: only nodes, no edges; the last
+```` ```json ```` block of the final answer is the draft.
 
 ```json
 {"conventions": ["..."],
- "nodes": [{"id": "A", "title": "...", "kind": "contract | implement", "goal": "...",
+ "nodes": [{"id": "A", "title": "...", "kind": "contract | implement", "item": "1",
+            "reason": "...", "goal": "...",
             "modify": [], "create": [], "provides": [], "requires": [],
             "requires_impl": [], "check": ["python -m pytest -q tests"],
             "context_files": []}]}
 ```
 
-`conventions` (optional, default empty) lists the repository's rules that
-every node must follow, for example "the current time comes only from the
-injected clock: functions that need it take a `now` argument". The program
-appends them to every node's goal as a `Repository conventions:` section, so
-every worker sees them; without conventions the goals are unchanged. The
-prompt asks the planner to find these rules first, to design the contract's
-interfaces so they can be kept (a module gets what it needs, such as `now`,
-from its caller), and not to add an integration node: the final checks
-verify the merged result, and a part that must be written against another
-part's implementation uses `requires_impl` and connects to it itself.
+- `item`: the draft item an `implement` node belongs to. By default one item
+  is one node. The model may **split** an item when the code shows a large,
+  independent piece of it, and may **add a contract** when several nodes need
+  a shared new interface, each with a `reason`. It never merges two items,
+  even when they edit the same function: it lists truthfully which files each
+  node edits, and Step 3 decides.
+- `item` and `reason` do not enter the graph's nodes (the schema is
+  unchanged). They become `revision_log` entries, placed first: `split` for an
+  item with several implement nodes, `add_node` for each contract.
+- `conventions` (optional) lists the repository's rules that every node must
+  follow, for example "the current time comes only from the injected clock:
+  functions that need it take a `now` argument". The program appends them to
+  every node's goal as a `Repository conventions:` section.
 
-Planner-only checks (`planner_checks()`, errors like V1-V13, applied only to
-planner graphs and not part of `validate()`, so hand-written graphs are not
-held to them):
+The program completes the draft into a graph (`generator` `{"kind":
+"planner", "planner_version": "planner-v1", "model": ...}`), runs
+`derive_edges()` and `validate()`, and applies the planner-only checks
+(`planner_checks()` and `item_checks()`; errors like V1-V13, not part of
+`validate()`, so hand-written graphs are not held to them):
 
 | Code | Error |
 | --- | --- |
 | `P1` | a contract node is an ancestor of another contract node (contracts are not ordered: merge them) |
 | `P2` | every file a node modifies or creates is under `tests/` (a test-only node: remove it or fold its work into the related nodes) |
 | `P3` | a contract node creates or modifies a file under `tests/` (a contract's check only runs the existing tests) |
+| `P4` | a draft item has no `implement` node; an `implement` node has no `item` or one that is not a draft item; a `contract` node has an `item` |
+| `P5` | an item is split into several nodes, or there is a `contract` node, without a `reason` |
+
+On any error the agent runs again with its previous draft and the errors (a
+fresh agent; the prompt repeats the request and the draft items), at most
+twice. If errors remain, the run fails: the last graph that could be built
+and the report are still written, and the exit code is 1.
 
 Goals describe implementation scope and integration points, generally within
 600 characters; specification details belong in `SPEC.md#Heading` context
-references, not in paraphrased goals. Only cross-node decisions absent from the
-specification belong in goals. The report's `goal_chars` maps node IDs to final
+references, not in paraphrased goals. The report's `goal_chars` maps node IDs to final
 goal character counts, including appended conventions. A goal longer than
 1200 characters produces a terminal note, without failing planning.
 
-Output: `--out` (the graph), `<out>.report.json` (every round's answer,
-draft JSON, conventions, errors and warnings; the draft and conventions of
-the written graph; the agent's calls, tokens and time; the number of
-revision rounds, success, totals, and wall time), and `<out>.logs/` (the
-planner agent's config, trace and stdout per round). `--timeout` applies to
-each round. Exit codes: `0` success, `1` errors remained, `2` input or git
-errors. Error codes in the report besides V1-V13 and P1-P3: `FORMAT` (no JSON block,
-invalid JSON, or a draft or schema mismatch) and `AGENT` (the planner agent
-failed or timed out).
+### Step 3: revision (program, `revise.py`)
+
+`revise_graph()` is a pure function on the valid graph of Step 2. It applies
+two rules until neither fits, scanning edges and nodes in list order, so the
+result is deterministic:
+
+- **M1**: for an edge X -> Y, X and Y become one node when all four hold:
+  1. X and Y are both `implement` nodes;
+  2. they edit a common file (`modify ∪ create`);
+  3. every other direct predecessor of Y is an ancestor of X (this keeps the
+     graph acyclic and never makes X's work start later);
+  4. every other direct successor of X is already a descendant of Y, so it
+     had to wait for Y anyway. Without this, a node W that only needs X would
+     have to wait for Y's work as well.
+
+  When 1 and 2 hold and 3 or 4 does not, the nodes stay apart: an `other`
+  entry gives the reason, and the report's `not_merged` lists the pair with
+  `blocked_by` (the predecessors of condition 3) and `delayed` (the
+  successors of condition 4).
+- **M2**: a `contract` node C whose only direct successor is Y, where every
+  other direct predecessor of Y is an ancestor of C, is merged into Y; the
+  result is an `implement` node.
+
+The merged node (members in order, X before Y):
+
+| Field | Merged as |
+| --- | --- |
+| `id` | member ids joined by `_` (`C_D`), with a numeric suffix on a clash |
+| `title` | member titles joined by ` + ` |
+| `goal` | `This sub-task combines N parts. Do them all, in this order.` and then `Part k (<id>: <title>):` with each member's own goal; the conventions appear once, at the end |
+| `edit_set.create`, `symbols`, `provides` | unions |
+| `edit_set.modify` | union, without files a member creates |
+| `requires` / `requires_impl` | unions, without symbols a member provides; a symbol in both stays in `requires_impl` |
+| `check.commands` | union in order; `timeout_s` is the maximum |
+| `context_files` | union in order, without files a member creates (a node cannot have its own new file as context) |
+
+Edges to or from a member point to the merged node, edges between members
+disappear, and of several edges between the same two nodes the strongest
+stays (`full` > `interface` > `order`). The merged node takes the place of
+its first member. Every merge is a `merge` entry in `revision_log` (`nodes`:
+the members, `into`: the new id, `reason`: the rule and the shared files).
+
+After the merges the graph is validated again (V1-V13 and P1-P3). An error
+there is a bug in the rules, not something the model can fix: the graph from
+before the merge is written, the report gets `REVISE` errors, and the exit
+code is 1. `generator.revision_mode` is `rule_assisted` when something was
+merged, otherwise `llm` after a revision round and `none` without one.
+
+### Output
+
+- `--out`: the final graph;
+- `<out>.unmerged.json`: the graph before Step 3 (edges derived), for
+  comparison. `--no-merge` skips Step 3: `--out` is then that graph and no
+  `.unmerged.json` is written;
+- `<out>.report.json`: `draft_items`, `estimated_changed_lines`, `fast_path`
+  (`taken`, `estimated_changed_lines`, `threshold`; `threshold` is null with
+  `--no-fast-path`), `stage1` (every Step 1 round: answer, errors, agent
+  statistics), `rounds` (every Step 2 round: answer, draft JSON, conventions,
+  errors, warnings, agent statistics), `node_items` (each node's `item` and
+  `reason`), `merges` (members, new id, rule, shared files) and `not_merged`,
+  `nodes_before_merge` and `nodes`, `errors` (of the step that failed),
+  `totals` and `duration_s` (Step 1 included) and `stage_totals` (Step 1 and
+  Step 2 separately);
+- `<out>.logs/` (Step 2) and `<out>.logs/draft/` (Step 1): each round's
+  config, trace and stdout.
+
+The terminal summary shows the number of draft items and the estimate,
+whether the fast path was taken, the node count before and after merging,
+and the members of each merge. `--timeout` applies to each model round. Exit
+codes: `0` success, `1` errors remained, `2` input or git errors. Error codes
+in the report besides V1-V13 and P1-P5: `FORMAT` (no JSON block, invalid
+JSON, or a draft or schema mismatch), `AGENT` (a planner agent failed or
+timed out) and `REVISE`.
 
 `experiments/taskgraph/planner_eval/` runs the planner on the experiment
 repositories and compares the result with the hand-written graphs.

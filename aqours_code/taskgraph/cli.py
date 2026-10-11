@@ -211,7 +211,8 @@ def _cmd_single(args: argparse.Namespace) -> int:
 
 def _cmd_plan(args: argparse.Namespace) -> int:
     from .gitops import GitError
-    from .planner import LONG_GOAL_CHARS, PlanOptions, planner_worker, run_plan
+    from . import planner
+    from .planner import LONG_GOAL_CHARS, PlanOptions, run_plan
 
     request_path = Path(args.request)
     if not request_path.is_file():
@@ -220,18 +221,40 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         return _error(f"repository not found: {args.repo}")
     if args.timeout <= 0:
         return _error("--timeout must be > 0")
+    if args.fast_path_lines < 0:
+        return _error("--fast-path-lines must be >= 0")
     options = PlanOptions(request_path=request_path, repo=Path(args.repo),
                           out=Path(args.out), final_checks=list(args.final_check),
-                          timeout_s=args.timeout, request_id=args.request_id)
+                          timeout_s=args.timeout, request_id=args.request_id,
+                          fast_path_lines=None if args.no_fast_path else args.fast_path_lines,
+                          merge=not args.no_merge)
     try:
-        result = run_plan(options, planner_worker())
+        result = run_plan(options, planner.planner_worker(), planner.draft_worker())
     except (GitError, RuntimeError, OSError, UnicodeDecodeError) as exc:
         return _error(str(exc))
     report = result.report
     totals = report["totals"]
+    fast = report["fast_path"]
+    estimate = fast["estimated_changed_lines"]
+    print(f"draft items: {len(report['draft_items'])}  estimated changed lines: "
+          f"{'-' if estimate is None else estimate}")
+    if fast["threshold"] is None:
+        print("fast path: off")
+    elif fast["taken"]:
+        print(f"fast path: taken ({estimate} < {fast['threshold']} lines): "
+              "single-agent graph, steps 2 and 3 skipped")
+    elif estimate is not None:
+        print(f"fast path: not taken ({estimate} >= {fast['threshold']} lines)")
     print(f"nodes: {report['nodes']}  edges: {report['edges']}  "
           f"revision rounds: {report['revision_rounds']}  "
           f"success: {'yes' if result.success else 'no'}")
+    if not fast["taken"] and report["graph_written"]:
+        merging = "" if report["merge"] else " (--no-merge)"
+        print(f"nodes before merge: {report['nodes_before_merge']}  after: "
+              f"{report['nodes']}{merging}")
+        for merge in report["merges"]:
+            print(f"merged ({merge['rule']}): {' + '.join(merge['members'])} -> "
+                  f"{merge['into']}")
     print(f"model calls: {totals['model_calls']}  tokens: {totals['input_tokens']} in / "
           f"{totals['output_tokens']} out  time: {report['duration_s']:.1f}s")
     for node_id, chars in report["goal_chars"].items():
@@ -239,13 +262,14 @@ def _cmd_plan(args: argparse.Namespace) -> int:
             print(f"note: node {node_id} goal has {chars} characters (over {LONG_GOAL_CHARS}); "
                   "prefer concise implementation scope and SPEC.md#heading references.")
     if not result.success:
-        last = report["rounds"][-1] if report["rounds"] else {"errors": []}
-        print(f"errors in the last round ({len(last['errors'])}):")
-        for issue in last["errors"]:
+        print(f"errors in the last round ({len(report['errors'])}):")
+        for issue in report["errors"]:
             nodes = f" {', '.join(issue['nodes'])}:" if issue["nodes"] else ""
             print(f"[{issue['code']}]{nodes} {issue['message']}")
     if report["graph_written"]:
         print(f"wrote {args.out}")
+    if report["unmerged_graph"]:
+        print(f"wrote {report['unmerged_graph']}")
     print(f"wrote {result.report_path}")
     return EXIT_OK if result.success else EXIT_INVALID
 
@@ -336,6 +360,13 @@ def build_parser() -> argparse.ArgumentParser:
                           help="command for the graph's final_checks (repeatable)")
     plan_cmd.add_argument("--timeout", type=float, default=1800.0,
                           help="timeout in seconds of each planner round")
+    plan_cmd.add_argument("--fast-path-lines", type=int, default=500,
+                          help="estimated changed lines below which the request is not "
+                               "split (default 500)")
+    plan_cmd.add_argument("--no-fast-path", action="store_true",
+                          help="always split, whatever the estimate")
+    plan_cmd.add_argument("--no-merge", action="store_true",
+                          help="skip step 3 (rule-based merging)")
     plan_cmd.add_argument("--request-id", help="request_id of the graph "
                           "(default: the --out file name without extension)")
     plan_cmd.set_defaults(func=_cmd_plan)

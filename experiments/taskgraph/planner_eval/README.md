@@ -1,16 +1,18 @@
-# Planner v0 evaluation
+# Planner evaluation
 
-Does the planner split a request the way a person would? Planner v0
-(`python -m aqours_code.taskgraph plan`) always outputs the split it thinks
-best; it does not decide whether to split at all and does not estimate cost.
-This evaluation runs it several times on the job runner and job platform
-tasks and compares the **structure** of each generated graph with the
-hand-written graph of the same repository.
+Does the planner split a request the way a person would? Planner v1
+(`python -m aqours_code.taskgraph plan`) drafts the pieces of work from the
+request alone, grounds them in the code, and lets the program merge the
+nodes that can only queue on one file; a small request takes the fast path
+and stays a single-agent graph. This evaluation runs it several times on the
+job runner and job platform tasks and compares the **structure** of each
+generated graph with the hand-written graph of the same repository.
 
 The planner never sees the hand-written graphs or the reference solutions:
 it reads only the request and a clone of the generated repository (which
-contains the base code, its tests, `SPEC.md`, and `README.md`), and
-`aqours_code/taskgraph/planner_prompt.md` says nothing about either task.
+contains the base code, its tests, `SPEC.md`, and `README.md`), and neither
+`aqours_code/taskgraph/planner_draft_prompt.md` nor `planner_prompt.md` says
+anything about either task.
 
 ## Running
 
@@ -32,7 +34,9 @@ python experiments/taskgraph/planner_eval/run_eval.py --out C:\tg\planner_eval -
 
 Options: `--repeat N` (default 3), `--final-check` (default
 `python -m pytest -q tests`), `--timeout` (seconds per planner round, default
-1800). Pass only the cases you want. The request and the hand-written graph of
+1800), and `--no-fast-path`, `--fast-path-lines N`, `--no-merge`, which are
+passed on to `plan` (use `--no-merge` to compare the graph with and without
+the rule-based merge). Pass only the cases you want. The request and the hand-written graph of
 each case are fixed in the script:
 
 | Case | Request | Hand-written graph |
@@ -46,14 +50,16 @@ Output, per run in `<out>/<case>/run<N>/`:
 
 ```text
 graph.json               the planner's graph
-graph.json.report.json   every round's draft, errors and warnings, totals
-graph.json.logs/         planner agent configs, traces and stdout per round
+graph.json.unmerged.json the graph before the rule-based merge (not on the fast path)
+graph.json.report.json   draft items, every round's draft and errors, merges, totals
+graph.json.logs/         planner agent configs, traces and stdout per round (draft/ for step 1)
 plan_stdout.txt          output of the plan command
 compare.md, compare.json the comparison with the hand-written graph
 ```
 
 and `<out>/summary.md` / `summary.json`: one row per run with the case,
-success, revision rounds, nodes, critical path, maximum parallel width,
+success, draft items, whether the fast path was taken, revision rounds, nodes
+before the merge and after it, critical path, maximum parallel width,
 test-only nodes, mean node match, model calls, and tokens. A failed run gets
 a row with a note; the remaining runs continue.
 
@@ -80,8 +86,8 @@ python -m aqours_code.taskgraph compare C:\tg\planner_eval\jp-modular\run1\graph
 | Repository | Expected |
 | --- | --- |
 | job platform, modular | one thin contract followed by at least four feature nodes that can run in parallel; feature nodes do not touch `runner.py`, `api.py` or `dashboard.py`; critical path 2–3; no test-only nodes |
-| job platform, coupled | the job-selection features (priorities, dependencies, rate limits) in one node; the nodes that edit `runner.py` queued one after another; a longer critical path than modular |
-| job runner (both) | validates and has a sensible structure (a check only) |
+| job platform, coupled | the features that all edit `runner.py` are separate nodes before the merge and one node after it (rule M1); the API and dashboard nodes stay parallel |
+| job runner (both) | validates; if the estimate is under 500 lines, the fast path gives the single-agent graph |
 
 The planner does not have to reproduce the hand-written graphs. They are
 ideal plans written after reading the reference solutions; the planner only

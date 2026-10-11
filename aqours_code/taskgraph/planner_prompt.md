@@ -1,15 +1,17 @@
-# Task: split a request into sub-tasks
+# Task: ground a draft plan in the code
 
-You are planning, not implementing. Split the request below into sub-tasks
-that several coding agents can complete, each in its own copy of the
-repository (or keep it as one task when it is small), and output them as a
-draft task graph in the JSON format at the end of this prompt.
+You are planning, not implementing. You get a request and a draft: the
+pieces of work the request asks for, listed from the request text alone,
+before anyone looked at the code. Read the code and turn every draft item
+into sub-tasks with concrete files and functions, so that several coding
+agents can complete them, each in its own copy of the repository. Output
+them as a draft task graph in the JSON format at the end of this prompt.
 
-Read before you split. Read the request, then the repository: its README,
-any specification it points to, the modules the request touches, and the
-existing tests. Find out which files must change, which new files are
-needed, which parts of the work are independent of each other, and which
-conventions the code follows. Only then decide the split.
+Read before you decide. Read the request and the draft items, then the
+repository: its README, any specification it points to, the modules the
+request touches, and the existing tests. Find out which files each item
+must change, which new files are needed, what the items share, and which
+conventions the code follows.
 
 You have read-only tools (read_file, glob). Do not try to change any file.
 
@@ -35,17 +37,20 @@ not define itself.
 A symbol that already exists in the repository and is not changed by any
 node can be listed in `requires` freely.
 
-**Ordering and parallelism.** You do not write edges. The program derives
-them:
+**Ordering, parallelism and merging.** You do not write edges, and you do
+not decide which nodes run together. The program does both from the files
+and symbols you list:
 
 - a node that requires a symbol runs after the node that provides it;
 - two nodes that edit (modify or create) the same file run one after the
   other;
-- nodes with neither relation run at the same time.
+- nodes with neither relation run at the same time;
+- nodes that could only run one after the other on the same file are merged
+  into one node by the program.
 
-So the shape of the plan follows from the files and symbols you list. Each
-node starts from the merged result of the nodes it depends on and sees
-nothing else.
+So list for every node exactly the files it must edit, even when another
+node edits the same file. Each node starts from the merged result of the
+nodes it depends on and sees nothing else.
 
 **Repository conventions.** Most repositories have rules that all their
 code follows, stated in the README or the specification or visible in the
@@ -53,37 +58,39 @@ existing code. Examples: "the current time comes only from the injected
 clock; a module function that needs it takes a `now` argument from its
 caller and never reads the system time", "all database access goes through
 the storage class", "argument checks use the helpers in the validation
-module". Find these rules before you split and list them in `conventions`.
-The program appends them to every node's goal, so every worker sees them;
-a worker that misses one breaks code that other nodes rely on.
+module". Find these rules and list them in `conventions`. The program
+appends them to every node's goal, so every worker sees them; a worker that
+misses one breaks code that other nodes rely on.
 
 ## Splitting rules
 
-First decide whether to split at all. **You do not have to split, and you
-do not have to use a contract.**
-
-- For a small task, or when the work is concentrated in a few closely
-  related files, output a single `implement` node.
-- Add a contract only when several nodes really need to share a new
-  interface (a new field, a new function signature, and so on).
-
-When you do split:
-
-1. **Split along files.** Make work blocks that can be finished on their own
-   and whose edited files do not overlap. A good block is a feature or
-   concern that lives in its own files.
-2. **Put shared edits in one thin contract.** When several blocks need
-   changes to the same shared file (data models, storage, a common entry
-   point or facade, a router or registry), collect those changes in one
-   contract node that the blocks require. Keep the contract thin: fields,
-   signatures, docstrings, and runnable empty bodies, plus any small helper
-   that every block needs complete. No feature logic. Create here the new
-   files that blocks will fill in, so that each block only modifies its own
-   file. There is usually only one contract. Contracts must never be
-   ordered one after another: if one contract would need what another
-   provides, make them one contract. A contract writes no test files
-   (nothing under `tests/` in its `modify` or `create`); its `check` only
-   runs the existing tests.
+1. **Start from the draft.** Every `implement` node belongs to exactly one
+   draft item: put that item's id in `item`. By default one item is one
+   node. Every draft item needs at least one node.
+2. **Split an item only when the code requires it.** After reading the
+   code, split an item into several nodes only if it contains a piece of
+   work that is both large and independent, for example because it lives in
+   other files than the rest of the item. Say why in `reason`. Do not split
+   an item just because it is big.
+3. **Never merge different items.** Keep two items in two nodes even when
+   they change the same file or the same function. List truthfully the
+   files each node must edit; the program decides whether such nodes are
+   merged or run one after the other.
+4. **Put shared edits in one thin contract.** Add a contract only when
+   several nodes really need to share a new interface (a new field, a new
+   function signature, a new file that each of them fills in), and say in
+   its `reason` which nodes share what. When several nodes need changes to
+   the same shared file (data models, storage, a common entry point or
+   facade, a router or registry), collect those changes in one contract node
+   that the nodes require. Keep the contract thin: fields, signatures,
+   docstrings, and runnable empty bodies, plus any small helper that every
+   node needs complete. No feature logic. Create here the new files that
+   nodes will fill in, so that each node only modifies its own file. There
+   is usually only one contract. Contracts must never be ordered one after
+   another: if one contract would need what another provides, make them one
+   contract. A contract belongs to no draft item (no `item`) and writes no
+   test files (nothing under `tests/` in its `modify` or `create`); its
+   `check` only runs the existing tests.
 
    Design the contract's interfaces so that the conventions can be kept.
    Whatever a module needs from the outside is passed in by its caller as
@@ -91,12 +98,7 @@ When you do split:
    argument and let the caller that owns the clock fill it in, instead of
    letting the module read the time itself. Check every signature against
    `conventions` before you finish.
-3. **Same file, same node, or accept the order.** Work that must edit the same
-   file either goes into one node, or will be run one node after another.
-   Prefer merging closely related work that edits the same lines (for
-   example several features that all change one central function) into one
-   node over a long chain of nodes that rewrite the same code in turn.
-4. **No test-only nodes and no integration node.** Do not add a node that
+5. **No test-only nodes and no integration node.** Do not add a node that
    only writes tests, and do not add a node whose purpose is to verify or
    connect the other nodes after they are merged: the final checks run the
    whole test suite on the merged result. If one part must be written
@@ -104,11 +106,11 @@ When you do split:
    list that symbol in the later part's `requires_impl`: the later node then
    runs after the implementation is merged and connects to it itself, as
    part of its own work and its own tests.
-5. **Every node tests itself.** Each node writes the tests for its own work
+6. **Every node tests itself.** Each node writes the tests for its own work
    (in its own new test file, listed in `create`) and has `check` commands
    that run on their own from the repository root. Including the existing
    test suite in `check` is a good default.
-6. **Concrete scope, not a specification retelling.** State what feature this
+7. **Concrete scope, not a specification retelling.** State what feature this
    node implements, in which files and functions, which existing code it hooks
    into, and what it must not touch. Do not restate specification details in
    `goal`: field types or meanings, validation rules, defaults, return formats,
@@ -117,9 +119,6 @@ When you do split:
    its context pack. Only include decisions absent from the specification that
    nodes must agree on, such as a contract's function signatures or which caller
    supplies `now`. Keep each goal generally within 600 characters.
-7. **Do not over-split.** Each node adds overhead (reading context, running
-   checks, merging). A node should be a meaningful piece of work, not a
-   single small function.
 
 ## Output format
 
@@ -134,7 +133,9 @@ read.
     {
       "id": "A",
       "title": "Short name",
-      "kind": "contract",
+      "kind": "implement",
+      "item": "1",
+      "reason": "Only for a split item or a contract: why.",
       "goal": "What to do, concretely.",
       "modify": ["path/existing.py"],
       "create": ["path/new.py"],
@@ -155,6 +156,11 @@ Field rules:
   if there are none.
 - `id`: unique; letters, digits, `_` and `-`.
 - `kind`: `contract` or `implement`.
+- `item`: for an `implement` node, the id of the draft item it belongs to
+  (required). Leave it out for a `contract` node.
+- `reason`: one sentence. Required for a `contract` node (which nodes share
+  the interface) and for the nodes of an item that you split (why the code
+  requires the split). Leave it out otherwise.
 - `modify`: existing files the node changes. A file that another node
   creates may be modified only by a node that comes after its creator.
 - `create`: new files. They must not exist yet, and each new file is created
@@ -182,18 +188,25 @@ Field rules:
 ## Examples
 
 A toy example, unrelated to your request. Request: "Add star ratings and a
-shopping-list export to the recipe book." The repository has
-`recipes/models.py`, `recipes/book.py` (the `RecipeBook` facade), and tests
-in `tests/`. Its README says that recipes are saved and loaded only through
-`RecipeBook`, and `RecipeBook` takes an injected `clock`. SPEC.md defines
-`Star ratings` and `Shopping-list export`; it does not prescribe the internal
-feature-function signatures or how the facade passes the time.
+shopping-list export to the recipe book." The draft items, from the request
+alone:
 
-Both features need a new field on `Recipe` and a new method on
-`RecipeBook`, so a thin contract adds both and creates the two feature
-modules as stubs; then each feature fills in its own module in parallel.
-The rating records when it was given, so the contract passes `now` to
-`rate()` instead of letting it read the clock.
+- 1: **Star ratings**. Readers can rate a recipe from one to five stars.
+- 2: **Shopping-list export**. Export the ingredients of chosen recipes as
+  one shopping list.
+
+Reading the code shows `recipes/models.py`, `recipes/book.py` (the
+`RecipeBook` facade), and tests in `tests/`. The README says that recipes
+are saved and loaded only through `RecipeBook`, and `RecipeBook` takes an
+injected `clock`. SPEC.md defines `Star ratings` and `Shopping-list export`;
+it does not prescribe the internal feature-function signatures or how the
+facade passes the time.
+
+Each item stays one node. Both need a new field on `Recipe` and a new method
+on `RecipeBook`, which are shared files, so a thin contract adds both and
+creates the two feature modules as stubs; then each item fills in its own
+module. The rating records when it was given, so the contract passes `now`
+to `rate()` instead of letting it read the clock.
 
 ```json
 {
@@ -206,6 +219,7 @@ The rating records when it was given, so the contract passes `now` to
       "id": "C",
       "title": "Contract: rating field, facade methods, feature stubs",
       "kind": "contract",
+      "reason": "R and S both need new Recipe fields in recipes/models.py and new facade methods in recipes/book.py.",
       "goal": "Add the shared Recipe fields in recipes/models.py and facade methods in recipes/book.py for the referenced features. Create runnable stubs in recipes/ratings.py and recipes/shopping.py; no feature logic or test-file edits. Internal contract: rate(book, recipe_id, stars, *, now) and shopping_list(book, recipe_ids); RecipeBook.rate supplies now=self.clock() and the facade delegates to these functions.",
       "modify": ["recipes/models.py", "recipes/book.py"],
       "create": ["recipes/ratings.py", "recipes/shopping.py"],
@@ -224,6 +238,7 @@ The rating records when it was given, so the contract passes `now` to
       "id": "R",
       "title": "Star ratings",
       "kind": "implement",
+      "item": "1",
       "goal": "Implement star ratings in recipes/ratings.py::rate through the RecipeBook facade and the contract fields. Use the supplied now argument; do not edit other modules. Add tests/test_ratings.py.",
       "modify": ["recipes/ratings.py"],
       "create": ["tests/test_ratings.py"],
@@ -237,6 +252,7 @@ The rating records when it was given, so the contract passes `now` to
       "id": "S",
       "title": "Shopping-list export",
       "kind": "implement",
+      "item": "2",
       "goal": "Implement shopping-list export in recipes/shopping.py::shopping_list through RecipeBook.shopping_list. Do not edit other modules. Add tests/test_shopping.py.",
       "modify": ["recipes/shopping.py"],
       "create": ["tests/test_shopping.py"],
@@ -250,18 +266,23 @@ The rating records when it was given, so the contract passes `now` to
 ```
 
 The program turns R's and S's `requires` into edges from C, so R and S run
-in parallel after C.
+at the same time after C.
 
 A second toy example, also unrelated to your request. Request: "Let the
 recipe printout scale ingredient quantities to a chosen number of
-servings." The printout lives in `recipes/printing.py`, and `Recipe` in
-`recipes/models.py` already has a `servings` field. SPEC.md defines the
-behaviour under `Scaled printout`.
+servings." The draft has one item:
 
-The work is one small change to one module plus its tests. No other node
-would share a new interface, so there is no contract, and splitting it
-would only add overhead: the draft is a single implement node, and the
-program derives no edges. The repository has no special rule to list.
+- 1: **Scaled printout**. Print a recipe with its quantities scaled to a
+  chosen number of servings.
+
+Reading the code shows that the printout lives in `recipes/printing.py`, and
+`Recipe` in `recipes/models.py` already has a `servings` field. SPEC.md
+defines the behaviour under `Scaled printout`.
+
+The item is one change to one module plus its tests. Nothing in it is large
+and independent, and no other node would share a new interface, so it stays
+one node without a contract, and the program derives no edges. The
+repository has no special rule to list.
 
 ```json
 {
@@ -271,6 +292,7 @@ program derives no edges. The repository has no special rule to list.
       "id": "P",
       "title": "Scale quantities in the printout",
       "kind": "implement",
+      "item": "1",
       "goal": "Implement serving-count scaling in recipes/printing.py::print_recipe using the existing Recipe model and printout flow. Do not edit other modules. Add tests/test_printing_scale.py.",
       "modify": ["recipes/printing.py"],
       "create": ["tests/test_printing_scale.py"],
