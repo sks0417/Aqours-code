@@ -17,10 +17,12 @@ many lines of code (including tests) the whole request will add or change.
 Answer as the last ```json block of your final answer:
 
 ```json
-{"estimated_changed_lines": 400,
+{"estimated_changed_lines": <number>,
  "items": [{"id": "1", "title": "Short name",
             "description": "What this item must achieve, in one or two sentences."}]}
 ```
+
+The example shows the format only; replace <number> with your own estimate.
 
 - `estimated_changed_lines`: one non-negative whole number for the whole
   request, not per item.

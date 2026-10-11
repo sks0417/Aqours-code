@@ -6,10 +6,16 @@ already derived) and merges nodes that could only run one after the other on
 the same file, where a split costs time and buys nothing:
 
 - **M1**: for an edge X -> Y between two ``implement`` nodes that edit a
-  common file, when every other direct predecessor of Y is an ancestor of X,
-  X and Y become one node. The last condition keeps the graph acyclic and
-  never delays X's work; when it fails, the nodes stay apart and an ``other``
-  revision says why.
+  common file, X and Y become one node when the merge delays nobody:
+
+  - every other direct predecessor of Y is an ancestor of X (this also keeps
+    the graph acyclic, and X's work does not start later);
+  - every other direct successor of X is a descendant of Y, so it had to wait
+    for Y anyway (a successor W that only needs X would otherwise have to
+    wait for Y's work too).
+
+  When one of the two fails, the nodes stay apart and an ``other`` revision
+  says why.
 - **M2**: a ``contract`` node whose only direct successor is Y, when every
   other direct predecessor of Y is an ancestor of the contract, is merged
   into Y; the result is an ``implement`` node.
@@ -97,6 +103,16 @@ def _blocking_predecessors(graph: Graph, first: str, second: str) -> list[str]:
     above = ancestors(graph)[first]
     return [node for node in _predecessors(graph, second)
             if node != first and node not in above]
+
+
+def _delayed_successors(graph: Graph, first: str, second: str) -> list[str]:
+    """Direct successors of ``first``, other than ``second``, that do not wait for ``second``.
+
+    Merging ``first`` and ``second`` would make them wait for ``second``'s work.
+    """
+    above = ancestors(graph)
+    return [node for node in _successors(graph, first)
+            if node != second and second not in above[node]]
 
 
 def _new_id(members: list[str], taken: set[str]) -> str:
@@ -198,7 +214,8 @@ def _find_m1(graph: Graph) -> tuple[Node, Node, list[str]] | None:
         if first.kind != "implement" or second.kind != "implement":
             continue
         shared = sorted(edit_files(first) & edit_files(second))
-        if shared and not _blocking_predecessors(graph, first.id, second.id):
+        if (shared and not _blocking_predecessors(graph, first.id, second.id)
+                and not _delayed_successors(graph, first.id, second.id)):
             return first, second, shared
     return None
 
@@ -225,11 +242,25 @@ def _not_merged(graph: Graph) -> list[dict]:
             continue
         shared = sorted(edit_files(first) & edit_files(second))
         blockers = _blocking_predecessors(graph, first.id, second.id)
-        if shared and blockers:
+        delayed = _delayed_successors(graph, first.id, second.id)
+        if shared and (blockers or delayed):
             seen.add((first.id, second.id))
             found.append({"rule": "M1", "nodes": [first.id, second.id], "files": shared,
-                          "blocked_by": blockers})
+                          "blocked_by": blockers, "delayed": delayed})
     return found
+
+
+def _why_not_merged(item: dict) -> str:
+    first, second = item["nodes"]
+    causes = []
+    if item["blocked_by"]:
+        causes.append(f"{second} also depends on {', '.join(item['blocked_by'])}, which is "
+                      f"not an ancestor of {first}")
+    if item["delayed"]:
+        causes.append(f"{', '.join(item['delayed'])} only needs {first} and would have to "
+                      f"wait for {second} too")
+    return (f"{first} and {second} both edit {', '.join(item['files'])} but were not merged "
+            f"(M1): {'; '.join(causes)}")
 
 
 def revise_graph(graph: Graph, conventions: list[str] | None = None) -> RevisedGraph:
@@ -267,11 +298,8 @@ def revise_graph(graph: Graph, conventions: list[str] | None = None) -> RevisedG
     result.not_merged = _not_merged(result.graph)
     for item in result.not_merged:
         first, second = item["nodes"]
-        result.entries.append(RevisionEntry(
-            action="other", nodes=[first, second],
-            reason=(f"{first} and {second} both edit {', '.join(item['files'])} but were not "
-                    f"merged (M1): {second} also depends on "
-                    f"{', '.join(item['blocked_by'])}, which is not an ancestor of {first}")))
+        result.entries.append(RevisionEntry(action="other", nodes=[first, second],
+                                            reason=_why_not_merged(item)))
     if result.entries:
         result.graph = result.graph.model_copy(
             update={"revision_log": [*result.graph.revision_log, *result.entries]})

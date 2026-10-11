@@ -85,7 +85,7 @@ def test_a_node_with_another_unrelated_predecessor_is_not_merged():
     assert ids(revised.graph) == ["X", "Z", "Y"] and revised.merges == []
     assert edges(revised.graph) == edges(graph)
     assert revised.not_merged == [{"rule": "M1", "nodes": ["X", "Y"], "files": ["runner.py"],
-                                   "blocked_by": ["Z"]}]
+                                   "blocked_by": ["Z"], "delayed": []}]
     entry = revised.graph.revision_log[-1]
     assert (entry.action, entry.nodes) == ("other", ["X", "Y"])
     assert "were not merged (M1)" in entry.reason and "Z" in entry.reason
@@ -102,6 +102,58 @@ def test_a_predecessor_that_is_an_ancestor_of_the_first_node_allows_the_merge():
     assert ids(revised.graph) == ["Z", "X_Y"]
     assert edges(revised.graph) == [("Z", "X_Y", "full")]
     assert revised.not_merged == []
+
+
+def test_a_merge_that_would_delay_another_successor_is_not_done():
+    # W only needs X; merged into X_Y it would also wait for all of Y's work.
+    graph = make_graph([
+        make_node("X", modify=("runner.py",), provides=("runner.py::run_loop",)),
+        make_node("Y", modify=("runner.py",)),
+        make_node("W", modify=("api.py",), requires_impl=("runner.py::run_loop",)),
+    ], [make_edge("X", "Y", "order"), make_edge("X", "W", "full")])
+    revised = revise_graph(graph)
+    assert ids(revised.graph) == ["X", "Y", "W"] and revised.merges == []
+    assert edges(revised.graph) == edges(graph)
+    assert revised.not_merged == [{"rule": "M1", "nodes": ["X", "Y"], "files": ["runner.py"],
+                                   "blocked_by": [], "delayed": ["W"]}]
+    entry = revised.graph.revision_log[-1]
+    assert (entry.action, entry.nodes) == ("other", ["X", "Y"])
+    assert entry.reason == ("X and Y both edit runner.py but were not merged (M1): W only "
+                            "needs X and would have to wait for Y too")
+
+
+def test_a_successor_that_already_waits_for_the_second_node_allows_the_merge():
+    graph = make_graph([
+        make_node("X", modify=("runner.py",)),
+        make_node("Y", modify=("runner.py",)),
+        make_node("W", modify=("api.py",)),
+    ], [make_edge("X", "Y", "order"), make_edge("X", "W", "full"),
+        make_edge("Y", "W", "full")])
+    revised = revise_graph(graph)
+    assert ids(revised.graph) == ["X_Y", "W"]
+    assert edges(revised.graph) == [("X_Y", "W", "full")]
+    assert revised.not_merged == []
+    # a successor further down Y's chain counts too
+    chain = make_graph([
+        make_node("X", modify=("runner.py",)), make_node("Y", modify=("runner.py",)),
+        make_node("V", modify=("store.py",)), make_node("W", modify=("api.py",)),
+    ], [make_edge("X", "Y", "order"), make_edge("X", "W", "full"),
+        make_edge("Y", "V", "full"), make_edge("V", "W", "full")])
+    assert ids(revise_graph(chain).graph) == ["X_Y", "V", "W"]
+
+
+def test_both_reasons_are_reported_together():
+    graph = make_graph([
+        make_node("X", modify=("runner.py",)), make_node("Z", modify=("store.py",)),
+        make_node("Y", modify=("runner.py",)), make_node("W", modify=("api.py",)),
+    ], [make_edge("X", "Y", "order"), make_edge("Z", "Y", "full"),
+        make_edge("X", "W", "full")])
+    revised = revise_graph(graph)
+    assert revised.merges == []
+    assert revised.not_merged == [{"rule": "M1", "nodes": ["X", "Y"], "files": ["runner.py"],
+                                   "blocked_by": ["Z"], "delayed": ["W"]}]
+    reason = revised.graph.revision_log[-1].reason
+    assert "Y also depends on Z" in reason and "W only needs X" in reason
 
 
 def test_contract_with_one_downstream_node_is_merged_into_it():

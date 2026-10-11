@@ -488,9 +488,12 @@ their content. It answers with the pieces of work the request names and an
 estimate of the lines the whole request will add or change:
 
 ```json
-{"estimated_changed_lines": 400,
+{"estimated_changed_lines": 1200,
  "items": [{"id": "1", "title": "Short name", "description": "What it must achieve."}]}
 ```
+
+(The prompt itself shows `<number>` instead of a figure, so that the model
+does not copy an example value near the fast-path threshold.)
 
 `estimated_changed_lines` must be a non-negative integer and `items` must
 have unique ids. An answer that cannot be read is retried once with the
@@ -571,12 +574,19 @@ goal character counts, including appended conventions. A goal longer than
 two rules until neither fits, scanning edges and nodes in list order, so the
 result is deterministic:
 
-- **M1**: for an edge X -> Y where X and Y are both `implement` nodes that
-  edit a common file (`modify ∪ create`), and every other direct predecessor
-  of Y is an ancestor of X, X and Y become one node. The last condition keeps
-  the graph acyclic and never makes X's work start later. When the first two
-  conditions hold and the third does not, the nodes stay apart and an `other`
-  entry says which predecessor prevented the merge.
+- **M1**: for an edge X -> Y, X and Y become one node when all four hold:
+  1. X and Y are both `implement` nodes;
+  2. they edit a common file (`modify ∪ create`);
+  3. every other direct predecessor of Y is an ancestor of X (this keeps the
+     graph acyclic and never makes X's work start later);
+  4. every other direct successor of X is already a descendant of Y, so it
+     had to wait for Y anyway. Without this, a node W that only needs X would
+     have to wait for Y's work as well.
+
+  When 1 and 2 hold and 3 or 4 does not, the nodes stay apart: an `other`
+  entry gives the reason, and the report's `not_merged` lists the pair with
+  `blocked_by` (the predecessors of condition 3) and `delayed` (the
+  successors of condition 4).
 - **M2**: a `contract` node C whose only direct successor is Y, where every
   other direct predecessor of Y is an ancestor of C, is merged into Y; the
   result is an `implement` node.

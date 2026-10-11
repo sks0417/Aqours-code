@@ -996,3 +996,12 @@ def test_invalid_graph_after_merging_is_a_program_error(toy_repo, tmp_path, monk
     assert [node.id for node in graph.nodes] == ["C", "P", "Q", "S"]
     assert graph == load_graph(unmerged_path_for(options.out))
     assert result.report["merges"] == [] and result.report["nodes"] == 4
+
+
+def test_draft_prompt_shows_no_example_line_count():
+    import re
+    text = DRAFT_PROMPT_PATH.read_text(encoding="utf-8")
+    assert '"estimated_changed_lines": <number>' in text
+    assert ("The example shows the format only; replace <number> with your own "
+            "estimate.") in text
+    assert re.search(r"\d{2,}", text) is None      # no figure a model could copy
