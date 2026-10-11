@@ -7,7 +7,7 @@
    turns every draft item into nodes with concrete files and symbols. It may
    split an item or add a contract, but never merges items. The program
    completes the answer into a :class:`Graph`, derives its edges, validates
-   it, and applies the planner checks P1-P5; on errors the agent gets its
+   it, and applies the planner checks P1-P6; on errors the agent gets its
    draft and the errors back for up to ``max_revisions`` more rounds.
 3. **Revise** (program, :mod:`revise`): nodes that can only queue on the
    same file are merged (M1), and a contract with one downstream node is
@@ -379,6 +379,37 @@ def item_checks(draft: Draft, items: list[DraftItem]) -> list[Issue]:
     return issues
 
 
+def implementation_checks(draft: Draft) -> list[Issue]:
+    """Error P6: a node waits for the implementations of two or more other items.
+
+    For every ``requires_impl`` symbol the program derives a ``full`` edge from
+    each implement node that provides it. A node that collects such edges
+    from several other draft items has become an integration node: it cannot
+    start until all of them are done. Waiting for one other item is fine, and
+    so is waiting for another node of the node's own item.
+    """
+    issues = []
+    for node in draft.nodes:
+        if node.kind != "implement":
+            continue
+        waited: dict[str, list[str]] = {}
+        for symbol in node.requires_impl:
+            for other in draft.nodes:
+                if (other.id != node.id and other.kind == "implement"
+                        and symbol in other.provides
+                        and other.item is not None and other.item != node.item):
+                    waited.setdefault(other.item, []).append(symbol)
+        if len(waited) >= 2:
+            symbols = list(dict.fromkeys(s for found in waited.values() for s in found))
+            issues.append(Issue(
+                "P6", [node.id],
+                f"{node.id} waits for the implementations of items {', '.join(waited)} "
+                f"(requires_impl: {', '.join(symbols)}). A node that only exposes other "
+                "features must depend on their interfaces: move these symbols to "
+                "`requires` and test against a fake"))
+    return issues
+
+
 def item_revisions(draft: Draft, items: list[DraftItem]) -> list[RevisionEntry]:
     """``split`` and ``add_node`` entries describing how Step 2 changed the draft."""
     entries = []
@@ -503,7 +534,7 @@ def build_prompt(request: str, index: RepoIndex, final_checks: list[str],
             f"# Fix your previous draft (revision {revision.number} of {MAX_REVISIONS})\n\n"
             "You already planned this request once; your draft is below, followed by "
             "the problems the program found after deriving the edges, validating "
-            "the graph and applying the planner checks (P1-P5). Fix every problem "
+            "the graph and applying the planner checks (P1-P6). Fix every problem "
             "and answer with the complete corrected draft (all nodes, not only the "
             "changed ones) as the last ```json block. Keep the parts that were "
             "fine.\n\n"
@@ -650,7 +681,7 @@ def _evaluate_answer(answer: str, info: GraphInfo, index: RepoIndex, revised: bo
     report = validate(derived, index)
     errors = [*report.errors, *planner_checks(derived)]
     if items is not None:
-        errors += item_checks(draft, items)
+        errors += [*item_checks(draft, items), *implementation_checks(draft)]
         if not errors:
             derived = derived.model_copy(update={"revision_log": [
                 *item_revisions(draft, items), *derived.revision_log]})

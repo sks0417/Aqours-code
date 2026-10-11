@@ -30,9 +30,18 @@ not define itself.
   can start as soon as the node that provides the interface, usually a
   contract, is merged. Use this for almost every dependency.
 - `requires_impl`: the node needs a working implementation, for example
-  because its tests call the real behaviour. The node waits until every
-  implement node that provides the symbol has finished. Use it only when the
-  interface is really not enough, because it makes the node wait longer.
+  because its own code extends or wraps another node's real behaviour. The
+  node waits until every implement node that provides the symbol has
+  finished. Use it only when the interface is really not enough, because it
+  makes the node wait longer.
+
+A node that exposes other nodes' features (REST routes, dashboard pages, a
+CLI, and so on) calls them through the interfaces the contract defines. Its
+dependencies are `requires`, not `requires_impl`, and its own tests use a
+small fake of the objects it calls (for example a fake runner that returns
+fixed values), so it runs in parallel with the features. Use
+`requires_impl` only when the node's own code, not its tests, cannot be
+written against an interface.
 
 A symbol that already exists in the repository and is not changed by any
 node can be listed in `requires` freely.
@@ -101,11 +110,7 @@ misses one breaks code that other nodes rely on.
 5. **No test-only nodes and no integration node.** Do not add a node that
    only writes tests, and do not add a node whose purpose is to verify or
    connect the other nodes after they are merged: the final checks run the
-   whole test suite on the merged result. If one part must be written
-   against another part's real implementation (not just its interface),
-   list that symbol in the later part's `requires_impl`: the later node then
-   runs after the implementation is merged and connects to it itself, as
-   part of its own work and its own tests.
+   whole test suite on the merged result.
 6. **Every node tests itself.** Each node writes the tests for its own work
    (in its own new test file, listed in `create`) and has `check` commands
    that run on their own from the repository root. Including the existing
@@ -266,7 +271,10 @@ to `rate()` instead of letting it read the clock.
 ```
 
 The program turns R's and S's `requires` into edges from C, so R and S run
-at the same time after C.
+at the same time after C. A node that only exposed these features to users
+(a command-line front end, say) would be a third node of the same kind: it
+would `require` the facade methods from C, test itself against a fake
+`RecipeBook`, and run at the same time as R and S.
 
 A second toy example, also unrelated to your request. Request: "Let the
 recipe printout scale ingredient quantities to a chosen number of

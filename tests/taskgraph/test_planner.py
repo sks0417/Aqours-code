@@ -22,6 +22,7 @@ from aqours_code.taskgraph.planner import (
     build_prompt,
     extract_json_block,
     file_sizes,
+    implementation_checks,
     item_checks,
     item_revisions,
     parse_draft,
@@ -478,6 +479,9 @@ def test_prompt_contains_request_files_and_revision(toy_index):
 @pytest.mark.parametrize("prompt_path", [PROMPT_PATH, DRAFT_PROMPT_PATH])
 def test_planner_prompts_mention_nothing_of_the_experiment_tasks(prompt_path):
     text = prompt_path.read_text(encoding="utf-8").lower()
+    # "dashboard" and "runner" appear only in the generic paragraph about nodes that
+    # expose other features ("dashboard pages", "a fake runner"), which is checked below.
+    text = text.replace("dashboard pages", "").replace("a fake runner", "")
     for word in ("job", "runner", "tenant", "webhook", "recurring", "rate limit",
                  "ratelimit", "audit", "notification", "priorit", "dashboard",
                  "cancel", "retry", "retries", "scheduler"):
@@ -531,7 +535,8 @@ def test_prompt_asks_for_conventions_and_no_integration_node():
     text = PROMPT_PATH.read_text(encoding="utf-8")
     assert "**Repository conventions.**" in text and '"conventions"' in text
     assert "No test-only nodes and no integration node" in text
-    assert "requires_impl" in text[text.index("5. **No test-only"):]
+    rule = text[text.index("5. **No test-only"):text.index("6. **Every node tests itself")]
+    assert "requires_impl" not in rule and "real implementation" not in rule
     assert "`now` argument" in text
 
 
@@ -756,7 +761,7 @@ def test_grounding_prompt_lists_the_draft_items_also_when_revising(toy_repo, tmp
         section = request.prompt[request.prompt.index("# Draft items"):]
         assert "- S: **item S**. achieve S" in section
         assert "- R: **item R**. achieve R" in section
-    assert "planner checks (P1-P5)" in worker.requests[1].prompt
+    assert "planner checks (P1-P6)" in worker.requests[1].prompt
     first = worker.requests[0].prompt
     assert first.index("# The request") < first.index("# Draft items") \
         < first.index("# Repository")
@@ -1005,3 +1010,85 @@ def test_draft_prompt_shows_no_example_line_count():
     assert ("The example shows the format only; replace <number> with your own "
             "estimate.") in text
     assert re.search(r"\d{2,}", text) is None      # no figure a model could copy
+
+
+# ── P6: a node must not wait for the implementations of several other items ──
+
+EXPOSURE = ("A node that exposes other nodes' features (REST routes, dashboard pages, a\n"
+            "CLI, and so on) calls them through the interfaces the contract defines. Its\n"
+            "dependencies are `requires`, not `requires_impl`, and its own tests use a\n"
+            "small fake of the objects it calls (for example a fake runner that returns\n"
+            "fixed values), so it runs in parallel with the features. Use\n"
+            "`requires_impl` only when the node's own code, not its tests, cannot be\n"
+            "written against an interface.")
+
+
+def test_prompt_tells_exposing_nodes_to_depend_on_interfaces():
+    text = PROMPT_PATH.read_text(encoding="utf-8")
+    assert EXPOSURE in text
+    concepts = text[text.index("## Concepts"):text.index("## Splitting rules")]
+    assert EXPOSURE in concepts
+    assert "because its own code extends or wraps another node's real behaviour" in concepts
+    assert "because its tests call the real behaviour" not in text
+
+
+def _features(*extra: dict) -> Draft:
+    """Three items with one implement node each, plus ``extra`` nodes."""
+    return _draft(
+        _node("C", "contract", modify=["facade.py"],
+              provides=["facade.py::Facade.a", "facade.py::Facade.b", "facade.py::Facade.c"]),
+        _node("A", item="1", modify=["a.py"], provides=["a.py::run"]),
+        _node("B", item="2", modify=["b.py"], provides=["b.py::run"]),
+        _node("B2", item="2", modify=["b2.py"], provides=["b2.py::extra"], reason="separate"),
+        *extra)
+
+
+def test_p6_waiting_for_two_other_items_is_an_error():
+    draft = _features(_node("API", item="3", modify=["api.py"],
+                            requires_impl=["a.py::run", "b.py::run", "b2.py::extra"]))
+    issues = implementation_checks(draft)
+    assert _codes(issues) == [("P6", ["API"])]
+    assert issues[0].message == (
+        "API waits for the implementations of items 1, 2 (requires_impl: a.py::run, "
+        "b.py::run, b2.py::extra). A node that only exposes other features must depend "
+        "on their interfaces: move these symbols to `requires` and test against a fake")
+
+
+def test_p6_allows_one_other_item_the_own_item_and_interfaces():
+    one_other = _features(_node("API", item="3", modify=["api.py"],
+                                requires_impl=["b.py::run", "b2.py::extra"]))
+    assert implementation_checks(one_other) == []          # both belong to item 2
+    own_item = _features(_node("B3", item="2", modify=["b3.py"],
+                               requires_impl=["b.py::run", "b2.py::extra", "a.py::run"]))
+    assert implementation_checks(own_item) == []           # only item 1 is another item
+    interfaces = _features(_node("API", item="3", modify=["api.py"],
+                                 requires=["a.py::run", "b.py::run", "facade.py::Facade.c"]))
+    assert implementation_checks(interfaces) == []
+    contract_only = _features(_node("API", item="3", modify=["api.py"],
+                                    requires_impl=["facade.py::Facade.a", "a.py::run",
+                                                   "models.py::Existing"]))
+    assert implementation_checks(contract_only) == []      # a contract is not an item
+
+
+def test_p6_is_reported_and_fixed_by_a_revision_round(toy_repo, tmp_path):
+    contract = _node("C", "contract", modify=["models.py"],
+                     provides=["models.py::JobStatus.CANCELLED"])
+    store = _node("S", modify=["store.py"], create=["tests/test_s.py"],
+                  provides=["store.py::JobStore.cancel"],
+                  requires=["models.py::JobStatus.CANCELLED"])
+    loop = _node("R", modify=["runner.py"], create=["tests/test_r.py"],
+                 provides=["runner.py::run_loop"],
+                 requires=["models.py::JobStatus.CANCELLED"])
+    front = {"modify": ["README.md"], "create": ["tests/test_front.py"]}
+    waiting = {"nodes": [contract, store, loop, _node(
+        "F", **front, requires_impl=["store.py::JobStore.cancel", "runner.py::run_loop"])]}
+    parallel = {"nodes": [contract, store, loop, _node(
+        "F", **front, requires=["models.py::JobStatus.CANCELLED"])]}
+    result, worker, options = plan(toy_repo, tmp_path, [answer(waiting), answer(parallel)])
+    assert result.success, result.report["errors"]
+    first = result.report["rounds"][0]["errors"]
+    assert [(issue["code"], issue["nodes"]) for issue in first] == [("P6", ["F"])]
+    assert "[P6] F: F waits for the implementations of items S, R" in worker.requests[1].prompt
+    graph = load_graph(options.out)
+    assert {(edge.from_, edge.to) for edge in graph.edges} == {("C", "S"), ("C", "R"),
+                                                                ("C", "F")}
