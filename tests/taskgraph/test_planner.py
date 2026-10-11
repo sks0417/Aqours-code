@@ -20,6 +20,7 @@ from aqours_code.taskgraph.planner import (
     PlanOptions,
     build_draft_prompt,
     build_prompt,
+    contract_checks,
     extract_json_block,
     file_sizes,
     implementation_checks,
@@ -535,7 +536,7 @@ def test_prompt_asks_for_conventions_and_no_integration_node():
     text = PROMPT_PATH.read_text(encoding="utf-8")
     assert "**Repository conventions.**" in text and '"conventions"' in text
     assert "No test-only nodes and no integration node" in text
-    rule = text[text.index("5. **No test-only"):text.index("6. **Every node tests itself")]
+    rule = text[text.index("6. **No test-only"):text.index("7. **Every node tests itself")]
     assert "requires_impl" not in rule and "real implementation" not in rule
     assert "`now` argument" in text
 
@@ -553,7 +554,7 @@ def test_prompt_examples_have_short_scope_goals_and_spec_references():
             assert any(ref.startswith('SPEC.md#') for ref in node['context_files'])
             assert 'raise ValueError' not in node['goal']
             assert 'int | None = None' not in node['goal']
-    rule = text[text.index('7. **'):text.index('## Output format')]
+    rule = text[text.index('8. **'):text.index('## Output format')]
     assert 'Do not restate specification details' in rule
     assert '600 characters' in rule
 
@@ -761,7 +762,7 @@ def test_grounding_prompt_lists_the_draft_items_also_when_revising(toy_repo, tmp
         section = request.prompt[request.prompt.index("# Draft items"):]
         assert "- S: **item S**. achieve S" in section
         assert "- R: **item R**. achieve R" in section
-    assert "planner checks (P1-P6)" in worker.requests[1].prompt
+    assert "planner checks (P1-P7)" in worker.requests[1].prompt
     first = worker.requests[0].prompt
     assert first.index("# The request") < first.index("# Draft items") \
         < first.index("# Repository")
@@ -1092,3 +1093,89 @@ def test_p6_is_reported_and_fixed_by_a_revision_round(toy_repo, tmp_path):
     graph = load_graph(options.out)
     assert {(edge.from_, edge.to) for edge in graph.edges} == {("C", "S"), ("C", "R"),
                                                                 ("C", "F")}
+
+
+
+# ── thin contracts: P7 and the prompt ──
+
+INTERFACES_ONLY = (
+    "A contract writes interfaces only: new fields, signatures with docstrings,\n"
+    "   and bodies that run but do nothing useful (return an empty result, raise\n"
+    "   NotImplementedError, or delegate to a stub). It never completes an\n"
+    "   implementation, not even of a small shared helper. A helper that several\n"
+    "   nodes need gets only its signature in the contract; one implement node\n"
+    "   writes its body, and the other nodes list it in `requires`.")
+ENTRY_POINTS = (
+    "Existing entry points that\n"
+    "   the request changes (an existing route, form, command or function that\n"
+    "   must accept new fields or behave differently) must be in some node's\n"
+    "   `modify`. Check every existing file the request affects: if no node lists\n"
+    "   it, add it to the contract (for the signature change) or to the node\n"
+    "   whose feature needs it.")
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_prompt_keeps_the_contract_to_interfaces_and_asks_for_entry_point_owners():
+    text = PROMPT_PATH.read_text(encoding="utf-8")
+    assert "any small helper that every node needs complete" not in _flat(text)
+    assert "helper that every node needs complete" not in _flat(text)
+    rules = text[text.index("## Splitting rules"):text.index("## Output format")]
+    assert INTERFACES_ONLY in rules and ENTRY_POINTS in rules
+    assert _flat(INTERFACES_ONLY) in _flat(rules[rules.index("4. **"):rules.index("5. **")])
+    assert _flat(ENTRY_POINTS) in _flat(rules[rules.index("5. **"):rules.index("6. **")])
+
+
+def test_p7_a_file_the_contract_creates_needs_an_implement_node():
+    orphan = _draft(
+        _node("C", "contract", modify=["models.py"],
+              create=["pkg/validation.py", "pkg/feature.py", "tests/test_c.py"]),
+        _node("A", item="1", modify=["pkg/feature.py"]),
+        _node("B", item="2", modify=["other.py"], create=["pkg/new.py"]))
+    issues = contract_checks(orphan)
+    assert _codes(issues) == [("P7", ["C"])]
+    assert issues[0].message == (
+        "contract C creates pkg/validation.py, but no implement node fills it in. A "
+        "contract only writes stubs: give the body to one implement node (put the file in "
+        "its `modify`) and let the others `require` its interface")
+    filled = _draft(
+        _node("C", "contract", modify=["models.py"],
+              create=["pkg/validation.py", "pkg/feature.py"]),
+        _node("A", item="1", modify=["pkg/feature.py", "pkg/validation.py"]),
+        _node("B", item="2", modify=["other.py"]))
+    assert contract_checks(filled) == []
+    two = _draft(_node("C", "contract", create=["x.py", "y.py"]),
+                 _node("A", item="1", modify=["a.py"]))
+    assert "creates x.py, y.py, but no implement node fills them in" in \
+        contract_checks(two)[0].message
+    no_contract = _draft(_node("A", item="1", modify=["a.py"], create=["pkg/new.py"]),
+                         _node("B", item="2", modify=["b.py"]))
+    assert contract_checks(no_contract) == []
+    modify_only = _draft(_node("C", "contract", modify=["models.py"]),
+                         _node("A", item="1", modify=["a.py"]))
+    assert contract_checks(modify_only) == []
+
+
+def test_p7_is_reported_and_fixed_by_a_revision_round(toy_repo, tmp_path):
+    def draft(owner_modify):
+        return {"nodes": [
+            _node("C", "contract", modify=["models.py"], create=["checks.py"],
+                  provides=["models.py::JobStatus.CANCELLED", "checks.py::check"]),
+            _node("S", modify=owner_modify, create=["tests/test_s.py"],
+                  requires=["models.py::JobStatus.CANCELLED"]),
+            _node("R", modify=["runner.py"], create=["tests/test_r.py"],
+                  requires=["checks.py::check"]),
+        ]}
+
+    result, worker, options = plan(
+        toy_repo, tmp_path,
+        [answer(draft(["store.py"])), answer(draft(["store.py", "checks.py"]))])
+    assert result.success, result.report["errors"]
+    first = result.report["rounds"][0]["errors"]
+    assert [(issue["code"], issue["nodes"]) for issue in first] == [("P7", ["C"])]
+    assert "[P7] C: contract C creates checks.py, but no implement node fills it in" \
+        in worker.requests[1].prompt
+    graph = load_graph(options.out)
+    assert "checks.py" in next(n for n in graph.nodes if n.id == "S").edit_set.modify

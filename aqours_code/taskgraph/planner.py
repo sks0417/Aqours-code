@@ -7,7 +7,7 @@
    turns every draft item into nodes with concrete files and symbols. It may
    split an item or add a contract, but never merges items. The program
    completes the answer into a :class:`Graph`, derives its edges, validates
-   it, and applies the planner checks P1-P6; on errors the agent gets its
+   it, and applies the planner checks P1-P7; on errors the agent gets its
    draft and the errors back for up to ``max_revisions`` more rounds.
 3. **Revise** (program, :mod:`revise`): nodes that can only queue on the
    same file are merged (M1), and a contract with one downstream node is
@@ -410,6 +410,31 @@ def implementation_checks(draft: Draft) -> list[Issue]:
     return issues
 
 
+def contract_checks(draft: Draft) -> list[Issue]:
+    """Error P7: a contract creates a file that no implement node fills in.
+
+    A contract only writes stubs, so a new file whose body no implement node
+    owns means the contract is expected to implement it. Files under
+    ``tests/`` are left to P3.
+    """
+    filled = {path for node in draft.nodes if node.kind == "implement"
+              for path in node.modify}
+    issues = []
+    for node in draft.nodes:
+        if node.kind != "contract":
+            continue
+        orphans = [path for path in node.create
+                   if not is_test_path(path) and path not in filled]
+        if orphans:
+            issues.append(Issue(
+                "P7", [node.id],
+                f"contract {node.id} creates {', '.join(orphans)}, but no implement node "
+                f"fills {'it' if len(orphans) == 1 else 'them'} in. A contract only writes "
+                "stubs: give the body to one implement node (put the file in its `modify`) "
+                "and let the others `require` its interface"))
+    return issues
+
+
 def item_revisions(draft: Draft, items: list[DraftItem]) -> list[RevisionEntry]:
     """``split`` and ``add_node`` entries describing how Step 2 changed the draft."""
     entries = []
@@ -534,7 +559,7 @@ def build_prompt(request: str, index: RepoIndex, final_checks: list[str],
             f"# Fix your previous draft (revision {revision.number} of {MAX_REVISIONS})\n\n"
             "You already planned this request once; your draft is below, followed by "
             "the problems the program found after deriving the edges, validating "
-            "the graph and applying the planner checks (P1-P6). Fix every problem "
+            "the graph and applying the planner checks (P1-P7). Fix every problem "
             "and answer with the complete corrected draft (all nodes, not only the "
             "changed ones) as the last ```json block. Keep the parts that were "
             "fine.\n\n"
@@ -679,7 +704,7 @@ def _evaluate_answer(answer: str, info: GraphInfo, index: RepoIndex, revised: bo
         return Evaluation(None, answer, [], exc.issues, [])
     derived, _entries = derive_edges(graph, index)
     report = validate(derived, index)
-    errors = [*report.errors, *planner_checks(derived)]
+    errors = [*report.errors, *planner_checks(derived), *contract_checks(draft)]
     if items is not None:
         errors += [*item_checks(draft, items), *implementation_checks(draft)]
         if not errors:

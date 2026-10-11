@@ -20,8 +20,9 @@ You have read-only tools (read_file, glob). Do not try to change any file.
 **contract and implement nodes.** A `contract` node writes shared interfaces
 that other nodes build on: new data fields, function and method signatures
 with docstrings, and a minimal default body that runs (return an empty
-result, raise `NotImplementedError`, or use an in-memory fake). It writes no
-feature logic. An `implement` node writes real behaviour.
+result, raise `NotImplementedError`, or delegate to a stub). It writes no
+feature logic and completes no implementation. An `implement` node writes
+real behaviour.
 
 **requires and requires_impl.** A node lists the symbols it uses that it does
 not define itself.
@@ -91,15 +92,21 @@ misses one breaks code that other nodes rely on.
    its `reason` which nodes share what. When several nodes need changes to
    the same shared file (data models, storage, a common entry point or
    facade, a router or registry), collect those changes in one contract node
-   that the nodes require. Keep the contract thin: fields, signatures,
-   docstrings, and runnable empty bodies, plus any small helper that every
-   node needs complete. No feature logic. Create here the new files that
-   nodes will fill in, so that each node only modifies its own file. There
-   is usually only one contract. Contracts must never be ordered one after
-   another: if one contract would need what another provides, make them one
-   contract. A contract belongs to no draft item (no `item`) and writes no
-   test files (nothing under `tests/` in its `modify` or `create`); its
-   `check` only runs the existing tests.
+   that the nodes require. Create here the new files that nodes will fill
+   in, so that each node only modifies its own file. There is usually only
+   one contract.
+
+   A contract writes interfaces only: new fields, signatures with docstrings,
+   and bodies that run but do nothing useful (return an empty result, raise
+   NotImplementedError, or delegate to a stub). It never completes an
+   implementation, not even of a small shared helper. A helper that several
+   nodes need gets only its signature in the contract; one implement node
+   writes its body, and the other nodes list it in `requires`.
+
+   Contracts must never be ordered one after another: if one contract would
+   need what another provides, make them one contract. A contract belongs to
+   no draft item (no `item`) and writes no test files (nothing under `tests/`
+   in its `modify` or `create`); its `check` only runs the existing tests.
 
    Design the contract's interfaces so that the conventions can be kept.
    Whatever a module needs from the outside is passed in by its caller as
@@ -107,15 +114,21 @@ misses one breaks code that other nodes rely on.
    argument and let the caller that owns the clock fill it in, instead of
    letting the module read the time itself. Check every signature against
    `conventions` before you finish.
-5. **No test-only nodes and no integration node.** Do not add a node that
+5. **Every changed entry point has an owner.** Existing entry points that
+   the request changes (an existing route, form, command or function that
+   must accept new fields or behave differently) must be in some node's
+   `modify`. Check every existing file the request affects: if no node lists
+   it, add it to the contract (for the signature change) or to the node
+   whose feature needs it.
+6. **No test-only nodes and no integration node.** Do not add a node that
    only writes tests, and do not add a node whose purpose is to verify or
    connect the other nodes after they are merged: the final checks run the
    whole test suite on the merged result.
-6. **Every node tests itself.** Each node writes the tests for its own work
+7. **Every node tests itself.** Each node writes the tests for its own work
    (in its own new test file, listed in `create`) and has `check` commands
    that run on their own from the repository root. Including the existing
    test suite in `check` is a good default.
-7. **Concrete scope, not a specification retelling.** State what feature this
+8. **Concrete scope, not a specification retelling.** State what feature this
    node implements, in which files and functions, which existing code it hooks
    into, and what it must not touch. Do not restate specification details in
    `goal`: field types or meanings, validation rules, defaults, return formats,
