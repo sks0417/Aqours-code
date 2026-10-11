@@ -85,7 +85,9 @@ cannot be done without it, and say why in your final answer.
 SANDBOX_NOTE = """
 Your bash commands run in a Linux container (POSIX sh, no network) whose
 working directory, /workspace, is your workspace. Use relative paths and
-POSIX shell syntax in commands.
+POSIX shell syntax in commands. Your shell is Linux: use /dev/null, never
+nul, and Linux commands (ls, cat, grep), not Windows ones (dir, type,
+findstr).
 """
 
 CONTRACT_NOTE = """
