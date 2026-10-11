@@ -35,7 +35,8 @@ from .schema import Graph, Node, dump_graph
 from .validate import ValidationReport, edit_files, unique_nodes, usable_edges, validate
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
-TASKGRAPH_VERSION = "coordinator-v0.3"
+DEFAULT_MERGE_REPAIRS = 1
+TASKGRAPH_VERSION = "coordinator-v0.4"
 AQOURS_SOURCE = Path(__file__).resolve().parents[2]
 DEFAULT_WORKERS = 2
 DEFAULT_MAX_ATTEMPTS = 2
@@ -62,6 +63,8 @@ class RunOptions:
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     worker_timeout_s: float = 1800.0
     hidden_tests: Path | None = None
+    # Repair rounds a node gets when its post-merge check fails (0: none).
+    merge_repairs: int = DEFAULT_MERGE_REPAIRS
 
 
 @dataclass
@@ -91,6 +94,8 @@ class NodeRecord:
     calls_before_first_write: int = 0
     soft_wall_blocked: int = 0
     confirmed_reads: list[str] = field(default_factory=list)
+    merge_repairs: int = 0
+    merge_repair_ok: bool | None = None  # None: no repair was needed
 
 
 @dataclass
@@ -197,6 +202,7 @@ class Coordinator:
         # start here, never from a merge still being checked, so an undone
         # merge cannot leak into another node's branch.
         self.integration_head = base_commit
+        self.bases: dict[str, str] = {}
         self.sandbox = worker_sandbox(worker)
         self.nodes = unique_nodes(graph)
         self.by_id = {node.id: node for node in self.nodes}
@@ -282,61 +288,81 @@ class Coordinator:
         with self.git_lock:
             start = self.integration_head
             gitops.add_node_worktree(self.repo, node.id, worktree, start)
+        # The commit the node's own changes are measured against: its start, or
+        # the integration commit merged into its branch for a repair.
+        self.bases[node.id] = start
         try:
             if self._attempt_until_checked(node, record, log_dir, worktree, start):
-                self._merge(node, record, log_dir)
+                self._merge(node, record, log_dir, worktree)
         finally:
             with self.git_lock:
                 branch = gitops.NODE_BRANCH_PREFIX + node.id
-                record.changed_files = gitops.changed_files(self.repo, start, branch)
+                base = self.bases[node.id]
+                record.changed_files = gitops.changed_files(self.repo, base, branch)
                 (log_dir / "diff.patch").write_text(
-                    gitops.diff_patch(self.repo, start, branch), encoding="utf-8")
+                    gitops.diff_patch(self.repo, base, branch), encoding="utf-8")
                 gitops.remove_worktree(self.repo, worktree)
             allowed = edit_files(node)
             record.out_of_scope_files = ([] if node.edit_set.any_file else
                                          [path for path in record.changed_files if path not in allowed])
             record.end_t = self.events.elapsed()
 
+    def _run_worker(self, node: Node, record: NodeRecord, log_dir: Path, worktree: Path,
+                    attempt: int, failure: AttemptFailure | None) -> WorkerResult:
+        """Run one worker attempt on ``worktree`` and commit what it left."""
+        record.attempts = attempt
+        pack = build_context_pack(node, worktree)
+        (log_dir / f"context_{attempt}.md").write_text(pack.text, encoding="utf-8")
+        metadata = {"attempt": attempt, "workspace": str(worktree), **pack.report()}
+        write_json_atomic(log_dir / f"context_{attempt}.json", metadata)
+        record.context_packs.append(metadata)
+        record.context_chars += len(pack.text)
+        prompt = build_node_prompt(self.graph, node, self.index, attempt, failure,
+                                   sandbox=self.sandbox.kind, context_pack=pack)
+        (log_dir / f"prompt_{attempt}.md").write_text(prompt, encoding="utf-8")
+        self.events.emit("worker_start", node=node.id, attempt=attempt)
+        request = WorkerRequest(node_id=node.id, attempt=attempt, prompt=prompt,
+                                workspace=worktree, log_dir=log_dir,
+                                timeout_s=self.options.worker_timeout_s,
+                                soft_wall_enabled=len(self.graph.nodes) > 1,
+                                own_files=pack.own_files, full_files=pack.full_files)
+        try:
+            result = self.worker.run(request)
+        except Exception as exc:  # noqa: BLE001 - a broken worker fails the attempt
+            result = WorkerResult(ok=False, reason="worker_error",
+                                  error=f"{type(exc).__name__}: {exc}")
+        write_json_atomic(log_dir / f"worker_{attempt}.json", result.to_dict())
+        record.worker_time_s += result.duration_s
+        record.model_calls += result.model_calls
+        record.input_tokens += result.input_tokens
+        record.output_tokens += result.output_tokens
+        self.events.emit("worker_end", node=node.id, attempt=attempt, ok=result.ok,
+                         reason=result.reason, duration_s=round(result.duration_s, 3),
+                         model_calls=result.model_calls,
+                         input_tokens=result.input_tokens,
+                         output_tokens=result.output_tokens)
+        record.worker_reasons.append("" if result.ok else (result.reason or "worker_error"))
+        return result
+
+    def _run_node_check(self, node: Node, record: NodeRecord, log_dir: Path,
+                        worktree: Path, attempt: int) -> CheckOutcome:
+        self.events.emit("check_start", node=node.id, attempt=attempt)
+        check = run_checks(node.check.commands, worktree, node.check.timeout_s)
+        (log_dir / f"check_{attempt}.txt").write_text(check.text, encoding="utf-8")
+        record.check_time_s += check.duration_s
+        self.events.emit("check_end", node=node.id, attempt=attempt, ok=check.ok,
+                         duration_s=round(check.duration_s, 3))
+        return check
+
     def _attempt_until_checked(self, node: Node, record: NodeRecord, log_dir: Path,
                                worktree: Path, start: str) -> bool:
         failure: AttemptFailure | None = None
         for attempt in range(1, self.options.max_attempts + 1):
-            record.attempts = attempt
-            pack = build_context_pack(node, worktree)
-            (log_dir / f"context_{attempt}.md").write_text(pack.text, encoding="utf-8")
-            metadata = {"attempt": attempt, "workspace": str(worktree), **pack.report()}
-            write_json_atomic(log_dir / f"context_{attempt}.json", metadata)
-            record.context_packs.append(metadata)
-            record.context_chars += len(pack.text)
-            prompt = build_node_prompt(self.graph, node, self.index, attempt, failure,
-                                       sandbox=self.sandbox.kind, context_pack=pack)
-            (log_dir / f"prompt_{attempt}.md").write_text(prompt, encoding="utf-8")
-            self.events.emit("worker_start", node=node.id, attempt=attempt)
-            request = WorkerRequest(node_id=node.id, attempt=attempt, prompt=prompt,
-                                    workspace=worktree, log_dir=log_dir,
-                                    timeout_s=self.options.worker_timeout_s,
-                                    soft_wall_enabled=len(self.graph.nodes) > 1,
-                                    own_files=pack.own_files, full_files=pack.full_files)
-            try:
-                result = self.worker.run(request)
-            except Exception as exc:  # noqa: BLE001 - a broken worker fails the attempt
-                result = WorkerResult(ok=False, reason="worker_error",
-                                      error=f"{type(exc).__name__}: {exc}")
-            write_json_atomic(log_dir / f"worker_{attempt}.json", result.to_dict())
-            record.worker_time_s += result.duration_s
-            record.model_calls += result.model_calls
-            record.input_tokens += result.input_tokens
-            record.output_tokens += result.output_tokens
-            self.events.emit("worker_end", node=node.id, attempt=attempt, ok=result.ok,
-                             reason=result.reason, duration_s=round(result.duration_s, 3),
-                             model_calls=result.model_calls,
-                             input_tokens=result.input_tokens,
-                             output_tokens=result.output_tokens)
+            result = self._run_worker(node, record, log_dir, worktree, attempt, failure)
             with self.git_lock:
                 gitops.commit_all(worktree, f"attempt {attempt}")
                 changed = gitops.changed_files(worktree, start)
-            worker_reason = "" if result.ok else (result.reason or "worker_error")
-            record.worker_reasons.append(worker_reason)
+            worker_reason = record.worker_reasons[-1]
             # A worker that timed out may still have finished the work: if it
             # changed files, its checks decide. Other worker failures are final.
             if worker_reason and not (worker_reason == "worker_timeout" and changed):
@@ -348,12 +374,7 @@ class Coordinator:
                 failure = AttemptFailure("no_changes",
                                          "The attempt finished without changing any file.")
                 continue
-            self.events.emit("check_start", node=node.id, attempt=attempt)
-            check = run_checks(node.check.commands, worktree, node.check.timeout_s)
-            (log_dir / f"check_{attempt}.txt").write_text(check.text, encoding="utf-8")
-            record.check_time_s += check.duration_s
-            self.events.emit("check_end", node=node.id, attempt=attempt, ok=check.ok,
-                             duration_s=round(check.duration_s, 3))
+            check = self._run_node_check(node, record, log_dir, worktree, attempt)
             if check.ok:
                 record.reason = ""
                 return True
@@ -362,7 +383,13 @@ class Coordinator:
         record.status = "failed"
         return False
 
-    def _merge(self, node: Node, record: NodeRecord, log_dir: Path) -> None:
+    def _merge_once(self, node: Node, record: NodeRecord, log_dir: Path,
+                    check_file: str) -> tuple[str, str]:
+        """Squash-merge the node and run its post-merge check, as one unit.
+
+        Returns ``("merged", commit)``, ``("merge_conflict", "")``, or
+        ``("post_merge_check_failed", check output)`` with the merge undone.
+        """
         branch = gitops.NODE_BRANCH_PREFIX + node.id
         with self.merge_lock:
             with self.git_lock:
@@ -372,22 +399,78 @@ class Coordinator:
                 self.events.emit("merge_end", node=node.id, ok=commit is not None,
                                  commit=commit)
             if commit is None:
-                record.status, record.reason = "failed", "merge_conflict"
-                return
+                return "merge_conflict", ""
             check = run_checks(node.check.commands, self.repo, node.check.timeout_s)
-            (log_dir / "post_merge_check.txt").write_text(check.text, encoding="utf-8")
+            (log_dir / check_file).write_text(check.text, encoding="utf-8")
             record.check_time_s += check.duration_s
             self.events.emit("post_merge_check_end", node=node.id, ok=check.ok,
                              duration_s=round(check.duration_s, 3))
             with self.git_lock:
                 if not check.ok:
                     gitops.undo_last_commit(self.repo)
-                    record.status, record.reason = "failed", "post_merge_check_failed"
-                    return
+                    return "post_merge_check_failed", check.text
                 self.integration_head = commit
-        record.status, record.merge_commit = "merged", commit
-        self.events.emit("node_merged", node=node.id, commit=commit,
-                         attempts=record.attempts)
+        return "merged", commit
+
+    def _repair(self, node: Node, record: NodeRecord, log_dir: Path, worktree: Path,
+                failure_text: str) -> str:
+        """One repair round on the merged state; return "" or the failure reason.
+
+        The current integration branch is merged into the node's branch, so the
+        worktree holds the state whose check just failed. The worker then runs
+        again with the post-merge check output. Runs without ``merge_lock``.
+        """
+        attempt = record.attempts + 1
+        record.merge_repairs += 1
+        self.events.emit("merge_repair_start", node=node.id, attempt=attempt)
+        with self.git_lock:
+            target = self.integration_head
+            merged = gitops.merge_commit_into(
+                worktree, target, f"merge integration for repair {record.merge_repairs}")
+        if not merged:
+            return "merge_conflict"
+        self.bases[node.id] = target
+        failure = AttemptFailure("post_merge_check_failed", failure_text, after_merge=True)
+        result = self._run_worker(node, record, log_dir, worktree, attempt, failure)
+        with self.git_lock:
+            gitops.commit_all(worktree, f"repair {record.merge_repairs}")
+        worker_reason = record.worker_reasons[-1]
+        if worker_reason and worker_reason != "worker_timeout":
+            record.error = (result.error or result.final_answer)[-2000:]
+            return worker_reason
+        check = self._run_node_check(node, record, log_dir, worktree, attempt)
+        return "" if check.ok else "repair_check_failed"
+
+    def _merge(self, node: Node, record: NodeRecord, log_dir: Path,
+               worktree: Path) -> None:
+        """Merge the node; repair it on the merged state if its post-merge check fails."""
+        repairs_left = max(self.options.merge_repairs, 0)
+        check_file = "post_merge_check.txt"
+        while True:
+            outcome, detail = self._merge_once(node, record, log_dir, check_file)
+            repairing = record.merge_repairs > 0
+            if outcome == "merged":
+                if repairing:
+                    record.merge_repair_ok = True
+                    self.events.emit("merge_repair_end", node=node.id, ok=True)
+                record.status, record.merge_commit = "merged", detail
+                self.events.emit("node_merged", node=node.id, commit=detail,
+                                 attempts=record.attempts)
+                return
+            reason = outcome
+            if outcome == "post_merge_check_failed" and repairs_left > 0:
+                if repairing:  # the previous repair did not hold after merging
+                    self.events.emit("merge_repair_end", node=node.id, ok=False)
+                repairs_left -= 1
+                reason = self._repair(node, record, log_dir, worktree, detail)
+                if not reason:
+                    check_file = f"post_merge_check_repair_{record.merge_repairs}.txt"
+                    continue
+            if record.merge_repairs:
+                record.merge_repair_ok = False
+                self.events.emit("merge_repair_end", node=node.id, ok=False)
+            record.status, record.reason = "failed", reason
+            return
 
     # ── final stage ──
 
@@ -506,6 +589,7 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "workers": options.workers,
         "max_attempts": options.max_attempts,
         "worker_timeout_s": options.worker_timeout_s,
+        "merge_repairs": options.merge_repairs,
         "hidden_tests": str(options.hidden_tests) if options.hidden_tests else None,
         "worker": worker.describe(),
         **sandbox.to_dict(),
@@ -555,6 +639,7 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "hidden_tests": hidden,
         **sandbox.to_dict(),
         "escape_attempts_total": escapes_total,
+        "merge_repairs_total": sum(r.merge_repairs for r in records.values()),
     }
     write_json_atomic(run_dir / "summary.json", summary)
     return RunResult(run_dir=run_dir, summary=summary)

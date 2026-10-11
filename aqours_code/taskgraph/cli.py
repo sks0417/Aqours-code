@@ -124,6 +124,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return EXIT_INPUT_ERROR
     if args.workers < 1 or args.max_attempts < 1:
         return _error("--workers and --max-attempts must be >= 1")
+    if args.merge_repairs < 0:
+        return _error("--merge-repairs must be >= 0")
     if args.worker == "command":
         if not args.command_map:
             return _error("--worker command needs --command-map")
@@ -142,7 +144,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return _error(f"hidden tests directory not found: {hidden}")
     options = RunOptions(out_dir=Path(args.out), workers=args.workers,
                          max_attempts=args.max_attempts,
-                         worker_timeout_s=args.worker_timeout, hidden_tests=hidden)
+                         worker_timeout_s=args.worker_timeout, hidden_tests=hidden,
+                         merge_repairs=args.merge_repairs)
     try:
         result = run_graph(graph, Path(args.repo), worker, options)
     except GraphInvalid as exc:
@@ -170,6 +173,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         hidden_stats = summary["hidden_tests"]
         print(f"hidden tests: {hidden_stats['passed']} passed, {hidden_stats['failed']} "
               f"failed, {hidden_stats['errors']} errors, {hidden_stats['skipped']} skipped")
+    repaired = [node_id for node_id, node in summary["nodes"].items()
+                if node["merge_repairs"]]
+    fixed = [node_id for node_id in repaired if summary["nodes"][node_id]["merge_repair_ok"]]
+    detail = (f" ({', '.join(repaired)}; repaired: {', '.join(fixed) or 'none'})"
+              if repaired else "")
+    print(f"merge repairs: {summary['merge_repairs_total']}{detail}")
     escapes = summary["escape_attempts_total"]
     print(f"sandbox: {summary['sandbox']}  escape attempts: {escapes}")
     if escapes and summary["sandbox"] == "none":
@@ -332,6 +341,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="JSON file mapping node id to a shell command (--worker command)")
     run_cmd.add_argument("--worker-timeout", type=float, default=1800.0)
     run_cmd.add_argument("--hidden-tests")
+    run_cmd.add_argument("--merge-repairs", type=int, default=1,
+                         help="repair rounds for a node whose post-merge check fails "
+                              "(default 1; 0 fails the node at once)")
     run_cmd.add_argument("--sandbox", choices=("docker", "none"), default="docker",
                          help="where worker shell commands run (none: tests only)")
     run_cmd.add_argument("--sandbox-image", default="aqours-code-eval:py311",

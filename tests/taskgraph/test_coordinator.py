@@ -227,10 +227,11 @@ def test_post_merge_check_failure_is_undone(toy_repo, tmp_path):
     command = py("import pathlib; pathlib.Path('p.txt').write_text('P'); "
                  "pathlib.Path('.task_outputs').mkdir(); "
                  "pathlib.Path('.task_outputs/flag').write_text('x')")
-    result = run(toy_repo, tmp_path, graph, {"P": command})
+    result = run(toy_repo, tmp_path, graph, {"P": command}, merge_repairs=0)
     record = result.summary["nodes"]["P"]
     assert record["status"] == "failed" and record["reason"] == "post_merge_check_failed"
     assert record["attempts"] == 1
+    assert (record["merge_repairs"], record["merge_repair_ok"]) == (0, None)
     assert integration_subjects(result) == []
     assert gitops.is_clean(result.run_dir / "repo")
 
@@ -254,7 +255,7 @@ def slow_post_merge_scenario(toy_repo, tmp_path, post_merge_ok: bool):
         "F": py("import sys, time; time.sleep(0.2); sys.exit(1)"),
         "Y": write("y.txt", "Y"),
     }
-    result = run(toy_repo, tmp_path, graph, commands, workers=2)
+    result = run(toy_repo, tmp_path, graph, commands, workers=2, merge_repairs=0)
     evts = events(result)
     # Y got F's slot while X's post-merge check was still running.
     assert event_t(evts, "worker_start", "Y") < event_t(evts, "post_merge_check_end", "X")
