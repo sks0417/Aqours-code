@@ -12,8 +12,10 @@ from pathlib import Path
 import pytest
 
 from aqours_code.taskgraph import build_index, derive_edges, load_graph, validate
+from aqours_code.taskgraph.checks import SandboxChecks, run_checks
 from aqours_code.taskgraph.cli import main
 from aqours_code.taskgraph.compare import critical_path_length
+from aqours_code.taskgraph.sandbox import DEFAULT_IMAGE, SandboxUnavailable, check_docker
 from aqours_code.taskgraph.validate import ancestors
 
 TASK = Path(__file__).resolve().parents[2] / "experiments" / "taskgraph" / "click_batch"
@@ -28,6 +30,20 @@ TICKET_MODULES = {
 }
 AFTER_CONTRACT = ("T1", "T2", "T5", "T6")
 INIT = "src/click/__init__.py"
+SKIP_LIST = "sandbox_skips.txt"
+SKIP_REASON = "needs a terminal pager; not available in the evaluation sandbox"
+
+
+def docker_ready() -> bool:
+    try:
+        check_docker(DEFAULT_IMAGE)
+    except SandboxUnavailable:
+        return False
+    return True
+
+
+needs_docker = pytest.mark.skipif(
+    not docker_ready(), reason="needs Docker and the aqours-code-eval image")
 
 
 def make_repo(dest: Path, with_reference: bool = False) -> str:
@@ -45,16 +61,37 @@ def run_pytest(repo: Path, target: str, xml: Path) -> tuple[int, dict[str, str]]
         [sys.executable, "-m", "pytest", "-q", target, "-p", "no:cacheprovider",
          f"--junitxml={xml}"],
         cwd=repo, capture_output=True, text=True, timeout=600)
-    outcomes = {}
+    return proc.returncode, read_junit(xml)[0]
+
+
+def read_junit(xml: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Outcome per test id (``classname::name``), and the reason of each skip."""
+    outcomes, reasons = {}, {}
     for case in ET.parse(xml).getroot().iter("testcase"):
         test_id = f"{case.get('classname')}::{case.get('name')}"
+        skipped = case.find("skipped")
         if case.find("failure") is not None or case.find("error") is not None:
             outcomes[test_id] = "failed"
-        elif case.find("skipped") is not None:  # skip and xfail
+        elif skipped is not None:  # skip and xfail
             outcomes[test_id] = "skipped"
+            reasons[test_id] = skipped.get("message", "")
         else:
             outcomes[test_id] = "passed"
-    return proc.returncode, outcomes
+    return outcomes, reasons
+
+
+def skip_list(path: Path = TASK / SKIP_LIST) -> list[str]:
+    """The pytest node ids in a skip list (comments and empty lines left out)."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+
+
+def junit_id(node_id: str, regression: bool = False) -> str:
+    """A ``tests/...`` node id as ``read_junit`` names it, in ``tests`` or ``regression``."""
+    path, _, name = node_id.partition("::")
+    if regression:
+        path = "_hidden_tests/regression/" + path.removeprefix("tests/")
+    return f"{path.removesuffix('.py').replace('/', '.')}::{name}"
 
 
 def group_of(test_id: str) -> str:
@@ -98,8 +135,43 @@ def repos(tmp_path_factory):
                                            root / f"{repo['path'].name}_{target}.xml")
                 for key, repo in built.items() for target in ("tests", "_hidden_tests")}
         for (key, target), future in runs.items():
-            built[key]["public" if target == "tests" else "hidden"] = future.result()
+            name = "public" if target == "tests" else "hidden"
+            built[key][name] = future.result()
+            built[key][f"{name}_xml"] = root / f"{built[key]['path'].name}_{target}.xml"
     return built
+
+
+@pytest.fixture(scope="module")
+def sandbox_runs(tmp_path_factory):
+    """Run the tests in the evaluation sandbox, as the Coordinator's checks do.
+
+    ``base`` and ``reference`` are the repositories of ``make_repo.py``;
+    ``unlisted`` is the base with an empty skip list. Each entry has whether
+    each command passed and, per target, what ``read_junit`` returns.
+    """
+    root = tmp_path_factory.mktemp("click_batch_sandbox")
+
+    def run(name: str) -> dict:
+        repo = root / name
+        make_repo(repo, with_reference=name == "reference")
+        targets = ["tests"]
+        if name == "reference":
+            targets.append("_hidden_tests")
+            shutil.copytree(TASK / "hidden_tests", repo / "_hidden_tests",
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        if name == "unlisted":
+            (repo / SKIP_LIST).write_text("", encoding="utf-8")
+        outcome = run_checks(
+            [f"python -m pytest -q {target} -p no:cacheprovider --junitxml=_junit_{target}.xml"
+             for target in targets],
+            repo, 900, stop_on_failure=False, checks=SandboxChecks(DEFAULT_IMAGE),
+            label=f"click-batch-{name}")
+        return {"ok": [item["ok"] for item in outcome.results], "text": outcome.text,
+                **{target: read_junit(repo / f"_junit_{target}.xml") for target in targets}}
+
+    names = ("base", "reference", "unlisted")
+    with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        return dict(zip(names, pool.map(run, names)))
 
 
 def test_make_repo_is_deterministic_and_graphs_use_its_commit(repos):
@@ -127,6 +199,38 @@ def test_snapshot_content_and_regression_copy():
                     for path in (TASK / "hidden_tests").glob("test_*.py"))
     assert hidden == sorted(TICKETS)
     assert sorted(path.stem for path in (TASK / "reference").iterdir()) == sorted(TICKETS)
+
+
+def test_skip_list_is_in_the_repository_and_beside_the_hidden_tests(repos):
+    listed = skip_list()
+    assert len(listed) == len(set(listed)) == 27
+    assert all(node_id.startswith("tests/") and "::test_" in node_id for node_id in listed)
+    source = (TASK / SKIP_LIST).read_bytes().replace(b"\r\n", b"\n")
+    assert source.startswith(b"#")  # the reason and how the list was made
+    # the hidden tests have their own copy, which no agent can edit
+    assert (TASK / "hidden_tests" / SKIP_LIST).read_bytes().replace(b"\r\n", b"\n") == source
+    for built in repos.values():
+        assert (built["path"] / SKIP_LIST).read_bytes() == source
+    tracked = subprocess.run(["git", "ls-files", SKIP_LIST, "conftest.py"],
+                             cwd=repos[False]["path"], capture_output=True, text=True)
+    assert tracked.stdout.split() == ["conftest.py", SKIP_LIST]
+    conftest = (repos[False]["path"] / "conftest.py").read_text(encoding="utf-8")
+    hidden_conftest = (TASK / "hidden_tests" / "conftest.py").read_text(encoding="utf-8")
+    assert SKIP_REASON in conftest and SKIP_REASON in hidden_conftest
+
+
+def test_listed_tests_are_skipped_on_the_base(repos):
+    base = repos[False]
+    for name, regression in (("public", False), ("hidden", True)):
+        outcomes, reasons = read_junit(base[f"{name}_xml"])
+        listed = {junit_id(node_id, regression) for node_id in skip_list()}
+        for test_id in listed:
+            assert outcomes[test_id] == "skipped", (name, test_id)
+            if sys.platform != "win32":  # on Windows click skips these tests itself
+                assert reasons[test_id] == SKIP_REASON, (name, test_id)
+        # no other test is skipped for the sandbox
+        assert {test_id for test_id, reason in reasons.items()
+                if reason == SKIP_REASON} <= listed
 
 
 def test_base_passes_its_own_tests_and_fails_every_ticket_test(repos):
@@ -212,3 +316,44 @@ def test_graph_structure():
     assert {(edge.from_, edge.to, edge.type) for edge in graph.edges} == {
         ("A", node_id, "interface") for node_id in AFTER_CONTRACT}
     assert critical_path_length(graph) == 2
+
+
+# ── in the evaluation sandbox, where the Coordinator runs checks and hidden tests ──
+
+@needs_docker
+def test_in_the_sandbox_the_base_passes_with_exactly_the_listed_tests_skipped(sandbox_runs):
+    base = sandbox_runs["base"]
+    assert base["ok"] == [True], base["text"][-2000:]
+    outcomes, reasons = base["tests"]
+    assert "failed" not in outcomes.values()
+    assert Counter(outcomes.values())["passed"] > 2000
+    skipped_for_the_sandbox = {test_id for test_id, reason in reasons.items()
+                               if reason == SKIP_REASON}
+    assert skipped_for_the_sandbox == {junit_id(node_id) for node_id in skip_list()}
+
+
+@needs_docker
+def test_in_the_sandbox_the_reference_passes_public_and_hidden_tests(sandbox_runs):
+    reference = sandbox_runs["reference"]
+    assert reference["ok"] == [True, True], reference["text"][-2000:]
+    for target in ("tests", "_hidden_tests"):
+        assert "failed" not in reference[target][0].values()
+    assert len(reference["tests"][0]) > len(sandbox_runs["base"]["tests"][0])
+    outcomes, reasons = reference["_hidden_tests"]
+    groups = by_group(outcomes)
+    assert set(groups) == {"regression", *TICKETS}
+    for ticket in TICKETS:
+        assert groups[ticket] == Counter(passed=groups[ticket].total()), ticket
+    assert groups["regression"] == Counter(sandbox_runs["base"]["tests"][0].values())
+    assert {test_id for test_id, reason in reasons.items() if reason == SKIP_REASON} == {
+        junit_id(node_id, regression=True) for node_id in skip_list()}
+
+
+@needs_docker
+def test_in_the_sandbox_exactly_the_listed_tests_fail_without_the_list(sandbox_runs):
+    unlisted = sandbox_runs["unlisted"]
+    assert unlisted["ok"] == [False]
+    outcomes, reasons = unlisted["tests"]
+    failed = {test_id for test_id, outcome in outcomes.items() if outcome == "failed"}
+    assert failed == {junit_id(node_id) for node_id in skip_list()}
+    assert SKIP_REASON not in reasons.values()

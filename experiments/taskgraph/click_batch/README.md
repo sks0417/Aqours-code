@@ -23,11 +23,13 @@ and whether a graph whose nodes each see one module does better.
 README.md           this file
 request.md          the request: eight tickets
 make_repo.py        builds the deterministic base repository
+sandbox_skips.txt   click tests that cannot run in the sandbox; skipped in the repository
 vendor/click/       snapshot of click (source, tests, pyproject.toml, README.md, LICENSE.txt)
 hidden_tests/       hidden tests (never shown to workers)
   test_t1_duration.py ... test_t8_hint.py   one file per ticket
   regression/       click's own tests at the snapshot commit, unchanged
   conftest.py
+  sandbox_skips.txt the hidden tests' own copy of the list
 reference/          reference solution: one patch per ticket (never shown to workers)
 graphs/
   single.json       one-node graph (single-agent baseline)
@@ -61,9 +63,9 @@ lines of click's source.
 python experiments/taskgraph/click_batch/make_repo.py <dest> [--with-reference]
 ```
 
-copies the snapshot to `<dest>` with LF line endings, adds the two files
+copies the snapshot to `<dest>` with LF line endings, adds the three files
 below, and commits once with a fixed author, date and message. The commit is
-`a9af6116c1c33ee893651f3523605a6e3dfaa643` on every platform.
+`bd8caad9078c90c90f38d096fb63650adf1213fd` on every platform.
 
 The package is not installed in the repository (nor in the Docker image the
 workers run in), so `make_repo.py` adds what an installation would provide:
@@ -73,13 +75,54 @@ workers run in), so `make_repo.py` adds what an installation would provide:
   subprocess (`tests/test_imports.py`, `tests/test_types/test_Path.py`);
 - `src/click.egg-info/PKG-INFO` (name and version only), because
   `tests/test_deprecations.py` compares `click.__version__` with
-  `importlib.metadata.version("click")`.
+  `importlib.metadata.version("click")`;
+- `sandbox_skips.txt`, the list of tests that `conftest.py` skips (see
+  [Tests skipped in the sandbox](#tests-skipped-in-the-sandbox)).
 
 There is no `SPEC.md`: the tickets are the specification. With
-`python -m pytest -q tests`, click's own tests pass on the base: 2,184 passed,
-102 skipped, 1 xfailed on Windows with Python 3.11 (the skips are tests for
-other platforms; click's `pyproject.toml` deselects its 31,000 stress tests
-and turns warnings into errors). The run takes about 5 seconds.
+`python -m pytest -q tests`, click's own tests pass on the base (click's
+`pyproject.toml` deselects its 31,000 stress tests and turns warnings into
+errors; the run takes about 10 seconds):
+
+| Where | Passed | Skipped | xfailed |
+| --- | --- | --- | --- |
+| the evaluation sandbox (Docker, Linux, Python 3.11) | 2,235 | 51 | 1 |
+| a Windows host, Python 3.11 | 2,184 | 102 | 1 |
+
+### Tests skipped in the sandbox
+
+The Coordinator runs node checks, post-merge checks, final checks and the
+hidden tests in the Docker sandbox the workers use (image
+`aqours-code-eval:py311`). 27 of click's own tests cannot pass there, on the
+unchanged base either: the image has no `less`, and `/tmp` is mounted
+`noexec`, so a test cannot run a fake pager that it creates in its temporary
+directory. They are the `less` cases of `test_echo_via_pager` (24), and
+`test_pipepager_less_detection_matches_stem[less]`, `[less.exe]` and
+`test_pipepager_less_detection_case_insensitive_on_windows` in
+`tests/test_termui.py`. Left alone, they would fail every node check and the
+final check of every scheme, whatever the agent did.
+
+So they are skipped, in the same way for the single agent and for the task
+graph:
+
+- [`sandbox_skips.txt`](sandbox_skips.txt) lists the 27 pytest node ids;
+- the `conftest.py` in the repository root marks a collected test whose node
+  id is in the list as skipped, with the reason `needs a terminal pager; not
+  available in the evaluation sandbox`. Matching is by exact node id, so no
+  other test is affected (the `cat` cases of the same tests still run);
+- `hidden_tests/conftest.py` does the same for `regression/`, from its own
+  copy of the list (`hidden_tests/sandbox_skips.txt`). The repository's list
+  and `conftest.py` are files an agent can edit; the hidden tests do not read
+  them.
+
+The list was made by running `python -m pytest -q tests` in the sandbox on
+the base repository with the list emptied and taking the tests that failed;
+base + reference gives the same 27. On Windows click already skips these
+tests itself. No ticket changes the pager code that they test.
+
+This was added on 2026-10-12, when the checks moved into the sandbox, and it
+changed the base commit (it was `a9af6116…` before). A run on the earlier
+commit is not comparable with later ones.
 
 ## The request
 
@@ -130,8 +173,13 @@ Lines changed (`git diff --numstat`, added / deleted):
 | 8 hints | 41 / 10 | 51 (`tests/test_error_hints.py`) | 102 |
 | **total** | **427 / 11 = 438** | **343** | **781** |
 
-With the reference, `python -m pytest -q tests` passes (2,251 passed, 102
-skipped, 1 xfailed on Windows) and so do all hidden tests.
+With the reference, `python -m pytest -q tests` passes and so do all hidden
+tests:
+
+| Where | `tests` | `_hidden_tests` |
+| --- | --- | --- |
+| the evaluation sandbox | 2,302 passed, 51 skipped, 1 xfailed | 2,305 passed, 51 skipped, 1 xfailed |
+| a Windows host | 2,251 passed, 102 skipped, 1 xfailed | 2,254 passed, 102 skipped, 1 xfailed |
 
 The Nushell source script of the reference has not been run in Nushell; the
 request only fixes what the script contains and what `nu_complete` prints.
@@ -145,7 +193,8 @@ itself, so it does not depend on the repository's `conftest.py`.
 
 - `regression/` is click's own test suite as it was at the snapshot commit.
   An agent that edits a public test to make it pass is still measured against
-  the original.
+  the original. The 27 tests of
+  [`sandbox_skips.txt`](hidden_tests/sandbox_skips.txt) are skipped here too.
 - `test_t<N>_*.py` are the tests of ticket N: 70 tests, 7 to 10 per ticket.
 
 The job platform task had three hidden tests that checked behaviour its
