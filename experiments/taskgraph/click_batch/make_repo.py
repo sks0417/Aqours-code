@@ -6,6 +6,8 @@ Copies ``vendor/click/`` to ``<dest>`` with LF line endings and adds what an
 installation would provide (the package is not installed): a root
 ``conftest.py`` that puts ``src`` on ``sys.path`` and ``PYTHONPATH``, and
 ``src/click.egg-info/PKG-INFO`` for ``importlib.metadata.version("click")``.
+It also copies ``sandbox_skips.txt``; the root ``conftest.py`` skips the tests
+listed there, which cannot run in the evaluation sandbox (see README.md).
 It commits once with a fixed author, date, and message, and prints the commit
 hash, which is the same on every platform. ``--with-reference`` then applies
 the patches in ``reference/`` to the working tree without committing them.
@@ -20,17 +22,40 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 COMMIT_MESSAGE = "click batch base"
+SKIP_LIST = "sandbox_skips.txt"
 ROOT_CONFTEST = '''\
-"""Make ``import click`` use ``src/click`` without installing the package."""
+"""Make ``import click`` use ``src/click`` without installing the package, and
+skip the tests listed in ``sandbox_skips.txt``."""
 import os
 import sys
 from pathlib import Path
 
-SRC = str(Path(__file__).resolve().parent / "src")
+import pytest
+
+ROOT = Path(__file__).resolve().parent
+SRC = str(ROOT / "src")
 sys.path.insert(0, SRC)
 # Tests that start a Python subprocess import click there too.
 os.environ["PYTHONPATH"] = os.pathsep.join(
     part for part in (SRC, os.environ.get("PYTHONPATH")) if part)
+
+SKIP_REASON = "needs a terminal pager; not available in the evaluation sandbox"
+
+
+def sandbox_skips() -> set:
+    """The node ids in ``sandbox_skips.txt`` (one per line; ``#`` starts a comment)."""
+    try:
+        lines = (ROOT / "sandbox_skips.txt").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    return {line.strip() for line in lines if line.strip() and not line.startswith("#")}
+
+
+def pytest_collection_modifyitems(config, items):
+    skips = sandbox_skips()
+    for item in items:
+        if item.nodeid in skips:
+            item.add_marker(pytest.mark.skip(reason=SKIP_REASON))
 '''
 # click's own tests compare ``click.__version__`` with the installed metadata.
 PKG_INFO = "Metadata-Version: 2.1\nName: click\nVersion: 8.6.0.dev\n"
@@ -82,6 +107,8 @@ def make_repo(dest: Path, with_reference: bool = False) -> str:
     dest.mkdir(parents=True, exist_ok=True)
     copy_tree(HERE / "vendor" / "click", dest)
     (dest / "conftest.py").write_bytes(ROOT_CONFTEST.encode("utf-8"))
+    (dest / SKIP_LIST).write_bytes(
+        (HERE / SKIP_LIST).read_bytes().replace(b"\r\n", b"\n"))
     (dest / "src" / "click.egg-info").mkdir()
     (dest / "src" / "click.egg-info" / "PKG-INFO").write_bytes(PKG_INFO.encode("utf-8"))
     git(dest, "init", "-q")
