@@ -1,11 +1,12 @@
-"""Docker sandbox for worker shell commands.
+"""Docker sandbox for worker shell commands and for the Coordinator's checks.
 
 With ``--sandbox docker`` (the default of ``run``), a worker's ``bash`` tool
 runs in a container that sees only the node's worktree, mounted at
 ``/workspace``, with no network and a read-only root file system. It uses
 the existing ``DockerCommandExecutor`` and the eval image. The worker's file
-tools already stay inside the worktree. Checks, final checks and hidden tests
-still run on the host, by the Coordinator.
+tools already stay inside the worktree. Node checks, post-merge checks, final
+checks and hidden tests run in the same kind of container (``checks.py``), so
+code a worker wrote never runs on the host.
 
 This module never imports the Aqours runtime at import time.
 """
@@ -57,7 +58,20 @@ class SandboxConfig:
 NO_SANDBOX = SandboxConfig(kind="none")
 
 
-def check_docker(image: str = DEFAULT_IMAGE, runner=subprocess.run) -> None:
+def utf8_run(args, **kwargs) -> subprocess.CompletedProcess:
+    """``subprocess.run`` whose text output is UTF-8 with undecodable bytes replaced.
+
+    Without this, ``text=True`` decodes with the platform's default encoding
+    and raises on a byte it cannot decode: one odd byte in a command's output
+    would end a worker or a check.
+    """
+    if kwargs.get("text") or kwargs.get("universal_newlines"):
+        kwargs.setdefault("encoding", "utf-8")
+        kwargs.setdefault("errors", "replace")
+    return subprocess.run(args, **kwargs)
+
+
+def check_docker(image: str = DEFAULT_IMAGE, runner=utf8_run) -> None:
     """Raise ``SandboxUnavailable`` unless Docker runs and ``image`` exists."""
     hint = f"Build the image with: {BUILD_COMMAND}"
     try:
@@ -89,7 +103,13 @@ def container_name(node_id: str, attempt: int, token: str) -> str:
     return f"{CONTAINER_PREFIX}-{safe[:30] or 'node'}-{attempt}-{token}"
 
 
-def remove_containers(name: str, runner=subprocess.run) -> list[str]:
+def check_container_name(label: str, token: str) -> str:
+    """A Docker container name for one group of check commands."""
+    safe = "".join(ch.lower() if ch.isalnum() else "-" for ch in label).strip("-")
+    return f"{CONTAINER_PREFIX}-{safe[:40] or 'check'}-{token}"
+
+
+def remove_containers(name: str, runner=utf8_run) -> list[str]:
     """Remove the container ``name`` and its restarts (``name-r<n>``); never raises.
 
     Returns the names that were still there, so a caller can tell whether the
@@ -156,8 +176,14 @@ class RestartingDockerExecutor:
 
 
 def docker_executor(workspace: str | Path, image: str, name: str, *,
-                    deadline: float | None = None) -> RestartingDockerExecutor:
-    """The executor a sandboxed worker uses for ``bash``."""
+                    deadline: float | None = None,
+                    command_timeout: float = COMMAND_TIMEOUT_S) -> RestartingDockerExecutor:
+    """The executor for shell commands in the sandbox.
+
+    A worker uses it for ``bash``; the Coordinator uses it for checks, with
+    the check's own timeout as ``command_timeout``. Both get the same
+    container: ``workspace`` at ``/workspace``, no network, the same limits.
+    """
     from aqours_code.command_executor import DockerCommandExecutor  # noqa: PLC0415
 
     def factory(index: int):
@@ -165,7 +191,7 @@ def docker_executor(workspace: str | Path, image: str, name: str, *,
         return DockerCommandExecutor(
             workspace=workspace, image=image, case_name=name, container_name=container,
             memory=CONTAINER_MEMORY, cpus=CONTAINER_CPUS, pids_limit=CONTAINER_PIDS,
-            command_timeout=COMMAND_TIMEOUT_S, docker_timeout=DOCKER_TIMEOUT_S,
-            operation_deadline=deadline)
+            command_timeout=command_timeout, docker_timeout=DOCKER_TIMEOUT_S,
+            operation_deadline=deadline, runner=utf8_run)
 
     return RestartingDockerExecutor(factory, deadline=deadline)

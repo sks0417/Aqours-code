@@ -262,7 +262,8 @@ def test_worker_entry_uses_docker_executor_with_the_worktree(monkeypatch, tmp_pa
         "memory": sandbox_module.CONTAINER_MEMORY, "cpus": sandbox_module.CONTAINER_CPUS,
         "pids_limit": sandbox_module.CONTAINER_PIDS,
         "command_timeout": sandbox_module.COMMAND_TIMEOUT_S,
-        "docker_timeout": sandbox_module.DOCKER_TIMEOUT_S, "operation_deadline": 123.0}]
+        "docker_timeout": sandbox_module.DOCKER_TIMEOUT_S, "operation_deadline": 123.0,
+        "runner": sandbox_module.utf8_run}]
     from aqours_code.command_executor import LocalCommandExecutor
     assert isinstance(worker_entry.command_executor_for({"sandbox": {"kind": "none"}}, 1.0),
                       LocalCommandExecutor)
