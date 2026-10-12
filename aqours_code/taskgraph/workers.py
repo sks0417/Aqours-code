@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Protocol
 
-from .process import run_process, run_shell
+from .process import run_process, run_shell, utf8_env
 from .sandbox import NO_SANDBOX, SandboxConfig, check_docker, container_name, remove_containers
 
 WORKER_ENTRY_MODULE = "aqours_code.taskgraph.worker_entry"
@@ -99,8 +99,8 @@ class CommandWorker:
         if command is None:
             return WorkerResult(ok=False, reason="worker_error",
                                 error=f"no command for node {request.node_id}")
-        env = {**os.environ, "TG_NODE_ID": request.node_id,
-               "TG_ATTEMPT": str(request.attempt)}
+        env = utf8_env({**os.environ, "TG_NODE_ID": request.node_id,
+                        "TG_ATTEMPT": str(request.attempt)})
         result = run_shell(command, cwd=request.workspace,
                            timeout=request.timeout_s, env=env)
         if result.timed_out:
@@ -145,7 +145,7 @@ class AqoursWorker:
         """Ask the worker entry which provider and model it would use."""
         info = {"worker": "aqours"}
         result = run_process([*self.entry_command, "--describe"], cwd=Path.cwd(),
-                             timeout=60)
+                             env=utf8_env(), timeout=60)
         try:
             info.update(json.loads(result.output.strip().splitlines()[-1]))
         except (IndexError, json.JSONDecodeError):
@@ -192,7 +192,7 @@ class AqoursWorker:
         write_json_atomic(config_path, config)
         result_path = Path(config["result_path"])
         result_path.unlink(missing_ok=True)
-        env = {**os.environ, "AQOURS_CODE_WORKDIR": config["workspace"]}
+        env = utf8_env({**os.environ, "AQOURS_CODE_WORKDIR": config["workspace"]})
         started = time.monotonic()
         try:
             proc = run_process([*self.entry_command, "--config", str(config_path)],

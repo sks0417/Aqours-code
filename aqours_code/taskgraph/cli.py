@@ -103,8 +103,9 @@ def _cmd_export_schema(args: argparse.Namespace) -> int:
 
 
 NO_SANDBOX_WARNING = (
-    "WARNING: --sandbox none: worker shell commands run on this machine and can read "
-    "any file on it. Use this only for tests; such a run is not a valid experiment.")
+    "WARNING: --sandbox none: worker shell commands and all checks run on this machine "
+    "and can read any file on it. Use this only for tests; such a run is not a valid "
+    "experiment.")
 
 
 def _banner(lines: list[str]) -> str:
@@ -181,6 +182,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(f"merge repairs: {summary['merge_repairs_total']}{detail}")
     escapes = summary["escape_attempts_total"]
     print(f"sandbox: {summary['sandbox']}  escape attempts: {escapes}")
+    print(f"checks ran in: {_where(summary['checks_sandbox'])}")
     if escapes and summary["sandbox"] == "none":
         print(_banner([f"{escapes} escape attempt(s) without a sandbox: workers may have "
                        "read files outside their workspace.",
@@ -190,6 +192,56 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"warning: cleanup: {warning}", file=sys.stderr)
     print(f"run directory: {result.run_dir}")
     return EXIT_OK if summary["status"] == "success" else EXIT_INVALID
+
+
+def _where(checks_sandbox: str) -> str:
+    return "docker" if checks_sandbox == "docker" else "the host (no sandbox)"
+
+
+def _cmd_rescore(args: argparse.Namespace) -> int:
+    from .checks import checks_for, rescore
+    from .sandbox import DEFAULT_IMAGE, SandboxConfig, SandboxUnavailable, check_docker
+
+    run_dir, tests_dir = Path(args.run_dir), Path(args.hidden_tests)
+    if not run_dir.is_dir():
+        return _error(f"run directory not found: {run_dir}")
+    if not tests_dir.is_dir():
+        return _error(f"hidden tests directory not found: {tests_dir}")
+    image = args.sandbox_image
+    if image is None:  # the image the run itself used, if it used one
+        try:
+            recorded = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+            image = recorded.get("sandbox_image")
+        except (OSError, ValueError, AttributeError):
+            image = None
+    sandbox = SandboxConfig(kind=args.sandbox, image=image or DEFAULT_IMAGE)
+    if sandbox.kind == "docker":
+        try:
+            check_docker(sandbox.image)
+        except SandboxUnavailable as exc:
+            return _error(f"{exc} (nothing was run; pass --sandbox none to run the "
+                          "hidden tests on this machine)")
+    else:
+        print("WARNING: --sandbox none: the hidden tests run the run's final code on "
+              "this machine.", file=sys.stderr)
+    try:
+        stats = rescore(run_dir.resolve(), tests_dir.resolve(), checks_for(sandbox))
+    except (OSError, ValueError) as exc:
+        return _error(str(exc))
+    print(f"hidden tests (rescored, {_where(stats['sandbox'])}): {stats['passed']} passed, "
+          f"{stats['failed']} failed, {stats['errors']} errors, {stats['skipped']} skipped")
+    if "cleanup_error" in stats:
+        print(f"warning: cleanup: could not remove the copied tests from "
+              f"{run_dir / 'final'}: {stats['cleanup_error']}", file=sys.stderr)
+    print(f"wrote {run_dir / 'hidden_tests_rescored.txt'}, "
+          f"{run_dir / 'hidden_tests_rescored.xml'}, and hidden_tests_rescored in "
+          f"{run_dir / 'summary.json'}")
+    if "parse_error" in stats or stats["timed_out"]:
+        why = "timed out" if stats["timed_out"] else f"exit code {stats['exit_code']}"
+        print(f"error: the hidden tests gave no result ({why}); see "
+              f"{run_dir / 'hidden_tests_rescored.txt'}", file=sys.stderr)
+        return EXIT_INVALID
+    return EXIT_OK
 
 
 def _cmd_audit(args: argparse.Namespace) -> int:
@@ -347,10 +399,22 @@ def build_parser() -> argparse.ArgumentParser:
                          help="repair rounds for a node whose post-merge check fails "
                               "(default 1; 0 fails the node at once)")
     run_cmd.add_argument("--sandbox", choices=("docker", "none"), default="docker",
-                         help="where worker shell commands run (none: tests only)")
+                         help="where worker shell commands, checks and hidden tests run "
+                              "(none: on this machine, tests only)")
     run_cmd.add_argument("--sandbox-image", default="aqours-code-eval:py311",
                          help="Docker image for --sandbox docker")
     run_cmd.set_defaults(func=_cmd_run)
+
+    rescore_cmd = commands.add_parser(
+        "rescore", help="run the hidden tests again on the final code of a finished run")
+    rescore_cmd.add_argument("run_dir", help="a run directory (it has final/ and summary.json)")
+    rescore_cmd.add_argument("--hidden-tests", required=True)
+    rescore_cmd.add_argument("--sandbox", choices=("docker", "none"), default="docker",
+                             help="where the tests run (default docker)")
+    rescore_cmd.add_argument("--sandbox-image",
+                             help="Docker image (default: the run's own, else "
+                                  "aqours-code-eval:py311)")
+    rescore_cmd.set_defaults(func=_cmd_rescore)
 
     audit_cmd = commands.add_parser(
         "audit", help="find workers that reached outside their workspace in past runs")

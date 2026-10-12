@@ -10,6 +10,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# Python children must not fall back to the platform's default encoding (cp1252
+# or cp936 on Windows), which cannot encode everything a model writes.
+UTF8_ENV = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+
+
+def utf8_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """``env`` (default: this process's environment) with Python I/O set to UTF-8."""
+    return {**(os.environ if env is None else env), **UTF8_ENV}
+
+
 @dataclass
 class ProcessResult:
     """Outcome of one command."""

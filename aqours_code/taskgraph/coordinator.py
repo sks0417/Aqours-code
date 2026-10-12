@@ -5,28 +5,37 @@ been merged into the integration branch. Workers run in threads that each
 drive one node. Every git command on the shared clone runs under ``git_lock``;
 a merge, its post-merge check, and a possible undo run as one unit under
 ``merge_lock``, and the check itself does not hold ``git_lock``.
+
+Node checks, post-merge checks, final checks and hidden tests run where the
+workers' shell commands run: in a Docker container with ``--sandbox docker``,
+on the host with ``--sandbox none`` (``checks.py``).
 """
 from __future__ import annotations
 
 import json
 import platform
 import secrets
-import shutil
 import sys
 import threading
 import time
-import xml.etree.ElementTree as ET
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import gitops
+from .checks import (
+    HIDDEN_TESTS_DIR,
+    CheckOutcome,
+    Checks,
+    checks_for,
+    run_checks,
+    run_hidden_tests,
+)
 from .cleanup import remove_reserved_files, remove_tree
 from .context_pack import build_context_pack
 from .context_metrics import node_context_metrics
 from .escapes import scan_run
-from .process import run_process, run_shell
 from .prompting import AttemptFailure, build_node_prompt
 from .repo_index import RepoIndex, build_index
 from .sandbox import NO_SANDBOX, SandboxConfig
@@ -35,14 +44,11 @@ from .validate import ValidationReport, edit_files, unique_nodes, usable_edges, 
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
 DEFAULT_MERGE_REPAIRS = 1
-TASKGRAPH_VERSION = "coordinator-v0.5"
+TASKGRAPH_VERSION = "coordinator-v0.6"
 AQOURS_SOURCE = Path(__file__).resolve().parents[2]
 DEFAULT_WORKERS = 2
 DEFAULT_MAX_ATTEMPTS = 2
 FINAL_CHECK_TIMEOUT_S = 1800.0
-HIDDEN_TESTS_TIMEOUT_S = 1800.0
-HIDDEN_TESTS_DIR = "_hidden_tests"
-CHECK_OUTPUT_LIMIT = 200_000
 
 
 class GraphInvalid(Exception):
@@ -64,6 +70,9 @@ class RunOptions:
     hidden_tests: Path | None = None
     # Repair rounds a node gets when its post-merge check fails (0: none).
     merge_repairs: int = DEFAULT_MERGE_REPAIRS
+    # Where checks run. None: where the worker's shell commands run (Docker
+    # with ``--sandbox docker``, the host with ``--sandbox none``).
+    checks: Checks | None = None
 
 
 @dataclass
@@ -143,38 +152,6 @@ class EventLog:
                 handle.write(line + "\n")
 
 
-@dataclass
-class CheckOutcome:
-    """Result of running a list of shell commands."""
-
-    ok: bool
-    text: str
-    duration_s: float
-    results: list[dict]
-
-
-def run_checks(commands: list[str], cwd: Path, timeout: float, *,
-               stop_on_failure: bool = True) -> CheckOutcome:
-    """Run ``commands`` in order through the shell."""
-    started = time.monotonic()
-    parts, results, ok = [], [], True
-    for command in commands:
-        if not command.strip():
-            continue
-        result = run_shell(command, cwd=cwd, timeout=timeout)
-        status = "timeout" if result.timed_out else f"exit {result.exit_code}"
-        parts.append(f"$ {command}\n[{status}, {result.duration_s:.2f}s]\n{result.output}")
-        results.append({"command": command, "ok": result.ok, "exit_code": result.exit_code,
-                        "timed_out": result.timed_out,
-                        "duration_s": round(result.duration_s, 3)})
-        if not result.ok:
-            ok = False
-            if stop_on_failure:
-                break
-    return CheckOutcome(ok=ok, text="\n".join(parts)[-CHECK_OUTPUT_LIMIT:],
-                        duration_s=time.monotonic() - started, results=results)
-
-
 class Coordinator:
     """Executes one graph in one run directory."""
 
@@ -196,6 +173,7 @@ class Coordinator:
         self.integration_head = base_commit
         self.bases: dict[str, str] = {}
         self.sandbox = worker_sandbox(worker)
+        self.checks = options.checks or checks_for(self.sandbox)
         self.nodes = unique_nodes(graph)
         self.by_id = {node.id: node for node in self.nodes}
         self.records = {node.id: NodeRecord() for node in self.nodes}
@@ -347,7 +325,8 @@ class Coordinator:
     def _run_node_check(self, node: Node, record: NodeRecord, log_dir: Path,
                         worktree: Path, attempt: int) -> CheckOutcome:
         self.events.emit("check_start", node=node.id, attempt=attempt)
-        check = run_checks(node.check.commands, worktree, node.check.timeout_s)
+        check = run_checks(node.check.commands, worktree, node.check.timeout_s,
+                           checks=self.checks, label=f"check-{node.id}")
         (log_dir / f"check_{attempt}.txt").write_text(check.text, encoding="utf-8")
         record.check_time_s += check.duration_s
         self.events.emit("check_end", node=node.id, attempt=attempt, ok=check.ok,
@@ -400,7 +379,8 @@ class Coordinator:
                                  commit=commit)
             if commit is None:
                 return "merge_conflict", ""
-            check = run_checks(node.check.commands, self.repo, node.check.timeout_s)
+            check = run_checks(node.check.commands, self.repo, node.check.timeout_s,
+                               checks=self.checks, label=f"merge-{node.id}")
             (log_dir / check_file).write_text(check.text, encoding="utf-8")
             record.check_time_s += check.duration_s
             self.events.emit("post_merge_check_end", node=node.id, ok=check.ok,
@@ -477,26 +457,22 @@ class Coordinator:
     def final_checks(self) -> list[dict]:
         """Run ``final_checks`` on the integration branch; record each command."""
         outcome = run_checks(self.graph.final_checks, self.repo, FINAL_CHECK_TIMEOUT_S,
-                             stop_on_failure=False)
+                             stop_on_failure=False, checks=self.checks, label="final")
         (self.run_dir / "final_checks.txt").write_text(outcome.text, encoding="utf-8")
         self.events.emit("final_checks_end", ok=outcome.ok, results=outcome.results)
         return outcome.results
 
     def hidden_tests(self, tests_dir: Path) -> dict:
-        """Run hidden tests on a clean checkout of the integration branch."""
+        """Run hidden tests on a clean checkout of the integration branch.
+
+        The tests stay in ``final/_hidden_tests`` until ``remove_answers``.
+        """
         final = self.run_dir / "final"
         with self.git_lock:
             gitops.add_detached_worktree(self.repo, final, gitops.INTEGRATION_BRANCH)
-        shutil.copytree(tests_dir, final / HIDDEN_TESTS_DIR)
-        xml_path = self.run_dir / "hidden_tests.xml"
-        result = run_process(
-            [sys.executable, "-m", "pytest", "-q", HIDDEN_TESTS_DIR, "-p",
-             "no:cacheprovider", f"--junitxml={xml_path}"],
-            cwd=final, timeout=HIDDEN_TESTS_TIMEOUT_S)
-        (self.run_dir / "hidden_tests.txt").write_text(result.output, encoding="utf-8")
-        stats = parse_junit(xml_path)
-        stats.update({"exit_code": result.exit_code, "timed_out": result.timed_out,
-                      "duration_s": round(result.duration_s, 3)})
+        stats = run_hidden_tests(final, tests_dir, self.checks,
+                                 xml_path=self.run_dir / "hidden_tests.xml",
+                                 text_path=self.run_dir / "hidden_tests.txt")
         self.events.emit("hidden_tests_end", **stats)
         return stats
 
@@ -545,24 +521,6 @@ class Coordinator:
         return warnings
 
 
-def parse_junit(path: Path) -> dict:
-    """Count passed, failed, errors and skipped tests in a JUnit XML file."""
-    counts = {"passed": 0, "failed": 0, "errors": 0, "skipped": 0}
-    try:
-        root = ET.parse(path).getroot()
-    except (OSError, ET.ParseError) as exc:
-        return {**counts, "parse_error": str(exc)}
-    suites = [root] if root.tag == "testsuite" else root.iter("testsuite")
-    total = 0
-    for suite in suites:
-        total += int(suite.get("tests", 0))
-        counts["failed"] += int(suite.get("failures", 0))
-        counts["errors"] += int(suite.get("errors", 0))
-        counts["skipped"] += int(suite.get("skipped", 0))
-    counts["passed"] = total - counts["failed"] - counts["errors"] - counts["skipped"]
-    return counts
-
-
 def run_status(records: dict[str, NodeRecord], final_results: list[dict]) -> str:
     """success, partial, or failed (hidden tests do not count)."""
     merged = [record for record in records.values() if record.status == "merged"]
@@ -590,6 +548,7 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
     if preflight is not None:
         preflight()  # SandboxUnavailable (a RuntimeError) stops the run here
     sandbox = worker_sandbox(worker)
+    options = replace(options, checks=options.checks or checks_for(sandbox))
 
     run_id = new_run_id()
     run_dir = Path(options.out_dir).resolve() / run_id
@@ -607,6 +566,7 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "hidden_tests": str(options.hidden_tests) if options.hidden_tests else None,
         "worker": worker.describe(),
         **sandbox.to_dict(),
+        "checks_sandbox": options.checks.kind,
         "taskgraph_version": TASKGRAPH_VERSION,
         "aqours_commit": gitops.source_state(AQOURS_SOURCE),
         "validation_warnings": [issue.format() for issue in report.warnings],
@@ -616,6 +576,7 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
     write_json_atomic(run_dir / "config.json", config)
     events = EventLog(run_dir / "events.jsonl")
     events.emit("run_start", run_id=run_id, workers=options.workers,
+                checks_sandbox=options.checks.kind,
                 nodes=[node.id for node in unique_nodes(graph)])
 
     base = gitops.clone_for_run(repo, run_dir / "repo", graph.base_commit)
@@ -650,6 +611,7 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "final_checks": final_results,
         "hidden_tests": hidden,
         **sandbox.to_dict(),
+        "checks_sandbox": options.checks.kind,
         "escape_attempts_total": escapes_total,
         "merge_repairs_total": sum(r.merge_repairs for r in records.values()),
     }

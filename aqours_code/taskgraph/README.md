@@ -190,9 +190,10 @@ python -m aqours_code.taskgraph index --repo <path> --commit <sha>
 python -m aqours_code.taskgraph export-schema [--out <path>]
 python -m aqours_code.taskgraph compare <planner_graph.json> <handwritten_graph.json> --repo <path> [--json <file>]
 python -m aqours_code.taskgraph audit <runs_dir | run_dir> [...]
+python -m aqours_code.taskgraph rescore <run_dir> --hidden-tests <dir> [--sandbox docker|none]
 ```
 
-`plan`, `run` and `audit` are described in their own sections below. `compare` prints
+`plan`, `run`, `audit` and `rescore` are described in their own sections below. `compare` prints
 a Markdown table of both graphs' structure: validation (error count, warning
 codes), node counts by kind, files edited by contract nodes, critical path
 (nodes on the longest chain), maximum parallel width (largest layer when
@@ -250,10 +251,11 @@ python -m aqours_code.taskgraph run <graph.json> --repo <path>
     [--sandbox docker|none] [--sandbox-image aqours-code-eval:py311]
 ```
 
-Run experiments on Linux or WSL2. Check commands, `final_checks`, and the
-`--command-map` commands run through the system shell, so write them for a
-POSIX shell. The process exits with `0` for `success`, `1` for any other
-status or an invalid graph, and `2` for input or git errors.
+Check commands and `final_checks` run through `/bin/sh` in the sandbox
+container (with `--sandbox none`, through the host's shell), so write them for
+a POSIX shell; `--command-map` commands always run through the host's shell.
+The process exits with `0` for `success`, `1` for any other status or an
+invalid graph, and `2` for input or git errors.
 
 Each run puts a full clone of the target repository under `--out` (default
 `runs/` in the current directory; `runs/` is git-ignored in the Aqours
@@ -280,9 +282,10 @@ calls and tokens are counted for the cost data. The model comes from the
 Aqours `.env` and environment. `--worker command` runs a fixed
 shell command per node instead (tests and debugging only).
 
-### Worker sandbox
+### Sandbox
 
-A worker must see only its own worktree. Its file tools (`read_file`,
+A worker must see only its own worktree, and nothing a worker wrote may run
+on the host. Its file tools (`read_file`,
 `write_file`, `edit_file`, `glob`) already refuse paths outside it; its
 `bash` commands run, with `--sandbox docker` (the default), in a Docker
 container started from `--sandbox-image` that mounts only the worktree at
@@ -306,8 +309,34 @@ The deleted paths are recorded in the node's `removed_reserved_files` and in a
 
 Inside the container git commands fail (the worktree's `.git` file points to
 a host path). Workers must not change repository state anyway; the
-coordinator commits on the host. Checks, post-merge checks, final checks and
-hidden tests also run on the host, as before.
+coordinator commits on the host.
+
+Every check runs code that a worker wrote, so the checks run in the sandbox
+too (`checks.py`). Each one gets a fresh container like a worker's: the same
+image and limits, no network, and the directory being checked mounted at
+`/workspace`. The container serves the commands of that one check and is then
+removed. A command may run as long as the check's own timeout.
+
+| Check | Directory mounted at `/workspace` | `--sandbox docker` | `--sandbox none` |
+| --- | --- | --- | --- |
+| node check (after each attempt) | the node's worktree `wt/<id>/` | container | host |
+| post-merge check | the integration clone `repo/` | container | host |
+| `final_checks` | the integration clone `repo/` | container | host |
+| hidden tests | the final checkout `final/` | container | host |
+
+The hidden tests run as `python -m pytest`, with the image's Python in the
+container and the Coordinator's own Python on the host. If the sandbox cannot
+start or run a command, the check fails with `[sandbox error] ...` in its
+output; it never falls back to the host. A check can only use what the image
+provides: a test suite that needs a program the image lacks (a pager, a
+compiler) fails there even on unchanged code, so run the repository's tests
+in the image once before using it for a task.
+
+Worker and planner processes start with `PYTHONUTF8=1` and
+`PYTHONIOENCODING=utf-8`, and every output the Coordinator reads from a child
+or from Docker is decoded as UTF-8 with undecodable bytes replaced, so a
+character the host's default encoding lacks cannot fail a worker or planner
+round.
 
 Before a run starts, `run` checks that Docker runs and that the image exists.
 If not, it exits with code 2 and explains how to build the image:
@@ -317,10 +346,11 @@ docker build -f evals/docker/Dockerfile -t aqours-code-eval:py311 .
 ```
 
 It never falls back to `--sandbox none`. `--sandbox none` runs worker
-commands on the host and is only for unit tests and `--worker command`
-(which always runs on the host); it prints a warning. `config.json` and
-`summary.json` record `sandbox` (`docker` or `none`) and `sandbox_image`. The
-planner needs no sandbox: it has no `bash`.
+commands and all checks on the host and is only for unit tests and
+`--worker command` (which always runs on the host, and so do its checks); it
+prints a warning. `config.json` and `summary.json` record `sandbox` (`docker`
+or `none`), `sandbox_image`, and `checks_sandbox` (where the four checks ran:
+`docker` or `none`). The planner needs no sandbox: it has no `bash`.
 
 ### Escape audit
 
@@ -373,7 +403,7 @@ found, `0` when none is, and `2` when no run directory is found.
    whose post-merge check passed (never from a merge still being checked, so
    an undone merge cannot leak into another branch), write the
    prompt, run the worker, delete reserved-name files (see
-   [Worker sandbox](#worker-sandbox)), and commit `attempt <n>`. The attempt fails on a
+   [Sandbox](#sandbox)), and commit `attempt <n>`. The attempt fails on a
    worker error (`worker_error`), on a timeout without changes
    (`worker_timeout`), on no change since the start
    commit (`no_changes`), or on a failing check command run in the worktree
@@ -419,8 +449,10 @@ found, `0` when none is, and `2` when no run directory is found.
 5. **Final stage.** Run every `final_checks` command on the integration branch
    and record each result. With `--hidden-tests DIR`, check out the
    integration HEAD into `final/`, copy `DIR` to `final/_hidden_tests/`, and
-   run `python -m pytest -q _hidden_tests -p no:cacheprovider --junitxml=...`.
-   Workers never see these tests.
+   run `python -m pytest -q _hidden_tests -p no:cacheprovider
+   --junitxml=_hidden_tests.xml` there; the report is then moved to
+   `hidden_tests.xml` in the run directory. Workers never see these tests.
+   Like every check, both run in the sandbox (see [Sandbox](#sandbox)).
 6. **Audit and clean up.** Scan the traces for escape attempts (see
    [Escape audit](#escape-audit)) and write `summary.json`. Only then delete
    `final/_hidden_tests/` and `wt/`, so that no later worker can find this
@@ -450,6 +482,7 @@ runs/<run_id>/            run_id = UTC timestamp + 4 random hex characters
   summary.json            results
   final_checks.txt        output of final_checks
   hidden_tests.xml/.txt   hidden test results, if any (the tests themselves are deleted)
+  hidden_tests_rescored.xml/.txt   results of the last `rescore`, if any
   repo/                   clone; tg/integration is checked out here
   wt/<node_id>/           node worktrees (removed when the node ends; wt/ when the run ends)
   nodes/<node_id>/        prompt_<n>.md, worker_<n>.json, worker_<n>_config.json,
@@ -487,8 +520,33 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
 - `final_checks`: one entry per command (`command`, `ok`, `exit_code`,
   `timed_out`, `duration_s`);
 - `hidden_tests`: `passed`, `failed`, `errors`, `skipped`, `exit_code`,
-  `timed_out`, `duration_s`, or `null`;
-- `sandbox`, `sandbox_image`, `escape_attempts_total`, `merge_repairs_total`.
+  `timed_out`, `duration_s`, or `null`; `parse_error` when pytest left no
+  report (the counts are then all 0);
+- `hidden_tests_rescored`: added by `rescore`: the same fields plus `sandbox`,
+  `sandbox_image`, `hidden_tests` (the directory used) and `rescored_at`;
+- `sandbox`, `sandbox_image`, `checks_sandbox`, `escape_attempts_total`,
+  `merge_repairs_total`.
+
+### Rescoring the hidden tests
+
+```bash
+python -m aqours_code.taskgraph rescore <run directory> --hidden-tests <dir>
+    [--sandbox docker|none] [--sandbox-image <image>]
+```
+
+runs the hidden tests again on the `final/` of a finished run, for a run
+whose hidden tests could not run (a crashed interpreter, a missing image) or
+when the tests themselves were corrected. It copies `<dir>` to
+`final/_hidden_tests/`, runs pytest there exactly as `run` does, and deletes
+the copy. The default is `--sandbox docker`, with the image the run used (or
+`--sandbox-image`); without Docker it exits with `2` and runs nothing, unless
+`--sandbox none` is given.
+
+The results go to `hidden_tests_rescored.txt` and `.xml` and to a new
+`hidden_tests_rescored` entry in `summary.json`. The run's own `hidden_tests`
+entry and files are never changed; a second `rescore` replaces the first. It
+prints the counts and exits with `0` when pytest produced a report, whatever
+the tests' results, and with `1` when it did not (the output file says why).
 
 ### Smoke test on the toy repository
 
