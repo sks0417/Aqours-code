@@ -1,0 +1,79 @@
+diff --git a/src/click/testing.py b/src/click/testing.py
+index cc123d4..442c11b 100644
+--- a/src/click/testing.py
++++ b/src/click/testing.py
+@@ -309,6 +309,35 @@ class Result:
+             "\r\n", "\n"
+         )
+ 
++    @property
++    def output_lines(self) -> list[str]:
++        """The lines of :attr:`output`, without line endings.
++
++        .. versionadded:: 8.6.0
++        """
++        return self.output.splitlines()
++
++    def assert_success(self, output: str | None = None) -> Result:
++        """Assert that the command exited with code 0 and return the
++        result, so that calls can be chained.
++
++        :param output: If given, also assert that :attr:`output` is
++            exactly this string.
++
++        .. versionadded:: 8.6.0
++        """
++        if self.exit_code != 0:
++            raise AssertionError(
++                f"Expected exit code 0, got {self.exit_code}. Output:\n{self.output}"
++            )
++
++        if output is not None and self.output != output:
++            raise AssertionError(
++                f"Expected output {output!r}, got {self.output!r}."
++            )
++
++        return self
++
+     def __repr__(self) -> str:
+         exc_str = repr(self.exception) if self.exception else "okay"
+         return f"<{type(self).__name__} {exc_str}>"
+diff --git a/tests/test_result_helpers.py b/tests/test_result_helpers.py
+new file mode 100644
+index 0000000..bad5911
+--- /dev/null
++++ b/tests/test_result_helpers.py
+@@ -0,0 +1,33 @@
++import pytest
++
++import click
++
++
++@click.command()
++@click.option("--code", default=0)
++def cli(code):
++    click.echo("one")
++    click.echo("two")
++    raise click.exceptions.Exit(code)
++
++
++def test_output_lines(runner):
++    assert runner.invoke(cli).output_lines == ["one", "two"]
++
++
++def test_assert_success(runner):
++    result = runner.invoke(cli)
++    assert result.assert_success() is result
++    assert result.assert_success(output="one\ntwo\n") is result
++
++    with pytest.raises(AssertionError, match="Expected output"):
++        result.assert_success(output="one\ntwo")
++
++
++def test_assert_success_exit_code(runner):
++    result = runner.invoke(cli, ["--code", "3"])
++
++    with pytest.raises(AssertionError, match="got 3") as exc_info:
++        result.assert_success(output="one\ntwo\n")
++
++    assert "one\ntwo\n" in str(exc_info.value)

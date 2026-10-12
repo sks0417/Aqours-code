@@ -20,7 +20,8 @@ def run_eval():
 
 
 def test_every_case_points_at_existing_files(run_eval):
-    assert set(run_eval.CASES) == {"jp-modular", "jp-coupled", "jr-modular", "jr-coupled"}
+    assert set(run_eval.CASES) == {"jp-modular", "jp-coupled", "jr-modular", "jr-coupled",
+                                   "click-batch"}
     for request, graph in run_eval.CASES.values():
         assert (run_eval.TASKS / request).is_file()
         assert (run_eval.TASKS / graph).is_file()

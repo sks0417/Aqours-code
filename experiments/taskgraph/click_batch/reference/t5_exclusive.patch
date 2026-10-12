@@ -1,0 +1,136 @@
+diff --git a/src/click/__init__.py b/src/click/__init__.py
+index b8b60a5..0ab5933 100644
+--- a/src/click/__init__.py
++++ b/src/click/__init__.py
+@@ -22,6 +22,7 @@ from .decorators import custom_version_option as custom_version_option
+ from .decorators import group as group
+ from .decorators import help_option as help_option
+ from .decorators import make_pass_decorator as make_pass_decorator
++from .decorators import mutually_exclusive as mutually_exclusive
+ from .decorators import option as option
+ from .decorators import pass_context as pass_context
+ from .decorators import pass_obj as pass_obj
+diff --git a/src/click/decorators.py b/src/click/decorators.py
+index cc42e5d..96c818c 100644
+--- a/src/click/decorators.py
++++ b/src/click/decorators.py
+@@ -11,6 +11,8 @@ from .core import Context
+ from .core import Group
+ from .core import Option
+ from .core import Parameter
++from .core import ParameterSource
++from .exceptions import UsageError
+ from .globals import get_current_context
+ from .utils import echo
+ 
+@@ -130,6 +132,57 @@ def pass_meta_key(
+     return decorator
+ 
+ 
++def mutually_exclusive(*names: str) -> t.Callable[[t.Callable[P, R]], t.Callable[P, R]]:
++    """Make the named parameters of a command mutually exclusive. Apply
++    it to the callback, below the command and parameter decorators.
++
++    The command fails with a usage error if more than one of the
++    parameters was given on the command line or through an environment
++    variable. A parameter left at its default does not count.
++
++    :param names: Names of two or more parameters of the command.
++    :raises ValueError: When the command is invoked, if fewer than two
++        names are given or a name is not a parameter of the command.
++
++    .. versionadded:: 8.6.0
++    """
++
++    def decorator(f: t.Callable[P, R]) -> t.Callable[P, R]:
++        def new_func(*args: P.args, **kwargs: P.kwargs) -> R:
++            ctx = get_current_context()
++            params = {param.name: param for param in ctx.command.get_params(ctx)}
++
++            if len(names) < 2:
++                raise ValueError("At least two parameter names are required.")
++
++            for name in names:
++                if name not in params:
++                    raise ValueError(
++                        f"{name!r} is not a parameter of {ctx.command.name!r}."
++                    )
++
++            given = [
++                params[name].get_error_hint(ctx)
++                for name in names
++                if ctx.get_parameter_source(name)
++                in (ParameterSource.COMMANDLINE, ParameterSource.ENVIRONMENT)
++            ]
++
++            if len(given) > 1:
++                raise UsageError(
++                    _("{params} cannot be used together.").format(
++                        params=", ".join(given)
++                    ),
++                    ctx=ctx,
++                )
++
++            return f(*args, **kwargs)
++
++        return update_wrapper(new_func, f)
++
++    return decorator
++
++
+ CmdType = t.TypeVar("CmdType", bound=Command)
+ 
+ 
+diff --git a/tests/test_mutually_exclusive.py b/tests/test_mutually_exclusive.py
+new file mode 100644
+index 0000000..5dd5be0
+--- /dev/null
++++ b/tests/test_mutually_exclusive.py
+@@ -0,0 +1,47 @@
++import pytest
++
++import click
++
++
++@click.command()
++@click.option("--json", is_flag=True)
++@click.option("--csv", is_flag=True)
++@click.option("--template", default="plain", envvar="TEMPLATE")
++@click.mutually_exclusive("json", "csv", "template")
++def export(json, csv, template):
++    click.echo(f"{json} {csv} {template}")
++
++
++@pytest.mark.parametrize(
++    ("args", "expect"),
++    [([], "False False plain\n"), (["--csv"], "False True plain\n")],
++)
++def test_at_most_one(runner, args, expect):
++    result = runner.invoke(export, args)
++    assert result.exit_code == 0
++    assert result.output == expect
++
++
++@pytest.mark.parametrize(
++    ("args", "env", "expect"),
++    [
++        (["--json", "--csv"], {}, "'--json', '--csv'"),
++        (["--csv"], {"TEMPLATE": "x"}, "'--csv', '--template'"),
++        (["--json", "--csv", "--template", "plain"], {}, "'--json', '--csv', '--template'"),
++    ],
++)
++def test_conflict(runner, args, env, expect):
++    result = runner.invoke(export, args, env=env)
++    assert result.exit_code == 2
++    assert f"Error: {expect} cannot be used together." in result.output
++
++
++@pytest.mark.parametrize("names", [(), ("json",), ("json", "missing")])
++def test_invalid_names(runner, names):
++    @click.command()
++    @click.option("--json", is_flag=True)
++    @click.mutually_exclusive(*names)
++    def cli(json):
++        pass
++
++    assert isinstance(runner.invoke(cli).exception, ValueError)

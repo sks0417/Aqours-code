@@ -1,0 +1,93 @@
+diff --git a/src/click/__init__.py b/src/click/__init__.py
+index 0ab5933..1ad06c1 100644
+--- a/src/click/__init__.py
++++ b/src/click/__init__.py
+@@ -72,6 +72,7 @@ from .types import UNPROCESSED as UNPROCESSED
+ from .types import UUID as UUID
+ from .utils import echo as echo
+ from .utils import format_filename as format_filename
++from .utils import format_size as format_size
+ from .utils import get_app_dir as get_app_dir
+ from .utils import open_file as open_file
+ 
+diff --git a/src/click/utils.py b/src/click/utils.py
+index 617ff5e..a71eb96 100644
+--- a/src/click/utils.py
++++ b/src/click/utils.py
+@@ -469,6 +469,41 @@ def format_filename(
+     return filename
+ 
+ 
++def format_size(num_bytes: int, binary: bool = False) -> str:
++    """Format a number of bytes as a human-readable size, such as
++    ``"1.5 kB"``.
++
++    Values below one kilobyte are shown as an integer number of bytes.
++    Larger values use the largest unit that keeps the number at least 1,
++    with one decimal.
++
++    :param num_bytes: The size in bytes. Must not be negative.
++    :param binary: Use powers of 1024 and the units ``KiB``, ``MiB``, ...
++        instead of powers of 1000 and ``kB``, ``MB``, ...
++
++    .. versionadded:: 8.6.0
++    """
++    if num_bytes < 0:
++        raise ValueError("'num_bytes' must not be negative.")
++
++    if binary:
++        base, units = 1024, ("KiB", "MiB", "GiB", "TiB", "PiB")
++    else:
++        base, units = 1000, ("kB", "MB", "GB", "TB", "PB")
++
++    if num_bytes < base:
++        return f"{int(num_bytes)} B"
++
++    size = num_bytes / base
++    unit = 0
++
++    while size >= base and unit < len(units) - 1:
++        size /= base
++        unit += 1
++
++    return f"{size:.1f} {units[unit]}"
++
++
+ def get_app_dir(app_name: str, roaming: bool = True, force_posix: bool = False) -> str:
+     r"""Returns the config folder for the application.  The default behavior
+     is to return whatever is most appropriate for the operating system.
+diff --git a/tests/test_format_size.py b/tests/test_format_size.py
+new file mode 100644
+index 0000000..4f01210
+--- /dev/null
++++ b/tests/test_format_size.py
+@@ -0,0 +1,29 @@
++import pytest
++
++import click
++
++
++@pytest.mark.parametrize(
++    ("num_bytes", "binary", "expect"),
++    [
++        (0, False, "0 B"),
++        (999, False, "999 B"),
++        (1000, False, "1.0 kB"),
++        (1500, False, "1.5 kB"),
++        (2_500_000, False, "2.5 MB"),
++        (10**15, False, "1.0 PB"),
++        (10**19, False, "10000.0 PB"),
++        (1023, True, "1023 B"),
++        (1024, True, "1.0 KiB"),
++        (2 * 1024**2, True, "2.0 MiB"),
++        (3 * 1024**3, True, "3.0 GiB"),
++        (1024**6, True, "1024.0 PiB"),
++    ],
++)
++def test_format_size(num_bytes, binary, expect):
++    assert click.format_size(num_bytes, binary=binary) == expect
++
++
++def test_negative():
++    with pytest.raises(ValueError):
++        click.format_size(-1)

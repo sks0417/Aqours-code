@@ -1,0 +1,200 @@
+diff --git a/src/click/__init__.py b/src/click/__init__.py
+index a34ab02..61f8c42 100644
+--- a/src/click/__init__.py
++++ b/src/click/__init__.py
+@@ -56,6 +56,7 @@ from .termui import unstyle as unstyle
+ from .types import BOOL as BOOL
+ from .types import Choice as Choice
+ from .types import DateTime as DateTime
++from .types import Duration as Duration
+ from .types import File as File
+ from .types import FLOAT as FLOAT
+ from .types import FloatRange as FloatRange
+diff --git a/src/click/types.py b/src/click/types.py
+index b6e98a9..92b857b 100644
+--- a/src/click/types.py
++++ b/src/click/types.py
+@@ -4,11 +4,13 @@ import abc
+ import collections.abc as cabc
+ import enum
+ import os
++import re
+ import stat
+ import sys
+ import typing as t
+ import uuid
+ from datetime import datetime
++from datetime import timedelta
+ from gettext import gettext as _
+ from gettext import ngettext
+ 
+@@ -590,6 +592,105 @@ class DateTime(ParamType[datetime]):
+         return "DateTime"
+ 
+ 
++class DurationInfoDict(ParamTypeInfoDict):
++    min: float | None
++    max: float | None
++
++
++_DURATION_NUMBER = r"\d+(?:\.\d+)?"
++# Each group is named after the ``timedelta`` argument it fills.
++_DURATION_RE = re.compile(
++    "".join(
++        rf"(?:(?P<{unit}>{_DURATION_NUMBER}){unit[0]})?"
++        for unit in ("days", "hours", "minutes", "seconds")
++    )
++)
++
++
++class Duration(ParamType[timedelta]):
++    """The Duration type converts a duration into a
++    :class:`datetime.timedelta`.
++
++    A plain non-negative number is a number of seconds (``"90"``,
++    ``"1.5"``). Otherwise the value is one or more ``<number><unit>``
++    parts with the units ``d``, ``h``, ``m``, ``s``, in this order and
++    each at most once, without spaces (``"1h30m"``, ``"1.5h"``).
++
++    :param min: The smallest accepted duration (inclusive).
++    :param max: The largest accepted duration (inclusive).
++
++    .. versionadded:: 8.6.0
++    """
++
++    name = "duration"
++
++    min: timedelta | None
++    max: timedelta | None
++
++    def __init__(
++        self, min: timedelta | None = None, max: timedelta | None = None
++    ) -> None:
++        self.min = min
++        self.max = max
++
++    def to_info_dict(self) -> DurationInfoDict:
++        return {
++            **super().to_info_dict(),
++            "min": None if self.min is None else self.min.total_seconds(),
++            "max": None if self.max is None else self.max.total_seconds(),
++        }
++
++    def _parse(self, value: t.Any) -> timedelta | None:
++        if not isinstance(value, str) or not value:
++            return None
++
++        if re.fullmatch(_DURATION_NUMBER, value):
++            return timedelta(seconds=float(value))
++
++        match = _DURATION_RE.fullmatch(value)
++
++        if match is None:
++            return None
++
++        return timedelta(
++            **{
++                unit: float(number)
++                for unit, number in match.groupdict().items()
++                if number is not None
++            }
++        )
++
++    def convert(
++        self, value: t.Any, param: Parameter | None, ctx: Context | None
++    ) -> timedelta:
++        if isinstance(value, timedelta):
++            return value
++
++        try:
++            converted = self._parse(value)
++        except OverflowError:
++            converted = None
++
++        if converted is None:
++            self.fail(
++                _("{value!r} is not a valid duration.").format(value=value),
++                param,
++                ctx,
++            )
++
++        if (self.min is not None and converted < self.min) or (
++            self.max is not None and converted > self.max
++        ):
++            self.fail(
++                _("{value!r} is out of range.").format(value=value), param, ctx
++            )
++
++        return converted
++
++    def __repr__(self) -> str:
++        return f"Duration({self.min!r}, {self.max!r})"
++
++
+ class _NumberParamTypeBase(
+     ParamType[_ValueT_co], t.Generic[_ValueT_contra, _ValueT_co]
+ ):
+diff --git a/tests/test_duration.py b/tests/test_duration.py
+new file mode 100644
+index 0000000..e36e259
+--- /dev/null
++++ b/tests/test_duration.py
+@@ -0,0 +1,58 @@
++from datetime import timedelta
++
++import pytest
++
++import click
++
++
++@pytest.mark.parametrize(
++    ("value", "expect"),
++    [
++        ("90", timedelta(seconds=90)),
++        ("1.5", timedelta(seconds=1.5)),
++        ("45s", timedelta(seconds=45)),
++        ("1h30m", timedelta(hours=1, minutes=30)),
++        ("1d2h3m4s", timedelta(days=1, hours=2, minutes=3, seconds=4)),
++        ("1.5h", timedelta(minutes=90)),
++        (timedelta(days=2), timedelta(days=2)),
++    ],
++)
++def test_convert(value, expect):
++    assert click.Duration().convert(value, None, None) == expect
++
++
++@pytest.mark.parametrize("value", ["", "abc", "1m1h", "1h1h", "1 h", "1H", "-5", "1x"])
++def test_invalid(runner, value):
++    @click.command()
++    @click.option("--timeout", type=click.Duration())
++    def cli(timeout):
++        pass
++
++    result = runner.invoke(cli, [f"--timeout={value}"])
++    assert result.exit_code == 2
++    assert f"{value!r} is not a valid duration." in result.output
++
++
++def test_bounds():
++    duration = click.Duration(min=timedelta(minutes=1), max=timedelta(hours=1))
++    assert duration.convert("1m", None, None) == timedelta(minutes=1)
++    assert duration.convert("1h", None, None) == timedelta(hours=1)
++
++    for value in "59s", "61m":
++        with pytest.raises(click.BadParameter, match="is out of range"):
++            duration.convert(value, None, None)
++
++
++def test_metavar_and_info_dict(runner):
++    @click.command()
++    @click.option("--timeout", type=click.Duration(max=timedelta(minutes=1)))
++    def cli(timeout):
++        pass
++
++    assert "--timeout DURATION" in runner.invoke(cli, ["--help"]).output
++    assert click.Duration(max=timedelta(minutes=1)).to_info_dict() == {
++        "param_type": "Duration",
++        "name": "duration",
++        "min": None,
++        "max": 60.0,
++    }

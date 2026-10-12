@@ -1,0 +1,119 @@
+diff --git a/src/click/shell_completion.py b/src/click/shell_completion.py
+index 8a2668b..6ae2462 100644
+--- a/src/click/shell_completion.py
++++ b/src/click/shell_completion.py
+@@ -268,6 +268,34 @@ Register-ArgumentCompleter -Native -CommandName %(prog_name)s -ScriptBlock {
+ }
+ """
+ 
++# Nushell calls the external completer with the words of the command line;
++# the last one is the word being completed (empty after a space).
++_SOURCE_NU = """\
++def %(complete_func)s [spans: list<string>] {
++    with-env {
++        %(complete_var)s: "nu_complete"
++        COMP_WORDS: ($spans | str join " ")
++        COMP_CWORD: (($spans | length) - 1 | into string)
++    } {
++        ^%(prog_name)s | lines | each {|line|
++            let parts = ($line | split row "\\t")
++            {value: ($parts | first), description: ($parts | get -o 1 | default "")}
++        }
++    }
++}
++
++let %(complete_func)s_previous = $env.config.completions.external.completer?
++
++$env.config.completions.external.enable = true
++$env.config.completions.external.completer = {|spans|
++    if ($spans | first) == "%(prog_name)s" {
++        %(complete_func)s $spans
++    } else if $%(complete_func)s_previous != null {
++        do $%(complete_func)s_previous $spans
++    }
++}
++"""
++
+ 
+ class _SourceVarsDict(t.TypedDict):
+     complete_func: str
+@@ -552,9 +580,30 @@ class PowerShellComplete(ShellComplete):
+         return f"{item.type}\n{item.value}\n{help_}"
+ 
+ 
++class NuComplete(PowerShellComplete):
++    """Shell completion for Nushell. The completion input is read from
++    ``COMP_WORDS`` and ``COMP_CWORD`` like :class:`PowerShellComplete`.
++
++    .. versionadded:: 8.6.0
++    """
++
++    name: t.ClassVar[str] = "nu"
++    source_template: t.ClassVar[str] = _SOURCE_NU
++
++    def format_completion(self, item: CompletionItem[str]) -> str:
++        # The script splits each line at the first tab into value and
++        # description, so the help text must stay on one line without tabs.
++        if item.help:
++            help_ = item.help.replace("\n", " ").replace("\t", " ")
++            return f"{item.value}\t{help_}"
++
++        return f"{item.value}"
++
++
+ _available_shells: t.Final[dict[str, type[ShellComplete]]] = {
+     "bash": BashComplete,
+     "fish": FishComplete,
++    "nu": NuComplete,
+     "powershell": PowerShellComplete,
+     "zsh": ZshComplete,
+ }
+diff --git a/tests/test_nushell_completion.py b/tests/test_nushell_completion.py
+new file mode 100644
+index 0000000..f25e896
+--- /dev/null
++++ b/tests/test_nushell_completion.py
+@@ -0,0 +1,43 @@
++import pytest
++
++import click
++from click.shell_completion import CompletionItem
++from click.shell_completion import get_completion_class
++from click.shell_completion import NuComplete
++
++
++@pytest.fixture
++def cli():
++    @click.group()
++    def cli():
++        pass
++
++    cli.add_command(click.Command("a"))
++    cli.add_command(click.Command("b", help="bee"))
++    return cli
++
++
++def test_registered():
++    assert get_completion_class("nu") is NuComplete
++
++
++def test_source(runner, cli):
++    result = runner.invoke(cli, prog_name="cli", env={"_CLI_COMPLETE": "nu_source"})
++    assert "def _cli_completion [spans: list<string>]" in result.output
++    assert '_CLI_COMPLETE: "nu_complete"' in result.output
++
++
++@pytest.mark.parametrize(
++    ("words", "cword", "expect"),
++    [("cli ", "1", "a\nb\tbee\n"), ("cli b", "1", "b\tbee\n"), ("cli a x", "1", "a\n")],
++)
++def test_complete(runner, cli, words, cword, expect):
++    env = {"_CLI_COMPLETE": "nu_complete", "COMP_WORDS": words, "COMP_CWORD": cword}
++    assert runner.invoke(cli, prog_name="cli", env=env).output == expect
++
++
++def test_format_completion_help_on_one_line(cli):
++    comp = NuComplete(cli, {}, "cli", "_CLI_COMPLETE")
++    item = CompletionItem("x", help="first\nsecond\tthird")
++    assert comp.format_completion(item) == "x\tfirst second third"
++    assert comp.format_completion(CompletionItem("x", type="dir")) == "x"
