@@ -1,0 +1,198 @@
+diff --git a/src/click/exceptions.py b/src/click/exceptions.py
+index 6272c38..d700041 100644
+--- a/src/click/exceptions.py
++++ b/src/click/exceptions.py
+@@ -33,20 +33,30 @@ def _format_possibilities(possibilities: list[str]) -> str:
+ 
+ 
+ class ClickException(Exception):
+-    """An exception that Click can handle and show to the user."""
++    """An exception that Click can handle and show to the user.
++
++    :param message: the error message to display.
++    :param hint: optionally a suggestion that is shown on its own line
++                 after the error.
++
++    .. versionchanged:: 8.6.0
++        Added the ``hint`` parameter.
++    """
+ 
+     #: The exit code for this exception.
+     exit_code: t.ClassVar[int] = 1
+ 
+     show_color: t.Final[bool | None]
+     message: t.Final[str]
++    hint: str | None
+ 
+-    def __init__(self, message: str) -> None:
++    def __init__(self, message: str, *, hint: str | None = None) -> None:
+         super().__init__(message)
+         # The context will be removed by the time we print the message, so cache
+         # the color settings here to be used later on (in `show`)
+         self.show_color = resolve_color_default()
+         self.message = message
++        self.hint = hint
+ 
+     def format_message(self) -> str:
+         return self.message
+@@ -63,6 +73,11 @@ class ClickException(Exception):
+             file=file,
+             color=self.show_color,
+         )
++        self._show_hint(file, self.show_color)
++
++    def _show_hint(self, file: t.IO[t.Any], color: bool | None) -> None:
++        if self.hint is not None:
++            echo(_("Hint: {hint}").format(hint=self.hint), file=file, color=color)
+ 
+ 
+ class UsageError(ClickException):
+@@ -79,8 +94,10 @@ class UsageError(ClickException):
+     ctx: Context | None
+     cmd: t.Final[Command | None]
+ 
+-    def __init__(self, message: str, ctx: Context | None = None) -> None:
+-        super().__init__(message)
++    def __init__(
++        self, message: str, ctx: Context | None = None, *, hint: str | None = None
++    ) -> None:
++        super().__init__(message, hint=hint)
+         self.ctx = ctx
+         self.cmd = self.ctx.command if self.ctx else None
+ 
+@@ -109,6 +126,7 @@ class UsageError(ClickException):
+             file=file,
+             color=color,
+         )
++        self._show_hint(file, color)
+ 
+ 
+ class BadParameter(UsageError):
+@@ -138,8 +156,10 @@ class BadParameter(UsageError):
+         ctx: Context | None = None,
+         param: Parameter | None = None,
+         param_hint: cabc.Sequence[str] | str | None = None,
++        *,
++        hint: str | None = None,
+     ) -> None:
+-        super().__init__(message, ctx)
++        super().__init__(message, ctx, hint=hint)
+         self.param = param
+         self.param_hint = param_hint
+ 
+@@ -177,8 +197,10 @@ class MissingParameter(BadParameter):
+         param: Parameter | None = None,
+         param_hint: cabc.Sequence[str] | str | None = None,
+         param_type: str | None = None,
++        *,
++        hint: str | None = None,
+     ) -> None:
+-        super().__init__(message or "", ctx, param, param_hint)
++        super().__init__(message or "", ctx, param, param_hint, hint=hint)
+         self.param_type = param_type
+ 
+     def format_message(self) -> str:
+@@ -244,11 +266,13 @@ class NoSuchOption(UsageError):
+         message: str | None = None,
+         possibilities: cabc.Iterable[str] | None = None,
+         ctx: Context | None = None,
++        *,
++        hint: str | None = None,
+     ) -> None:
+         if message is None:
+             message = _("No such option {name!r}.").format(name=option_name)
+ 
+-        super().__init__(message, ctx)
++        super().__init__(message, ctx, hint=hint)
+         self.option_name = option_name
+ 
+         if possibilities:
+@@ -280,11 +304,13 @@ class NoSuchCommand(UsageError):
+         message: str | None = None,
+         possibilities: cabc.Iterable[str] | None = None,
+         ctx: Context | None = None,
++        *,
++        hint: str | None = None,
+     ) -> None:
+         if message is None:
+             message = _("No such command {name!r}.").format(name=command_name)
+ 
+-        super().__init__(message, ctx)
++        super().__init__(message, ctx, hint=hint)
+         self.command_name = command_name
+ 
+         if possibilities:
+@@ -314,9 +340,14 @@ class BadOptionUsage(UsageError):
+     option_name: t.Final[str]
+ 
+     def __init__(
+-        self, option_name: str, message: str, ctx: Context | None = None
++        self,
++        option_name: str,
++        message: str,
++        ctx: Context | None = None,
++        *,
++        hint: str | None = None,
+     ) -> None:
+-        super().__init__(message, ctx)
++        super().__init__(message, ctx, hint=hint)
+         self.option_name = option_name
+ 
+ 
+diff --git a/tests/test_error_hints.py b/tests/test_error_hints.py
+new file mode 100644
+index 0000000..26613a0
+--- /dev/null
++++ b/tests/test_error_hints.py
+@@ -0,0 +1,51 @@
++import io
++
++import pytest
++
++import click
++
++
++def show(exc):
++    out = io.StringIO()
++    exc.show(out)
++    return out.getvalue()
++
++
++@pytest.mark.parametrize(
++    ("exc", "expect"),
++    [
++        (click.ClickException("boom", hint="retry"), "Error: boom\nHint: retry\n"),
++        (click.ClickException("boom"), "Error: boom\n"),
++        (click.UsageError("bad", hint="retry"), "Error: bad\nHint: retry\n"),
++        (
++            click.BadParameter("bad", param_hint="--x", hint="retry"),
++            "Error: Invalid value for --x: bad\nHint: retry\n",
++        ),
++        (
++            click.NoSuchOption("--x", hint="retry"),
++            "Error: No such option '--x'.\nHint: retry\n",
++        ),
++        (
++            click.FileError("f.txt", hint="denied"),
++            "Error: Could not open file 'f.txt': denied\n",
++        ),
++    ],
++)
++def test_show(exc, expect):
++    assert show(exc) == expect
++
++
++def test_hint_attribute():
++    assert click.UsageError("bad", hint="retry").hint == "retry"
++    assert click.UsageError("bad").hint is None
++    assert click.FileError("f.txt", hint="denied").hint is None
++
++
++def test_command_output(runner):
++    @click.command()
++    def cli():
++        raise click.UsageError("bad", hint="retry")
++
++    result = runner.invoke(cli)
++    assert result.exit_code == 2
++    assert result.output.endswith("\n\nError: bad\nHint: retry\n")

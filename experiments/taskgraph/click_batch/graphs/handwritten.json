@@ -1,0 +1,343 @@
+{
+  "request_id": "click-batch-handwritten",
+  "request": "# Batch of improvements for click\n\nThis repository is the click command-line library. Implement the eight\nindependent changes below. Each one is small; together they touch several\nparts of the library. Keep every existing test passing and add tests for\nthe new behaviour. Public names listed as \"exported from `click`\" must be\nimportable as `click.<name>`.\n\n## 1. `click.Duration` parameter type\n\nAdd a parameter type class `Duration` in `click/types.py`, exported from\n`click`, that converts a duration to `datetime.timedelta`.\n\n- A plain non-negative number means seconds: `\"90\"`, `\"1.5\"`.\n- Otherwise the value is one or more `<number><unit>` parts with units\n  `d`, `h`, `m`, `s` (lowercase), in this order, each unit at most once,\n  without spaces: `\"45s\"`, `\"2d\"`, `\"1h30m\"`, `\"1d2h3m4s\"`, `\"1.5h\"`.\n- A `datetime.timedelta` value is returned unchanged.\n- `Duration(min=None, max=None)` takes optional `timedelta` bounds\n  (inclusive). A value outside the bounds fails.\n- Any other value fails. Failures use the parameter type's normal failure\n  mechanism, so a command reports them as a usage error (exit code 2).\n  The message for an invalid value contains `is not a valid duration`;\n  the message for a value outside the bounds contains `is out of range`.\n- The type's `name` is `\"duration\"` and its metavar in help output is\n  `DURATION`. `to_info_dict()` includes `\"min\"` and `\"max\"`, each `None` or\n  the bound in seconds as a float.\n\n## 2. `click.select`\n\nAdd `select(text, options, default=None)` in `click/termui.py`, exported\nfrom `click`, that lets the user pick one of several strings.\n\n- It prints `text`, then each option on its own line as `  {n}) {option}`\n  with `n` counting from 1, then prompts with `click.prompt` using the\n  prompt text `Enter a number`. If `default` is given, the prompt's default\n  is the default option's number.\n- The answer may be a number from 1 to the number of options, or the exact\n  text of an option. `select` returns the chosen option string.\n- For any other answer it prints `Error: '{answer}' is not a valid choice.`\n  and prompts again.\n- An empty `options` list, or a `default` that is not one of the options,\n  raises `ValueError`.\n\n## 3. Test helpers on `click.testing.Result`\n\n- `Result.output_lines`: a property returning `output` split into lines,\n  without line endings.\n- `Result.assert_success(output=None)`: raises `AssertionError` if\n  `exit_code` is not 0; the message contains the exit code and the output.\n  If `output` is given, it also raises `AssertionError` when `output` is\n  not exactly equal to it. It returns the result itself.\n\n## 4. Nushell completion\n\nSupport Nushell as a completion shell named `nu`, through a class\n`NuComplete` in `click/shell_completion.py` registered in the same way as\nthe existing shells, so that `_{PROG}_COMPLETE=nu_source` prints a source\nscript and `_{PROG}_COMPLETE=nu_complete` prints completions.\n\n- The source script contains the program name and the string\n  `nu_complete`.\n- Completion input is read like the PowerShell completer: environment\n  variable `COMP_WORDS` (the command line) and `COMP_CWORD` (the index of\n  the word being completed).\n- Each completion is printed on its own line as `{value}\\t{help}`, or just\n  `{value}` when there is no help. Newlines and tabs in the help text are\n  replaced by spaces.\n\n## 5. `click.mutually_exclusive`\n\nAdd a decorator `mutually_exclusive(*names)` in `click/decorators.py`,\nexported from `click`. It is applied to a command callback below the\n`@click.command()` and parameter decorators:\n\n    @click.command()\n    @click.option(\"--json\", is_flag=True)\n    @click.option(\"--csv\", is_flag=True)\n    @click.mutually_exclusive(\"json\", \"csv\")\n    def export(json, csv): ...\n\nWhen the command runs and more than one of the named parameters was given\non the command line or through an environment variable (not just left at\nits default), the command fails with a usage error (exit code 2) whose\nmessage contains every conflicting option as it appears in help (for\nexample `--json` and `--csv`) and the words `cannot be used together`.\nFewer than two names, or a name that is not a parameter of the command,\nraises `ValueError` when the command is invoked.\n\n## 6. `click.format_size`\n\nAdd `format_size(num_bytes, binary=False)` in `click/utils.py`, exported\nfrom `click`, returning a human-readable size.\n\n- With `binary=False` it uses powers of 1000 and units `B`, `kB`, `MB`,\n  `GB`, `TB`, `PB`; with `binary=True` powers of 1024 and units `B`, `KiB`,\n  `MiB`, `GiB`, `TiB`, `PiB`.\n- Values below 1000 (or 1024) are printed as an integer: `\"512 B\"`.\n  Larger values use the largest unit that keeps the number at least 1,\n  with one decimal: `\"1.5 kB\"`, `\"2.0 MiB\"`. Beyond the last unit, the last\n  unit is used.\n- Negative values raise `ValueError`.\n\n## 7. Bullet lists in `click.wrap_text`\n\nAdd a parameter `preserve_bullets=False` to `wrap_text` in\n`click/formatting.py`. When it is true, a line starting with `- `, `* `,\nor a number followed by `. ` (after any initial indent) starts a new\nbullet item: the item is wrapped to the width on its own, and its\ncontinuation lines are indented so that they line up with the text after\nthe bullet marker. Text that is not a bullet item is wrapped as before.\nWith the default `False`, the output is exactly as before.\n\n## 8. Hints on errors\n\nGive `click.ClickException` (and so all its subclasses, including\n`UsageError`) an optional keyword argument `hint=None` and an attribute\n`hint`. When `hint` is set, `show()` prints an extra final line\n`Hint: {hint}` after the usual error output. Without a hint, the output is\nunchanged.\n",
+  "repo": "click_batch",
+  "base_commit": "a9af6116c1c33ee893651f3523605a6e3dfaa643",
+  "final_checks": [
+    "python -m pytest -q tests"
+  ],
+  "generator": {
+    "kind": "manual",
+    "revision_mode": "none"
+  },
+  "nodes": [
+    {
+      "id": "A",
+      "title": "Contract: export the four new public names from click",
+      "kind": "contract",
+      "goal": "Four changes of the request add a public name that must be importable from click. Export them in src/click/__init__.py, in the style and alphabetical order of the imports there: Duration from .types, select from .termui, mutually_exclusive from .decorators, and format_size from .utils. So that `import click` keeps working, add each name to its module as a stub and nothing more: the signature the request gives, a one-line docstring, and a body that does no real work. In src/click/types.py, class Duration(ParamType) with name = \"duration\" and __init__(self, min=None, max=None) that stores the bounds (do not write convert). In src/click/termui.py, select(text, options, default=None) raising NotImplementedError. In src/click/decorators.py, mutually_exclusive(*names) returning a decorator that returns the callback unchanged. In src/click/utils.py, format_size(num_bytes, binary=False) raising NotImplementedError. Put each stub where the finished code belongs (Duration after DateTime, select after prompt, mutually_exclusive before command, format_size after format_filename). Do not implement any behaviour of the request, do not touch any other file, and write no tests: four other sub-tasks replace the stubs, each in its own module.",
+      "edit_set": {
+        "any_file": false,
+        "modify": [
+          "src/click/__init__.py",
+          "src/click/types.py",
+          "src/click/termui.py",
+          "src/click/decorators.py",
+          "src/click/utils.py"
+        ],
+        "create": [],
+        "symbols": []
+      },
+      "requires": [],
+      "requires_impl": [],
+      "provides": [
+        "src/click/__init__.py::Duration",
+        "src/click/__init__.py::select",
+        "src/click/__init__.py::mutually_exclusive",
+        "src/click/__init__.py::format_size",
+        "src/click/types.py::Duration",
+        "src/click/termui.py::select",
+        "src/click/decorators.py::mutually_exclusive",
+        "src/click/utils.py::format_size"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [],
+      "size": "small"
+    },
+    {
+      "id": "T1",
+      "title": "click.Duration parameter type",
+      "kind": "implement",
+      "goal": "Implement change 1 of the request in src/click/types.py only. Replace the stub class Duration with the real parameter type: convert, the bounds, the failure messages, and to_info_dict. Fail through ParamType.fail, as the other types in the module do. click/__init__.py already exports Duration. The request is the specification of the change; implement exactly what it says for this change and nothing from the other seven. Do not edit any other file. Write the tests of this change in the new file tests/test_duration.py.",
+      "edit_set": {
+        "any_file": false,
+        "modify": [
+          "src/click/types.py"
+        ],
+        "create": [
+          "tests/test_duration.py"
+        ],
+        "symbols": []
+      },
+      "requires": [
+        "src/click/__init__.py::Duration"
+      ],
+      "requires_impl": [],
+      "provides": [
+        "src/click/types.py::Duration"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_duration.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "src/click/exceptions.py"
+      ],
+      "size": "small"
+    },
+    {
+      "id": "T2",
+      "title": "click.select",
+      "kind": "implement",
+      "goal": "Implement change 2 of the request in src/click/termui.py only. Replace the stub select with the real function, built on prompt and echo of the same module. click/__init__.py already exports select. Test it with CliRunner.invoke(..., input=...). The request is the specification of the change; implement exactly what it says for this change and nothing from the other seven. Do not edit any other file. Write the tests of this change in the new file tests/test_select.py.",
+      "edit_set": {
+        "any_file": false,
+        "modify": [
+          "src/click/termui.py"
+        ],
+        "create": [
+          "tests/test_select.py"
+        ],
+        "symbols": []
+      },
+      "requires": [
+        "src/click/__init__.py::select"
+      ],
+      "requires_impl": [],
+      "provides": [
+        "src/click/termui.py::select"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_select.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [],
+      "size": "small"
+    },
+    {
+      "id": "T3",
+      "title": "Result.output_lines and Result.assert_success",
+      "kind": "implement",
+      "goal": "Implement change 3 of the request in src/click/testing.py only. Add the property output_lines and the method assert_success to the class Result. The request is the specification of the change; implement exactly what it says for this change and nothing from the other seven. Do not edit any other file. Write the tests of this change in the new file tests/test_result_helpers.py.",
+      "edit_set": {
+        "any_file": false,
+        "modify": [
+          "src/click/testing.py"
+        ],
+        "create": [
+          "tests/test_result_helpers.py"
+        ],
+        "symbols": []
+      },
+      "requires": [],
+      "requires_impl": [],
+      "provides": [
+        "src/click/testing.py::Result.output_lines",
+        "src/click/testing.py::Result.assert_success"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_result_helpers.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [],
+      "size": "small"
+    },
+    {
+      "id": "T4",
+      "title": "Nushell completion",
+      "kind": "implement",
+      "goal": "Implement change 4 of the request in src/click/shell_completion.py only. Add a source script template and the class NuComplete next to the other shells, and register it under the name nu in the table of available shells. Read COMP_WORDS and COMP_CWORD as PowerShellComplete does. The request is the specification of the change; implement exactly what it says for this change and nothing from the other seven. Do not edit any other file. Write the tests of this change in the new file tests/test_nushell_completion.py.",
+      "edit_set": {
+        "any_file": false,
+        "modify": [
+          "src/click/shell_completion.py"
+        ],
+        "create": [
+          "tests/test_nushell_completion.py"
+        ],
+        "symbols": []
+      },
+      "requires": [],
+      "requires_impl": [],
+      "provides": [
+        "src/click/shell_completion.py::NuComplete"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_nushell_completion.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [],
+      "size": "small"
+    },
+    {
+      "id": "T5",
+      "title": "click.mutually_exclusive",
+      "kind": "implement",
+      "goal": "Implement change 5 of the request in src/click/decorators.py only. Replace the stub mutually_exclusive with the real decorator: wrap the callback like the other decorators of the module do, and do every check when the command is invoked. In the wrapper, get_current_context() gives the context; Context.get_parameter_source(name) returns ParameterSource.COMMANDLINE or ParameterSource.ENVIRONMENT (src/click/core.py) for a parameter that was given, ctx.command.params lists the command's parameters, and a parameter's option names are in Parameter.opts. click/__init__.py already exports mutually_exclusive. The request is the specification of the change; implement exactly what it says for this change and nothing from the other seven. Do not edit any other file. Write the tests of this change in the new file tests/test_mutually_exclusive.py.",
+      "edit_set": {
+        "any_file": false,
+        "modify": [
+          "src/click/decorators.py"
+        ],
+        "create": [
+          "tests/test_mutually_exclusive.py"
+        ],
+        "symbols": []
+      },
+      "requires": [
+        "src/click/__init__.py::mutually_exclusive"
+      ],
+      "requires_impl": [],
+      "provides": [
+        "src/click/decorators.py::mutually_exclusive"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_mutually_exclusive.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "src/click/exceptions.py",
+        "src/click/globals.py"
+      ],
+      "size": "small"
+    },
+    {
+      "id": "T6",
+      "title": "click.format_size",
+      "kind": "implement",
+      "goal": "Implement change 6 of the request in src/click/utils.py only. Replace the stub format_size with the real function. click/__init__.py already exports format_size. Do not import new standard library modules at module level: tests/test_imports.py limits what `import click` may import. The request is the specification of the change; implement exactly what it says for this change and nothing from the other seven. Do not edit any other file. Write the tests of this change in the new file tests/test_format_size.py.",
+      "edit_set": {
+        "any_file": false,
+        "modify": [
+          "src/click/utils.py"
+        ],
+        "create": [
+          "tests/test_format_size.py"
+        ],
+        "symbols": []
+      },
+      "requires": [
+        "src/click/__init__.py::format_size"
+      ],
+      "requires_impl": [],
+      "provides": [
+        "src/click/utils.py::format_size"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_format_size.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [],
+      "size": "small"
+    },
+    {
+      "id": "T7",
+      "title": "Bullet lists in wrap_text",
+      "kind": "implement",
+      "goal": "Implement change 7 of the request in src/click/formatting.py only. Add the parameter preserve_bullets to wrap_text, for both values of preserve_paragraphs. With preserve_bullets=False the function must return exactly what it returns now. Only `re` and other modules that click already imports may be imported at module level (tests/test_imports.py). The request is the specification of the change; implement exactly what it says for this change and nothing from the other seven. Do not edit any other file. Write the tests of this change in the new file tests/test_wrap_bullets.py.",
+      "edit_set": {
+        "any_file": false,
+        "modify": [
+          "src/click/formatting.py"
+        ],
+        "create": [
+          "tests/test_wrap_bullets.py"
+        ],
+        "symbols": []
+      },
+      "requires": [],
+      "requires_impl": [],
+      "provides": [
+        "src/click/formatting.py::wrap_text"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_wrap_bullets.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [
+        "src/click/_textwrap.py"
+      ],
+      "size": "small"
+    },
+    {
+      "id": "T8",
+      "title": "Hints on errors",
+      "kind": "implement",
+      "goal": "Implement change 8 of the request in src/click/exceptions.py only. Add the keyword-only argument hint and the attribute hint to ClickException, pass it through the __init__ of every subclass that defines one, and print the Hint line at the end of ClickException.show and UsageError.show. FileError already has a positional argument named hint with another meaning (the reason the file could not be opened): leave FileError as it is. The request is the specification of the change; implement exactly what it says for this change and nothing from the other seven. Do not edit any other file. Write the tests of this change in the new file tests/test_error_hints.py.",
+      "edit_set": {
+        "any_file": false,
+        "modify": [
+          "src/click/exceptions.py"
+        ],
+        "create": [
+          "tests/test_error_hints.py"
+        ],
+        "symbols": [
+          "src/click/exceptions.py::ClickException.show",
+          "src/click/exceptions.py::UsageError.show"
+        ]
+      },
+      "requires": [],
+      "requires_impl": [],
+      "provides": [
+        "src/click/exceptions.py::ClickException.hint"
+      ],
+      "check": {
+        "commands": [
+          "python -m pytest -q tests",
+          "python -m pytest -q tests/test_error_hints.py"
+        ],
+        "timeout_s": 300
+      },
+      "context_files": [],
+      "size": "small"
+    }
+  ],
+  "edges": [
+    {
+      "from": "A",
+      "to": "T1",
+      "type": "interface",
+      "source": "manual",
+      "reason": "T1 replaces the stub of Duration that A added to its module, and its tests import click.Duration, which A exports."
+    },
+    {
+      "from": "A",
+      "to": "T2",
+      "type": "interface",
+      "source": "manual",
+      "reason": "T2 replaces the stub of select that A added to its module, and its tests import click.select, which A exports."
+    },
+    {
+      "from": "A",
+      "to": "T5",
+      "type": "interface",
+      "source": "manual",
+      "reason": "T5 replaces the stub of mutually_exclusive that A added to its module, and its tests import click.mutually_exclusive, which A exports."
+    },
+    {
+      "from": "A",
+      "to": "T6",
+      "type": "interface",
+      "source": "manual",
+      "reason": "T6 replaces the stub of format_size that A added to its module, and its tests import click.format_size, which A exports."
+    }
+  ],
+  "revision_log": []
+}

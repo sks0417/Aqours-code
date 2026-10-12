@@ -1,0 +1,114 @@
+diff --git a/src/click/__init__.py b/src/click/__init__.py
+index 61f8c42..b8b60a5 100644
+--- a/src/click/__init__.py
++++ b/src/click/__init__.py
+@@ -51,6 +51,7 @@ from .termui import pause as pause
+ from .termui import progressbar as progressbar
+ from .termui import prompt as prompt
+ from .termui import secho as secho
++from .termui import select as select
+ from .termui import style as style
+ from .termui import unstyle as unstyle
+ from .types import BOOL as BOOL
+diff --git a/src/click/termui.py b/src/click/termui.py
+index 8fe0085..fa385e9 100644
+--- a/src/click/termui.py
++++ b/src/click/termui.py
+@@ -286,6 +286,50 @@ def prompt(
+         echo(_("Error: The two entered values do not match."), err=err)
+ 
+ 
++def select(text: str, options: cabc.Sequence[str], default: str | None = None) -> str:
++    """Let the user pick one of several strings and return it.
++
++    Prints ``text`` and a numbered list of the options, then prompts for
++    a number. The answer may also be the exact text of an option. Any
++    other answer shows an error and prompts again.
++
++    :param text: The text to show above the options.
++    :param options: The strings to choose from.
++    :param default: The option used when no input is given.
++    :raises ValueError: If ``options`` is empty or ``default`` is not one
++        of the options.
++
++    .. versionadded:: 8.6.0
++    """
++    options = list(options)
++
++    if not options:
++        raise ValueError("'options' must not be empty.")
++
++    if default is not None and default not in options:
++        raise ValueError(f"The default {default!r} is not one of the options.")
++
++    def value_proc(answer: str) -> str:
++        if answer in options:
++            return answer
++
++        if answer.isascii() and answer.isdigit() and 1 <= int(answer) <= len(options):
++            return options[int(answer) - 1]
++
++        raise UsageError(_("{answer!r} is not a valid choice.").format(answer=answer))
++
++    echo(text)
++
++    for number, option in enumerate(options, 1):
++        echo(f"  {number}) {option}")
++
++    return prompt(
++        _("Enter a number"),
++        default=None if default is None else str(options.index(default) + 1),
++        value_proc=value_proc,
++    )
++
++
+ def confirm(
+     text: str,
+     default: bool | None = False,
+diff --git a/tests/test_select.py b/tests/test_select.py
+new file mode 100644
+index 0000000..7f35e05
+--- /dev/null
++++ b/tests/test_select.py
+@@ -0,0 +1,41 @@
++import pytest
++
++import click
++
++
++def run(runner, input, default=None):
++    @click.command()
++    def cli():
++        click.echo(click.select("Colour?", ["red", "green", "blue"], default=default))
++
++    return runner.invoke(cli, input=input)
++
++
++@pytest.mark.parametrize(("input", "expect"), [("1\n", "red"), ("blue\n", "blue")])
++def test_select(runner, input, expect):
++    result = run(runner, input)
++    assert result.output == (
++        "Colour?\n  1) red\n  2) green\n  3) blue\n"
++        f"Enter a number: {input}{expect}\n"
++    )
++
++
++def test_default(runner):
++    result = run(runner, "\n", default="green")
++    assert "Enter a number [2]: " in result.output
++    assert result.output.endswith("\ngreen\n")
++
++
++def test_invalid_answer_prompts_again(runner):
++    result = run(runner, "4\npink\n3\n")
++    assert "Error: '4' is not a valid choice.\n" in result.output
++    assert "Error: 'pink' is not a valid choice.\n" in result.output
++    assert result.output.endswith("\nblue\n")
++
++
++def test_invalid_arguments():
++    with pytest.raises(ValueError):
++        click.select("Colour?", [])
++
++    with pytest.raises(ValueError):
++        click.select("Colour?", ["red"], default="blue")
