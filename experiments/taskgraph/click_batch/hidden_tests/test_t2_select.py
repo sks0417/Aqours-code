@@ -58,7 +58,8 @@ def test_exact_text_selects_option(runner):
 
 
 def test_default_is_the_number_of_the_default_option(runner):
-    """If `default` is given, the prompt's default is the default option's number."""
+    """If `default` is given, the prompt's default is the default option's
+    number (click.prompt shows it as `[n]`)."""
     result = run_select(runner, "\n", default="banana")
     assert result.exit_code == 0, result.output
     assert "Enter a number [2]" in result.output

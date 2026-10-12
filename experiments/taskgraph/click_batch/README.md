@@ -97,6 +97,16 @@ Eight tickets, each in one module. Four add a name that is exported from
 | 7 | `wrap_text(preserve_bullets=...)` | `formatting.py` | |
 | 8 | `hint=` on `ClickException` and its subclasses | `exceptions.py` | |
 
+The request was amended once, on 2026-10-11 and before any run, because two
+hidden tests relied on something it did not say:
+
+- ticket 2: "(click.prompt shows it as `[n]`)" after "the prompt's default is
+  the default option's number", for the test that looks for
+  `Enter a number [2]`;
+- ticket 7: "An item continues over the following lines until the next line
+  that starts a bullet item or a blank line.", for
+  `test_item_runs_until_the_next_item`, which had assumed where an item ends.
+
 ## Reference solution
 
 `reference/t1_duration.patch` ... `reference/t8_hint.patch`, one per ticket,
@@ -162,8 +172,8 @@ specification did not state. The rules here:
     input;
   - ticket 7: what separates one item from the next or from the surrounding
     text (the tests compare non-empty lines), indented bullet lines, the
-    combination with `initial_indent` / `subsequent_indent`, text after the
-    last item in the same paragraph;
+    combination with `initial_indent` / `subsequent_indent`, a blank line
+    after an item when `preserve_paragraphs` is off;
   - ticket 8: `FileError`, whose existing positional argument is also named
     `hint`, and subclasses other than `UsageError` and `BadParameter`.
 
@@ -195,7 +205,7 @@ tests pass. `tests/taskgraph/test_click_batch_task.py` checks this.
 | `test_prompts_for_a_number_after_the_options` | then prompts with `click.prompt` using the prompt text `Enter a number`. |
 | `test_number_selects_option` | The answer may be a number from 1 to the number of options ... `select` returns the chosen option string. |
 | `test_exact_text_selects_option` | The answer may be ... the exact text of an option. |
-| `test_default_is_the_number_of_the_default_option` | If `default` is given, the prompt's default is the default option's number. |
+| `test_default_is_the_number_of_the_default_option` | If `default` is given, the prompt's default is the default option's number (click.prompt shows it as `[n]`). |
 | `test_other_answers_print_an_error_and_prompt_again` | For any other answer it prints `Error: '{answer}' is not a valid choice.` and prompts again. |
 | `test_empty_options_raise_value_error` | An empty `options` list ... raises `ValueError`. |
 | `test_default_that_is_not_an_option_raises_value_error` | a `default` that is not one of the options, raises `ValueError`. |
@@ -262,11 +272,11 @@ tests pass. `tests/taskgraph/test_click_batch_task.py` checks this.
 | `test_star_items` | a line starting with `- `, `* `, ... starts a new bullet item |
 | `test_numbered_items_line_up_after_the_number` | or a number followed by `. ` ... its continuation lines are indented so that they line up with the text after the bullet marker. |
 | `test_every_item_starts_its_own_line_when_it_fits` | a line starting with `- ` ... starts a new bullet item |
-| `test_item_runs_until_the_next_item` | a line starting with `- ` ... starts a new bullet item: the item is wrapped to the width on its own |
+| `test_item_runs_until_the_next_item` | An item continues over the following lines until the next line that starts a bullet item or a blank line. |
 | `test_no_line_is_wider_than_the_width` | the item is wrapped to the width on its own |
 | `test_text_without_items_is_wrapped_as_before` | Text that is not a bullet item is wrapped as before. |
 | `test_text_before_items_is_wrapped_as_before` | Text that is not a bullet item is wrapped as before. |
-| `test_items_between_paragraphs` | Text that is not a bullet item is wrapped as before. (with `preserve_paragraphs`, the paragraphs around a list) |
+| `test_items_between_paragraphs` | An item continues over the following lines until ... a blank line. / Text that is not a bullet item is wrapped as before. (with `preserve_paragraphs`, the paragraphs around a list) |
 
 **`test_t8_hint.py`** (8 tests)
 

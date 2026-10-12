@@ -68,14 +68,15 @@ def test_every_item_starts_its_own_line_when_it_fits():
 
 
 def test_item_runs_until_the_next_item():
-    """a line starting with `- ` ... starts a new bullet item: the item is
-    wrapped to the width on its own"""
-    text = "- alpha beta\n  gamma delta epsilon\n- zeta"
-    assert lines(click.wrap_text(text, 20, preserve_bullets=True)) == [
-        "- alpha beta gamma",
-        "  delta epsilon",
-        "- zeta",
-    ]
+    """An item continues over the following lines until the next line that
+    starts a bullet item or a blank line."""
+    for text in ("- alpha beta\n  gamma delta epsilon\n- zeta",
+                 "- alpha beta\ngamma delta epsilon\n- zeta"):
+        assert lines(click.wrap_text(text, 20, preserve_bullets=True)) == [
+            "- alpha beta gamma",
+            "  delta epsilon",
+            "- zeta",
+        ], text
 
 
 def test_no_line_is_wider_than_the_width():
@@ -111,7 +112,8 @@ def test_text_before_items_is_wrapped_as_before():
 
 
 def test_items_between_paragraphs():
-    """Text that is not a bullet item is wrapped as before. (with
+    """An item continues over the following lines until ... a blank line. /
+    Text that is not a bullet item is wrapped as before. (with
     `preserve_paragraphs`, the paragraphs around a list)"""
     last = "Last paragraph of plain text here."
     wrapped = click.wrap_text(

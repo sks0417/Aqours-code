@@ -34,7 +34,7 @@ from `click`, that lets the user pick one of several strings.
 - It prints `text`, then each option on its own line as `  {n}) {option}`
   with `n` counting from 1, then prompts with `click.prompt` using the
   prompt text `Enter a number`. If `default` is given, the prompt's default
-  is the default option's number.
+  is the default option's number (click.prompt shows it as `[n]`).
 - The answer may be a number from 1 to the number of options, or the exact
   text of an option. `select` returns the chosen option string.
 - For any other answer it prints `Error: '{answer}' is not a valid choice.`
@@ -108,8 +108,10 @@ Add a parameter `preserve_bullets=False` to `wrap_text` in
 or a number followed by `. ` (after any initial indent) starts a new
 bullet item: the item is wrapped to the width on its own, and its
 continuation lines are indented so that they line up with the text after
-the bullet marker. Text that is not a bullet item is wrapped as before.
-With the default `False`, the output is exactly as before.
+the bullet marker. An item continues over the following lines until the
+next line that starts a bullet item or a blank line. Text that is not a
+bullet item is wrapped as before. With the default `False`, the output is
+exactly as before.
 
 ## 8. Hints on errors
 
