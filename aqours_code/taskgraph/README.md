@@ -292,7 +292,17 @@ up to 600 s (and never past the worker's deadline); a command that times out
 gets a fresh container on the same worktree for the next command. The
 container is removed when the worker ends, and the coordinator removes any
 leftover after the worker process exits, however it ended. The worker prompt
-tells the agent that bash runs in a Linux container at `/workspace`.
+tells the agent that bash runs in a Linux container at `/workspace`, and to
+use `/dev/null` and Linux commands, never `nul` or Windows commands.
+
+A Windows habit such as `dir /b src 2>nul` creates a file named `nul` in the
+container. On a Windows host that name is a device: git cannot commit the file
+and a plain delete fails. So after every worker attempt, before the commit,
+the coordinator deletes each file in the worktree whose name without its
+extension is `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9` or `LPT1`–`LPT9` (in
+any letter case, in any directory), on every host. No task needs such a file.
+The deleted paths are recorded in the node's `removed_reserved_files` and in a
+`reserved_files_removed` event.
 
 Inside the container git commands fail (the worktree's `.git` file points to
 a host path). Workers must not change repository state anyway; the
@@ -362,7 +372,8 @@ found, `0` when none is, and `2` when no run directory is found.
    `tg/node/<id>` and worktree `wt/<id>` from the last integration commit
    whose post-merge check passed (never from a merge still being checked, so
    an undone merge cannot leak into another branch), write the
-   prompt, run the worker, and commit `attempt <n>`. The attempt fails on a
+   prompt, run the worker, delete reserved-name files (see
+   [Worker sandbox](#worker-sandbox)), and commit `attempt <n>`. The attempt fails on a
    worker error (`worker_error`), on a timeout without changes
    (`worker_timeout`), on no change since the start
    commit (`no_changes`), or on a failing check command run in the worktree
@@ -411,9 +422,13 @@ found, `0` when none is, and `2` when no run directory is found.
    run `python -m pytest -q _hidden_tests -p no:cacheprovider --junitxml=...`.
    Workers never see these tests.
 6. **Audit and clean up.** Scan the traces for escape attempts (see
-   [Escape audit](#escape-audit)), then delete `final/_hidden_tests/` and
-   `wt/`, so that no later worker can find this run's answers. `final/`
-   keeps the final code; `nodes/` keeps the diffs, logs and traces.
+   [Escape audit](#escape-audit)) and write `summary.json`. Only then delete
+   `final/_hidden_tests/` and `wt/`, so that no later worker can find this
+   run's answers. `final/` keeps the final code; `nodes/` keeps the diffs,
+   logs and traces. A path that cannot be deleted does not fail the run: it
+   gives a `cleanup_warning` event and a `warning: cleanup:` line on stderr.
+   Delete that path by hand before the next run. `wall_time_s` does not
+   include this clean-up.
 
 The run status is `success` when every node is merged and every final check
 passes, `partial` when some node is merged, and `failed` otherwise. Hidden
@@ -453,9 +468,10 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
 `check_start`, `check_end`, `merge_start`, `merge_end`,
 `post_merge_check_end`, `merge_repair_start` (with `attempt`),
 `merge_repair_end` (with `ok`: whether the node was merged after the repair),
+`reserved_files_removed` (with `attempt`, `files`),
 `node_merged`, `node_failed`, `node_skipped`,
 `final_checks_end`, `hidden_tests_end`, `escape_audit_end` (with `total`),
-`run_end`.
+`cleanup_warning` (with `path`, `error`), `run_end`.
 
 ### summary.json
 
@@ -466,7 +482,7 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
   `out_of_scope_files`, `merge_commit`, `error`, `escape_attempts`,
   `escape_samples`, `merge_repairs` (repair rounds that ran), `merge_repair_ok`
   (`true` if the node was merged after a repair, `false` if it still failed,
-  `null` without a repair);
+  `null` without a repair), `removed_reserved_files`;
 - `totals`: `model_calls`, `input_tokens`, `output_tokens`;
 - `final_checks`: one entry per command (`command`, `ok`, `exit_code`,
   `timed_out`, `duration_s`);

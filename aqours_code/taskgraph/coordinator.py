@@ -9,11 +9,9 @@ a merge, its post-merge check, and a possible undo run as one unit under
 from __future__ import annotations
 
 import json
-import os
 import platform
 import secrets
 import shutil
-import stat
 import sys
 import threading
 import time
@@ -24,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import gitops
+from .cleanup import remove_reserved_files, remove_tree
 from .context_pack import build_context_pack
 from .context_metrics import node_context_metrics
 from .escapes import scan_run
@@ -36,7 +35,7 @@ from .validate import ValidationReport, edit_files, unique_nodes, usable_edges, 
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
 DEFAULT_MERGE_REPAIRS = 1
-TASKGRAPH_VERSION = "coordinator-v0.4"
+TASKGRAPH_VERSION = "coordinator-v0.5"
 AQOURS_SOURCE = Path(__file__).resolve().parents[2]
 DEFAULT_WORKERS = 2
 DEFAULT_MAX_ATTEMPTS = 2
@@ -96,6 +95,8 @@ class NodeRecord:
     confirmed_reads: list[str] = field(default_factory=list)
     merge_repairs: int = 0
     merge_repair_ok: bool | None = None  # None: no repair was needed
+    # Files named like a Windows device (nul, con, ...) deleted after a worker.
+    removed_reserved_files: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -104,23 +105,14 @@ class RunResult:
 
     run_dir: Path
     summary: dict
+    # What could not be deleted at the end of the run; the results stand.
+    cleanup_warnings: list[str] = field(default_factory=list)
 
 
 def worker_sandbox(worker: Worker) -> SandboxConfig:
     """Where the worker runs shell commands (``none`` if it does not say)."""
     sandbox = getattr(worker, "sandbox", None)
     return sandbox if isinstance(sandbox, SandboxConfig) else NO_SANDBOX
-
-
-def _make_writable(func, path, _exc_info) -> None:
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
-
-
-def remove_tree(path: Path) -> None:
-    """Delete ``path`` if it exists, including read-only git files on Windows."""
-    if path.exists():
-        shutil.rmtree(path, onerror=_make_writable)
 
 
 def new_run_id() -> str:
@@ -309,7 +301,7 @@ class Coordinator:
 
     def _run_worker(self, node: Node, record: NodeRecord, log_dir: Path, worktree: Path,
                     attempt: int, failure: AttemptFailure | None) -> WorkerResult:
-        """Run one worker attempt on ``worktree`` and commit what it left."""
+        """Run one worker attempt on ``worktree``; the caller commits what it left."""
         record.attempts = attempt
         pack = build_context_pack(node, worktree)
         (log_dir / f"context_{attempt}.md").write_text(pack.text, encoding="utf-8")
@@ -342,6 +334,14 @@ class Coordinator:
                          input_tokens=result.input_tokens,
                          output_tokens=result.output_tokens)
         record.worker_reasons.append("" if result.ok else (result.reason or "worker_error"))
+        # A Windows host cannot commit or delete files named nul, con, ...;
+        # no task needs them, so they go before the commit on every host.
+        removed = remove_reserved_files(worktree)
+        if removed:
+            record.removed_reserved_files.extend(
+                path for path in removed if path not in record.removed_reserved_files)
+            self.events.emit("reserved_files_removed", node=node.id, attempt=attempt,
+                             files=removed)
         return result
 
     def _run_node_check(self, node: Node, record: NodeRecord, log_dir: Path,
@@ -520,15 +520,29 @@ class Coordinator:
             record.soft_wall_blocked = metrics["soft_wall_blocked"]
             record.confirmed_reads = metrics["confirmed_reads"]
 
-    def remove_answers(self) -> None:
+    def remove_answers(self) -> list[str]:
         """Delete what a later worker must not find: hidden tests and worktrees.
 
         ``final/`` keeps the final code; ``nodes/`` keeps diffs, logs, traces.
+        A failure never stops the run: it becomes a ``cleanup_warning`` event
+        and one of the returned messages, which name the path left behind.
         """
-        remove_tree(self.run_dir / "final" / HIDDEN_TESTS_DIR)
-        remove_tree(self.run_dir / "wt")
-        with self.git_lock:
-            gitops.git(self.repo, "worktree", "prune", check=False)
+        warnings = []
+        for path in (self.run_dir / "final" / HIDDEN_TESTS_DIR, self.run_dir / "wt"):
+            try:
+                remove_tree(path)
+            except Exception as exc:  # noqa: BLE001 - the results are already written
+                error = f"{type(exc).__name__}: {exc}"
+                self.events.emit("cleanup_warning", path=str(path), error=error[:2000])
+                warnings.append(f"could not remove {path}: {error}")
+        try:
+            with self.git_lock:
+                gitops.git(self.repo, "worktree", "prune", check=False)
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+            self.events.emit("cleanup_warning", path=str(self.repo), error=error[:2000])
+            warnings.append(f"could not prune worktrees of {self.repo}: {error}")
+        return warnings
 
 
 def parse_junit(path: Path) -> dict:
@@ -612,10 +626,8 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
               if options.hidden_tests else None)
     escapes_total = coordinator.audit_escapes()
     coordinator.audit_context()
-    coordinator.remove_answers()
     status = run_status(coordinator.records, final_results)
     wall_time = events.elapsed()
-    events.emit("run_end", status=status, wall_time_s=wall_time)
 
     records = coordinator.records
     summary = {
@@ -642,4 +654,7 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "merge_repairs_total": sum(r.merge_repairs for r in records.values()),
     }
     write_json_atomic(run_dir / "summary.json", summary)
-    return RunResult(run_dir=run_dir, summary=summary)
+    # Clean up only now: whatever goes wrong here, the results are on disk.
+    cleanup_warnings = coordinator.remove_answers()
+    events.emit("run_end", status=status, wall_time_s=wall_time)
+    return RunResult(run_dir=run_dir, summary=summary, cleanup_warnings=cleanup_warnings)

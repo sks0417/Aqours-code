@@ -16,10 +16,7 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import shutil
-import stat
 import sys
 import tempfile
 import time
@@ -31,6 +28,7 @@ from pydantic import (BaseModel, ConfigDict, Field, StrictInt, ValidationError,
                       field_validator)
 
 from . import gitops
+from .cleanup import remove_tree
 from .compare import is_test_only, is_test_path
 from .derive import derive_edges
 from .repo_index import RepoIndex, build_index
@@ -634,16 +632,6 @@ def _agent_dict(result: WorkerResult) -> dict:
 def _totals(rounds: list[dict]) -> dict:
     return {key: sum(entry["agent"][key] for entry in rounds)
             for key in ("model_calls", "input_tokens", "output_tokens")}
-
-
-def _make_writable(func, path, _exc_info) -> None:
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
-
-
-def remove_tree(path: Path) -> None:
-    """Delete ``path``, including read-only git objects on Windows."""
-    shutil.rmtree(path, onerror=_make_writable)
 
 
 def _agent_failure(result: WorkerResult) -> Issue:

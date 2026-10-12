@@ -186,6 +186,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                        "read files outside their workspace.",
                        "THE RESULTS OF THIS RUN ARE INVALID. See escape_samples in "
                        "summary.json."]))
+    for warning in result.cleanup_warnings:
+        print(f"warning: cleanup: {warning}", file=sys.stderr)
     print(f"run directory: {result.run_dir}")
     return EXIT_OK if summary["status"] == "success" else EXIT_INVALID
 
