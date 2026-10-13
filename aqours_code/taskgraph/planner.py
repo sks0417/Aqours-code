@@ -1,9 +1,11 @@
-"""Planner v1: draft from the request, ground it in the code, revise by rules.
+"""Planner v2: draft from the request, ground it in the code, revise by rules.
 
 1. **Draft** (model, request only): one agent without file tools lists the
    pieces of work the request names and estimates the changed lines. A small
    estimate takes the *fast path*: the single-agent graph, no further steps.
-2. **Ground** (model, read-only tools): a second agent reads the code and
+2. **Ground** (model, read-only tools): a second agent gets an outline of
+   the source files (:mod:`outline`: every definition with its signature and
+   line numbers), reads only the details the outline does not show, and
    turns every draft item into nodes with concrete files and symbols. It may
    split an item or add a contract, but never merges items. The program
    completes the answer into a :class:`Graph`, derives its edges, validates
@@ -12,6 +14,10 @@
 3. **Revise** (program, :mod:`revise`): nodes that can only queue on the
    same file are merged (M1), and a contract with one downstream node is
    merged into it (M2).
+
+v2 differs from v1 only in what Step 2 costs: the outline replaces reading
+whole files, and goals no longer repeat the request. What is split, and when,
+is decided exactly as before.
 """
 from __future__ import annotations
 
@@ -31,6 +37,7 @@ from . import gitops
 from .cleanup import remove_tree
 from .compare import is_test_only, is_test_path
 from .derive import derive_edges
+from .outline import Outline, build_outline
 from .repo_index import RepoIndex, build_index
 from .revise import RevisedGraph, goal_with_conventions, revise_graph
 from .schema import Graph, RevisionEntry, dump_graph
@@ -38,8 +45,9 @@ from .single import single_graph
 from .validate import Issue, ancestors, edit_files, unique_nodes, validate
 from .workers import AqoursWorker, Worker, WorkerRequest, WorkerResult, write_json_atomic
 
-PLANNER_VERSION = "planner-v1"
-LONG_GOAL_CHARS = 1200
+PLANNER_VERSION = "planner-v2"
+LONG_GOAL_CHARS = 1200  # the terminal notes a goal longer than this
+REPORTED_GOAL_CHARS = 1500  # the report lists goals longer than this in long_goals
 PLANNER_ENTRY_MODULE = "aqours_code.taskgraph.planner_entry"
 PROMPT_PATH = Path(__file__).resolve().parent / "planner_prompt.md"
 DRAFT_PROMPT_PATH = Path(__file__).resolve().parent / "planner_draft_prompt.md"
@@ -538,8 +546,13 @@ class Revision:
 
 def build_prompt(request: str, index: RepoIndex, final_checks: list[str],
                  revision: Revision | None = None,
-                 items: list[DraftItem] | None = None) -> str:
-    """Return the full prompt of one round of Step 2."""
+                 items: list[DraftItem] | None = None,
+                 outline: str | None = None) -> str:
+    """Return the full prompt of one round of Step 2.
+
+    ``outline`` is the text of :func:`outline.build_outline`; the planner
+    plans from it instead of reading the source files.
+    """
     checks = "\n".join(f"- `{command}`" for command in final_checks) or "- (none)"
     parts = [
         load_prompt().rstrip(),
@@ -547,9 +560,11 @@ def build_prompt(request: str, index: RepoIndex, final_checks: list[str],
         _items_section(items or []),
         ("# Repository\n\nThe repository is checked out in your working directory. "
          f"Its files:\n\n{_file_list(index)}"),
-        ("# Final checks\n\nAfter all sub-tasks are merged, these commands check the "
-         f"whole result:\n\n{checks}"),
     ]
+    if outline is not None:
+        parts.append("# Repository outline\n\n" + outline.strip())
+    parts.append("# Final checks\n\nAfter all sub-tasks are merged, these commands check "
+                 f"the whole result:\n\n{checks}")
     if revision is not None:
         problems = "\n".join(f"- {issue.format()}" for issue in revision.errors)
         draft = revision.draft[-DRAFT_ECHO_CHARS:].strip() or "(empty answer)"
@@ -756,11 +771,13 @@ def run_plan(options: PlanOptions, worker: Worker,
     errors: list[Issue] = []
     revised: RevisedGraph | None = None
     fast_path = False
+    outline = Outline("")
     tmp = Path(tempfile.mkdtemp(prefix="tg-plan-"))
     try:
         clone = tmp / "repo"
         gitops.clone_for_run(repo, clone, base_commit)
         index = build_index(clone, base_commit)
+        outline = build_outline(clone, index)
         draft_items, stage1, errors = run_draft_stage(
             request, file_sizes(clone, index), draft_stage_worker, clone,
             log_dir / "draft", options.timeout_s)
@@ -774,7 +791,7 @@ def run_plan(options: PlanOptions, worker: Worker,
             revision: Revision | None = None
             for number in range(options.max_revisions + 1):
                 prompt = build_prompt(request, index, info.final_checks, revision,
-                                      draft_items.items)
+                                      draft_items.items, outline.text)
                 result = worker.run(WorkerRequest(
                     node_id="planner", attempt=number + 1, prompt=prompt, workspace=clone,
                     log_dir=log_dir, timeout_s=options.timeout_s))
@@ -820,6 +837,7 @@ def run_plan(options: PlanOptions, worker: Worker,
     before = unmerged if unmerged is not None else graph
     merged = revised is not None and success
     stage_totals = {"stage1": _totals(stage1), "stage2": _totals(rounds)}
+    goal_chars = {node.id: len(node.goal) for node in graph.nodes} if graph is not None else {}
     report = {
         "planner_version": PLANNER_VERSION,
         "model": info.model,
@@ -851,7 +869,12 @@ def run_plan(options: PlanOptions, worker: Worker,
         "nodes_before_merge": len(before.nodes) if before is not None else 0,
         "nodes": len(graph.nodes) if graph is not None else 0,
         "edges": len(graph.edges) if graph is not None else 0,
-        "goal_chars": {node.id: len(node.goal) for node in graph.nodes} if graph is not None else {},
+        "goal_chars": goal_chars,
+        "long_goals": {node_id: chars for node_id, chars in goal_chars.items()
+                       if chars > REPORTED_GOAL_CHARS},
+        "outline_chars": outline.chars,
+        "outline_reduction": outline.reduction,
+        "outline_omitted_files": outline.omitted_files,
         "rounds": rounds,
         "totals": {key: stage_totals["stage1"][key] + stage_totals["stage2"][key]
                    for key in ("model_calls", "input_tokens", "output_tokens")},
