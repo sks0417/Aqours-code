@@ -1,0 +1,8 @@
+[
+  {"task": "jp-modular", "method": "single", "run": "C:/tg/runs/20261011T210453Z-93db"},
+  {"task": "jp-modular", "method": "taskgraph", "run": "C:/tg/runs/20261011T205729Z-3562",
+   "plan_report": "C:/tg/solve/jp-modular-full1/graph.json.report.json"},
+  {"task": "click-batch", "method": "single", "run": "C:/tg/runs/20261012T025828Z-ac6e"},
+  {"task": "click-batch", "method": "taskgraph", "run": "C:/tg/runs/20261012T025224Z-ab2e",
+   "plan_report": "C:/tg/solve/click-full2/graph.json.report.json"}
+]

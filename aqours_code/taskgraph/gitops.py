@@ -128,6 +128,31 @@ def merge_commit_into(worktree: Path, commit: str, message: str) -> bool:
     return True
 
 
+def merge_keep_conflicts(worktree: Path, commit: str) -> list[str]:
+    """Merge ``commit`` into the branch checked out in ``worktree``, without committing.
+
+    Returns the files with conflicts, which keep their conflict markers
+    (``<<<<<<<``, ``=======``, ``>>>>>>>``); an empty list means the merge was
+    clean. Either way the merge stays open until :func:`commit_merge`.
+    Raises ``GitError`` when git could not start the merge at all.
+    """
+    proc = git(worktree, "merge", "--no-ff", "--no-commit", "--no-verify", commit,
+               check=False)
+    output = git(worktree, "-c", "core.quotepath=off", "diff", "--name-only",
+                 "--diff-filter=U", "-z").stdout
+    conflicts = sorted(name for name in output.split("\0") if name)
+    if proc.returncode != 0 and not conflicts:
+        detail = (proc.stderr or proc.stdout).strip() or f"exit code {proc.returncode}"
+        raise GitError(f"git merge {commit} failed in {worktree}: {detail}")
+    return conflicts
+
+
+def commit_merge(worktree: Path, message: str) -> None:
+    """Stage everything and conclude the merge that ``merge_keep_conflicts`` opened."""
+    git(worktree, "add", "-A")
+    git(worktree, "commit", "-q", "--no-verify", "--allow-empty", "-m", message)
+
+
 def undo_last_commit(repo: Path) -> None:
     """Drop the last commit of the checked-out branch and its changes."""
     git(repo, "reset", "-q", "--hard", "HEAD~1")
