@@ -320,6 +320,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
                   f"{merge['into']}")
     print(f"model calls: {totals['model_calls']}  tokens: {totals['input_tokens']} in / "
           f"{totals['output_tokens']} out  time: {report['duration_s']:.1f}s")
+    print(f"outline: {report['outline_chars']} characters "
+          f"(shortened: {report['outline_reduction']})")
     for node_id, chars in report["goal_chars"].items():
         if chars > LONG_GOAL_CHARS:
             print(f"note: node {node_id} goal has {chars} characters (over {LONG_GOAL_CHARS}); "

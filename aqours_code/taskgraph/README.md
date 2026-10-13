@@ -566,12 +566,23 @@ python -m aqours_code.taskgraph plan <request.md> --repo <path> --out <graph.jso
     [--fast-path-lines 500] [--no-fast-path] [--no-merge]
 ```
 
-Planner v1 builds the graph in the three steps of the project proposal: a
+Planner v2 builds the graph in the three steps of the project proposal: a
 draft from the request alone, grounding in the code, and a rule-based
 revision. The model makes the decisions that need reading (what the request
 asks for, which files each piece touches, whether a piece must be split,
 whether an interface is missing); the program makes the decisions that follow
 from the files (which nodes are ordered, which nodes are merged).
+
+v2 changes only what Step 2 costs, not what it decides. Planning took a
+large part of a run (about 240 of 520 s on the click batch, 235 of 670 s on
+the job platform): on the click batch Step 2 read the source files one by
+one, in full, and every one of its 26 calls carried all of them again (about
+980,000 input tokens); on the job platform it wrote goals of about 1,700
+characters that repeated the request. v2 gives Step 2 an
+[outline of the code](#the-repository-outline) to plan from and asks for
+[short goals](#goals). The fast path and its threshold, Step 1, the checks
+P1-P7 and the program revision of Step 3 are exactly those of v1, so what is
+split, and when, is decided as before.
 
 | Proposal property | Where it is decided |
 | --- | --- |
@@ -612,7 +623,7 @@ written, no graph).
 as the `single` command (goal = the request plus the generic sentence,
 `any_file: true`, no context pack), built by the same function. Only the
 metadata differ: `generator` is `{"kind": "planner", "planner_version":
-"planner-v1", ...}` and `revision_log` has one `other` entry `fast path:
+"planner-v2", ...}` and `revision_log` has one `other` entry `fast path:
 estimated N changed lines < threshold T`. The reason: every node costs about
 60 s of fixed overhead (context reading, checks, merge) and planning itself
 about 2 minutes, so splitting a change of a few hundred lines cannot beat one
@@ -623,9 +634,69 @@ planner makes; nodes carry no size or cost estimates.
 
 A second agent (`read_file`, `glob`, `compact`) gets
 [`planner_prompt.md`](planner_prompt.md), the request, the draft items (a
-`# Draft items` section), the file list and the final checks. It reads the
-code and answers with a draft graph: only nodes, no edges; the last
+`# Draft items` section), the file list, the repository outline (a
+`# Repository outline` section) and the final checks. It plans from the
+outline and answers with a draft graph: only nodes, no edges; the last
 ```` ```json ```` block of the final answer is the draft.
+
+#### The repository outline
+
+`outline.py` lists, with `ast` and without a model, what every source file
+defines. A source file is a Python file that is not a test: not under a
+`tests/` directory, not named `test_*.py`, and not `conftest.py`.
+
+```text
+## src/click/types.py (1437 lines)
+_ValueT = ... (L29)
+class ParamType(t.Generic[_ValueT_co, _InputT_contra], abc.ABC) (L65-L239): Represents the type of a parameter. Validates and converts values
+  fields: is_composite, arity, name, envvar_list_splitter (L94-L106)
+  def to_info_dict(self) -> ParamTypeInfoDict (L122): Gather information that could be useful for a tool generating
+  def fail(self, message: str, param: Parameter | None=None, ctx: Context | None=None) -> t.NoReturn (L215): Helper method to fail with an invalid value message.
+class DateTime(ParamType[datetime]) (L522-L590): The DateTime type converts date strings into `datetime` objects.
+def convert_type(ty: t.Any | None=None, default: t.Any | None=None) -> ParamType[t.Any] (L1356): Find the most appropriate :class:`ParamType` for the given Python
+```
+
+- A file's header has its path and line count. A file that cannot be parsed
+  has only the header and `(could not be parsed)`.
+- Top-level classes with their bases and line range, their methods, top-level
+  functions, and the names assigned at the top level, each with its line
+  number. Signatures (parameters, defaults, annotations, return type) come
+  from `ast.unparse`. A docstring gives its first line, cut to 100
+  characters.
+- A class also gets one `fields:` line with the names assigned in its body
+  (dataclass fields, enum members, class attributes), because the symbols a
+  contract adds are often such fields.
+- Definitions inside `if`/`try` blocks at the top level are listed;
+  `typing.overload` stubs, nested functions and nested classes are not.
+
+The outline is at most 60,000 characters. A longer one is shortened in
+steps, each including the ones before it, until it fits:
+
+| `outline_reduction` | Left out |
+| --- | --- |
+| `none` | nothing |
+| `no_docstrings` | the docstring lines |
+| `no_private` | names that start with `_` (not `__init__` and other dunder names) |
+| `no_methods` | methods, `fields:` lines and top-level names: only classes and top-level functions remain |
+| `truncated` | whole files from the end of the list; a last line names the files that are not listed |
+
+A shortened outline starts with a line that says what is left out. The
+report records `outline_chars`, `outline_reduction` and
+`outline_omitted_files`, and `plan` prints the first two.
+
+#### Reading the code
+
+The prompt tells the agent to plan from the outline, to read a file only for
+a detail the outline does not show (how a function works inside), to read
+only the lines it needs, and not to read test files: their names in the file
+list are enough to choose where new tests go. Two facts about the runtime
+make this cheap, and the prompt states both:
+
+- `read_file` reads part of a file: `offset` is the number of lines to skip
+  and `limit` the number of lines to return, so lines 120 to 160 are `offset`
+  119 and `limit` 41;
+- every tool call of one answer is executed before the next model call, so
+  the agent is told to ask for all the files it needs in one turn.
 
 ```json
 {"conventions": ["..."],
@@ -651,7 +722,7 @@ code and answers with a draft graph: only nodes, no edges; the last
   every node's goal as a `Repository conventions:` section.
 
 The program completes the draft into a graph (`generator` `{"kind":
-"planner", "planner_version": "planner-v1", "model": ...}`), runs
+"planner", "planner_version": "planner-v2", "model": ...}`), runs
 `derive_edges()` and `validate()`, and applies the planner-only checks
 (`planner_checks()`, `item_checks()`, `implementation_checks()` and
 `contract_checks()`; errors like V1-V13, not part of
@@ -690,11 +761,22 @@ fresh agent; the prompt repeats the request and the draft items), at most
 twice. If errors remain, the run fails: the last graph that could be built
 and the report are still written, and the exit code is 1.
 
-Goals describe implementation scope and integration points, generally within
-600 characters; specification details belong in `SPEC.md#Heading` context
-references, not in paraphrased goals. The report's `goal_chars` maps node IDs to final
-goal character counts, including appended conventions. A goal longer than
-1200 characters produces a terminal note, without failing planning.
+#### Goals
+
+A worker's prompt already has the whole request (`# Overall request`), so a
+goal does not repeat it. It names the part of the request the node
+implements, by quoting its heading or item title, and adds only what the
+request does not say: where in the code the change goes, which existing
+functions or classes to use, and decisions the node shares with other nodes;
+under 800 characters. A specification file is not retold either: its
+sections go in `context_files` as `SPEC.md#Heading`. The goals of the
+prompt's examples are written this way, for instance `"Star ratings": fill in
+recipes/ratings.py::rate, which RecipeBook.rate already calls. ...`.
+
+A long goal is never an error. The report's `goal_chars` maps node ids to
+the final goals' character counts, including appended conventions, and
+`long_goals` holds those over 1,500; a goal over 1,200 characters also gets a
+note on the terminal.
 
 ### Step 3: revision (program, `revise.py`)
 
@@ -757,8 +839,9 @@ merged, otherwise `llm` after a revision round and `none` without one.
   errors, warnings, agent statistics), `node_items` (each node's `item` and
   `reason`), `merges` (members, new id, rule, shared files) and `not_merged`,
   `nodes_before_merge` and `nodes`, `errors` (of the step that failed),
-  `totals` and `duration_s` (Step 1 included) and `stage_totals` (Step 1 and
-  Step 2 separately);
+  `goal_chars` and `long_goals`, `outline_chars`, `outline_reduction` and
+  `outline_omitted_files`, `totals` and `duration_s` (Step 1 included) and
+  `stage_totals` (Step 1 and Step 2 separately);
 - `<out>.logs/` (Step 2) and `<out>.logs/draft/` (Step 1): each round's
   config, trace and stdout.
 

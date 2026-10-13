@@ -10,6 +10,7 @@ import pytest
 
 from aqours_code.taskgraph import build_index, derive_edges, load_graph
 from aqours_code.taskgraph.cli import main
+from aqours_code.taskgraph.outline import build_outline
 from aqours_code.taskgraph.planner import (
     DRAFT_PROMPT_PATH,
     PLANNER_VERSION,
@@ -541,7 +542,22 @@ def test_prompt_asks_for_conventions_and_no_integration_node():
     assert "`now` argument" in text
 
 
-def test_prompt_examples_have_short_scope_goals_and_spec_references():
+GOAL_RULE = (
+    "`goal`: the worker also receives the whole request, so do not repeat it. Name the "
+    "part of the request this node implements (quote its heading or item title), then add "
+    "only what the request does not say: where in the code the change goes, which "
+    "existing functions or classes to use, and decisions this node shares with other "
+    "nodes. Keep it under 800 characters.")
+READING_RULE = (
+    "The outline below lists every definition in the source files with its\n"
+    "signature, line numbers and the first line of its docstring. Plan from the\n"
+    "outline. Read a file only for a detail the outline does not show, such as\n"
+    "how a function works inside, and read only the lines you need. Do not read\n"
+    "whole source files to find out what they contain, and do not read test\n"
+    "files: their names in the file list are enough to choose where new tests go.\n")
+
+
+def test_prompt_examples_have_short_goals_that_name_the_part_of_the_request():
     import re
     text = PROMPT_PATH.read_text(encoding='utf-8')
     examples = [json.loads(block) for block in re.findall(r'```json\n(.*?)\n```', text, re.S)]
@@ -549,14 +565,83 @@ def test_prompt_examples_have_short_scope_goals_and_spec_references():
     for example in examples:
         for node in example['nodes']:
             assert len(node['goal']) <= 600, node['id']
+    titles = ('"Star ratings"', '"Shopping-list export"', '"Scaled printout"')
     for example in examples[1:]:
         for node in example['nodes']:
             assert any(ref.startswith('SPEC.md#') for ref in node['context_files'])
             assert 'raise ValueError' not in node['goal']
             assert 'int | None = None' not in node['goal']
+            assert any(title in node['goal'] for title in titles), node['id']  # quotes its item
+            if node['kind'] == 'implement':
+                assert node['goal'].startswith(titles) and len(node['goal']) < 200
     rule = text[text.index('8. **'):text.index('## Output format')]
-    assert 'Do not restate specification details' in rule
-    assert '600 characters' in rule
+    assert GOAL_RULE in " ".join(rule.split())
+    assert 'SPEC.md#Heading' in rule and 'A specification file is not repeated either' in rule
+    # the earlier wording is gone
+    assert '600 characters' not in text
+    assert 'Do not restate specification details' not in text
+    assert 'State what feature this' not in " ".join(text.split())
+
+
+def test_prompt_tells_the_planner_to_plan_from_the_outline():
+    text = PROMPT_PATH.read_text(encoding='utf-8')
+    assert READING_RULE in text
+    head = text[:text.index("## Concepts")]
+    assert READING_RULE in head
+    # partial reads and several tool calls in one turn, as the runtime supports them
+    assert ("`read_file` reads part of a file with `offset` (how many lines to skip) and\n"
+            "`limit` (how many lines to return): for lines 120 to 160, pass `offset` 119\n"
+            "and `limit` 41. When you need several files, ask for all of them in one turn.\n"
+            ) in head
+    assert "You have read-only tools (read_file, glob)." in head
+    # the earlier instruction to read the modules and the tests is gone
+    flat = " ".join(text.split())
+    for old in ("Read before you decide", "Read the code and turn every draft item",
+                "the modules the request touches, and the existing tests",
+                "After reading the code", "Reading the code shows"):
+        assert old not in flat, old
+    assert "After looking at the code, split an item into several nodes only if" in flat
+
+
+def test_planner_agent_can_read_part_of_a_file_and_several_files_in_one_turn(toy_repo,
+                                                                            tmp_path):
+    """What the prompt says about ``read_file`` holds in the runtime."""
+    (toy_repo.path / "numbers.txt").write_text(
+        "".join(f"line {number}\n" for number in range(1, 201)), encoding="utf-8")
+
+    class RecordingClient(FakeClient):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.calls: list[dict] = []
+
+        def create(self, **kwargs):
+            self.calls.append({"tools": kwargs.get("tools") or [],
+                               "messages": json.dumps(kwargs.get("messages"), default=str)})
+            return super().create(**kwargs)
+
+    two_reads = SimpleNamespace(
+        content=[SimpleNamespace(type="tool_use", id="call_a", name="read_file",
+                                 input={"path": "numbers.txt", "offset": 119, "limit": 41}),
+                 SimpleNamespace(type="tool_use", id="call_b", name="read_file",
+                                 input={"path": "README.md"})],
+        stop_reason="tool_use", usage=SimpleNamespace(input_tokens=50, output_tokens=5))
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    config = AqoursWorker().config_for(WorkerRequest(
+        node_id="planner", attempt=1, prompt="plan", timeout_s=60,
+        workspace=toy_repo.path, log_dir=log_dir))
+    config.update(model_provider="scripted", model="scripted-model")
+    client = RecordingClient([two_reads, final(answer(VALID_DRAFT))])
+    result = run_planner(config, model_client=client)
+    assert result.ok and result.model_calls == 2  # both reads were answered in one turn
+
+    schema = next(tool for tool in client.calls[0]["tools"] if tool["name"] == "read_file")
+    assert {"path", "offset", "limit"} <= set(schema["input_schema"]["properties"])
+    after = client.calls[1]["messages"]
+    assert "call_a" in after and "call_b" in after
+    assert "line 120" in after and "line 160" in after   # offset 119, limit 41: lines 120-160
+    assert "line 119\\n" not in after and "line 161" not in after
+    assert "# Toy job queue" in after                     # the second read, same turn
 
 
 @pytest.mark.parametrize('length', [1200, 1201])
@@ -700,7 +785,7 @@ def test_small_estimate_takes_the_fast_path(toy_repo, tmp_path):
     assert ours == theirs
     assert graph.nodes[0].edit_set.any_file and graph.nodes[0].context_files == []
     assert graph.generator.model_dump() == {
-        "kind": "planner", "planner_version": "planner-v1", "model": "scripted-model",
+        "kind": "planner", "planner_version": "planner-v2", "model": "scripted-model",
         "revision_mode": "none"}
     assert [(e.action, e.reason) for e in graph.revision_log] == [
         ("other", "fast path: estimated 300 changed lines < threshold 500")]
@@ -896,7 +981,7 @@ def test_full_flow_merges_queued_nodes_and_writes_all_outputs(toy_repo, tmp_path
     assert [(e.from_, e.to, e.type) for e in graph.edges] == [
         ("C", "P_Q", "interface"), ("C", "S", "interface")]
     assert graph.generator.revision_mode == "rule_assisted"
-    assert graph.generator.planner_version == "planner-v1"
+    assert graph.generator.planner_version == "planner-v2"
     assert validate(graph, index).ok and planner_checks(graph) == []
     merged = graph.nodes[1]
     assert merged.edit_set.modify == ["runner.py"]
@@ -911,7 +996,7 @@ def test_full_flow_merges_queued_nodes_and_writes_all_outputs(toy_repo, tmp_path
     assert graph.revision_log[-1].into == "P_Q"
 
     report = json.loads(report_path_for(options.out).read_text(encoding="utf-8"))
-    assert report["success"] and report["planner_version"] == "planner-v1"
+    assert report["success"] and report["planner_version"] == "planner-v2"
     assert report["draft_items"] == [
         {"id": name, "title": f"item {name}", "description": f"achieve {name}"}
         for name in ("P", "Q", "S")]
@@ -1179,3 +1264,101 @@ def test_p7_is_reported_and_fixed_by_a_revision_round(toy_repo, tmp_path):
         in worker.requests[1].prompt
     graph = load_graph(options.out)
     assert "checks.py" in next(n for n in graph.nodes if n.id == "S").edit_set.modify
+
+
+# ── planner v2: the outline in the prompt and the report, long goals ──
+
+def test_prompt_has_the_outline_between_the_file_list_and_the_final_checks(toy_repo, toy_index):
+    outline = build_outline(toy_repo.path, toy_index)
+    prompt = build_prompt(REQUEST, toy_index, ["python -m pytest -q tests"],
+                          outline=outline.text)
+    files, section, checks = (prompt.index(heading) for heading in (
+        "# Repository\n\n", "# Repository outline\n\n", "# Final checks\n\n"))
+    assert files < section < checks
+    body = prompt[section:checks]
+    assert body == "# Repository outline\n\n" + outline.text.strip() + "\n\n"
+    assert "## store.py (16 lines)\nclass JobStore (L4-L16): In-memory job store.\n" in body
+    assert "  def add(self, job: Job) -> None (L11)\n" in body
+    assert "## runner.py (11 lines)\nMAX_ATTEMPTS = ... (L3)\n" in body
+    assert "  fields: PENDING, RUNNING, DONE (L6-L8)" in body
+    assert "## broken.py (2 lines) (could not be parsed)" in body
+    assert "test_basic" not in body                       # test files are not outlined
+    assert "- tests/test_basic.py" in prompt[files:section]  # they are in the file list
+    assert "# Repository outline" not in build_prompt(REQUEST, toy_index, [])
+
+
+def test_every_grounding_round_gets_the_outline_and_the_report_records_it(toy_repo, tmp_path):
+    result, worker, options = plan(toy_repo, tmp_path,
+                                   [answer(INVALID_DRAFT), answer(VALID_DRAFT)])
+    assert result.success and len(worker.requests) == 2
+    outline = build_outline(toy_repo.path, build_index(toy_repo.path, toy_repo.commit))
+    for request in worker.requests:  # the first round and the revision
+        assert "# Repository outline\n\n" + outline.text.strip() + "\n\n# Final checks" \
+            in request.prompt
+        assert READING_RULE in request.prompt and GOAL_RULE in " ".join(request.prompt.split())
+    assert "# Repository outline" not in worker.drafter.requests[0].prompt  # Step 1 is unchanged
+    report = json.loads(report_path_for(options.out).read_text(encoding="utf-8"))
+    assert report["planner_version"] == "planner-v2"
+    assert (report["outline_chars"], report["outline_reduction"]) == (outline.chars, "none")
+    assert report["outline_omitted_files"] == [] and report["long_goals"] == {}
+
+
+def test_report_records_how_far_the_outline_was_shortened(toy_repo, tmp_path, monkeypatch):
+    import aqours_code.taskgraph.planner as planner_module
+
+    index = build_index(toy_repo.path, toy_repo.commit)
+    full = build_outline(toy_repo.path, index)
+    # In so small an outline the note costs more than the docstrings save, so
+    # the first level that fits is the one without methods.
+    short = build_outline(toy_repo.path, index, limit=full.chars - 1)
+    assert short.reduction == "no_methods"
+    monkeypatch.setattr(planner_module, "build_outline",
+                        lambda root, index: build_outline(root, index, limit=full.chars - 1))
+    result, worker, _ = plan(toy_repo, tmp_path, [answer(VALID_DRAFT)])
+    assert result.success
+    assert result.report["outline_reduction"] == "no_methods"
+    assert result.report["outline_chars"] == short.chars < full.chars
+    prompt = worker.requests[0].prompt
+    assert "(Shortened to fit: only classes and top-level functions are listed.)" in prompt
+    assert "In-memory job store." not in prompt and "def add(self" not in prompt
+    assert "class JobStore (L4-L16)\n" in prompt
+
+
+def test_fast_path_report_has_the_outline_fields_too(toy_repo, tmp_path):
+    result, worker, _ = plan(toy_repo, tmp_path, [answer(VALID_DRAFT)], estimate=300)
+    assert result.success and worker.requests == []
+    assert result.report["outline_chars"] > 0 and result.report["outline_reduction"] == "none"
+    assert result.report["long_goals"] == {}
+
+
+@pytest.mark.parametrize("length", [1500, 1501])
+def test_goals_over_1500_characters_are_listed_in_the_report_only(toy_repo, tmp_path, length):
+    draft = {"nodes": [_node("A", goal="x" * length, modify=["runner.py"]),
+                       _node("B", goal="short", modify=["store.py"])]}
+    result, _, options = plan(toy_repo, tmp_path, [answer(draft)])
+    assert result.success and result.report["rounds"][0]["errors"] == []  # never an error
+    report = json.loads(report_path_for(options.out).read_text(encoding="utf-8"))
+    assert report["goal_chars"] == {"A": length, "B": 5}
+    assert report["long_goals"] == ({"A": 1501} if length == 1501 else {})
+    assert [node.goal for node in load_graph(options.out).nodes] == ["x" * length, "short"]
+
+
+def test_long_goals_count_the_appended_conventions(toy_repo, tmp_path):
+    draft = {"conventions": ["c" * 200], "nodes": [
+        _node("A", goal="x" * 1400, modify=["runner.py"])]}
+    result, _, _ = plan(toy_repo, tmp_path, [answer(draft)])
+    assert result.success
+    assert result.report["long_goals"] == {"A": result.report["goal_chars"]["A"]}
+    assert result.report["goal_chars"]["A"] > 1600
+
+
+def test_plan_command_prints_the_outline_size(toy_repo, tmp_path, monkeypatch, capsys):
+    request = tmp_path / "request.md"
+    request.write_text(REQUEST, encoding="utf-8")
+    patch_workers(monkeypatch, ScriptedPlanner([answer(SINGLE_NODE_DRAFT)]),
+                  [items_answer(["A"])])
+    out = tmp_path / "graph.json"
+    assert main(["plan", str(request), "--repo", str(toy_repo.path), "--out", str(out)]) == 0
+    report = json.loads(report_path_for(out).read_text(encoding="utf-8"))
+    assert (f"outline: {report['outline_chars']} characters (shortened: none)"
+            in capsys.readouterr().out)
