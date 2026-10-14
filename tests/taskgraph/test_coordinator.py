@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -534,3 +535,144 @@ def test_run_command_takes_conflict_repairs(toy_repo, tmp_path, capsys):
     assert main(["run", str(graph_path), "--repo", str(toy_repo.path), "--worker",
                  "command", "--command-map", str(command_map),
                  "--conflict-repairs", "-1"]) == 2
+
+
+# ── task 25d: conflict resolutions per round of merging, and in merge repairs ──
+
+ROUNDS = """\
+import os, pathlib, time
+readme = pathlib.Path('README.md')
+attempt = int(os.environ['TG_ATTEMPT'])
+if attempt == 1:
+    time.sleep({sleep})
+    pathlib.Path('{name}.txt').write_text('{name}')
+    readme.write_bytes(readme.read_bytes() + b'from {name}\\n')
+else:
+    if attempt == {repair}:  # the merge repair: wait, then fix what the check wants
+        time.sleep({repair_sleep})
+        pathlib.Path('{name}fix.txt').write_text('fixed')
+    if {drop}:
+        readme.write_bytes(b''.join(line for line in readme.read_bytes().splitlines(True)
+                                    if not line.startswith((b'<<<<<<<', b'=======',
+                                                            b'>>>>>>>'))))
+"""
+
+
+def rounds_worker(tmp_path, name: str, sleep: float = 0, repair: int = 0,
+                  repair_sleep: float = 0, drop: bool = True) -> str:
+    return script(tmp_path, name, ROUNDS.format(name=name, sleep=sleep, repair=repair,
+                                                repair_sleep=repair_sleep, drop=drop))
+
+
+def fixed_node(node_id: str) -> dict:
+    """A README node whose post-merge check wants <id>fix.txt, made only by a repair."""
+    data = readme_node(node_id)
+    data["edit_set"]["create"].append(f"{node_id}fix.txt")
+    data["check"]["post_merge_commands"] = [py(
+        f"import pathlib, sys; ok = pathlib.Path('{node_id}fix.txt').exists(); "
+        f"print('' if ok else 'FIX-MISSING-{node_id}'); sys.exit(0 if ok else 1)")]
+    return data
+
+
+def test_the_merge_after_a_repair_may_resolve_a_conflict_again(toy_repo, tmp_path):
+    """The jp run: a conflict, a failed post-merge check, a repair during which
+    another node merges, and a second conflict after the repair."""
+    graph = graph_for(toy_repo, [readme_node("w"), fixed_node("x"), readme_node("y")])
+    commands = {"w": rounds_worker(tmp_path, "w"),
+                # attempt 2 resolves the first conflict, 3 is the repair, 4 the second
+                "x": rounds_worker(tmp_path, "x", sleep=0.8, repair=3, repair_sleep=5),
+                "y": rounds_worker(tmp_path, "y", sleep=4)}
+    result = run(toy_repo, tmp_path, graph, commands, workers=3)
+    nodes, evts = result.summary["nodes"], events(result)
+    x = nodes["x"]
+    assert x["status"] == "merged", x
+    assert (x["merge_conflicts"], x["merge_repairs"], x["conflict_resolved"]) == (2, 1, True)
+    assert x["attempts"] == 4
+    conflicts = [e["t"] for e in evts if e["type"] == "merge_conflict" and e["node"] == "x"]
+    assert len(conflicts) == 2
+    # y merged while x was repairing, which is what the second conflict was with
+    repair = event_t(evts, "merge_repair_start", "x")
+    assert repair < event_t(evts, "node_merged", "y") < conflicts[1]
+    final = (result.run_dir / "repo" / "README.md").read_text(encoding="utf-8")
+    assert all(f"from {name}" in final for name in "wxy") and "<<<<<<<" not in final
+    assert result.summary["status"] == "success"
+
+
+def test_a_round_does_not_retry_a_merge_that_keeps_conflicting(toy_repo, tmp_path,
+                                                               monkeypatch):
+    calls = []
+    real = gitops.squash_merge
+
+    def always_conflicts(repo, branch, message):
+        if branch.endswith("/y"):
+            calls.append(branch)
+            return None
+        return real(repo, branch, message)
+
+    monkeypatch.setattr(gitops, "squash_merge", always_conflicts)
+    graph = graph_for(toy_repo, [node("y", create=("y.txt",))])
+    result = run(toy_repo, tmp_path, graph, {"y": write("y.txt", "y")})
+    record = result.summary["nodes"]["y"]
+    assert (record["status"], record["reason"]) == ("failed", "merge_conflict")
+    assert (record["merge_conflicts"], record["conflict_resolved"]) == (1, False)
+    assert len(calls) == 2  # the merge, and once more after the one resolution
+
+
+def wait_for_y_before_repairing(monkeypatch):
+    """Let y merge before x's repair merges the integration branch in."""
+    from aqours_code.taskgraph.coordinator import Coordinator
+    real = Coordinator._repair
+
+    def delayed(self, node, *args, **kwargs):
+        deadline = time.monotonic() + 60
+        while (node.id == "x" and self.records["y"].status != "merged"
+               and time.monotonic() < deadline):
+            time.sleep(0.05)
+        return real(self, node, *args, **kwargs)
+
+    monkeypatch.setattr(Coordinator, "_repair", delayed)
+
+
+def test_a_conflict_at_the_start_of_a_repair_goes_to_the_worker(toy_repo, tmp_path,
+                                                                 monkeypatch):
+    wait_for_y_before_repairing(monkeypatch)
+    graph = graph_for(toy_repo, [fixed_node("x"), readme_node("y")])
+    commands = {"x": rounds_worker(tmp_path, "x", repair=2),
+                "y": rounds_worker(tmp_path, "y", sleep=1)}
+    result = run(toy_repo, tmp_path, graph, commands, workers=2)
+    x = result.summary["nodes"]["x"]
+    assert x["status"] == "merged", x
+    assert (x["merge_conflicts"], x["merge_repairs"], x["conflict_resolved"]) == (1, 1, True)
+    prompt = (result.run_dir / "nodes" / "x" / "prompt_2.md").read_text(encoding="utf-8")
+    assert "# Your work broke after merging" in prompt and "FIX-MISSING-x" in prompt
+    assert "# Your work conflicts with other nodes' work" in prompt
+    assert "conflict markers (<<<<<<<, =======, >>>>>>>): README.md" in prompt
+    assert prompt.index("# Your work broke after merging") < prompt.index(
+        "# Your work conflicts with other nodes' work")
+    final = (result.run_dir / "repo" / "README.md").read_text(encoding="utf-8")
+    assert "from x" in final and "from y" in final and "<<<<<<<" not in final
+
+
+def test_markers_left_in_a_repair_fail_the_node(toy_repo, tmp_path, monkeypatch):
+    wait_for_y_before_repairing(monkeypatch)
+    graph = graph_for(toy_repo, [fixed_node("x"), readme_node("y")])
+    commands = {"x": rounds_worker(tmp_path, "x", repair=2, drop=False),
+                "y": rounds_worker(tmp_path, "y", sleep=1)}
+    result = run(toy_repo, tmp_path, graph, commands, workers=2)
+    x = result.summary["nodes"]["x"]
+    assert (x["status"], x["reason"]) == ("failed", "merge_conflict")
+    assert (x["merge_conflicts"], x["conflict_resolved"]) == (1, False)
+    assert integration_subjects(result) == ["[taskgraph] y: y"]
+
+
+def test_no_conflict_repairs_fail_a_conflict_at_the_start_of_a_repair(toy_repo, tmp_path,
+                                                                      monkeypatch):
+    wait_for_y_before_repairing(monkeypatch)
+    graph = graph_for(toy_repo, [fixed_node("x"), readme_node("y")])
+    commands = {"x": rounds_worker(tmp_path, "x", repair=2),
+                "y": rounds_worker(tmp_path, "y", sleep=1)}
+    result = run(toy_repo, tmp_path, graph, commands, workers=2, conflict_repairs=0)
+    x = result.summary["nodes"]["x"]
+    assert (x["status"], x["reason"]) == ("failed", "merge_conflict")
+    assert (x["merge_conflicts"], x["conflict_resolved"], x["attempts"]) == (0, None, 1)
+    assert not any(e["type"] == "merge_conflict" for e in events(result))

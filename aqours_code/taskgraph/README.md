@@ -473,14 +473,17 @@ found, `0` when none is, and `2` when no run directory is found.
    with `node`, `kind` (`node`, `post_merge` or `final`) and `ok` (whether
    the second run passed). The check's log file keeps both runs.
 4. **Merge.** Squash-merge the node branch into `tg/integration` as one commit
-   `[taskgraph] <id>: <title>`. A conflict resets the branch and, if the node
-   has a conflict resolution left (below), is resolved once; otherwise the
-   node fails (`merge_conflict`). The node's checks then run again on the integration
-   branch, and a failure undoes the merge, so the integration branch stays
-   clean. The post-merge check runs `check.post_merge_commands` when the node
-   has them, and `check.commands` otherwise (planner v3 gives a node a narrow
-   node check and the whole suite after merging when its effect is hard to
-   predict). A failed post-merge check gets a repair round (below).
+   `[taskgraph] <id>: <title>`. A conflict resets the branch and, if this
+   round of merging has a conflict resolution left (below), is resolved;
+   otherwise the node fails (`merge_conflict`). The node's checks then run
+   again on the integration branch, and a failure undoes the merge, so the
+   integration branch stays clean. The post-merge check runs
+   `check.post_merge_commands` when the node has them, and `check.commands`
+   otherwise (planner v3 gives a node a narrow node check and the whole suite
+   after merging when its effect is hard to predict). A failed post-merge
+   check gets a repair round (below). Changed files outside `modify ∪ create`
+   are recorded as `out_of_scope_files` but do not fail the node. For
+   `any_file` nodes, the list stays empty.
 
    **Conflict resolution.** Nodes that edit one file in parallel (`shared`)
    can conflict when the second one merges. Then, **still holding the merge
@@ -497,11 +500,20 @@ found, `0` when none is, and `2` when no run directory is found.
    runs as usual (a failure there gets the usual repair round). Holding the
    lock means the resolution starts from the newest integration state and
    nothing else merges meanwhile, so no second conflict can follow; the
-   price is that other nodes' merges wait for that round. A node gets at
-   most `--conflict-repairs` resolutions (default 1; 0 fails the node at
-   once, as before). The round's worker time and tokens count for the node. Changed files outside `modify ∪ create` are recorded as
-   `out_of_scope_files` but do not fail the node. For `any_file` nodes, the list
-   stays empty.
+   price is that other nodes' merges wait for that round. The round's worker
+   time and tokens count for the node.
+
+   `--conflict-repairs` (default 1) is the number of resolutions in **each
+   round of merging**: the first merge is one round, and the merge after
+   each merge repair is another. A repair holds no lock, so other nodes may
+   merge while it runs and the merge after it can conflict again; one
+   resolution takes well under a minute, and giving up there would throw
+   away the node's whole work. So a node resolves at most
+   `(--merge-repairs + 1) × --conflict-repairs` conflicts in its rounds of
+   merging, and a merge that still conflicts after a round's resolutions
+   fails the node (`merge_conflict`) instead of being tried again. 0 fails
+   the node at the first conflict, also at the start of a repair, as before
+   task 25c.
 
    **Merge repair.** Two nodes can each be correct and still break together,
    on files that do not overlap, so no plan can foresee it (one registers a
@@ -511,11 +523,17 @@ found, `0` when none is, and `2` when no run directory is found.
    at once with `post_merge_check_failed`):
    - the current integration branch is merged into the node's branch, so its
      worktree holds the other nodes' finished work plus its own: the state
-     whose check just failed. A conflict here fails the node
-     (`merge_conflict`);
+     whose check just failed. Nodes that merged after that check can make
+     this merge conflict: the conflict markers are then kept, and the
+     conflict is handed to the worker with the check output (it counts in
+     `merge_conflicts` and gives `merge_conflict` /
+     `merge_conflict_resolved` events, but belongs to the repair, not to a
+     round of merging);
    - the worker runs once more (the attempt number continues) with the
      post-merge check output under `# Your work broke after merging`: fix it
-     in your own files, leave the other sub-tasks' code alone. The context
+     in your own files, leave the other sub-tasks' code alone; after a
+     conflict, the conflict section follows, naming the conflicting files.
+     Markers left in a file fail the node (`merge_conflict`). The context
      pack is rebuilt from the new worktree; the soft wall applies as usual;
    - the node's own check runs in the worktree. If it fails, the node fails
      with `repair_check_failed`. If it passes, the node is squash-merged and
@@ -603,8 +621,9 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
   `null` without a repair), `removed_reserved_files`,
   `check_timeout_retries` (node and post-merge checks that timed out and were
   run once more), `normalized_line_endings` (files put back to LF),
-  `merge_conflicts` (merges that conflicted) and `conflict_resolved`
-  (`true`/`false`, `null` without a conflict);
+  `merge_conflicts` (all conflicts met, in rounds of merging and at the start
+  of merge repairs) and `conflict_resolved` (whether the last resolution
+  worked: `true`/`false`, `null` without a conflict);
 - `totals`: `model_calls`, `input_tokens`, `output_tokens`;
 - `final_checks`: one entry per command (`command`, `ok`, `exit_code`,
   `timed_out`, `duration_s`);

@@ -585,8 +585,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="repair rounds for a node whose post-merge check fails "
                               "(default 1; 0 fails the node at once)")
     run_cmd.add_argument("--conflict-repairs", type=int, default=1,
-                         help="conflict resolutions for a node whose merge conflicts "
-                              "(default 1; 0 fails the node at once)")
+                         help="conflict resolutions in each round of merging: the first "
+                              "merge and the merge after each merge repair (default 1; "
+                              "0 fails the node at once on a conflict)")
     run_cmd.add_argument("--sandbox", choices=("docker", "none"), default="docker",
                          help="where worker shell commands, checks and hidden tests run "
                               "(none: on this machine, tests only)")
