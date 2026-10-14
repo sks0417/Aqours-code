@@ -140,6 +140,9 @@ Field rules:
   functions changed or added (so that two units changing the same function
   can be recognised); for `registration`, the registered names, written as
   symbols of the file they are registered in (`pkg/__init__.py::Name`).
+  For a change inside a class, name the member (`path.py::Class.method`,
+  `path.py::Class.field`), not the class. Name the class itself only when the
+  whole class is new or rewritten.
   Every symbol of an edit is in that edit's file. `lines`: how many lines of
   that file change. `standalone`: only for `logic` (see above). `note`: for
   `registration`, what it registers.
@@ -193,7 +196,7 @@ functions. The README says that recipes are saved and loaded only through
       "goal": "\"Star ratings\": a ratings list on Recipe in recipes/models.py, and rate(book, recipe_id, stars, *, now) in a new recipes/ratings.py that stores through RecipeBook. Tests in tests/test_ratings.py import rate from recipes.",
       "size": 140,
       "edits": [
-        {"file": "recipes/models.py", "kind": "logic", "symbols": ["recipes/models.py::Recipe"], "lines": 15, "standalone": true},
+        {"file": "recipes/models.py", "kind": "logic", "symbols": ["recipes/models.py::Recipe.ratings"], "lines": 15, "standalone": true},
         {"file": "recipes/__init__.py", "kind": "registration", "symbols": ["recipes/__init__.py::rate"], "lines": 1, "note": "export rate from recipes"}
       ],
       "create": ["recipes/ratings.py", "tests/test_ratings.py"],

@@ -22,9 +22,9 @@ directly.
    step 2, where that interface goes first and opens the cycle.
 1. **P1, which nodes.** Units in ``together`` are merged; a unit smaller
    than ``SMALL_UNIT_LINES`` joins the group it is most related to (same
-   file, or uses between them). Units changing the same function are merged
-   too (P3, step 3.1, done here because it decides the nodes). One group
-   left: the single-agent graph.
+   file, unless both only register names there, or uses between them).
+   Units changing the same function are merged too (P3, step 3.1, done here
+   because it decides the nodes). One group left: the single-agent graph.
 2. **P2, real dependencies first.** A ``behavior`` use waits for the
    provider; an ``interface`` use waits too when either side is smaller
    than ``WAIT_LINES``; otherwise the interface goes into the node ``PRE``
@@ -32,15 +32,17 @@ directly.
    last, into ``REG``, when nobody uses it; stays with its unit when only
    that unit, or users that wait anyway, need it; and goes into ``PRE``,
    together with the interface of what it registers, when another unit
-   needs it early.
+   needs it early. When two or more nodes keep registrations in one file
+   (step 2c, P3), those registrations go into ``PRE`` with their interfaces
+   too, so that the nodes do not queue as a whole on that file.
 3. **P3, shared edits.** On a file several groups edit, a small
    (``SMALL_SHARED_EDIT_LINES``) edit that can be written on its own moves
    into ``PRE``; everything else stays and is ordered (``derive_edges``).
 4. **P4, checks.** Each node runs its own tests and the existing tests that
-   import a module it changes (:mod:`affected`); more than
-   ``AFFECTED_TESTS_MAX`` such files, or test files whose imports cannot be
-   read, run the whole suite. A node that edits a file another node edits,
-   ``PRE`` and ``REG`` run the whole suite after merging.
+   import, directly or indirectly, a file it changes (:mod:`affected`); more
+   than ``AFFECTED_TESTS_MAX`` such files, or Python files whose imports
+   cannot be read, run the whole suite. A node that edits a file another
+   node edits, ``PRE`` and ``REG`` run the whole suite after merging.
 5. **The graph.** Nodes, explicit edges for the decisions, then
    :func:`derive_edges` and :func:`validate`.
 
@@ -192,6 +194,7 @@ class _Interface:
     new_file: bool
     providers: list[str]  # bucket keys implementing it
     users: list[str]      # bucket keys using it from PRE
+    registered_as: list[str] = field(default_factory=list)  # names PRE registers it as
 
 
 @dataclass
@@ -343,13 +346,24 @@ class _Synthesizer:
         return {path for unit_id in members
                 for path in [*self.units[unit_id].edit_files(), *self.units[unit_id].create]}
 
+    def _kinds_on(self, members: list[str], path: str) -> set[str]:
+        return {edit.kind for unit_id in members for edit in self.units[unit_id].edits
+                if edit.file == path}
+
     def relation(self, first: list[str], second: list[str]) -> int:
-        """Shared files plus distinct symbols used between two groups."""
-        shared = len(self._files_of(first) & self._files_of(second))
+        """Shared files plus distinct symbols used between two groups.
+
+        A file on which both groups only register names does not count: an
+        export next to another export is no reason to do two pieces of work
+        together.
+        """
+        shared = [path for path in self._files_of(first) & self._files_of(second)
+                  if not self._kinds_on(first, path) == {"registration"}
+                  == self._kinds_on(second, path)]
         symbols = {symbol for provider, user, symbol, _ in self.unit_deps
                    if (provider in first and user in second)
                    or (provider in second and user in first)}
-        return shared + len(symbols)
+        return len(shared) + len(symbols)
 
     def merge_mutual(self) -> None:
         """Step 0: merge groups that need each other's real results."""
@@ -562,10 +576,13 @@ class _Synthesizer:
                 return symbol
         return None
 
-    def add_interface(self, symbol: str, users: list[str]) -> None:
+    def add_interface(self, symbol: str, users: list[str],
+                      registered_as: str | None = None) -> None:
         if symbol in self.interfaces:
             item = self.interfaces[symbol]
             item.users = _unique([*item.users, *users])
+            if registered_as is not None:
+                item.registered_as = _unique([*item.registered_as, registered_as])
             self.after_pre.extend(users)
             return
         path = parse_symbol(symbol).path
@@ -581,7 +598,9 @@ class _Synthesizer:
         self.pre.provides = _unique([*self.pre.provides, symbol])
         self.pre.contributors = _unique([*self.pre.contributors,
                                          *self.providers.get(symbol, [])])
-        self.interfaces[symbol] = _Interface(symbol, path, new_file, providers, list(users))
+        self.interfaces[symbol] = _Interface(
+            symbol, path, new_file, providers, list(users),
+            [registered_as] if registered_as is not None else [])
         self.after_pre.extend([*providers, *users])
 
     def step2(self) -> None:
@@ -659,8 +678,7 @@ class _Synthesizer:
         own = [member for member in home.units
                if any(use.symbol in names for use in self.units[member].uses)]
         label = ", ".join(names) or "(no names)"
-        alone = set(home.files()) == {edit.file} and len(
-            [item for item in home.edits if item.edit.file == edit.file]) == 1
+        alone = self.is_all_of(home, placed)
         if self.off("p2"):
             self.decide("P2", "ablated", [unit.id],
                         f"p2 is off: {unit.id} registers {label} in {edit.file} itself")
@@ -682,25 +700,11 @@ class _Synthesizer:
                         f"{unit.id} and its users wait for it")
             return
         if first:
-            _move_edit(home, self.pre, placed)
-            self.pre.provides = _unique([*self.pre.provides, *names])
-            self.pre.contributors = _unique([*self.pre.contributors, unit.id])
-            home.provides = [symbol for symbol in home.provides if symbol not in names]
-            for name, symbol in targets.items():
-                if symbol is not None:
-                    self.add_interface(symbol, [])
-            self.after_pre.extend([home.key, *first])
+            self.register_first(home, placed, targets, first)
             for user in first:
                 for name in names:
                     if ordering.get((home.key, user, name)) == "first":
                         self.firsts.append((user, name))
-            for member in own:
-                self.firsts.extend((home.key, name) for name in names
-                                   if any(use.symbol == name
-                                          for use in self.units[member].uses))
-            self.registrations[PRE].append(_Registration(unit.id, edit, targets, first))
-            home.notes.append(f"An earlier step registers {label} in {edit.file}; do not "
-                              "register it again.")
             interfaces = ", ".join(symbol for symbol in targets.values() if symbol) or "-"
             self.decide("P2", "registration_first", [unit.id, *self.units_of(first)],
                         f"{', '.join(self.units_of(first))} use {label}, which {unit.id} "
@@ -727,8 +731,9 @@ class _Synthesizer:
         home.provides = [symbol for symbol in home.provides if symbol not in names]
         self.before_reg.append(home.key)
         self.registrations[REG].append(_Registration(unit.id, edit, targets, []))
-        modules = _unique(_module_name(parse_symbol(symbol).path)
-                          for symbol in targets.values() if symbol) or ["the module that defines it"]
+        modules = (_unique(_module_name(parse_symbol(symbol).path)
+                           for symbol in targets.values() if symbol)
+                   or ["the module that defines it"])
         bare = ", ".join(parse_symbol(name).qualname for name in names) or label
         if edit.file in home.files():
             home.notes.append(f"Another step registers {bare} in {edit.file}; do not "
@@ -743,6 +748,95 @@ class _Synthesizer:
                     "the registration moves into REG, which runs after "
                     f"{unit.id} and keeps {edit.file} out of the parallel work",
                     nodes=[REG])
+
+    def is_all_of(self, bucket: Bucket, placed: Placed) -> bool:
+        """Whether moving ``placed`` out would leave ``bucket`` without files."""
+        path = placed.edit.file
+        return set(bucket.files()) == {path} and len(
+            [item for item in bucket.edits if item.edit.file == path]) == 1
+
+    def register_first(self, home: Bucket, placed: Placed, targets: dict[str, str | None],
+                       users: list[str]) -> None:
+        """Move a registration into PRE with the interfaces of what it registers.
+
+        ``home`` and ``users`` start after PRE; members of ``home`` that use a
+        registered name now take it from PRE.
+        """
+        names = list(placed.edit.symbols)
+        _move_edit(home, self.pre, placed)
+        self.pre.provides = _unique([*self.pre.provides, *names])
+        self.pre.contributors = _unique([*self.pre.contributors, placed.unit])
+        home.provides = [symbol for symbol in home.provides if symbol not in names]
+        for name, symbol in targets.items():
+            if symbol is not None:
+                self.add_interface(symbol, [], registered_as=name)
+        self.after_pre.extend([home.key, *users])
+        for member in home.units:
+            self.firsts.extend((home.key, name) for name in names
+                               if any(use.symbol == name for use in self.units[member].uses))
+        own = [home.key] if any(use.symbol in names for member in home.units
+                                for use in self.units[member].uses) else []
+        self.registrations[PRE].append(_Registration(placed.unit, placed.edit, targets,
+                                                     _unique([*users, *own])))
+        home.notes.append(f"An earlier step registers {', '.join(names)} in "
+                          f"{placed.edit.file}; do not register it again.")
+
+    def share_kept_registrations(self) -> None:
+        """Step 2c: registrations kept by several nodes in one file go into PRE.
+
+        Each node that kept a registration needs its registered name early (its
+        own tests, or users that wait for it). When two or more nodes keep
+        registrations in the same file, ordering them by that file would queue
+        the whole nodes, not just the few lines of the registrations; so the
+        registrations go into PRE with the interfaces of what they register.
+        A registration whose symbol is unknown (no interface can go first), or
+        that is all of its node's work, stays and is ordered.
+        """
+        if self.off("p2") or self.off("p3"):
+            return  # both fall back to registering in place, ordered by file
+        kept: dict[str, list[tuple[Bucket, Placed]]] = {}
+        for bucket in self.buckets:
+            for placed in bucket.edits:
+                if placed.edit.kind == "registration":
+                    kept.setdefault(placed.edit.file, []).append((bucket, placed))
+        for path, entries in kept.items():
+            keys = _unique(bucket.key for bucket, _ in entries)
+            if len(keys) < 2:
+                continue
+            stayed: list[tuple[Bucket, Placed, str]] = []
+            for bucket, placed in entries:
+                names = list(placed.edit.symbols)
+                label = ", ".join(names) or "(no names)"
+                targets = {name: self.target(placed.unit, name) for name in names}
+                unknown = [name for name, symbol in targets.items() if symbol is None]
+                if unknown or self.is_all_of(bucket, placed):
+                    why = (f"the symbol {', '.join(unknown)} stands for is not known, so "
+                           "its interface cannot go first" if unknown else
+                           f"it is all of {bucket.key}'s work")
+                    stayed.append((bucket, placed, why))
+                    continue
+                users = _unique(user for provider, user, symbol, _ in self.waits
+                                if provider == bucket.key and symbol in names)
+                self.register_first(bucket, placed, targets, users)
+                interfaces = ", ".join(symbol for symbol in targets.values() if symbol)
+                self.decide("P3", "registration_first_shared", [placed.unit],
+                            f"{', '.join(keys)} all keep registrations in {path} and need "
+                            "their registered names early; registered by each of them, "
+                            f"the whole nodes would queue on {path}. So {placed.unit}'s "
+                            f"registration of {label} goes into PRE together with the "
+                            f"interface of {interfaces}, and {bucket.key} starts after PRE",
+                            nodes=[PRE], nodes_sharing=len(keys))
+            for bucket, placed, why in stayed:
+                others = [other.key for other in self.all_buckets()
+                          if other is not bucket and path in other.files()]
+                label = ", ".join(placed.edit.symbols) or "(no names)"
+                self.decide("P3", "registration_kept_ordered", [placed.unit],
+                            f"{placed.unit} keeps its registration of {label} in {path} "
+                            f"because {why}; {bucket.key} therefore queues, as a whole "
+                            f"node, with the other nodes that edit {path} "
+                            f"({', '.join(others) or 'none'})",
+                            nodes=[key for key in others if key in (PRE, REG)],
+                            nodes_sharing=len(keys))
 
     def units_of(self, keys: list[str]) -> list[str]:
         return [unit_id for key in keys for unit_id in self.by_key[key].units]
@@ -894,7 +988,7 @@ class _Synthesizer:
         if self.tests.unresolved:
             commands = list(self.full)
             self.decide("P4", "full_suite_fallback", units,
-                        f"the imports of {len(self.tests.unresolved)} test file(s) cannot be "
+                        f"the imports of {len(self.tests.unresolved)} Python file(s) cannot be "
                         f"read ({', '.join(self.tests.unresolved[:5])}), so it is unknown "
                         f"which tests {bucket.key} affects: it runs the whole suite",
                         nodes=marker, unresolved=len(self.tests.unresolved))
@@ -964,12 +1058,18 @@ class _Synthesizer:
             where = (f"create {item.path} with only this interface; "
                      f"{self._names(item.providers, ids)} fills in the module later"
                      if item.new_file else f"in {item.path}")
+            used = []
+            if item.users:
+                used.append(f"used by {self._names(item.users, ids)}")
+            if item.registered_as:
+                used.append(f"registered below as "
+                            f"{', '.join(f'`{name}`' for name in item.registered_as)}")
             lines.append(
                 f"{number}. The interface of `{item.symbol}` ({where}): its name and "
                 "signature (for a field: its type and default) with a docstring, and a body "
                 "that runs but does nothing useful (return an empty value or raise "
                 f"NotImplementedError). Implemented by {self._names(item.providers, ids)}; "
-                f"used by {self._names(item.users, ids)}.")
+                f"{'; '.join(used) or 'used by none'}.")
         for registration in self.registrations[PRE]:
             number += 1
             names = ", ".join(f"`{name}`" for name in registration.edit.symbols)
@@ -1093,9 +1193,10 @@ class _Synthesizer:
                              reason=f"units {', '.join(bucket.units)} form one node "
                                     "(planner v3, see the decisions)")
                for bucket in self.buckets if len(bucket.units) > 1]
+        roles = {PRE: "shared interfaces and edits first", REG: "registrations last"}
         log += [RevisionEntry(action="add_node", nodes=[ids[bucket.key]],
                               reason=f"{ids[bucket.key]} added by planner v3 "
-                                     f"({'shared interfaces and edits first' if bucket is self.pre else 'registrations last'})")
+                                     f"({roles[bucket.key]})")
                 for bucket in (self.pre, self.reg) if not bucket.is_empty()]
         graph = Graph.model_validate({
             "request_id": info.request_id, "request": info.request, "repo": info.repo,
@@ -1195,6 +1296,7 @@ def synthesize(facts: Facts, index: RepoIndex, info: GraphInfo,
     synth.make_buckets()
     synth.check_invariants("step 1 (groups)")
     synth.step2()
+    synth.share_kept_registrations()
     synth.check_invariants("step 2 (real dependencies)")
     synth.check_cycles()
     synth.step3()

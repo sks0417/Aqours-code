@@ -96,7 +96,7 @@ CLICK_FILES = (INIT, *(f"src/click/{name}.py" for name in MODULES), "tests/test_
                "tests/test_imports.py", "README.md")
 
 
-def click_units(own_use: str | None = None) -> list[dict]:
+def click_units(own_use: str = "") -> list[dict]:
     units = []
     for number, name in enumerate(MODULES):
         uid = "DEFGHIJK"[number]
@@ -107,7 +107,7 @@ def click_units(own_use: str | None = None) -> list[dict]:
         if number < 5:
             edits.append(registration(INIT, f"Feature{uid}"))
             provides.append(f"{INIT}::Feature{uid}")
-            if uid == own_use:
+            if uid in own_use:
                 uses.append(use(f"{INIT}::Feature{uid}"))
         test = f"tests/test_{name}_feature.py"
         units.append(unit(uid, size=150, edits=edits, create=[test], provides=provides,
@@ -554,3 +554,116 @@ def print_structures():  # pragma: no cover - used to write the report of task 2
                                         index(*CLICK_FILES), CLICK_TESTS)),
                          ("test 4", run(jp_facts(), index(*JP_FILES)))):
         print(f"## {name}\n{json.dumps(structure(result), indent=1)}")
+
+
+# ── task 25b: registrations several nodes keep in one file ──
+
+def test_registrations_several_nodes_need_early_go_first_instead_of_queuing_the_nodes():
+    result = run(facts(*click_units(own_use="DEFGH")), index(*CLICK_FILES), CLICK_TESTS)
+    graph_nodes = nodes(result)
+    pre = graph_nodes["PRE"]
+    names = [f"{INIT}::Feature{uid}" for uid in "DEFGH"]
+    targets = [f"src/click/{MODULES[n]}.py::Feature{uid}" for n, uid in enumerate("DEFGH")]
+    assert set(pre.provides) == {*names, *targets}
+    items = [line for line in pre.goal.splitlines() if line[:1].isdigit()]
+    assert [line.split(". ", 1)[1].split(" ", 2)[:2] for line in items] == (
+        [["The", "interface"]] * 5 + [["In", "src/click/__init__.py,"]] * 5)
+    assert pre.edit_set.modify[0] == INIT
+    assert result.reg is None
+    # no edge between D-K; D-H start after PRE, all at the same time
+    assert edges(result) == {("PRE", uid) for uid in "DEFGH"}
+    for uid in "DEFGH":
+        assert INIT not in graph_nodes[uid].edit_set.modify
+        assert graph_nodes[uid].requires == [f"{INIT}::Feature{uid}"]
+    shared = [d for d in result.decisions if d.rule == "registration_first_shared"]
+    assert [d.units for d in shared] == [[uid] for uid in "DEFGH"]
+    assert all(d.property == "P3" and d.numbers == {"nodes_sharing": 5} for d in shared)
+    assert "the whole nodes would queue on src/click/__init__.py" in shared[0].reason
+
+
+def test_a_registration_whose_symbol_is_unknown_is_kept_and_ordered():
+    def registrar(uid: str, name: str) -> dict:
+        path = f"pkg/{uid.lower()}.py"
+        return unit(uid, edits=[logic(path, f"real_{uid}"), registration("pkg/__init__.py",
+                                                                          name)],
+                    provides=[f"{path}::real_{uid}", f"pkg/__init__.py::{name}"],
+                    uses=[use(f"pkg/__init__.py::{name}")])
+
+    files = ("pkg/__init__.py", "pkg/a.py", "pkg/b.py", "pkg/c.py")
+    both = run(facts(registrar("A", "alias_a"), registrar("B", "alias_b")), index(*files))
+    assert both.pre is None
+    assert edges(both, "order") == {("A", "B")}
+    assert rules(both, "P3")[:2] == ["P3/registration_kept_ordered"] * 2
+    kept = [d for d in both.decisions if d.rule == "registration_kept_ordered"][0]
+    assert "is not known" in kept.reason and "queues, as a whole node" in kept.reason
+
+    mixed = run(facts(registrar("A", "alias_a"), registrar("B", "real_B"),
+                      registrar("C", "real_C")), index(*files))
+    assert [d.rule for d in mixed.decisions if d.property == "P3"][:3] == [
+        "registration_first_shared", "registration_first_shared",
+        "registration_kept_ordered"]
+    assert ("PRE", "A") in edges(mixed, "order")  # A queues behind PRE on __init__.py
+    assert {("PRE", "B"), ("PRE", "C")} <= edges(mixed, "interface")
+    assert "pkg/__init__.py" in nodes(mixed)["A"].edit_set.modify
+
+
+def test_a_small_unit_sharing_only_a_registration_file_is_not_merged():
+    def small(path: str, kind: str) -> dict:
+        edit = (registration("pkg/__init__.py", "small") if kind == "registration"
+                else logic("pkg/__init__.py", "small"))
+        return unit("S", size=10, edits=[logic(path, "s"), edit])
+
+    big = unit("B", edits=[logic("pkg/b.py", "b"), registration("pkg/__init__.py", "b")])
+    other = unit("O", edits=[logic("pkg/o.py", "o")])
+    files = ("pkg/__init__.py", "pkg/b.py", "pkg/s.py", "pkg/o.py")
+    alone = run(facts(big, small("pkg/s.py", "registration"), other), index(*files))
+    assert {"B", "S", "O"} <= set(alone.node_units)
+    assert rules(alone, "P1") == ["P1/small_kept"]
+    merged = run(facts(big, small("pkg/s.py", "logic"), other), index(*files))
+    assert {key: units for key, units in merged.node_units.items() if key != "REG"} == {
+        "B_S": ["B", "S"], "O": ["O"]}
+    assert rules(merged, "P1") == ["P1/small_merged"]
+
+
+def test_affected_tests_follow_imports_through_the_source_modules():
+    files = {"pkg/__init__.py", "pkg/a.py", "pkg/b.py", "pkg/c.py", "tests/test_pkg.py",
+             "tests/test_c.py"}
+    tests = scan_sources({"pkg/__init__.py": "from . import a\n",
+                          "pkg/a.py": "from pkg import b\n",
+                          "pkg/b.py": "import pkg.a\n",  # a cycle: a -> b -> a
+                          "pkg/c.py": "",
+                          "tests/test_pkg.py": "import pkg\n",
+                          "tests/test_c.py": "from pkg import c\n"}, files)
+    # test_c imports pkg.c, which runs pkg/__init__.py, which imports a (and a imports b)
+    assert tests.affected(["pkg/a.py"]) == ["tests/test_c.py", "tests/test_pkg.py"]
+    assert tests.affected(["pkg/b.py"]) == ["tests/test_c.py", "tests/test_pkg.py"]
+    assert tests.affected(["pkg/c.py"]) == ["tests/test_c.py"]
+    assert tests.reached("tests/test_pkg.py") == {"pkg/__init__.py", "pkg/a.py", "pkg/b.py"}
+    # every import of a package runs its __init__.py, so test_c reaches a and b too
+    assert tests.reached("tests/test_c.py") == {"pkg/__init__.py", "pkg/a.py", "pkg/b.py",
+                                                "pkg/c.py"}
+    result = run(facts(unit("A", edits=[logic("pkg/a.py", "f")]),
+                       unit("C", edits=[logic("pkg/c.py", "g")])), index(*files), tests)
+    assert nodes(result)["A"].check.commands == [
+        "python -m pytest -q tests/test_c.py tests/test_pkg.py"]
+
+
+def test_a_source_file_that_does_not_parse_runs_the_whole_suite():
+    files = {"pkg/__init__.py", "pkg/a.py", "pkg/broken.py", "tests/test_pkg.py"}
+    tests = scan_sources({"pkg/__init__.py": "", "pkg/a.py": "", "pkg/broken.py": "def (:\n",
+                          "tests/test_pkg.py": "import pkg.a\n"}, files)
+    assert tests.unresolved == ["pkg/broken.py"]
+    result = run(facts(unit("A", edits=[logic("pkg/a.py", "f")]),
+                       unit("B", edits=[logic("pkg/__init__.py", "g")])), index(*files), tests)
+    assert all(node.check.commands == [FINAL] for node in result.graph.nodes)
+    assert "pkg/broken.py" in [d for d in result.decisions
+                               if d.rule == "full_suite_fallback"][0].reason
+
+
+def test_a_source_module_does_not_resolve_names_from_its_own_directory():
+    files = {"src/click/__init__.py", "src/click/core.py", "src/click/types.py",
+             "tests/helpers.py", "tests/test_x.py"}
+    tests = scan_sources({"src/click/core.py": "import types\n",
+                          "tests/test_x.py": "import helpers\n"}, files)
+    assert tests.sources["src/click/core.py"] == set()  # the standard library's types
+    assert tests.imports["tests/test_x.py"] == {"tests/helpers.py"}

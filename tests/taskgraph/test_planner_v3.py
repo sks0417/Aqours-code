@@ -18,7 +18,7 @@ from aqours_code.taskgraph.planner_v3 import (FACTS_PROMPT_PATH, FactsRevision,
 from aqours_code.taskgraph.repo_index import RepoIndex
 from aqours_code.taskgraph.synthesize import synthesize
 from aqours_code.taskgraph.validate import Issue, validate
-from taskgraph_support import make_graph, make_node
+from taskgraph_support import git, make_graph, make_node
 from test_planner import (REQUEST, ScriptedDrafter, ScriptedPlanner, answer, items_answer,
                           patch_workers)
 
@@ -257,11 +257,9 @@ def test_v3_is_the_default_and_builds_the_graph_from_the_facts(toy_repo, tmp_pat
     assert graph.generator.revision_mode == "none" and graph.generator.ablate is None
     assert [node.id for node in graph.nodes] == ["S", "R"] and graph.edges == []
     by_id = {node.id: node for node in graph.nodes}
-    # tests/test_basic.py imports store and runner: it is affected by both
-    assert by_id["S"].check.commands == [
-        "python -m pytest -q tests/test_cancel.py tests/test_basic.py"]
-    assert by_id["R"].check.commands == [
-        "python -m pytest -q tests/test_skip.py tests/test_basic.py"]
+    # the toy repository's broken.py does not parse: which tests a change
+    # affects is unknown, so every node runs the whole suite
+    assert all(node.check.commands == [FINAL] for node in graph.nodes)
     assert by_id["S"].goal.endswith("- All storage access goes through JobStore.")
     assert by_id["R"].context_files == ["README.md"]
     report = json.loads(report_path_for(options.out).read_text(encoding="utf-8"))
@@ -271,12 +269,26 @@ def test_v3_is_the_default_and_builds_the_graph_from_the_facts(toy_repo, tmp_pat
     assert report["facts"]["units"][0]["id"] == "S"
     assert report["node_units"] == {"S": ["S"], "R": ["R"]}
     assert report["decision_counts"] == {"P1": 0, "P2": 0, "P3": 0, "P4": 2}
-    assert [d["rule"] for d in report["decisions"]] == ["affected_tests"] * 2
+    assert [d["rule"] for d in report["decisions"]] == ["full_suite_fallback"] * 2
+    assert "broken.py" in report["decisions"][0]["reason"]
     assert report["pre_node"] is None and report["reg_node"] is None
     assert report["ablate"] == [] and report["units"] == 2
-    assert report["test_imports"] == {"files": 1, "unresolved": []}
+    assert report["test_imports"] == {"files": 1, "sources": 3, "unresolved": ["broken.py"]}
     assert report["totals"]["model_calls"] == 2
     assert "unmerged_graph" not in report
+
+
+def test_v3_checks_run_the_tests_that_reach_a_changed_file(toy_repo, tmp_path):
+    git(toy_repo.path, "rm", "-q", "broken.py")
+    git(toy_repo.path, "commit", "-q", "-m", "drop the broken file")
+    result, _, options = plan_v3(toy_repo, tmp_path, [answer(TWO_UNITS)])
+    by_id = {node.id: node for node in load_graph(options.out).nodes}
+    # tests/test_basic.py imports store and runner: it is affected by both
+    assert by_id["S"].check.commands == [
+        "python -m pytest -q tests/test_cancel.py tests/test_basic.py"]
+    assert by_id["R"].check.commands == [
+        "python -m pytest -q tests/test_skip.py tests/test_basic.py"]
+    assert result.report["test_imports"] == {"files": 1, "sources": 3, "unresolved": []}
 
 
 def test_facts_errors_and_contradictions_are_revised_by_the_model(toy_repo, tmp_path):
@@ -421,3 +433,14 @@ def test_scan_reads_relative_imports_and_src_layout():
         "tests/sub/__init__.py", "tests/sub/helpers.py", "src/pkg/__init__.py",
         "src/pkg/mod.py", "top.py"}
     assert extract_json_block(answer({"a": 1})) == '{\n  "a": 1\n}\n'
+
+
+def test_facts_prompt_asks_for_members_not_classes():
+    text = _flat(load_facts_prompt())
+    assert _flat("""For a change inside a class, name the member (`path.py::Class.method`,
+        `path.py::Class.field`), not the class. Name the class itself only when the
+        whole class is new or rewritten.""") in text
+    edited = [symbol for unit in example_facts().units for edit in unit.edits
+              if edit.kind == "logic" for symbol in edit.symbols]
+    assert "recipes/models.py::Recipe.ratings" in edited
+    assert "recipes/models.py::Recipe" not in edited

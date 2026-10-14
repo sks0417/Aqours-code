@@ -1002,7 +1002,7 @@ shows facts only, no structure.
 | --- | --- |
 | unit | one piece of work. By default one draft item is one unit; an item with large, unrelated parts in different files may have several units (same `item`). Every draft item has at least one. |
 | `size` | estimated changed lines, tests included |
-| `edits` | changes to **existing** files, one per file. `kind`: `logic` (implements behaviour) or `registration` (only enters a name into a list or table: an export, `__all__`, a registry, a route table). `symbols`: for `logic`, the classes and functions changed or added (to see whether two units change the same function); for `registration`, the registered names (`src/click/__init__.py::Duration`), which other units may `use`. `lines`: lines changed in that file. `standalone` (`logic` only): the edit can be written with only the code already in the repository, without the unit's other edits or other units; `false` when unsure. `note`: what a registration registers. |
+| `edits` | changes to **existing** files, one per file. `kind`: `logic` (implements behaviour) or `registration` (only enters a name into a list or table: an export, `__all__`, a registry, a route table). `symbols`: for `logic`, the classes and functions changed or added (to see whether two units change the same function); a change inside a class names the member (`Class.method`, `Class.field`), and the class itself only when the whole class is new or rewritten; for `registration`, the registered names (`src/click/__init__.py::Duration`), which other units may `use`. `lines`: lines changed in that file. `standalone` (`logic` only): the edit can be written with only the code already in the repository, without the unit's other edits or other units; `false` when unsure. `note`: what a registration registers. |
 | `create` | new files, tests included |
 | `provides` | symbols added or changed for others, registered names included |
 | `uses` | symbols another unit provides, or this unit registers. `need: "interface"`: the name and signature are enough to write the code and run its tests; `need: "behavior"`: the real results are needed; `"behavior"` when unsure. A unit that imports its own symbol through its registered name (a test with `from click import Duration`) lists that name too. |
@@ -1061,7 +1061,9 @@ run again after the merges of step 1, since merges can close new cycles.
    (a shared file, or uses between them) joins the one it is most related to
    (shared files plus distinct symbols used between them; the first in order
    on a tie) (P1/`small_merged`); a small group related to none stays alone
-   (P1/`small_kept`).
+   (P1/`small_kept`). A file on which both groups only make `registration`
+   edits is not a shared file here: an export next to another export is no
+   reason to do two pieces of work together.
 4. Groups whose `logic` edits name the same symbol are merged: two workers
    cannot change one function apart (P3/`same_symbol_merged`; done here
    because it decides the nodes).
@@ -1098,6 +1100,20 @@ A registration that is all of its group's work, or whose symbol s cannot be
 found, is kept, and its users wait for A (P2/`registration_kept`,
 P2/`registration_target_unknown`).
 
+**Step 2c (property 3): registrations several nodes keep in one file.** A
+registration kept in its node (its own tests, or users that wait for it,
+need the name) is ordered with every other node that edits the same file,
+and the order holds back the *whole* node, not just its few lines. So when
+two or more nodes keep registrations in one file, each of those
+registrations goes into `PRE` together with the interface of what it
+registers, exactly as for `registration_first`, and the node starts after
+`PRE` instead of queuing (P3/`registration_first_shared`). A registration
+whose symbol cannot be found (no interface can go first), or that is all of
+its node's work, stays and is ordered; the record says that the node queues
+as a whole (P3/`registration_kept_ordered`). A file on which only one node
+keeps registrations is left as it is. With `p2` or `p3` turned off this step
+does not run.
+
 After step 2, a dependency that still forms a cycle (through waits, `PRE`,
 `REG`, and context files created by another unit) is a contradiction in the
 facts: the model revises them, with the units on the cycle and what each uses
@@ -1107,8 +1123,9 @@ facts: the model revises them, with the units on the cycle and what each uses
 more groups still edit:
 
 1. same function: already merged in step 1;
-2. registrations kept in several groups queue one after the other, a few
-   lines each (P3/`ordered`);
+2. registrations that several groups still keep in the file after step 2c
+   (symbol unknown, or all of the group's work) queue one after the other
+   (P3/`ordered`);
 3. a `logic` edit moves into `PRE` only when all three hold: at most
    `SMALL_SHARED_EDIT_LINES` lines, `standalone: true`, and another group
    also edits the file (P3/`small_shared_edit_first`). It stays when it is
@@ -1120,8 +1137,8 @@ more groups still edit:
 of each.
 
 - `PRE` (`kind: "contract"`, first in the graph) holds only what steps 2
-  and 3 moved there: the chosen interfaces, the registrations that go first,
-  the small shared edits. It writes no stubs for other symbols, no tests,
+  and 3 moved there: the chosen interfaces, the registrations that go first
+  (also those of step 2c), the small shared edits. It writes no stubs for other symbols, no tests,
   and creates no module of a unit, except the module of a chosen interface
   (`PRE` then creates the file and the unit `modify`s it). Its goal is
   written by the program: one item per interface, registration or edit, with
@@ -1138,21 +1155,27 @@ of each.
 
 **Step 4, property 4: how each node is checked.**
 
-- Affected tests: `affected.py` reads the `import` statements of the
-  existing test files under `tests/` with `ast` (also imports inside
-  functions, and relative imports). Module names are mapped to files from
-  the repository root (a top-level package), `src/` (the `src` layout) and
-  the test file's directory. A test file is affected by a node when it
-  imports, directly, a module the node changes, or a package above it, or
-  when the node changes the test file itself or a `conftest.py` above it.
-  Only direct imports count: `import click` reaches `src/click/__init__.py`,
-  not every module `__init__.py` imports.
+- Affected tests: `affected.py` reads the `import` statements of every
+  Python file of the repository with `ast` (also imports inside functions,
+  and relative imports). Module names are mapped to files from the
+  repository root (a top-level package) and `src/` (the `src` layout); a
+  file under `tests/` also resolves names from its own directory, as pytest
+  does, while a source module does not (`import types` in
+  `src/click/core.py` is the standard library). A test file is affected by
+  a node when it imports, **directly or indirectly**, a file the node
+  changes: the imports are followed from the test file through the source
+  modules, `__init__.py` included, so `import click` reaches every module
+  `src/click/__init__.py` imports (import cycles are followed once). A
+  `conftest.py` counts as imported by the test files in its directory and
+  below, and a changed test file affects itself.
 - Node check (`check.commands`): a node with tests of its own runs
   `python -m pytest -q <own tests> <affected tests>`; any other node
   (`PRE` and `REG` too) runs `python -m pytest -q <affected tests>`, or,
   without affected tests, `python -m compileall -q <its .py files>`. More
-  than `AFFECTED_TESTS_MAX` affected test files, or test files whose imports
-  cannot be read, run `final_checks` (P4/`full_suite_fallback`). The other
+  than `AFFECTED_TESTS_MAX` affected test files, or any Python file (test or
+  source) whose imports cannot be read because it does not parse, run
+  `final_checks` (P4/`full_suite_fallback`): which tests a change reaches is
+  then unknown. The other
   cases are recorded as P4/`affected_tests` and P4/`compile_only`.
 - Post-merge check (`check.post_merge_commands`): a node that edits a file
   another node also edits, and `PRE` and `REG`, run `final_checks`, because
@@ -1213,8 +1236,8 @@ outline fields, `totals`, `stage_totals`, `duration_s`):
 - `ablate`;
 - `revision_rounds` and `revision_reasons` (the error codes of every round
   that had to be revised);
-- `test_imports` (test files read, and those whose imports could not be
-  read).
+- `test_imports` (`files`: test files read, `sources`: other Python files
+  read, `unresolved`: files whose imports could not be read).
 
 There is no `.unmerged.json`: v3 does not merge after the fact. The terminal
 summary adds the node and edge counts, whether there is a `PRE` and a `REG`,
@@ -1226,6 +1249,10 @@ units: 8  decisions: P1: 0  P2: 5  P3: 0  P4: 10
 ```
 
 Error codes besides those of v2: `F1`-`F9`, `CONFLICT` and `SYNTH`.
+
+The rules of step 3 listed by name: `registration_too_large`,
+`same_symbol_merged`, `registration_first_shared`,
+`registration_kept_ordered`, `small_shared_edit_first` and `ordered`.
 
 ### Worker reading soft wall
 
