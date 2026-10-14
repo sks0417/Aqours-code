@@ -223,7 +223,8 @@ def test_the_example_shows_facts_only_and_every_kind_of_fact():
                for uid in units for use in units[uid].uses)
 
 
-def test_the_example_facts_give_a_valid_graph():
+def test_the_example_facts_give_a_valid_graph(monkeypatch):
+    monkeypatch.setattr(synthesize_module, "PARALLEL_PATH_MAX", 1.0)  # keep it split
     info = GraphInfo("r", "request", "repo", "abc", [FINAL], None)
     result = synthesize(example_facts(), RECIPE_INDEX, info)
     assert validate(result.graph, RECIPE_INDEX).ok
@@ -268,8 +269,9 @@ def test_v3_is_the_default_and_builds_the_graph_from_the_facts(toy_repo, tmp_pat
     assert report["revision_reasons"] == []
     assert report["facts"]["units"][0]["id"] == "S"
     assert report["node_units"] == {"S": ["S"], "R": ["R"]}
-    assert report["decision_counts"] == {"P1": 0, "P2": 0, "P3": 0, "P4": 2}
-    assert [d["rule"] for d in report["decisions"]] == ["full_suite_fallback"] * 2
+    assert report["decision_counts"] == {"P1": 1, "P2": 0, "P3": 0, "P4": 2}
+    assert [d["rule"] for d in report["decisions"]] == [
+        "full_suite_fallback", "full_suite_fallback", "parallel_enough"]
     assert "broken.py" in report["decisions"][0]["reason"]
     assert report["pre_node"] is None and report["reg_node"] is None
     assert report["ablate"] == [] and report["units"] == 2
@@ -381,7 +383,8 @@ def test_plan_command_prints_the_v3_summary(toy_repo, tmp_path, monkeypatch, cap
     output = capsys.readouterr().out
     assert ("nodes: 2  edges: 0  PRE: no  REG: no  revision rounds: 0  success: yes"
             in output)
-    assert "units: 2  decisions: P1: 0  P2: 0  P3: 0  P4: 2" in output
+    assert "units: 2  decisions: P1: 1  P2: 0  P3: 0  P4: 2" in output
+    assert "parallelism: critical path 80 / 160 lines (0.50 <= 0.70) -> split" in output
     assert "ablated" not in output and "nodes before merge" not in output
     assert f"wrote {out}" in output and f"wrote {report_path_for(out)}" in output
 

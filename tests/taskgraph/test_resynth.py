@@ -99,7 +99,10 @@ def test_resynth_command_prints_the_plan_summary(toy_repo, tmp_path, capsys):
     assert main(["resynth", str(path), "--out", str(out), "--ablate", "p2"]) == 0
     output = capsys.readouterr().out
     assert f"synthesized again from the facts of {path} (no model calls)" in output
-    assert "nodes: 2  edges: 1" in output and "ablated: p2" in output
+    # p2 off: R waits for S, a chain of all the work, so one agent does it
+    assert "nodes: 1  edges: 0" in output and "ablated: p2" in output
+    assert ("parallelism: critical path 240 / 240 lines (1.00 > 0.70) -> single agent"
+            in output)
     assert "model calls: 0" in output and f"wrote {out}" in output
 
 

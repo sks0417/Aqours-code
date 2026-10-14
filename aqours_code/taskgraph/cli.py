@@ -437,6 +437,20 @@ def _print_plan_end(args: argparse.Namespace, result, report: dict) -> None:
         print(f"wrote {args.out}")
 
 
+def _parallelism_line(parallelism: dict, p1_off: bool) -> str:
+    """``parallelism: critical path 2405 / 2825 lines (0.85 > 0.70) -> single agent``."""
+    ratio, limit = parallelism["ratio"], parallelism["threshold"]
+    compare = ">" if ratio > limit else "<="
+    if parallelism["collapsed"]:
+        outcome = "single agent"
+    elif p1_off:
+        outcome = "split (p1 off)"
+    else:
+        outcome = "split"
+    return (f"parallelism: critical path {parallelism['critical']} / {parallelism['total']} "
+            f"lines ({ratio:.2f} {compare} {limit:.2f}) -> {outcome}")
+
+
 def _print_plan_v3(args: argparse.Namespace, result) -> int:
     report = result.report
     _print_plan_start(report)
@@ -448,6 +462,9 @@ def _print_plan_v3(args: argparse.Namespace, result) -> int:
         counts = "  ".join(f"{prop}: {count}"
                            for prop, count in report["decision_counts"].items())
         print(f"units: {report['units']}  decisions: {counts}")
+    parallelism = report.get("parallelism")
+    if parallelism:
+        print(_parallelism_line(parallelism, "p1" in report["ablate"]))
     if report["ablate"]:
         print(f"ablated: {', '.join(report['ablate'])} (rules turned off)")
     _print_plan_end(args, result, report)

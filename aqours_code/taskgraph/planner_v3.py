@@ -204,6 +204,7 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         "decision_counts": synthesis.counts() if built else {},
         "pre_node": synthesis.pre if built else None,
         "reg_node": synthesis.reg if built else None,
+        "parallelism": synthesis.parallelism if built else None,
         "nodes": len(graph.nodes) if graph is not None else 0,
         "edges": len(graph.edges) if graph is not None else 0,
         "goal_chars": goal_chars,

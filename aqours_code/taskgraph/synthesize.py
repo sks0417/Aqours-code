@@ -66,7 +66,7 @@ from .repo_index import RepoIndex
 from .revise import Part, _new_id, goal_with_conventions, merged_goal
 from .schema import Graph, RevisionEntry, parse_symbol
 from .single import single_node
-from .validate import Issue, validate
+from .validate import Issue, usable_edges, validate
 
 # Initial assumptions, not proven optima (see the module docstring).
 SMALL_UNIT_LINES = 30          # P1: a smaller unit joins a related one
@@ -74,6 +74,12 @@ WAIT_LINES = 60                # P2: a smaller provider or user waits instead of
 SMALL_SHARED_EDIT_LINES = 20   # P3: a shared edit this small may go first
 AFFECTED_TESTS_MAX = 30        # P4: more affected test files run the whole suite
 REGISTRATION_MAX_LINES = 5     # a "registration" longer than this is logic
+# P1: when the heaviest chain of nodes carries more than this share of all the
+# work, the graph becomes the single-agent graph. At 0.7 the ideal speed-up of
+# the split graph is at most 1 / 0.7, about 1.43 times, which the fixed cost of
+# the extra nodes (starting, reading the code, checking, merging) roughly eats up.
+PARALLEL_PATH_MAX = 0.7
+INTERFACE_LINES = 5            # P1: the work PRE does for one interface
 
 PROPERTIES = ("p1", "p2", "p3", "p4")
 PRE, REG = "PRE", "REG"
@@ -133,6 +139,9 @@ class Synthesis:
     pre: str | None = None
     reg: str | None = None
     ablate: list[str] = field(default_factory=list)
+    # node_work, total, critical, ratio, path, threshold, collapsed; None when
+    # the units formed one group before any graph was built
+    parallelism: dict | None = None
 
     def counts(self) -> dict[str, int]:
         """Number of decisions per property."""
@@ -1230,17 +1239,71 @@ class _Synthesizer:
                                         if key in node_ids)])
         node_units = {ids[bucket.key]: list(bucket.units or bucket.contributors)
                       for bucket in nodes}
+        work = {node_ids[bucket.key]: self.work_of(bucket) for bucket in nodes}
+        parallelism = measure_parallelism(derived, work)
+        if self.judge_parallelism(parallelism):
+            return self.single(info, revised, parallelism)
         return Synthesis(derived, self.decisions, node_units,
                          pre=node_ids.get(PRE), reg=node_ids.get(REG),
-                         ablate=sorted(self.ablate))
+                         ablate=sorted(self.ablate), parallelism=parallelism)
 
-    def single(self, info: GraphInfo, revised: bool) -> Synthesis:
-        members = self.groups[0]
-        self.decide("P1", "single_unit", members,
-                    f"after merging, all units ({', '.join(members)}) are one group: the "
-                    "single-agent graph, as on the fast path", nodes=["solve"])
-        for decision in self.decisions:
-            decision.nodes = ["solve"]
+    def work_of(self, bucket: Bucket) -> int:
+        """Lines of work in a node: its units' sizes without what moved to PRE or REG.
+
+        PRE does the edits moved into it plus ``INTERFACE_LINES`` per
+        interface; REG does the registrations moved into it.
+        """
+        if bucket is self.pre:
+            return (sum(item.edit.lines for item in bucket.edits)
+                    + INTERFACE_LINES * len(self.interfaces))
+        if bucket is self.reg:
+            return sum(item.edit.lines for item in bucket.edits)
+        moved = sum(item.edit.lines for other in (self.pre, self.reg) for item in other.edits
+                    if item.unit in bucket.units)
+        return max(self.size(bucket.units) - moved, 0)
+
+    def judge_parallelism(self, parallelism: dict) -> bool:
+        """P1: record whether the graph is parallel enough; True to use one agent."""
+        path = " -> ".join(parallelism["path"])
+        critical, total = parallelism["critical"], parallelism["total"]
+        ratio, limit = parallelism["ratio"], PARALLEL_PATH_MAX
+        numbers = {"critical": critical, "total": total, "ratio": ratio, "threshold": limit}
+        chain = (f"the longest chain of nodes {path} has {critical} lines, "
+                 f"{ratio:.0%} of all {total} lines")
+        if self.off("p1"):
+            self.decide("P1", "ablated", [], f"p1 is off: the graph stays split; {chain}",
+                        nodes=parallelism["path"], **numbers)
+            return False
+        if ratio > limit:
+            parallelism["collapsed"] = True
+            self.decide("P1", "low_parallelism_single", [],
+                        f"{chain}, more than {limit:.0%}: split, most of the work would "
+                        "still queue, and every extra node adds its fixed cost (starting, "
+                        "reading the code, checking, merging), so one agent does it all",
+                        nodes=["solve"], **numbers)
+            return True
+        self.decide("P1", "parallel_enough", [],
+                    f"{chain}, at most {limit:.0%}: enough of the work runs in parallel to "
+                    "pay for the extra nodes, so the graph stays split",
+                    nodes=parallelism["path"], **numbers)
+        return False
+
+    def single(self, info: GraphInfo, revised: bool,
+               parallelism: dict | None = None) -> Synthesis:
+        """The single-agent graph: all units are one group, or the split graph is
+        not parallel enough (``parallelism`` given; the decisions before it then
+        describe that split graph, which is not used)."""
+        members = [unit.id for unit in self.facts.units]
+        if parallelism is None:
+            members = self.groups[0]
+            self.decide("P1", "single_unit", members,
+                        f"after merging, all units ({', '.join(members)}) are one group: "
+                        "the single-agent graph, as on the fast path", nodes=["solve"])
+            for decision in self.decisions:
+                decision.nodes = ["solve"]
+        why = ("all units form one group" if parallelism is None else
+               f"the split graph is not parallel enough (longest chain "
+               f"{parallelism['critical']} of {parallelism['total']} lines)")
         graph = Graph.model_validate({
             "request_id": info.request_id, "request": info.request, "repo": info.repo,
             "base_commit": info.base_commit, "final_checks": info.final_checks,
@@ -1248,11 +1311,49 @@ class _Synthesizer:
             "nodes": [single_node(info.request, info.final_checks)],
             "edges": [],
             "revision_log": [{"action": "other", "nodes": ["solve"],
-                              "reason": "planner v3: all units form one group "
-                                        f"({', '.join(members)})"}],
+                              "reason": f"planner v3: {why} ({', '.join(members)})"}],
         })
         return Synthesis(graph, self.decisions, {"solve": list(members)},
-                         ablate=sorted(self.ablate))
+                         ablate=sorted(self.ablate), parallelism=parallelism)
+
+
+def measure_parallelism(graph: Graph, work: dict[str, int]) -> dict:
+    """The heaviest chain of nodes along every edge (interface, full and order).
+
+    ``work`` maps node ids to lines of work. Returns ``node_work``, ``total``,
+    ``critical`` (the work on the heaviest chain), ``ratio`` (``critical /
+    total``, 0 without any work), ``path`` (the chain's nodes, first to
+    last), ``threshold`` and ``collapsed`` (False; set by the caller).
+    """
+    order = [node.id for node in graph.nodes]
+    preds: dict[str, list[str]] = {node_id: [] for node_id in order}
+    for edge in usable_edges(graph):
+        if edge.from_ not in preds[edge.to]:
+            preds[edge.to].append(edge.from_)
+    best: dict[str, int] = {}
+    before: dict[str, str | None] = {}
+
+    def heaviest(node_id: str) -> int:  # the graph is acyclic (validated)
+        if node_id not in best:
+            previous = [(heaviest(pred), -order.index(pred), pred) for pred in preds[node_id]]
+            top = max(previous, default=(0, 0, None))
+            best[node_id] = work.get(node_id, 0) + top[0]
+            before[node_id] = top[2]
+        return best[node_id]
+
+    for node_id in order:
+        heaviest(node_id)
+    end = max(order, key=lambda node_id: (best[node_id], -order.index(node_id)))
+    path = [end]
+    while before[path[-1]] is not None:
+        path.append(before[path[-1]])
+    total = sum(work.get(node_id, 0) for node_id in order)
+    critical = best[end]
+    return {"node_work": {node_id: work.get(node_id, 0) for node_id in order},
+            "total": total, "critical": critical,
+            "ratio": round(critical / total, 4) if total else 0.0,
+            "path": list(reversed(path)), "threshold": PARALLEL_PATH_MAX,
+            "collapsed": False}
 
 
 def generator(info: GraphInfo, revised: bool, ablate) -> dict:
@@ -1305,6 +1406,7 @@ def synthesize(facts: Facts, index: RepoIndex, info: GraphInfo,
     return synth.build(info, revised)
 
 
-__all__ = ["AFFECTED_TESTS_MAX", "Decision", "FactsConflict", "PRE", "PROPERTIES", "REG",
+__all__ = ["AFFECTED_TESTS_MAX", "Decision", "FactsConflict", "INTERFACE_LINES",
+           "PARALLEL_PATH_MAX", "PRE", "PROPERTIES", "REG", "measure_parallelism",
            "SMALL_SHARED_EDIT_LINES", "SMALL_UNIT_LINES", "Synthesis", "SynthesisError",
            "WAIT_LINES", "parse_ablate", "synthesize"]
