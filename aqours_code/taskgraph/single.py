@@ -9,6 +9,19 @@ from .schema import Graph
 SINGLE_INSTRUCTION = 'Keep the existing tests passing and add tests for the new behaviour.'
 
 
+def single_node(request: str, final_checks: list[str] | None = None) -> dict:
+    """The one node of the single-agent control: the whole request, any file."""
+    return {
+        'id': 'solve',
+        'title': 'Implement the whole request',
+        'kind': 'implement',
+        'goal': request + '\n\n' + SINGLE_INSTRUCTION,
+        'edit_set': {'any_file': True, 'modify': [], 'create': []},
+        'context_files': [], 'requires': [], 'requires_impl': [], 'provides': [],
+        'check': {'commands': list(final_checks or []) or ['git diff --check']},
+    }
+
+
 def single_graph(request: str, repo: Path, final_checks: list[str] | None = None) -> Graph:
     """No reference implementation, source inventory, planner or model is consulted.
 
@@ -26,15 +39,7 @@ def single_graph(request: str, repo: Path, final_checks: list[str] | None = None
         'base_commit': head(Path(repo)),
         'final_checks': checks,
         'generator': {'kind': 'manual'},
-        'nodes': [{
-            'id': 'solve',
-            'title': 'Implement the whole request',
-            'kind': 'implement',
-            'goal': request + '\n\n' + SINGLE_INSTRUCTION,
-            'edit_set': {'any_file': True, 'modify': [], 'create': []},
-            'context_files': [], 'requires': [], 'requires_impl': [], 'provides': [],
-            'check': {'commands': checks or ['git diff --check']},
-        }],
+        'nodes': [single_node(request, checks)],
         'edges': [],
         'revision_log': [{
             'action': 'other', 'nodes': ['solve'],

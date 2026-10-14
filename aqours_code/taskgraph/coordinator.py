@@ -6,6 +6,11 @@ drive one node. Every git command on the shared clone runs under ``git_lock``;
 a merge, its post-merge check, and a possible undo run as one unit under
 ``merge_lock``, and the check itself does not hold ``git_lock``.
 
+The post-merge check runs ``check.post_merge_commands`` when a node has them,
+and ``check.commands`` otherwise. A node with ``run_after_failed_upstream``
+runs once all its upstream nodes have finished, even if some failed; its
+prompt names those, and other nodes are still skipped after a failure.
+
 Node checks, post-merge checks, final checks and hidden tests run where the
 workers' shell commands run: in a Docker container with ``--sandbox docker``,
 on the host with ``--sandbox none`` (``checks.py``). A check that times out
@@ -48,11 +53,13 @@ from .validate import ValidationReport, edit_files, unique_nodes, usable_edges, 
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
 DEFAULT_MERGE_REPAIRS = 1
-TASKGRAPH_VERSION = "coordinator-v0.7"
+TASKGRAPH_VERSION = "coordinator-v0.8"
 AQOURS_SOURCE = Path(__file__).resolve().parents[2]
 DEFAULT_WORKERS = 2
 DEFAULT_MAX_ATTEMPTS = 2
 FINAL_CHECK_TIMEOUT_S = 1800.0
+FINISHED = ("merged", "failed", "skipped")
+SKIP_FAILED_NOTE = "Skip the registrations of these failed sub-tasks: {nodes}"
 
 
 class GraphInvalid(Exception):
@@ -126,6 +133,11 @@ class RunResult:
     cleanup_warnings: list[str] = field(default_factory=list)
 
 
+def post_merge_commands(node: Node) -> list[str]:
+    """The node's post-merge check: ``post_merge_commands`` if given, else ``commands``."""
+    return node.check.post_merge_commands or node.check.commands
+
+
 def worker_sandbox(worker: Worker) -> SandboxConfig:
     """Where the worker runs shell commands (``none`` if it does not say)."""
     sandbox = getattr(worker, "sandbox", None)
@@ -196,15 +208,22 @@ class Coordinator:
     # ── scheduling ──
 
     def _is_ready(self, node_id: str) -> bool:
+        if self.by_id[node_id].run_after_failed_upstream:
+            return all(self.records[up].status in FINISHED for up in self.upstream[node_id])
         return all(self.records[up].status == "merged" for up in self.upstream[node_id])
+
+    def failed_upstream(self, node_id: str) -> list[str]:
+        """Direct upstream nodes that finished without being merged, in node order."""
+        return [node.id for node in self.nodes if node.id in self.upstream[node_id]
+                and self.records[node.id].status in ("failed", "skipped")]
 
     def _skip_descendants(self, node_id: str) -> None:
         stack = list(self.downstream[node_id])
         while stack:
             current = stack.pop()
             record = self.records[current]
-            if record.status != "pending":
-                continue
+            if record.status != "pending" or self.by_id[current].run_after_failed_upstream:
+                continue  # such a node runs anyway, once its upstream nodes finish
             record.status, record.reason = "skipped", "upstream_failed"
             self.events.emit("node_skipped", node=current, reason="upstream_failed",
                              cause=node_id)
@@ -299,6 +318,10 @@ class Coordinator:
         record.context_chars += len(pack.text)
         prompt = build_node_prompt(self.graph, node, self.index, attempt, failure,
                                    sandbox=self.sandbox.kind, context_pack=pack)
+        failed = self.failed_upstream(node.id) if node.run_after_failed_upstream else []
+        if failed:
+            prompt = (prompt.rstrip("\n") + "\n\n"
+                      + SKIP_FAILED_NOTE.format(nodes=", ".join(failed)) + "\n")
         (log_dir / f"prompt_{attempt}.md").write_text(prompt, encoding="utf-8")
         self.events.emit("worker_start", node=node.id, attempt=attempt)
         request = WorkerRequest(node_id=node.id, attempt=attempt, prompt=prompt,
@@ -412,7 +435,7 @@ class Coordinator:
                                  commit=commit)
             if commit is None:
                 return "merge_conflict", "", False
-            check = run_checks_with_retry(node.check.commands, self.repo,
+            check = run_checks_with_retry(post_merge_commands(node), self.repo,
                                           node.check.timeout_s, checks=self.checks,
                                           label=f"merge-{node.id}")
             (log_dir / check_file).write_text(check.text, encoding="utf-8")

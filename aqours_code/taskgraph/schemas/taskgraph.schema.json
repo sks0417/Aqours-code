@@ -18,6 +18,22 @@
           "exclusiveMinimum": 0,
           "title": "Timeout S",
           "type": "integer"
+        },
+        "post_merge_commands": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Commands run on the integration branch after the node is merged; without them the post-merge check runs `commands`.",
+          "title": "Post Merge Commands"
         }
       },
       "required": [
@@ -181,6 +197,28 @@
           "default": null,
           "description": "How the draft graph was revised: by an LLM ('llm'), by program rules plus an LLM ('rule_assisted'), or not at all ('none').",
           "title": "Revision Mode"
+        },
+        "ablate": {
+          "anyOf": [
+            {
+              "items": {
+                "enum": [
+                  "p1",
+                  "p2",
+                  "p3",
+                  "p4"
+                ],
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Planner v3 only: the properties whose rules were turned off (each falls back to its simplest behaviour).",
+          "title": "Ablate"
         }
       },
       "required": [
@@ -286,6 +324,12 @@
           "default": null,
           "description": "Expected size of the change.",
           "title": "Size"
+        },
+        "run_after_failed_upstream": {
+          "default": false,
+          "description": "Run once every upstream node has finished, even if some failed or were skipped; the prompt then names them. Other nodes are skipped when an upstream node fails.",
+          "title": "Run After Failed Upstream",
+          "type": "boolean"
         }
       },
       "required": [

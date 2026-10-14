@@ -25,15 +25,19 @@ Unknown fields are rejected everywhere.
 | Object | Fields |
 | --- | --- |
 | `Graph` | `request_id`, `request`, `repo`, `base_commit`, `final_checks` (default `[]`), `generator`, `nodes` (≥ 1), `edges` (default `[]`), `revision_log` (default `[]`) |
-| `Generator` | `kind`: `manual` \| `planner`; optional `planner_version`, `model`, `revision_mode`: `llm` \| `rule_assisted` \| `none` |
-| `Node` | `id` (`[A-Za-z0-9_-]+`), `title`, `kind`: `contract` \| `implement`, `goal` (non-empty), `edit_set`, `requires`, `requires_impl`, `provides`, `check`, `context_files`, optional `size`: `small` \| `medium` \| `large` |
+| `Generator` | `kind`: `manual` \| `planner`; optional `planner_version`, `model`, `revision_mode`: `llm` \| `rule_assisted` \| `none`, `ablate` (planner v3: the properties `p1`-`p4` whose rules were turned off) |
+| `Node` | `id` (`[A-Za-z0-9_-]+`), `title`, `kind`: `contract` \| `implement`, `goal` (non-empty), `edit_set`, `requires`, `requires_impl`, `provides`, `check`, `context_files`, optional `size`: `small` \| `medium` \| `large`, `run_after_failed_upstream` (default `false`; see [Flow](#flow)) |
 | `EditSet` | `any_file` (default `false`; unrestricted files, single-node graphs only), `modify` (existing files), `create` (new files), optional `symbols` (functions/methods the node changes; an implement node listing a symbol here counts as its implementer for `requires_impl`, V12 and W5) |
-| `Check` | `commands`, `timeout_s` (integer > 0, default 300) |
+| `Check` | `commands`, `timeout_s` (integer > 0, default 300), optional `post_merge_commands` (the post-merge check; default: `commands`) |
 | `Edge` | `from`, `to`, `type`: `interface` \| `full` \| `order`, `source`: `manual` \| `llm` \| `derived`, `reason` |
 | `RevisionEntry` | `action`: `merge` \| `split` \| `add_edge` \| `remove_edge` \| `add_node` \| `other`, `nodes`, optional `into`, `reason` |
 
 In Python, `Edge.from` is `Edge.from_`; it is always serialized as `from`.
 Use `load_graph(path)` and `dump_graph(graph, path)` for JSON I/O.
+`generator.ablate`, `check.post_merge_commands` and
+`run_after_failed_upstream` are left out of the serialized graph while they
+are unset (`null` or `false`), so a graph that does not use them reads and
+writes exactly as before they existed.
 
 Within one node, `modify`, `create`, `context_files`, `requires`,
 `requires_impl`, `provides` and `edit_set.symbols` must not repeat an entry,
@@ -47,8 +51,10 @@ validators remain authoritative.
 ### Execution semantics
 
 Every edge, whatever its `type`, means that the downstream node starts only
-after the upstream node has **finished and been merged**. The Coordinator must
-follow this rule; the validator relies on it when it accepts a symbol provided
+after the upstream node has **finished and been merged**. (The one exception
+is a node with `run_after_failed_upstream`, which also starts after an
+upstream node failed; see [Flow](#flow).) The Coordinator must follow this
+rule; the validator relies on it when it accepts a symbol provided
 by any ancestor (V6) and when it accepts an edit conflict ordered by any edge
 (V5). The edge type records *why* the order exists:
 
@@ -121,7 +127,7 @@ skipped and listed in `index.warnings`.
 | V1 | Node ids are unique; edges reference existing nodes; no self-loops; no duplicate edge with the same `from`, `to` and `type`. |
 | V2 | The graph, with all edge types, has no cycle. |
 | V3 | Each `modify` file exists at the base commit or is created by an ancestor (a file created only by a non-ancestor is reported with its creator: missing edge?); `create` files do not exist at the base commit; each `context_files` file exists at the base commit or is created by an ancestor (one created by a non-ancestor, including the node itself, is reported with its creator: missing edge?). *Needs an index.* |
-| V4 | Every node has at least one non-empty check command. |
+| V4 | Every node has at least one non-empty check command; `check.post_merge_commands`, when given, too. |
 | V5 | Two nodes that edit a common file (`modify ∪ create`) must be ordered: one is an ancestor of the other. |
 | V6 | Every `requires` symbol exists at the base commit or is provided by an ancestor (contract or implement). A node's own `provides` does not count. *Needs an index.* |
 | V7 | Every node lists at least one file to edit, unless `any_file` is true. |
@@ -406,7 +412,17 @@ found, `0` when none is, and `2` when no run directory is found.
    ready node starts when fewer than `--workers` nodes are running and its
    `modify ∪ create` does not overlap a running node; ties start in `nodes`
    order. When a node fails, its descendants are `skipped`
-   (`upstream_failed`); unrelated nodes continue. Every git command on the
+   (`upstream_failed`); unrelated nodes continue.
+
+   **Running after a failed upstream node.** A node with
+   `run_after_failed_upstream: true` is ready once every direct upstream node
+   has *finished* (merged, failed or skipped), and is never skipped because
+   of an upstream failure. Its prompt then ends with `Skip the registrations
+   of these failed sub-tasks: <ids>`, naming the direct upstream nodes that
+   were not merged. Planner v3 sets it only on `REG`, the node that registers
+   the names other nodes defined (an export, a registry entry): a failed
+   feature must not keep the others from being registered. Every other node
+   behaves as before. Every git command on the
    shared clone runs under one lock; a merge, its post-merge check, and a
    possible undo run as one unit under a separate merge lock, so a slow
    post-merge check never blocks other nodes from starting or committing.
@@ -456,8 +472,11 @@ found, `0` when none is, and `2` when no run directory is found.
    `[taskgraph] <id>: <title>`. A conflict resets the branch and fails the node
    (`merge_conflict`); the node's checks then run again on the integration
    branch, and a failure undoes the merge, so the integration branch stays
-   clean. A conflict is not retried; a failed post-merge check gets a repair
-   round (below). Changed files outside `modify ∪ create` are recorded as
+   clean. The post-merge check runs `check.post_merge_commands` when the node
+   has them, and `check.commands` otherwise (planner v3 gives a node a narrow
+   node check and the whole suite after merging when its effect is hard to
+   predict). A conflict is not retried; a failed post-merge check gets a
+   repair round (below). Changed files outside `modify ∪ create` are recorded as
    `out_of_scope_files` but do not fail the node. For `any_file` nodes, the list
    stays empty.
 
@@ -607,9 +626,17 @@ python -m aqours_code.taskgraph run aqours_code/taskgraph/examples/toy_graph.jso
 
 ```bash
 python -m aqours_code.taskgraph plan <request.md> --repo <path> --out <graph.json>
+    [--planner v3|v2] [--ablate p1,p2,p3,p4]
     [--final-check "python -m pytest -q tests"] [--timeout 1800] [--request-id <id>]
     [--fast-path-lines 500] [--no-fast-path] [--no-merge]
 ```
+
+`--planner v3` (the default, `planner_version` `planner-v3`) is described in
+[Planner v3](#planner-v3-the-model-reports-facts-the-program-decides-the-structure);
+`--planner v2` runs planner v2, described in the rest of this section,
+exactly as before (its graphs and reports still say `planner-v2`).
+`--ablate` is for v3 only and `--no-merge` for v2 only; the other options
+apply to both.
 
 Planner v2 builds the graph in the three steps of the project proposal: a
 draft from the request alone, grounding in the code, and a rule-based
@@ -900,6 +927,332 @@ timed out) and `REVISE`.
 
 `experiments/taskgraph/planner_eval/` runs the planner on the experiment
 repositories and compares the result with the hand-written graphs.
+
+### Planner v3: the model reports facts, the program decides the structure
+
+The four properties of the project proposal are meant to **decide the shape
+of the graph from the features of the task**. In v2 every structural choice
+is the model's (Step 2, from its prompt and examples), and the program only
+checks that the graph is valid. The result was the same template for every
+task, "build a heavy contract, then run the workers in parallel":
+
+- on the click batch the contract was not needed: four nodes waited for it,
+  at a cost of more than 400,000 tokens;
+- on the job platform the contract ran 208-305 s, the longest stretch of the
+  critical path;
+- every node check and every post-merge check ran the whole test suite.
+
+v3 splits the work differently:
+
+- **The model (Step 2) reports task facts and makes local judgements:** where
+  each piece of work changes the code, what it provides and uses, whether it
+  needs an interface or the real behaviour, how large it is, which pieces
+  belong together. These judgements can still be wrong; the program checks
+  them, and takes the conservative choice where they are uncertain.
+- **The program (Step 3, `synthesize.py`) decides the structure** from those
+  facts, by the rules of the four properties. The same rules give a single
+  node, plain parallel nodes, interfaces first and then parallel nodes, or
+  nodes that wait for each other. Every decision records its property, its
+  rule and its grounds, and every property can be turned off.
+
+**Core principle: first satisfy the real dependencies, then use rules to cut
+the coordination cost.** The thresholds below are initial assumptions, not
+proven optima.
+
+Step 1 (draft items, fast path) is the same as in v2. v3 does not run v2's
+merges M1 and M2.
+
+#### Step 2: task facts (`facts.py`, `planner_facts_prompt.md`)
+
+The agent (read-only tools, as in v2) gets
+[`planner_facts_prompt.md`](planner_facts_prompt.md), the request, the draft
+items, the file list and the outline. The prompt keeps v2's instructions on
+reading (plan from the outline, read parts of files with `offset`/`limit`,
+several files per turn), conventions and short goals, and drops every
+structural rule (how to build a contract, when to split, which checks to
+run, "no integration node"). Instead it says: *You describe the work; you
+do not design the task graph. The program decides which units become nodes,
+which shared edits are made first or last, what runs in parallel, and how
+each node is checked, from what you report.* Its example (a toy recipe book)
+shows facts only, no structure.
+
+```json
+{
+  "conventions": ["A rule every unit must follow."],
+  "units": [{
+    "id": "D", "item": "1", "title": "Duration parameter type",
+    "goal": "The part of the request, then where in the code it goes (under 800 characters).",
+    "size": 150,
+    "edits": [
+      {"file": "src/click/types.py", "kind": "logic",
+       "symbols": ["src/click/types.py::Duration"], "lines": 120, "standalone": false},
+      {"file": "src/click/__init__.py", "kind": "registration",
+       "symbols": ["src/click/__init__.py::Duration"], "lines": 1,
+       "note": "export Duration from click"}],
+    "create": ["tests/test_types/test_duration.py"],
+    "provides": ["src/click/types.py::Duration", "src/click/__init__.py::Duration"],
+    "uses": [{"symbol": "src/click/__init__.py::Duration", "need": "interface"}],
+    "tests": ["tests/test_types/test_duration.py"],
+    "context_files": ["README.md"]}],
+  "together": [{"units": ["P1", "P2"], "reason": "Why one cannot stand without the other."}]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| unit | one piece of work. By default one draft item is one unit; an item with large, unrelated parts in different files may have several units (same `item`). Every draft item has at least one. |
+| `size` | estimated changed lines, tests included |
+| `edits` | changes to **existing** files, one per file. `kind`: `logic` (implements behaviour) or `registration` (only enters a name into a list or table: an export, `__all__`, a registry, a route table). `symbols`: for `logic`, the classes and functions changed or added (to see whether two units change the same function); a change inside a class names the member (`Class.method`, `Class.field`), and the class itself only when the whole class is new or rewritten; for `registration`, the registered names (`src/click/__init__.py::Duration`), which other units may `use`. `lines`: lines changed in that file. `standalone` (`logic` only): the edit can be written with only the code already in the repository, without the unit's other edits or other units; `false` when unsure. `note`: what a registration registers. |
+| `create` | new files, tests included |
+| `provides` | symbols added or changed for others, registered names included |
+| `uses` | symbols another unit provides, or this unit registers. `need: "interface"`: the name and signature are enough to write the code and run its tests; `need: "behavior"`: the real results are needed; `"behavior"` when unsure. A unit that imports its own symbol through its registered name (a test with `from click import Duration`) lists that name too. |
+| `tests` | the unit's own test files; empty when nothing can be observed on its own (pure wiring) |
+| `together` | units that are one piece of work logically, with a reason; editing the same file is not a reason |
+
+**Checks of the facts** (errors go back to the model in the usual revision
+rounds, at most `MAX_REVISIONS`):
+
+| Code | Error |
+| --- | --- |
+| `F1` | a unit's `item` is not a draft item, or a draft item has no unit |
+| `F2` | a unit id is repeated |
+| `F3` | an edit names a file that does not exist, the same file twice, or a symbol of another file; a unit edits and creates nothing |
+| `F4` | a created file exists, is created by several units, or is also in `edits` |
+| `F5` | a provided symbol is not in a file of the unit's `edits` or `create`; a registered name is not in the `symbols` of its registration edit |
+| `F6` | `need` is neither `interface` nor `behavior`; a used symbol is provided by no unit |
+| `F7` | a test file is neither in the unit's `create` nor in its `edits` |
+| `F8` | `together` names an unknown unit |
+| `F9` | a context file neither exists nor is created by a unit; a context heading does not exist |
+
+One correction the program makes itself and records: a `registration` edit
+of more than 5 lines is treated as `logic` with `standalone: false`
+(P3/`registration_too_large`).
+
+#### Step 3: the graph (`synthesize.py`)
+
+Input: the facts, the repository index, `final_checks` and the imports of
+the existing test files (`affected.py`). Output: the graph and `decisions`,
+one per structural choice: `property` (P1-P4), `rule`, the units and nodes
+involved, the numbers used, and a reason.
+
+The thresholds are module constants. They are **initial assumptions**. Their
+basis: a worker's fixed cost (starting, reading the code, checking) is about
+a minute, as much as writing a few dozen lines directly.
+
+| Constant | Value | Use |
+| --- | --- | --- |
+| `SMALL_UNIT_LINES` | 30 | P1: a smaller unit joins a related one |
+| `WAIT_LINES` | 60 | P2: when the provider or the user is smaller, the user waits instead of putting the interface first |
+| `SMALL_SHARED_EDIT_LINES` | 20 | P3: the largest shared edit that may be made first |
+| `AFFECTED_TESTS_MAX` | 30 | P4: more affected test files run the whole suite |
+
+**Step 0: contradictions.** The `uses` form a graph: B uses what A provides
+gives A -> B, for both needs. A cycle made only of `behavior` uses (each needs
+the other's real result) means the units cannot stand on their own: they are
+merged (P1/`mutual_behavior_merged`). A cycle with an `interface` use is left
+to step 2, where that interface goes first and opens the cycle. This step is
+run again after the merges of step 1, since merges can close new cycles.
+
+**Step 1, property 1: which nodes.**
+
+1. Every unit starts as its own group.
+2. Groups named in `together` are merged (P1/`together`).
+3. A group smaller than `SMALL_UNIT_LINES` that is related to other groups
+   (a shared file, or uses between them) joins the one it is most related to
+   (shared files plus distinct symbols used between them; the first in order
+   on a tie) (P1/`small_merged`); a small group related to none stays alone
+   (P1/`small_kept`). A file on which both groups only make `registration`
+   edits is not a shared file here: an export next to another export is no
+   reason to do two pieces of work together.
+4. Groups whose `logic` edits name the same symbol are merged: two workers
+   cannot change one function apart (P3/`same_symbol_merged`; done here
+   because it decides the nodes).
+5. One group left: the single-agent graph of the fast path (`solve`, any
+   file), and nothing else is done (P1/`single_unit`).
+
+A merged group has its edits by file, its sizes added, and its goals one
+after the other (`merged_goal`, as in v2). From here on, "unit" means group.
+
+**Step 2, property 2: real dependencies first.** For each use (user B,
+symbol s, provider A):
+
+| Case | Structure | Record |
+| --- | --- | --- |
+| `need: "behavior"` | B waits for A (`requires_impl`, a `full` edge) | P2/`wait_for_behavior` |
+| `need: "interface"`, A or B smaller than `WAIT_LINES` | B waits for A | P2/`wait_small` |
+| `need: "interface"`, otherwise | the interface of s (signature, docstring, a body that runs) goes into the node `PRE`; A and B both start after `PRE` | P2/`interface_first` |
+
+An `interface` use that lies on a cycle of uses never waits (waiting would
+close the cycle): its interface goes into `PRE` whatever the sizes. That is
+how step 2 opens the cycles step 0 left.
+
+For a registered name r (A registers r for its symbol s, found as A's symbol
+with the same last name in another file), **who needs r decides where the
+registration goes**, not the kind of edit:
+
+| Who needs r | Structure | Record |
+| --- | --- | --- |
+| nobody | **last**: the registration leaves A for the node `REG`, which runs after A | P2/`registration_last` |
+| only A's own group, or other units that wait for A anyway (behavior, or small) | **kept**: A registers it itself | P2/`registration_kept` |
+| another unit that does not wait for A | **first**: the registration and the interface of s go into `PRE` (registering a name that does not exist yet would break importing the package, so the interface comes along); A and the users start after `PRE` | P2/`registration_first` |
+
+A registration that is all of its group's work, or whose symbol s cannot be
+found, is kept, and its users wait for A (P2/`registration_kept`,
+P2/`registration_target_unknown`).
+
+**Step 2c (property 3): registrations several nodes keep in one file.** A
+registration kept in its node (its own tests, or users that wait for it,
+need the name) is ordered with every other node that edits the same file,
+and the order holds back the *whole* node, not just its few lines. So when
+two or more nodes keep registrations in one file, each of those
+registrations goes into `PRE` together with the interface of what it
+registers, exactly as for `registration_first`, and the node starts after
+`PRE` instead of queuing (P3/`registration_first_shared`). A registration
+whose symbol cannot be found (no interface can go first), or that is all of
+its node's work, stays and is ordered; the record says that the node queues
+as a whole (P3/`registration_kept_ordered`). A file on which only one node
+keeps registrations is left as it is. With `p2` or `p3` turned off this step
+does not run.
+
+After step 2, a dependency that still forms a cycle (through waits, `PRE`,
+`REG`, and context files created by another unit) is a contradiction in the
+facts: the model revises them, with the units on the cycle and what each uses
+(`CONFLICT`).
+
+**Step 3, property 3: shared edits.** For each existing file that two or
+more groups still edit:
+
+1. same function: already merged in step 1;
+2. registrations that several groups still keep in the file after step 2c
+   (symbol unknown, or all of the group's work) queue one after the other
+   (P3/`ordered`);
+3. a `logic` edit moves into `PRE` only when all three hold: at most
+   `SMALL_SHARED_EDIT_LINES` lines, `standalone: true`, and another group
+   also edits the file (P3/`small_shared_edit_first`). It stays when it is
+   all of its group's work. **Few lines alone are no reason to go first;**
+4. everything else stays, and `derive_edges()` orders the nodes on the file
+   (P3/`ordered`, with the file and the reasons).
+
+**`PRE` and `REG`** exist only when something is put into them, at most one
+of each.
+
+- `PRE` (`kind: "contract"`, first in the graph) holds only what steps 2
+  and 3 moved there: the chosen interfaces, the registrations that go first
+  (also those of step 2c), the small shared edits. It writes no stubs for other symbols, no tests,
+  and creates no module of a unit, except the module of a chosen interface
+  (`PRE` then creates the file and the unit `modify`s it). Its goal is
+  written by the program: one item per interface, registration or edit, with
+  who implements it and who uses it.
+- `REG` (`kind: "implement"`, last) holds only the registrations that go
+  last; its goal lists them with their notes. It has
+  `run_after_failed_upstream`, so a failed feature does not keep the others
+  from being registered (the Coordinator names the failed ones in its
+  prompt).
+- A unit whose registration moved to `REG` gets a sentence at the end of its
+  goal: `Another step registers <name> in <file>; do not edit that file, and
+  import from <module> in your tests.` A unit whose edit moved to `PRE` is
+  told that an earlier step makes it.
+
+**Step 4, property 4: how each node is checked.**
+
+- Affected tests: `affected.py` reads the `import` statements of every
+  Python file of the repository with `ast` (also imports inside functions,
+  and relative imports). Module names are mapped to files from the
+  repository root (a top-level package) and `src/` (the `src` layout); a
+  file under `tests/` also resolves names from its own directory, as pytest
+  does, while a source module does not (`import types` in
+  `src/click/core.py` is the standard library). A test file is affected by
+  a node when it imports, **directly or indirectly**, a file the node
+  changes: the imports are followed from the test file through the source
+  modules, `__init__.py` included, so `import click` reaches every module
+  `src/click/__init__.py` imports (import cycles are followed once). A
+  `conftest.py` counts as imported by the test files in its directory and
+  below, and a changed test file affects itself.
+- Node check (`check.commands`): a node with tests of its own runs
+  `python -m pytest -q <own tests> <affected tests>`; any other node
+  (`PRE` and `REG` too) runs `python -m pytest -q <affected tests>`, or,
+  without affected tests, `python -m compileall -q <its .py files>`. More
+  than `AFFECTED_TESTS_MAX` affected test files, or any Python file (test or
+  source) whose imports cannot be read because it does not parse, run
+  `final_checks` (P4/`full_suite_fallback`): which tests a change reaches is
+  then unknown. The other
+  cases are recorded as P4/`affected_tests` and P4/`compile_only`.
+- Post-merge check (`check.post_merge_commands`): a node that edits a file
+  another node also edits, and `PRE` and `REG`, run `final_checks`, because
+  the effect of their merge is the hardest to predict
+  (P4/`shared_file_full_check`). Every other node runs its node check again
+  (no `post_merge_commands`).
+- The final checks are unchanged: the whole suite.
+
+When `--final-check` is not given, `git diff --check` stands in for the
+whole suite, as in the `single` command.
+
+**Step 5: the graph.** Nodes get their unit's id (a merged group:
+`_new_id`, member ids joined by `_`); `PRE` and `REG` come first and last.
+The decisions become explicit edges (`PRE -> X` `interface`, waits `full`,
+`X -> REG` `full`; all `source: "derived"`), `derive_edges()` adds the
+rest (the order on shared files, context files), and `validate()` checks
+the graph. Every goal ends with the conventions, as in v2.
+
+**Where a problem comes from** decides who fixes it:
+
+- the program broke one of its own invariants while moving edits or making
+  dependencies (a file or new file nobody is responsible for, a symbol nobody
+  provides any more, a unit in no group): `synthesize()` checks the
+  invariants after every step and raises `SynthesisError`, naming the
+  invariant and the latest decisions. The model is not asked; the run fails
+  with a `SYNTH` error;
+- the facts themselves cause it (a cycle left after step 2, or an edge
+  `derive_edges()` skipped for a cycle so that `validate()` fails): the
+  model revises the facts (`CONFLICT`).
+
+#### Ablation
+
+`plan --ablate p1,p2,p3,p4` (any of them) turns properties off. Each falls
+back to its simplest behaviour, its decisions are recorded with the rule
+`ablated`, and the graph says so in `generator.ablate` (and the report in
+`ablate`):
+
+| Off | Fallback |
+| --- | --- |
+| `p1` | `together` is ignored and small units are not merged (cycles of `behavior` uses are still merged, or the graph could not hold) |
+| `p2` | every use waits; every registration stays with its unit; no `PRE` for interfaces. A cycle of uses of any need is then merged like a `behavior` cycle, since no interface can open it |
+| `p3` | no merge of units changing the same function, no shared edit moved: the same file is only ordered |
+| `p4` | every node check and every post-merge check runs the whole suite |
+
+#### Output
+
+The graph (`generator`: `planner_version` `planner-v3`, `revision_mode`
+`llm` after a revision round, else `none`, and `ablate`), and
+`<out>.report.json` with, besides the fields v2 also writes (`draft_items`,
+`fast_path`, `stage1`, `rounds`, `errors`, `goal_chars`, `long_goals`, the
+outline fields, `totals`, `stage_totals`, `duration_s`):
+
+- `planner` (`v3`), `facts` (the facts of the round that built the graph),
+  `units`, `conventions`;
+- `decisions` (the full list) and `decision_counts` (per property);
+- `node_units` (node id -> the units it is made of; for `PRE` and `REG`, the
+  units whose parts they took over), `pre_node` and `reg_node`;
+- `ablate`;
+- `revision_rounds` and `revision_reasons` (the error codes of every round
+  that had to be revised);
+- `test_imports` (`files`: test files read, `sources`: other Python files
+  read, `unresolved`: files whose imports could not be read).
+
+There is no `.unmerged.json`: v3 does not merge after the fact. The terminal
+summary adds the node and edge counts, whether there is a `PRE` and a `REG`,
+and the number of decisions per property:
+
+```text
+nodes: 9  edges: 5  PRE: no  REG: REG  revision rounds: 0  success: yes
+units: 8  decisions: P1: 0  P2: 5  P3: 0  P4: 10
+```
+
+Error codes besides those of v2: `F1`-`F9`, `CONFLICT` and `SYNTH`.
+
+The rules of step 3 listed by name: `registration_too_large`,
+`same_symbol_merged`, `registration_first_shared`,
+`registration_kept_ordered`, `small_shared_edit_first` and `ordered`.
 
 ### Worker reading soft wall
 

@@ -368,7 +368,8 @@ def _cmd_single(args: argparse.Namespace) -> int:
 def _cmd_plan(args: argparse.Namespace) -> int:
     from .gitops import GitError
     from . import planner
-    from .planner import REPORTED_GOAL_CHARS, PlanOptions, run_plan
+    from .planner import PlanOptions, run_plan
+    from .synthesize import parse_ablate
 
     request_path = Path(args.request)
     if not request_path.is_file():
@@ -379,17 +380,29 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         return _error("--timeout must be > 0")
     if args.fast_path_lines < 0:
         return _error("--fast-path-lines must be >= 0")
+    try:
+        ablate = parse_ablate(args.ablate)
+    except ValueError as exc:
+        return _error(f"--ablate: {exc}")
+    if args.planner == "v2" and ablate:
+        return _error("--ablate applies only to --planner v3")
+    if args.planner == "v3" and args.no_merge:
+        return _error("--no-merge applies only to --planner v2 (v3 does not merge by M1/M2)")
     options = PlanOptions(request_path=request_path, repo=Path(args.repo),
                           out=Path(args.out), final_checks=list(args.final_check),
                           timeout_s=args.timeout, request_id=args.request_id,
                           fast_path_lines=None if args.no_fast_path else args.fast_path_lines,
-                          merge=not args.no_merge)
+                          merge=not args.no_merge, planner=args.planner, ablate=ablate)
     try:
         result = run_plan(options, planner.planner_worker(), planner.draft_worker())
     except (GitError, RuntimeError, OSError, UnicodeDecodeError) as exc:
         return _error(str(exc))
-    report = result.report
-    totals = report["totals"]
+    if args.planner == "v3":
+        return _print_plan_v3(args, result)
+    return _print_plan_v2(args, result)
+
+
+def _print_plan_start(report: dict) -> None:
     fast = report["fast_path"]
     estimate = fast["estimated_changed_lines"]
     print(f"draft items: {len(report['draft_items'])}  estimated changed lines: "
@@ -401,16 +414,12 @@ def _cmd_plan(args: argparse.Namespace) -> int:
               "single-agent graph, steps 2 and 3 skipped")
     elif estimate is not None:
         print(f"fast path: not taken ({estimate} >= {fast['threshold']} lines)")
-    print(f"nodes: {report['nodes']}  edges: {report['edges']}  "
-          f"revision rounds: {report['revision_rounds']}  "
-          f"success: {'yes' if result.success else 'no'}")
-    if not fast["taken"] and report["graph_written"]:
-        merging = "" if report["merge"] else " (--no-merge)"
-        print(f"nodes before merge: {report['nodes_before_merge']}  after: "
-              f"{report['nodes']}{merging}")
-        for merge in report["merges"]:
-            print(f"merged ({merge['rule']}): {' + '.join(merge['members'])} -> "
-                  f"{merge['into']}")
+
+
+def _print_plan_end(args: argparse.Namespace, result, report: dict) -> None:
+    from .planner import REPORTED_GOAL_CHARS
+
+    totals = report["totals"]
     print(f"model calls: {totals['model_calls']}  tokens: {totals['input_tokens']} in / "
           f"{totals['output_tokens']} out  time: {report['duration_s']:.1f}s")
     print(f"outline: {report['outline_chars']} characters "
@@ -426,6 +435,41 @@ def _cmd_plan(args: argparse.Namespace) -> int:
             print(f"[{issue['code']}]{nodes} {issue['message']}")
     if report["graph_written"]:
         print(f"wrote {args.out}")
+
+
+def _print_plan_v3(args: argparse.Namespace, result) -> int:
+    report = result.report
+    _print_plan_start(report)
+    print(f"nodes: {report['nodes']}  edges: {report['edges']}  "
+          f"PRE: {report['pre_node'] or 'no'}  REG: {report['reg_node'] or 'no'}  "
+          f"revision rounds: {report['revision_rounds']}  "
+          f"success: {'yes' if result.success else 'no'}")
+    if report["decision_counts"]:
+        counts = "  ".join(f"{prop}: {count}"
+                           for prop, count in report["decision_counts"].items())
+        print(f"units: {report['units']}  decisions: {counts}")
+    if report["ablate"]:
+        print(f"ablated: {', '.join(report['ablate'])} (rules turned off)")
+    _print_plan_end(args, result, report)
+    print(f"wrote {result.report_path}")
+    return EXIT_OK if result.success else EXIT_INVALID
+
+
+def _print_plan_v2(args: argparse.Namespace, result) -> int:
+    report = result.report
+    fast = report["fast_path"]
+    _print_plan_start(report)
+    print(f"nodes: {report['nodes']}  edges: {report['edges']}  "
+          f"revision rounds: {report['revision_rounds']}  "
+          f"success: {'yes' if result.success else 'no'}")
+    if not fast["taken"] and report["graph_written"]:
+        merging = "" if report["merge"] else " (--no-merge)"
+        print(f"nodes before merge: {report['nodes_before_merge']}  after: "
+              f"{report['nodes']}{merging}")
+        for merge in report["merges"]:
+            print(f"merged ({merge['rule']}): {' + '.join(merge['members'])} -> "
+                  f"{merge['into']}")
+    _print_plan_end(args, result, report)
     if report["unmerged_graph"]:
         print(f"wrote {report['unmerged_graph']}")
     print(f"wrote {result.report_path}")
@@ -566,8 +610,14 @@ def build_parser() -> argparse.ArgumentParser:
                                "split (default 500)")
     plan_cmd.add_argument("--no-fast-path", action="store_true",
                           help="always split, whatever the estimate")
+    plan_cmd.add_argument("--planner", choices=("v2", "v3"), default="v3",
+                          help="planner version (default v3: the model reports task facts, "
+                               "the program builds the graph)")
+    plan_cmd.add_argument("--ablate", default="",
+                          help="v3 only: turn off the rules of properties, e.g. p1,p3 "
+                               "(each falls back to its simplest behaviour)")
     plan_cmd.add_argument("--no-merge", action="store_true",
-                          help="skip step 3 (rule-based merging)")
+                          help="v2 only: skip step 3 (rule-based merging)")
     plan_cmd.add_argument("--request-id", help="request_id of the graph "
                           "(default: the --out file name without extension)")
     plan_cmd.set_defaults(func=_cmd_plan)
