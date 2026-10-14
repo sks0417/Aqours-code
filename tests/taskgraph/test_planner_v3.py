@@ -168,9 +168,9 @@ def test_facts_prompt_leaves_the_structure_to_the_program():
         decides which units become nodes, which shared edits are made first or
         last, what runs in parallel, and how each node is checked, from what you
         report. Report truthfully, even when two units edit the same file or the
-        same function. When you are unsure whether an interface is enough, say
-        "behavior"; when you are unsure whether an edit can be written on its own,
-        say standalone false.""") in _flat(text)
+        same function. When you are unsure whether an edit can be written on its
+        own, say standalone false.""") in _flat(text)
+    assert 'say "behavior"' not in text
     lowered = text.lower()
     for word in ("contract", "integration", "requires_impl", '"check"', "split rule"):
         assert word not in lowered, word
@@ -218,7 +218,11 @@ def test_the_example_shows_facts_only_and_every_kind_of_fact():
     assert others                                            # a name another unit uses
     assert any(name not in used for name in registered)      # a name nobody uses
     assert {"interface", "behavior"} <= set(used.values())
-    assert the_facts.together and the_facts.together[0].reason
+    # a field is used through its interface; every behavior use names its result
+    assert used["recipes/models.py::Recipe.ratings"] == "interface"
+    assert all(use.why for unit in the_facts.units for use in unit.uses
+               if use.need == "behavior")
+    assert the_facts.together == []
     assert any(use.symbol in units[uid].registration_names()  # a unit uses its own name
                for uid in units for use in units[uid].uses)
 
@@ -227,7 +231,11 @@ def test_the_example_facts_give_a_valid_graph():
     info = GraphInfo("r", "request", "repo", "abc", [FINAL], None)
     result = synthesize(example_facts(), RECIPE_INDEX, info)
     assert validate(result.graph, RECIPE_INDEX).ok
-    assert result.node_units["R_B"] == ["R", "B"]
+    # R and B are no longer one unit: B starts after PRE, which adds Recipe.ratings
+    assert list(result.node_units) == ["PRE", "R", "B", "S", "C", "REG"]
+    assert {(edge.from_, edge.to) for edge in result.graph.edges
+            if edge.type == "full"} >= {("B", "C"), ("S", "REG")}
+    assert not result.parallelism["collapsed"]
 
 
 def test_facts_prompt_has_the_sections_and_the_revision(toy_index):
@@ -253,7 +261,7 @@ def test_v3_is_the_default_and_builds_the_graph_from_the_facts(toy_repo, tmp_pat
     assert result.success and len(worker.requests) == 1
     assert "You describe the work" in worker.requests[0].prompt
     graph = load_graph(options.out)
-    assert graph.generator.planner_version == "planner-v3"
+    assert graph.generator.planner_version == "planner-v3.1"
     assert graph.generator.revision_mode == "none" and graph.generator.ablate is None
     assert [node.id for node in graph.nodes] == ["S", "R"] and graph.edges == []
     by_id = {node.id: node for node in graph.nodes}
@@ -263,13 +271,14 @@ def test_v3_is_the_default_and_builds_the_graph_from_the_facts(toy_repo, tmp_pat
     assert by_id["S"].goal.endswith("- All storage access goes through JobStore.")
     assert by_id["R"].context_files == ["README.md"]
     report = json.loads(report_path_for(options.out).read_text(encoding="utf-8"))
-    assert report["planner"] == "v3" and report["planner_version"] == "planner-v3"
+    assert report["planner"] == "v3" and report["planner_version"] == "planner-v3.1"
     assert report["success"] and report["revision_rounds"] == 0
     assert report["revision_reasons"] == []
     assert report["facts"]["units"][0]["id"] == "S"
     assert report["node_units"] == {"S": ["S"], "R": ["R"]}
-    assert report["decision_counts"] == {"P1": 0, "P2": 0, "P3": 0, "P4": 2}
-    assert [d["rule"] for d in report["decisions"]] == ["full_suite_fallback"] * 2
+    assert report["decision_counts"] == {"P1": 1, "P2": 0, "P3": 0, "P4": 2}
+    assert [d["rule"] for d in report["decisions"]] == [
+        "full_suite_fallback", "full_suite_fallback", "parallel_enough"]
     assert "broken.py" in report["decisions"][0]["reason"]
     assert report["pre_node"] is None and report["reg_node"] is None
     assert report["ablate"] == [] and report["units"] == 2
@@ -353,7 +362,7 @@ def test_the_fast_path_of_v3_is_marked_as_v3(toy_repo, tmp_path):
     result = run_plan(options, ScriptedPlanner([]),
                       ScriptedDrafter([items_answer(["1"], estimate=100)]))
     assert result.success and result.report["fast_path"]["taken"]
-    assert load_graph(options.out).generator.planner_version == "planner-v3"
+    assert load_graph(options.out).generator.planner_version == "planner-v3.1"
 
 
 def test_an_unknown_planner_version_is_refused(toy_repo, tmp_path):
@@ -381,7 +390,8 @@ def test_plan_command_prints_the_v3_summary(toy_repo, tmp_path, monkeypatch, cap
     output = capsys.readouterr().out
     assert ("nodes: 2  edges: 0  PRE: no  REG: no  revision rounds: 0  success: yes"
             in output)
-    assert "units: 2  decisions: P1: 0  P2: 0  P3: 0  P4: 2" in output
+    assert "units: 2  decisions: P1: 1  P2: 0  P3: 0  P4: 2" in output
+    assert "parallelism: critical path 80 / 160 lines (0.50 <= 0.70) -> split" in output
     assert "ablated" not in output and "nodes before merge" not in output
     assert f"wrote {out}" in output and f"wrote {report_path_for(out)}" in output
 
@@ -444,3 +454,40 @@ def test_facts_prompt_asks_for_members_not_classes():
               if edit.kind == "logic" for symbol in edit.symbols]
     assert "recipes/models.py::Recipe.ratings" in edited
     assert "recipes/models.py::Recipe" not in edited
+
+
+def test_facts_prompt_asks_for_a_reason_for_behavior():
+    text = _flat(load_facts_prompt())
+    for bullet in ('''- `need: "interface"`: the unit only needs the symbol to exist with its
+        name and signature. This is the usual case: creating, reading or raising
+        a class, a field or an exception, and calling a function or method whose
+        result the unit's tests can replace with a small fake.''',
+                   '''- `need: "behavior"`: the unit's code or tests depend on a result that only
+        the provider's real code produces, so that a fake would make the tests
+        meaningless. Say which result in `why`, in one sentence. If you cannot
+        name such a result, the need is "interface".''',
+                   '''- Name the method you call, not its class: `RecipeBook.rate`, not
+        `RecipeBook`. A use of a class means its constructor and fields only.'''):
+        assert _flat(bullet) in text
+    assert "`why` is required when `need` is `\"behavior\"`" in text
+
+
+def test_behavior_uses_without_a_reason_are_reported(toy_repo, tmp_path):
+    data = json.loads(json.dumps(TWO_UNITS))
+    data["units"][1]["uses"] = [
+        {"symbol": "store.py::JobStore.cancel", "need": "behavior"},
+        {"symbol": "store.py::JobStore.cancel", "need": "behavior", "why": "  "}]
+    data["units"][0]["uses"] = [
+        {"symbol": "runner.py::run_loop", "need": "behavior", "why": "the counts"}]
+    data["units"][0]["edits"][0]["symbols"] = ["store.py::JobStore.cancel"]
+    result, _, _ = plan_v3(toy_repo, tmp_path, [answer(data)])
+    assert result.report["behavior_without_why"] == [
+        {"unit": "R", "symbol": "store.py::JobStore.cancel"},
+        {"unit": "R", "symbol": "store.py::JobStore.cancel"}]
+    assert result.success  # recorded only: no error, no revision round
+    assert result.report["revision_rounds"] == 0
+
+
+def test_facts_without_why_still_parse():
+    the_facts = parse_facts(answer(TWO_UNITS))
+    assert all(use.why == "" for unit in the_facts.units for use in unit.uses)

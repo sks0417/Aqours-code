@@ -132,6 +132,16 @@
           "title": "Symbols",
           "type": "array",
           "uniqueItems": true
+        },
+        "shared": {
+          "description": "This node edits these files while other nodes edit other parts of them at the same time; merge conflicts are resolved at merge time. Two nodes that both list a file here may run in parallel on it. Each must also be in modify.",
+          "items": {
+            "description": "Repository-relative POSIX path: '/' separators, no leading '/', no drive letter, no empty, '.' or '..' segments, no segment starting or ending with whitespace, and no control characters.",
+            "type": "string"
+          },
+          "title": "Shared",
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [

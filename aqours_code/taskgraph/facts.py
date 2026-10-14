@@ -51,10 +51,15 @@ class FactEdit(_Facts):
 
 
 class FactUse(_Facts):
-    """A symbol another unit (or this unit's registration) provides."""
+    """A symbol another unit (or this unit's registration) provides.
+
+    ``why`` names, for a ``behavior`` need, the result only the provider's
+    real code produces. Facts written before it existed have none.
+    """
 
     symbol: Symbol
     need: str
+    why: str = ""
 
 
 class Unit(_Facts):

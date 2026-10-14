@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from string import Template
 
 from .context_pack import ContextPack, build_context_pack
 
@@ -128,6 +129,19 @@ Output excerpt:
 ```
 """
 
+# A merge left conflict markers in a file; ``$who`` is "teammates" or "other nodes".
+CONFLICT_SECTION = Template("""
+# Your work conflicts with $who' work
+
+While you worked, $who merged changes to some of the same files. Your
+workspace now holds your work merged with theirs; these files contain
+conflict markers (<<<<<<<, =======, >>>>>>>): $files.
+
+Resolve every conflict so that both your work and theirs are kept, run the
+tests that cover your work, and finish.
+""")
+CONFLICT_MARKER = b"<<<<<<<"
+
 TIMEOUT_NOTE = """
 The check did not fail an assertion: it timed out. A command did not finish
 within its time limit, and not when it was run a second time either. The
@@ -148,12 +162,15 @@ class AttemptFailure:
     ``after_merge`` marks a merge repair: the node's own checks passed, and the
     checks failed once its work was merged with other nodes' work.
     ``timed_out`` marks a check that timed out (twice) instead of failing.
+    ``conflict_files`` marks a conflict resolution: merging the integration
+    branch into the node's work left conflict markers in these files.
     """
 
     reason: str
     output: str = ""
     after_merge: bool = False
     timed_out: bool = False
+    conflict_files: list[str] | None = None
 
 
 def _bullets(items: list[str]) -> str:
@@ -191,7 +208,10 @@ def build_node_prompt(graph: Graph, node: Node, index: RepoIndex, attempt: int,
     if failure is not None:
         output = failure.output[-FAILURE_EXCERPT_CHARS:].strip() or "(no output)"
         timeout_note = TIMEOUT_NOTE if failure.timed_out else ""
-        if failure.after_merge:
+        if failure.conflict_files is not None:
+            retry = CONFLICT_SECTION.substitute(who="other nodes",
+                                                files=", ".join(failure.conflict_files))
+        elif failure.after_merge:
             retry = MERGE_REPAIR_TEMPLATE.format(output=output, timeout_note=timeout_note)
         else:
             retry = RETRY_TEMPLATE.format(attempt=attempt, reason=failure.reason,

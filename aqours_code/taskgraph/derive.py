@@ -5,7 +5,7 @@ from typing import Literal
 
 from .repo_index import RepoIndex
 from .schema import Edge, Graph, Node, RevisionEntry
-from .validate import ancestors, edit_files, implementers, unique_nodes
+from .validate import ancestors, conflicting_files, implementers, unique_nodes
 
 
 def _try_add_edge(graph: Graph, edge: Edge, entries: list[RevisionEntry],
@@ -168,7 +168,7 @@ def _derive_order_edges(graph: Graph, entries: list[RevisionEntry]) -> None:
     nodes = unique_nodes(graph)
     for i, first in enumerate(nodes):
         for second in nodes[i + 1:]:
-            overlap = edit_files(first) & edit_files(second)
+            overlap = conflicting_files(first, second)
             if not overlap:
                 continue
             ancestor_map = ancestors(graph)
@@ -214,8 +214,9 @@ def derive_edges(graph: Graph, index: RepoIndex) -> tuple[Graph, list[RevisionEn
         ancestor gets a ``full`` edge.
     1c. ``context_files`` that a single other node creates (creator -> reader).
 
-    Step 2 adds ordering edges. Ancestry is recomputed after every added
-    edge. An ordering edge goes from the node that creates a file the other
+    Step 2 adds ordering edges for the files two nodes both edit, except files
+    both list in ``edit_set.shared`` (they edit different parts of them in
+    parallel). Ancestry is recomputed after every added edge. An ordering edge goes from the node that creates a file the other
     node modifies; otherwise from a contract node; otherwise from the node
     listed first. When each node creates a file the other modifies, no edge
     is added and an ``other`` entry explains the conflict. Entries for added

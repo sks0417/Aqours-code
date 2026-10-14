@@ -17,6 +17,12 @@ from aqours_code.taskgraph.synthesize import (AFFECTED_TESTS_MAX, SMALL_SHARED_E
 from aqours_code.taskgraph.validate import validate
 
 FINAL = "python -m pytest -q tests"
+@pytest.fixture
+def keep_split(monkeypatch):
+    """Keep a chain of nodes split, for tests of other rules than parallelism (P1)."""
+    monkeypatch.setattr(synthesize_module, "PARALLEL_PATH_MAX", 1.0)
+
+
 INFO = GraphInfo(request_id="r", request="the request", repo="repo", base_commit="abc",
                  final_checks=[FINAL], model="m")
 
@@ -269,7 +275,7 @@ def shared_facts(standalone: bool) -> Facts:
                    for uid in "ABC"))
 
 
-def test_7_small_standalone_shared_edits_go_first_others_are_ordered():
+def test_7_small_standalone_shared_edits_go_first_others_are_ordered(keep_split):
     first = run(shared_facts(standalone=True), index("config.py"))
     graph_nodes = nodes(first)
     assert graph_nodes["PRE"].edit_set.modify == ["config.py"]
@@ -280,15 +286,16 @@ def test_7_small_standalone_shared_edits_go_first_others_are_ordered():
     assert all(d.numbers == {"lines": 10, "threshold": SMALL_SHARED_EDIT_LINES}
                for d in first.decisions if d.rule == "small_shared_edit_first")
 
+    # not standalone: the edits stay with their units; they change different
+    # symbols of config.py, so the units edit it in parallel (task 25c)
     kept = run(shared_facts(standalone=False), index("config.py"))
-    assert kept.pre is None
-    assert edges(kept, "order") == {("A", "B"), ("A", "C"), ("B", "C")}
-    ordered = [d for d in kept.decisions if d.rule == "ordered"]
-    assert len(ordered) == 1 and "cannot be written on its own" in ordered[0].reason
+    assert kept.pre is None and kept.graph.edges == []
+    assert all(node.edit_set.shared == ["config.py"] for node in kept.graph.nodes)
+    assert rules(kept, "P3") == ["P3/parallel_different_symbols"]
     assert all(node.check.post_merge_commands == [FINAL] for node in kept.graph.nodes)
 
 
-def test_8_mutual_behavior_is_merged_and_an_interface_cycle_is_opened_by_pre():
+def test_8_mutual_behavior_is_merged_and_an_interface_cycle_is_opened_by_pre(keep_split):
     merged = run(facts(
         unit("A", edits=[logic("a.py", "x")], provides=["a.py::x"],
              uses=[use("b.py::y", "behavior")]),
@@ -296,7 +303,7 @@ def test_8_mutual_behavior_is_merged_and_an_interface_cycle_is_opened_by_pre():
              uses=[use("a.py::x", "behavior")]),
         unit("C", edits=[logic("c.py", "z")])), index("a.py", "b.py", "c.py"))
     assert list(nodes(merged)) == ["A_B", "C"]
-    assert rules(merged, "P1") == ["P1/mutual_behavior_merged"]
+    assert rules(merged, "P1") == ["P1/mutual_behavior_merged", "P1/parallel_enough"]
 
     for size in (100, WAIT_LINES - 10):
         opened = run(facts(
@@ -417,7 +424,7 @@ def test_11_nodes_editing_a_shared_file_check_the_whole_suite_after_merging():
 
 # ── P1: together, small units, a single node ──
 
-def test_together_and_small_units_are_merged_and_one_group_is_the_single_graph():
+def test_together_and_small_units_are_merged_and_one_group_is_the_single_graph(keep_split):
     the_facts = facts(
         unit("A", edits=[logic("a.py", "f")], provides=["a.py::f"]),
         unit("B", edits=[logic("b.py", "g")]),
@@ -426,7 +433,8 @@ def test_together_and_small_units_are_merged_and_one_group_is_the_single_graph()
         together=[{"units": ["A", "B"], "reason": "one feature"}])
     result = run(the_facts, index("a.py", "b.py", "t.py"))
     assert result.node_units == {"A_B_S": ["A", "B", "S"], "T": ["T"]}
-    assert rules(result, "P1") == ["P1/together", "P1/small_merged", "P1/small_kept"]
+    assert rules(result, "P1") == ["P1/together", "P1/small_merged", "P1/small_kept",
+                                   "P1/parallel_enough"]
     small = [d for d in result.decisions if d.rule == "small_merged"][0]
     assert small.numbers == {"size": 20, "threshold": SMALL_UNIT_LINES, "relation": 1}
 
@@ -482,7 +490,8 @@ def test_ablate_p1_ignores_together_and_small_units_but_merges_mutual_behavior()
         together=[{"units": ["C", "D"], "reason": "one"}])
     result = run(the_facts, index("a.py", "b.py", "c.py", "d.py"), ablate={"p1"})
     assert result.node_units == {"A_B": ["A", "B"], "C": ["C"], "D": ["D"], "S": ["S"]}
-    assert rules(result, "P1") == ["P1/mutual_behavior_merged", "P1/ablated", "P1/ablated"]
+    assert rules(result, "P1") == ["P1/mutual_behavior_merged", "P1/ablated", "P1/ablated",
+                                   "P1/ablated"]  # together, small unit, parallelism
     assert result.graph.generator.ablate == ["p1"]
 
 
@@ -498,7 +507,7 @@ def test_ablate_p2_waits_for_every_use_and_keeps_registrations():
     assert edges(click, "order") >= {("D", "E"), ("E", "F")}
 
 
-def test_ablate_p3_keeps_same_function_and_small_shared_edits_in_place():
+def test_ablate_p3_keeps_same_function_and_small_shared_edits_in_place(keep_split):
     result = run(shared_facts(standalone=True), index("config.py"), ablate={"p3"})
     assert result.pre is None
     assert edges(result, "order") == {("A", "B"), ("A", "C"), ("B", "C")}
@@ -531,11 +540,11 @@ def test_decisions_and_graph_are_deterministic():
     second = synthesize(jp_facts(), index(*JP_FILES), INFO)
     assert [d.to_dict() for d in first.decisions] == [d.to_dict() for d in second.decisions]
     assert graph_to_json(first.graph) == graph_to_json(second.graph)
-    assert first.graph.generator.planner_version == PLANNER_VERSION == "planner-v3"
+    assert first.graph.generator.planner_version == PLANNER_VERSION == "planner-v3.1"
     assert first.graph.generator.ablate is None
     # P3: PRE and M order on jobs/models.py, PRE creates the modules X and Y fill in;
     # P4: one check per node, and a whole-suite post-merge check for PRE, M, X, Y
-    assert first.counts() == {"P1": 0, "P2": 5, "P3": 3, "P4": 10}
+    assert first.counts() == {"P1": 1, "P2": 5, "P3": 3, "P4": 10}
     assert all(d.nodes for d in first.decisions)
 
 
@@ -581,7 +590,7 @@ def test_registrations_several_nodes_need_early_go_first_instead_of_queuing_the_
     assert "the whole nodes would queue on src/click/__init__.py" in shared[0].reason
 
 
-def test_a_registration_whose_symbol_is_unknown_is_kept_and_ordered():
+def test_a_registration_whose_symbol_is_unknown_is_kept_and_ordered(keep_split):
     def registrar(uid: str, name: str) -> dict:
         path = f"pkg/{uid.lower()}.py"
         return unit(uid, edits=[logic(path, f"real_{uid}"), registration("pkg/__init__.py",
@@ -618,11 +627,11 @@ def test_a_small_unit_sharing_only_a_registration_file_is_not_merged():
     files = ("pkg/__init__.py", "pkg/b.py", "pkg/s.py", "pkg/o.py")
     alone = run(facts(big, small("pkg/s.py", "registration"), other), index(*files))
     assert {"B", "S", "O"} <= set(alone.node_units)
-    assert rules(alone, "P1") == ["P1/small_kept"]
+    assert rules(alone, "P1") == ["P1/small_kept", "P1/parallel_enough"]
     merged = run(facts(big, small("pkg/s.py", "logic"), other), index(*files))
     assert {key: units for key, units in merged.node_units.items() if key != "REG"} == {
         "B_S": ["B", "S"], "O": ["O"]}
-    assert rules(merged, "P1") == ["P1/small_merged"]
+    assert rules(merged, "P1") == ["P1/small_merged", "P1/parallel_enough"]
 
 
 def test_affected_tests_follow_imports_through_the_source_modules():
@@ -667,3 +676,204 @@ def test_a_source_module_does_not_resolve_names_from_its_own_directory():
                           "tests/test_x.py": "import helpers\n"}, files)
     assert tests.sources["src/click/core.py"] == set()  # the standard library's types
     assert tests.imports["tests/test_x.py"] == {"tests/helpers.py"}
+
+
+# ── task 25c, section 2: P1 gives a graph that is not parallel enough to one agent ──
+
+def chain_facts() -> Facts:
+    return facts(
+        unit("A", size=100, edits=[logic("a.py", "f")], provides=["a.py::f"]),
+        unit("B", size=100, edits=[logic("b.py", "g")], provides=["b.py::g"],
+             uses=[use("a.py::f", "behavior")]),
+        unit("C", size=100, edits=[logic("c.py", "h")], uses=[use("b.py::g", "behavior")]))
+
+
+def test_a_chain_of_nodes_goes_to_one_agent():
+    result = run(chain_facts(), index("a.py", "b.py", "c.py"))
+    assert [node.id for node in result.graph.nodes] == ["solve"]
+    assert result.graph.nodes[0].edit_set.any_file
+    assert result.node_units == {"solve": ["A", "B", "C"]}
+    par = result.parallelism
+    assert par == {"node_work": {"A": 100, "B": 100, "C": 100}, "total": 300,
+                   "critical": 300, "ratio": 1.0, "path": ["A", "B", "C"],
+                   "threshold": 0.7, "collapsed": True}
+    last = result.decisions[-1]
+    assert (last.property, last.rule, last.nodes) == ("P1", "low_parallelism_single", ["solve"])
+    assert last.numbers == {"critical": 300, "total": 300, "ratio": 1.0, "threshold": 0.7}
+    assert "A -> B -> C has 300 lines, 100% of all 300 lines, more than 70%" in last.reason
+    # the decisions before it describe the split graph that was not used
+    assert [d.rule for d in result.decisions[:2]] == ["wait_for_behavior"] * 2
+
+
+def test_independent_nodes_stay_split():
+    result = run(facts(*(unit(uid, size=100, edits=[logic(f"{uid.lower()}.py", "f")])
+                         for uid in "ABC")), index("a.py", "b.py", "c.py"))
+    assert [node.id for node in result.graph.nodes] == ["A", "B", "C"]
+    assert result.parallelism["ratio"] == pytest.approx(0.3333, abs=1e-4)
+    assert not result.parallelism["collapsed"]
+    assert result.decisions[-1].rule == "parallel_enough"
+    assert result.decisions[-1].nodes == ["A"]  # the heaviest chain: one node, first on a tie
+
+
+def test_work_moved_into_pre_counts_for_pre_not_for_its_unit():
+    result = run(shared_facts(standalone=True), index("config.py"))
+    work = result.parallelism["node_work"]
+    assert work == {"PRE": 30, "A": 90, "B": 90, "C": 90}
+    assert result.parallelism["critical"] == 120 and result.parallelism["path"] == ["PRE", "A"]
+    jp = run(jp_facts(), index(*JP_FILES)).parallelism
+    # PRE: three interfaces of INTERFACE_LINES each, and no moved edit
+    assert jp["node_work"]["PRE"] == 3 * synthesize_module.INTERFACE_LINES
+
+
+def test_ablate_p1_keeps_a_chain_split():
+    result = run(chain_facts(), index("a.py", "b.py", "c.py"), ablate={"p1"})
+    assert [node.id for node in result.graph.nodes] == ["A", "B", "C"]
+    assert result.parallelism["ratio"] == 1.0 and not result.parallelism["collapsed"]
+    assert result.decisions[-1].rule == "ablated" and result.decisions[-1].property == "P1"
+
+
+def test_order_edges_count_for_the_critical_path():
+    # no symbols: the two edits of m.py are ordered, so the nodes form a chain
+    result = run(facts(unit("A", edits=[logic("m.py")]), unit("B", edits=[logic("m.py")]),
+                       unit("C", size=60, edits=[logic("c.py", "h")])), index("m.py", "c.py"))
+    assert result.parallelism["path"] == ["A", "B"]
+    assert result.parallelism["critical"] == 240 and result.parallelism["total"] == 300
+    assert result.parallelism["collapsed"] and result.graph.nodes[0].id == "solve"
+
+
+def test_one_group_has_no_parallelism_figures():
+    single = synthesize(facts(unit("A", edits=[logic("a.py", "f")])), index("a.py"), INFO)
+    assert single.parallelism is None
+
+
+# ── task 25c, section 3: a behavior use of a class that only holds data ──
+
+def class_facts(provider_edit: dict, used: str, why: str = "") -> Facts:
+    return facts(
+        unit("M", edits=[provider_edit], provides=[f"models.py::{used}"]),
+        unit("U", edits=[logic("ui.py", "page")],
+             uses=[{"symbol": f"models.py::{used}", "need": "behavior", "why": why}]))
+
+
+def test_a_behavior_use_of_a_data_class_is_an_interface_use():
+    result = run(class_facts(logic("models.py", "RateLimit"), "RateLimit"),
+                 index("models.py", "ui.py"))
+    decision = [d for d in result.decisions if d.rule == "class_use_interface"]
+    assert len(decision) == 1 and decision[0].property == "P2" and decision[0].units == ["U"]
+    assert decision[0].reason == ("U uses RateLimit, a class whose methods no unit changes, "
+                                  "so only its constructor and fields are needed: interface")
+    assert "P2/interface_first" in rules(result, "P2")  # no longer a wait
+    assert nodes(result)["U"].requires == ["models.py::RateLimit"]
+
+
+def test_a_class_whose_methods_a_unit_changes_keeps_the_behavior_use():
+    result = run(class_facts(logic("models.py", "RateLimit", "RateLimit.allowed"),
+                             "RateLimit", why="the limits allowed computes"),
+                 index("models.py", "ui.py"))
+    assert "class_use_interface" not in [d.rule for d in result.decisions]
+    assert rules(result, "P2") == ["P2/wait_for_behavior"]
+
+
+@pytest.mark.parametrize("name", ["SCHEMA", "JOB_FIELDS", "_Private", "render"])
+def test_names_that_are_not_classes_keep_the_behavior_use(name):
+    result = synthesize(class_facts(logic("models.py", name), name),
+                        index("models.py", "ui.py"), INFO)
+    assert "class_use_interface" not in [d.rule for d in result.decisions]
+
+
+def test_ablate_p2_skips_the_class_check():
+    result = synthesize(class_facts(logic("models.py", "RateLimit"), "RateLimit"),
+                        index("models.py", "ui.py"), INFO, ablate={"p2"})
+    assert "class_use_interface" not in [d.rule for d in result.decisions]
+
+
+# ── task 25c, section 4: nodes changing different symbols of one file run in parallel ──
+
+def runner_facts(first: dict, second: dict) -> Facts:
+    return facts(unit("A", edits=[first, logic("a.py", "fa")]),
+                 unit("B", edits=[second, logic("b.py", "fb")]))
+
+
+RUNNER_FILES = ("runner.py", "a.py", "b.py")
+
+
+def test_different_methods_of_one_file_are_edited_in_parallel():
+    result = run(runner_facts(logic("runner.py", "Runner.a"), logic("runner.py", "Runner.b")),
+                 index(*RUNNER_FILES))
+    graph_nodes = nodes(result)
+    assert graph_nodes["A"].edit_set.shared == ["runner.py"]
+    assert graph_nodes["B"].edit_set.shared == ["runner.py"]
+    assert result.graph.edges == []
+    assert ("Other nodes change Runner.b in runner.py at the same time. Change only your "
+            "own parts of it and leave theirs as they are; if your changes conflict with "
+            "theirs when merging, you will be asked to resolve the conflict."
+            ) in graph_nodes["A"].goal
+    assert "Other nodes change Runner.a in runner.py" in graph_nodes["B"].goal
+    decision = [d for d in result.decisions if d.rule == "parallel_different_symbols"]
+    assert len(decision) == 1 and decision[0].units == ["A", "B"]
+    assert "A: Runner.a; B: Runner.b" in decision[0].reason
+    assert "ordered" not in [d.rule for d in result.decisions]
+    # the shared file is edited by two nodes: both check the whole suite after merging
+    assert graph_nodes["A"].check.post_merge_commands == [FINAL]
+
+
+@pytest.mark.parametrize(("first", "second", "why"), [
+    (logic("runner.py", "Runner"), logic("runner.py", "Runner.b"),
+     "change Runner and Runner.b, which overlap"),
+    (logic("runner.py", "Runner.a"), logic("runner.py"),
+     "B list no symbols for their edit there"),
+])
+def test_overlapping_or_unknown_parts_of_one_file_are_ordered(keep_split, first, second, why):
+    result = run(runner_facts(first, second), index(*RUNNER_FILES))
+    assert edges(result, "order") == {("A", "B")}
+    assert all(not node.edit_set.shared for node in result.graph.nodes)
+    ordered = [d for d in result.decisions if d.rule == "ordered"]
+    assert len(ordered) == 1 and why in ordered[0].reason
+
+
+def test_registrations_in_one_file_are_not_edited_in_parallel(keep_split):
+    def registrar(uid: str) -> dict:  # the registered name stands for an unknown symbol
+        return unit(uid, edits=[logic(f"{uid.lower()}.py", "f"),
+                                registration("pkg.py", f"alias_{uid}")],
+                    provides=[f"pkg.py::alias_{uid}"], uses=[use(f"pkg.py::alias_{uid}")])
+
+    result = run(facts(registrar("A"), registrar("B")), index("pkg.py", "a.py", "b.py"))
+    assert edges(result, "order") == {("A", "B")}
+    assert all(not node.edit_set.shared for node in result.graph.nodes)
+    ordered = [d for d in result.decisions if d.rule == "ordered"]
+    assert "A, B register names there" in ordered[0].reason
+
+
+def test_ablate_p3_orders_different_methods_of_one_file(keep_split):
+    result = run(runner_facts(logic("runner.py", "Runner.a"), logic("runner.py", "Runner.b")),
+                 index(*RUNNER_FILES), ablate={"p3"})
+    assert edges(result, "order") == {("A", "B")}
+    assert all(not node.edit_set.shared for node in result.graph.nodes)
+
+
+def test_a_shared_file_must_be_modified():
+    from taskgraph_support import make_graph, make_node
+    node = make_node("A", modify=("a.py",), create=("b.py",))
+    node["edit_set"]["shared"] = ["b.py", "c.py"]
+    report = validate(make_graph([node]))
+    assert [(issue.code, issue.message) for issue in report.errors] == [
+        ("V14", "edit_set.shared lists b.py, c.py, which are not in edit_set.modify")]
+
+
+def test_nodes_sharing_a_file_need_no_order_but_other_overlaps_still_do():
+    from aqours_code.taskgraph import derive_edges
+    from taskgraph_support import make_graph, make_node
+    first = make_node("A", modify=("runner.py", "models.py"))
+    second = make_node("B", modify=("runner.py", "models.py"))
+    third = make_node("C", modify=("runner.py",))
+    for node in (first, second, third):
+        node["edit_set"]["shared"] = ["runner.py"]
+    first["edit_set"]["shared"].append("models.py")
+    graph = make_graph([first, second, third])
+    report = validate(graph)
+    # A and B overlap on models.py, which only A shares: still a conflict
+    assert [(issue.code, issue.nodes) for issue in report.errors] == [("V5", ["A", "B"])]
+    the_index = index("runner.py", "models.py")
+    derived, _ = derive_edges(graph, the_index)
+    assert {(e.from_, e.to) for e in derived.edges} == {("A", "B")}
+    assert validate(derived, the_index).ok

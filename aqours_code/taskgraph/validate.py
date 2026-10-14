@@ -1,4 +1,4 @@
-"""Validation rules V1-V13 and warnings W1-W5 for task graphs."""
+"""Validation rules V1-V14 and warnings W1-W5 for task graphs."""
 from __future__ import annotations
 
 from collections import Counter, deque
@@ -103,6 +103,16 @@ def ancestors(graph: Graph) -> dict[str, set[str]]:
 def edit_files(node: Node) -> set[str]:
     """Return ``modify ∪ create`` for a node."""
     return set(node.edit_set.modify) | set(node.edit_set.create)
+
+
+def conflicting_files(first: Node, second: Node) -> set[str]:
+    """Files both nodes edit, except those both list in ``edit_set.shared``.
+
+    A file both nodes share is edited by them in parallel, in different parts;
+    a conflict there is resolved when merging, so it needs no order.
+    """
+    shared = set(first.edit_set.shared) & set(second.edit_set.shared)
+    return (edit_files(first) & edit_files(second)) - shared
 
 
 def _changes_symbol(node: Node, symbol: str) -> bool:
@@ -282,7 +292,7 @@ def _check_edit_conflicts(graph: Graph, ancestor_map: dict[str, set[str]],
     nodes = unique_nodes(graph)
     for i, first in enumerate(nodes):
         for second in nodes[i + 1:]:
-            overlap = edit_files(first) & edit_files(second)
+            overlap = conflicting_files(first, second)
             if not overlap:
                 continue
             if (first.id in ancestor_map[second.id]
@@ -317,6 +327,16 @@ def _check_requires(graph: Graph, index: RepoIndex,
                     "V6", [node.id],
                     f"requires {symbol}, which is neither defined at the base "
                     "commit nor provided by another node"))
+
+
+def _check_shared_files(graph: Graph, report: ValidationReport) -> None:
+    for node in graph.nodes:
+        outside = [path for path in node.edit_set.shared if path not in node.edit_set.modify]
+        if outside:
+            report.errors.append(Issue(
+                "V14", [node.id],
+                f"edit_set.shared lists {', '.join(outside)}, which "
+                f"{'is' if len(outside) == 1 else 'are'} not in edit_set.modify"))
 
 
 def _check_edit_set_nonempty(graph: Graph, report: ValidationReport) -> None:
@@ -491,7 +511,7 @@ def _warn_unused_provides(graph: Graph, report: ValidationReport) -> None:
 
 
 def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
-    """Check ``graph`` against rules V1-V13 and warnings W1-W5.
+    """Check ``graph`` against rules V1-V14 and warnings W1-W5.
 
     Checks that need repository information (V3, V6, V12, W5) are skipped,
     with a warning, when ``index`` is None.
@@ -507,6 +527,7 @@ def validate(graph: Graph, index: RepoIndex | None = None) -> ValidationReport:
     if index is not None:
         _check_requires(graph, index, ancestor_map, report)
     _check_edit_set_nonempty(graph, report)
+    _check_shared_files(graph, report)
     _check_symbol_format(graph, report)
     _check_interface_sources(graph, report)
     _check_symbol_files(graph, report)

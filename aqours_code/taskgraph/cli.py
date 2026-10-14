@@ -127,6 +127,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return _error("--workers and --max-attempts must be >= 1")
     if args.merge_repairs < 0:
         return _error("--merge-repairs must be >= 0")
+    if args.conflict_repairs < 0:
+        return _error("--conflict-repairs must be >= 0")
     if args.worker == "command":
         if not args.command_map:
             return _error("--worker command needs --command-map")
@@ -146,7 +148,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     options = RunOptions(out_dir=Path(args.out), workers=args.workers,
                          max_attempts=args.max_attempts,
                          worker_timeout_s=args.worker_timeout, hidden_tests=hidden,
-                         merge_repairs=args.merge_repairs)
+                         merge_repairs=args.merge_repairs,
+                         conflict_repairs=args.conflict_repairs)
     try:
         result = run_graph(graph, Path(args.repo), worker, options)
     except GraphInvalid as exc:
@@ -180,6 +183,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     detail = (f" ({', '.join(repaired)}; repaired: {', '.join(fixed) or 'none'})"
               if repaired else "")
     print(f"merge repairs: {summary['merge_repairs_total']}{detail}")
+    conflicted = [node_id for node_id, node in summary["nodes"].items()
+                  if node["merge_conflicts"]]
+    resolved = [node_id for node_id in conflicted
+                if summary["nodes"][node_id]["conflict_resolved"]]
+    detail = (f" ({', '.join(conflicted)}; resolved: {', '.join(resolved) or 'none'})"
+              if conflicted else "")
+    print(f"merge conflicts: {summary['merge_conflicts_total']}{detail}")
     print(f"check timeout retries: {summary['check_timeout_retries_total']}")
     escapes = summary["escape_attempts_total"]
     print(f"sandbox: {summary['sandbox']}  escape attempts: {escapes}")
@@ -437,6 +447,20 @@ def _print_plan_end(args: argparse.Namespace, result, report: dict) -> None:
         print(f"wrote {args.out}")
 
 
+def _parallelism_line(parallelism: dict, p1_off: bool) -> str:
+    """``parallelism: critical path 2405 / 2825 lines (0.85 > 0.70) -> single agent``."""
+    ratio, limit = parallelism["ratio"], parallelism["threshold"]
+    compare = ">" if ratio > limit else "<="
+    if parallelism["collapsed"]:
+        outcome = "single agent"
+    elif p1_off:
+        outcome = "split (p1 off)"
+    else:
+        outcome = "split"
+    return (f"parallelism: critical path {parallelism['critical']} / {parallelism['total']} "
+            f"lines ({ratio:.2f} {compare} {limit:.2f}) -> {outcome}")
+
+
 def _print_plan_v3(args: argparse.Namespace, result) -> int:
     report = result.report
     _print_plan_start(report)
@@ -448,6 +472,9 @@ def _print_plan_v3(args: argparse.Namespace, result) -> int:
         counts = "  ".join(f"{prop}: {count}"
                            for prop, count in report["decision_counts"].items())
         print(f"units: {report['units']}  decisions: {counts}")
+    parallelism = report.get("parallelism")
+    if parallelism:
+        print(_parallelism_line(parallelism, "p1" in report["ablate"]))
     if report["ablate"]:
         print(f"ablated: {', '.join(report['ablate'])} (rules turned off)")
     _print_plan_end(args, result, report)
@@ -474,6 +501,26 @@ def _print_plan_v2(args: argparse.Namespace, result) -> int:
         print(f"wrote {report['unmerged_graph']}")
     print(f"wrote {result.report_path}")
     return EXIT_OK if result.success else EXIT_INVALID
+
+
+def _cmd_resynth(args: argparse.Namespace) -> int:
+    from .gitops import GitError
+    from .planner_v3 import ResynthError, run_resynth
+    from .synthesize import parse_ablate
+
+    try:
+        ablate = parse_ablate(args.ablate)
+    except ValueError as exc:
+        return _error(f"--ablate: {exc}")
+    graph_path = Path(args.graph)
+    try:
+        result = run_resynth(graph_path, Path(args.out), ablate)
+    except ResynthError as exc:
+        return _error(str(exc))
+    except (GitError, RuntimeError, OSError, UnicodeDecodeError) as exc:
+        return _error(str(exc))
+    print(f"synthesized again from the facts of {graph_path} (no model calls)")
+    return _print_plan_v3(args, result)
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
@@ -536,6 +583,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--hidden-tests")
     run_cmd.add_argument("--merge-repairs", type=int, default=1,
                          help="repair rounds for a node whose post-merge check fails "
+                              "(default 1; 0 fails the node at once)")
+    run_cmd.add_argument("--conflict-repairs", type=int, default=1,
+                         help="conflict resolutions for a node whose merge conflicts "
                               "(default 1; 0 fails the node at once)")
     run_cmd.add_argument("--sandbox", choices=("docker", "none"), default="docker",
                          help="where worker shell commands, checks and hidden tests run "
@@ -621,6 +671,15 @@ def build_parser() -> argparse.ArgumentParser:
     plan_cmd.add_argument("--request-id", help="request_id of the graph "
                           "(default: the --out file name without extension)")
     plan_cmd.set_defaults(func=_cmd_plan)
+
+    resynth_cmd = commands.add_parser(
+        "resynth", help="build a v3 graph again from the facts saved with it (no model)")
+    resynth_cmd.add_argument("graph", help="a planner v3 graph; <graph>.report.json has "
+                                          "the facts")
+    resynth_cmd.add_argument("--out", required=True)
+    resynth_cmd.add_argument("--ablate", default="",
+                             help="turn off the rules of properties, e.g. p1,p3")
+    resynth_cmd.set_defaults(func=_cmd_resynth)
 
     compare_cmd = commands.add_parser("compare", help="compare two graphs' structure")
     compare_cmd.add_argument("planner_graph")

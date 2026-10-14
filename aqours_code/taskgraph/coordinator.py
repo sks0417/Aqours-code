@@ -6,6 +6,15 @@ drive one node. Every git command on the shared clone runs under ``git_lock``;
 a merge, its post-merge check, and a possible undo run as one unit under
 ``merge_lock``, and the check itself does not hold ``git_lock``.
 
+Two nodes that both list a file in ``edit_set.shared`` may run at the same
+time although they edit it. When a node's squash merge conflicts, the
+Coordinator, still holding ``merge_lock``, merges the integration branch into
+the node's work with the conflict markers, lets the worker resolve them once,
+checks the node, and merges again. Holding the lock means the resolution
+starts from the newest integration state and nothing else merges meanwhile,
+so the second merge cannot conflict; the price is that other nodes' merges
+wait for that round.
+
 The post-merge check runs ``check.post_merge_commands`` when a node has them,
 and ``check.commands`` otherwise. A node with ``run_after_failed_upstream``
 runs once all its upstream nodes have finished, even if some failed; its
@@ -45,14 +54,16 @@ from .context_pack import build_context_pack
 from .context_metrics import node_context_metrics
 from .escapes import scan_run
 from .line_endings import LineEndings
-from .prompting import AttemptFailure, build_node_prompt
+from .prompting import CONFLICT_MARKER, AttemptFailure, build_node_prompt
 from .repo_index import RepoIndex, build_index
 from .sandbox import NO_SANDBOX, SandboxConfig
 from .schema import Graph, Node, dump_graph
-from .validate import ValidationReport, edit_files, unique_nodes, usable_edges, validate
+from .validate import (ValidationReport, conflicting_files, edit_files, unique_nodes,
+                       usable_edges, validate)
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
 DEFAULT_MERGE_REPAIRS = 1
+DEFAULT_CONFLICT_REPAIRS = 1
 TASKGRAPH_VERSION = "coordinator-v0.8"
 AQOURS_SOURCE = Path(__file__).resolve().parents[2]
 DEFAULT_WORKERS = 2
@@ -81,6 +92,8 @@ class RunOptions:
     hidden_tests: Path | None = None
     # Repair rounds a node gets when its post-merge check fails (0: none).
     merge_repairs: int = DEFAULT_MERGE_REPAIRS
+    # Conflict resolutions a node gets when its merge conflicts (0: it fails).
+    conflict_repairs: int = DEFAULT_CONFLICT_REPAIRS
     # Where checks run. None: where the worker's shell commands run (Docker
     # with ``--sandbox docker``, the host with ``--sandbox none``).
     checks: Checks | None = None
@@ -115,6 +128,9 @@ class NodeRecord:
     confirmed_reads: list[str] = field(default_factory=list)
     merge_repairs: int = 0
     merge_repair_ok: bool | None = None  # None: no repair was needed
+    # Merges that conflicted, and whether the resolution worked (None: no conflict).
+    merge_conflicts: int = 0
+    conflict_resolved: bool | None = None
     # Files named like a Windows device (nul, con, ...) deleted after a worker.
     removed_reserved_files: list[str] = field(default_factory=list)
     # Checks (node and post-merge) that timed out and were run once more.
@@ -240,16 +256,17 @@ class Coordinator:
                             and self._is_ready(node.id)):
                         announced.add(node.id)
                         self.events.emit("node_ready", node=node.id)
-                busy = set().union(*(edit_files(self.by_id[n]) for n in running.values()))
+                busy = [self.by_id[node_id] for node_id in running.values()]
                 for node in self.nodes:
                     if len(running) >= self.options.workers:
                         break
                     record = self.records[node.id]
+                    # Files both nodes share are edited in parallel, in different parts.
                     if (record.status != "pending" or node.id not in announced
-                            or edit_files(node) & busy):
+                            or any(conflicting_files(node, other) for other in busy)):
                         continue
                     record.status = "running"
-                    busy |= edit_files(node)
+                    busy.append(node)
                     running[pool.submit(self._run_node_safely, node)] = node.id
                 if not running:
                     break
@@ -416,25 +433,76 @@ class Coordinator:
         record.status = "failed"
         return False
 
-    def _merge_once(self, node: Node, record: NodeRecord, log_dir: Path,
+    def _squash(self, node: Node) -> str | None:
+        """Squash-merge the node's branch into the integration branch (None: conflict)."""
+        with self.git_lock:
+            self.events.emit("merge_start", node=node.id)
+            commit = gitops.squash_merge(self.repo, gitops.NODE_BRANCH_PREFIX + node.id,
+                                         f"[taskgraph] {node.id}: {node.title}")
+            self.events.emit("merge_end", node=node.id, ok=commit is not None, commit=commit)
+        return commit
+
+    def _resolve_conflict(self, node: Node, record: NodeRecord, log_dir: Path,
+                          worktree: Path) -> str:
+        """One conflict resolution, run while the caller holds ``merge_lock``.
+
+        The integration branch is merged into the node's worktree with its
+        conflict markers kept (the node's changes are measured from that
+        commit from now on), the worker runs once more with the conflicting
+        files named, and the node's own check runs. Returns "" when the merge
+        can be committed, else ``merge_conflict`` (markers left), the
+        worker's reason, or ``conflict_check_failed``.
+        """
+        record.merge_conflicts += 1
+        with self.git_lock:
+            target = self.integration_head
+            files = gitops.merge_keep_conflicts(worktree, target)
+        self.bases[node.id] = target
+        self.events.emit("merge_conflict", node=node.id, files=files)
+        reason = ""
+        if files:
+            attempt = record.attempts + 1
+            failure = AttemptFailure("merge_conflict", conflict_files=files)
+            result = self._run_worker(node, record, log_dir, worktree, attempt, failure)
+            worker_reason = record.worker_reasons[-1]
+            if worker_reason and worker_reason != "worker_timeout":
+                record.error = (result.error or result.final_answer)[-2000:]
+                reason = worker_reason
+            elif any((worktree / path).is_file()
+                     and CONFLICT_MARKER in (worktree / path).read_bytes() for path in files):
+                reason = "merge_conflict"
+            elif not self._run_node_check(node, record, log_dir, worktree, attempt).ok:
+                reason = "conflict_check_failed"
+        if not reason:
+            with self.git_lock:
+                gitops.commit_merge(worktree, "resolve conflicts with other nodes' work")
+        record.conflict_resolved = not reason
+        self.events.emit("merge_conflict_resolved", node=node.id, ok=not reason)
+        return reason
+
+    def _merge_once(self, node: Node, record: NodeRecord, log_dir: Path, worktree: Path,
                     check_file: str) -> tuple[str, str, bool]:
         """Squash-merge the node and run its post-merge check, as one unit.
 
-        Returns ``("merged", commit, False)``, ``("merge_conflict", "", False)``,
-        or ``("post_merge_check_failed", check output, timed out)`` with the
-        merge undone. A check that times out is run once more first, still
-        under ``merge_lock``.
+        A conflicting merge gets one resolution (``conflict_repairs``), still
+        under ``merge_lock``: see :meth:`_resolve_conflict`. Returns
+        ``("merged", commit, False)``, ``(reason, "", False)`` when the merge
+        conflicted and was not resolved, or ``("post_merge_check_failed",
+        check output, timed out)`` with the merge undone. A check that times
+        out is run once more first, still under ``merge_lock``.
         """
-        branch = gitops.NODE_BRANCH_PREFIX + node.id
         with self.merge_lock:
-            with self.git_lock:
-                self.events.emit("merge_start", node=node.id)
-                commit = gitops.squash_merge(self.repo, branch,
-                                             f"[taskgraph] {node.id}: {node.title}")
-                self.events.emit("merge_end", node=node.id, ok=commit is not None,
-                                 commit=commit)
+            commit = self._squash(node)
             if commit is None:
-                return "merge_conflict", "", False
+                if record.merge_conflicts >= max(self.options.conflict_repairs, 0):
+                    return "merge_conflict", "", False
+                reason = self._resolve_conflict(node, record, log_dir, worktree)
+                if reason:
+                    return reason, "", False
+                commit = self._squash(node)  # nothing merged meanwhile: no conflict
+                if commit is None:
+                    record.conflict_resolved = False
+                    return "merge_conflict", "", False
             check = run_checks_with_retry(post_merge_commands(node), self.repo,
                                           node.check.timeout_s, checks=self.checks,
                                           label=f"merge-{node.id}")
@@ -486,7 +554,8 @@ class Coordinator:
         repairs_left = max(self.options.merge_repairs, 0)
         check_file = "post_merge_check.txt"
         while True:
-            outcome, detail, timed_out = self._merge_once(node, record, log_dir, check_file)
+            outcome, detail, timed_out = self._merge_once(node, record, log_dir, worktree,
+                                                          check_file)
             repairing = record.merge_repairs > 0
             if outcome == "merged":
                 if repairing:
@@ -624,6 +693,7 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "max_attempts": options.max_attempts,
         "worker_timeout_s": options.worker_timeout_s,
         "merge_repairs": options.merge_repairs,
+        "conflict_repairs": options.conflict_repairs,
         "hidden_tests": str(options.hidden_tests) if options.hidden_tests else None,
         "worker": worker.describe(),
         **sandbox.to_dict(),
@@ -675,6 +745,8 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "checks_sandbox": options.checks.kind,
         "escape_attempts_total": escapes_total,
         "merge_repairs_total": sum(r.merge_repairs for r in records.values()),
+        "merge_conflicts_total": sum(r.merge_conflicts for r in records.values()),
+        "conflicts_resolved_total": sum(1 for r in records.values() if r.conflict_resolved),
         "check_timeout_retries_total": (
             sum(r.check_timeout_retries for r in records.values())
             + coordinator.final_check_timeout_retries),
