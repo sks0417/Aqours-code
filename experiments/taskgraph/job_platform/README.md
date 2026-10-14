@@ -264,6 +264,11 @@ base + reference. Copy the directory to `_hidden_tests/` in the repository and
 run `python -m pytest -q _hidden_tests` there (the Coordinator does this with
 `--hidden-tests`).
 
+Three of the new tests disagree with `SPEC.md` and are listed in
+[`known_bad_tests.txt`](known_bad_tests.txt). Until they are fixed, pass that
+file to `python -m aqours_code.taskgraph score --exclude` so that they count
+neither for nor against a run.
+
 ## Generating a repository
 
 ```bash

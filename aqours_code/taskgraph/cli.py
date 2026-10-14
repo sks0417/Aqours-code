@@ -194,6 +194,97 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return EXIT_OK if summary["status"] == "success" else EXIT_INVALID
 
 
+def _cmd_team(args: argparse.Namespace) -> int:
+    from . import planner
+    from .gitops import GitError
+    from .sandbox import SandboxConfig, SandboxUnavailable
+    from .team import TeamOptions, run_team
+    from .workers import AqoursWorker
+
+    request_path = Path(args.request)
+    if not request_path.is_file():
+        return _error(f"request file not found: {request_path}")
+    if not Path(args.repo).is_dir():
+        return _error(f"repository not found: {args.repo}")
+    if args.workers < 1 or args.max_attempts < 1:
+        return _error("--workers and --max-attempts must be >= 1")
+    if args.worker_timeout <= 0 or args.lead_timeout <= 0:
+        return _error("--worker-timeout and --lead-timeout must be > 0")
+    hidden = Path(args.hidden_tests) if args.hidden_tests else None
+    if hidden is not None and not hidden.is_dir():
+        return _error(f"hidden tests directory not found: {hidden}")
+    worker = AqoursWorker(sandbox=SandboxConfig(kind=args.sandbox, image=args.sandbox_image))
+    if worker.sandbox.kind == "none":
+        print(NO_SANDBOX_WARNING, file=sys.stderr)
+    options = TeamOptions(request_path=request_path, repo=Path(args.repo),
+                          out_dir=Path(args.out), workers=args.workers,
+                          max_attempts=args.max_attempts,
+                          worker_timeout_s=args.worker_timeout,
+                          lead_timeout_s=args.lead_timeout,
+                          final_checks=list(args.final_check), hidden_tests=hidden)
+    try:
+        result = run_team(options, worker, planner.planner_worker())
+    except SandboxUnavailable as exc:
+        return _error(f"{exc} (the run did not start; it never falls back to "
+                      "--sandbox none)")
+    except (GitError, RuntimeError, OSError, UnicodeDecodeError) as exc:
+        return _error(str(exc))
+    summary = result.summary
+    team = summary["team"]
+    if summary["reason"] == "lead_plan_invalid":
+        print("the lead gave no usable task list:")
+        for problem in team["plan_problems"]:
+            print(f"- {problem}")
+    print(f"tasks: {team['n_tasks']}  max parallel: {team['max_parallel']}")
+    for task in team["tasks"]:
+        reason = f" ({task['reason']})" if task["reason"] else ""
+        attempts = summary["nodes"][task["id"]]["attempts"]
+        print(f"{task['id']}: {task['status']}{reason} attempts={attempts}  {task['title']}")
+    print(f"conflicts: {team['conflicts']} (resolved: {team['conflicts_resolved']})  "
+          f"out-of-scope files: {team['out_of_scope_total']}  "
+          f"lead wrap-up changed: {len(team['wrapup_changed_files'])} file(s)")
+    totals = summary["totals"]
+    print(f"status: {summary['status']}  wall_time: {summary['wall_time_s']:.1f}s  "
+          f"model_calls: {totals['model_calls']}  tokens: "
+          f"{totals['input_tokens']} in / {totals['output_tokens']} out")
+    for check in summary["final_checks"]:
+        print(f"final check: {'ok' if check['ok'] else 'FAILED'}  {check['command']}")
+    if summary["hidden_tests"] is not None:
+        hidden_stats = summary["hidden_tests"]
+        print(f"hidden tests: {hidden_stats['passed']} passed, {hidden_stats['failed']} "
+              f"failed, {hidden_stats['errors']} errors, {hidden_stats['skipped']} skipped")
+    escapes = summary["escape_attempts_total"]
+    print(f"sandbox: {summary['sandbox']}  escape attempts: {escapes}")
+    print(f"checks ran in: {_where(summary['checks_sandbox'])}")
+    if escapes and summary["sandbox"] == "none":
+        print(_banner([f"{escapes} escape attempt(s) without a sandbox: workers may have "
+                       "read files outside their workspace.",
+                       "THE RESULTS OF THIS RUN ARE INVALID. See escape_samples in "
+                       "summary.json."]))
+    for warning in result.cleanup_warnings:
+        print(f"warning: cleanup: {warning}", file=sys.stderr)
+    print(f"run directory: {result.run_dir}")
+    return EXIT_OK if summary["status"] == "success" else EXIT_INVALID
+
+
+def _cmd_score(args: argparse.Namespace) -> int:
+    from .score import ScoreError, format_score, load_exclusions, load_manifest
+    from .score import score_manifest, write_score
+
+    try:
+        entries = load_manifest(Path(args.manifest))
+        exclusions = load_exclusions(Path(args.exclude)) if args.exclude else []
+        result = score_manifest(entries, exclusions)
+        if args.out:
+            write_score(result, Path(args.out))
+    except (ScoreError, OSError) as exc:
+        return _error(str(exc))
+    print(format_score(result), end="")
+    if args.out:
+        print(f"\nwrote {Path(args.out) / 'score.md'} and {Path(args.out) / 'score.json'}")
+    return EXIT_OK
+
+
 def _where(checks_sandbox: str) -> str:
     return "docker" if checks_sandbox == "docker" else "the host (no sandbox)"
 
@@ -406,6 +497,34 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--sandbox-image", default="aqours-code-eval:py311",
                          help="Docker image for --sandbox docker")
     run_cmd.set_defaults(func=_cmd_run)
+
+    team_cmd = commands.add_parser(
+        "team", help="plan-then-parallel baseline: a lead plans, teammates work in parallel")
+    team_cmd.add_argument("request", help="request text (Markdown)")
+    team_cmd.add_argument("--repo", required=True)
+    team_cmd.add_argument("--out", default="runs")
+    team_cmd.add_argument("--workers", type=int, default=4,
+                          help="teammates working at the same time (default 4)")
+    team_cmd.add_argument("--max-attempts", type=int, default=2)
+    team_cmd.add_argument("--worker-timeout", type=float, default=1800.0)
+    team_cmd.add_argument("--lead-timeout", type=float, default=1800.0,
+                          help="timeout in seconds of each lead call (planning, wrap-up)")
+    team_cmd.add_argument("--final-check", action="append", default=[],
+                          help="command run on the merged work (repeatable)")
+    team_cmd.add_argument("--hidden-tests")
+    team_cmd.add_argument("--sandbox", choices=("docker", "none"), default="docker",
+                          help="where teammates' shell commands, checks and hidden tests "
+                               "run (none: on this machine, tests only)")
+    team_cmd.add_argument("--sandbox-image", default="aqours-code-eval:py311",
+                          help="Docker image for --sandbox docker")
+    team_cmd.set_defaults(func=_cmd_team)
+
+    score_cmd = commands.add_parser(
+        "score", help="composite score of runs against the single-agent baseline")
+    score_cmd.add_argument("manifest", help="JSON list of {task, method, run[, plan_report]}")
+    score_cmd.add_argument("--exclude", help="file of pytest node ids to leave out")
+    score_cmd.add_argument("--out", help="directory for score.md and score.json")
+    score_cmd.set_defaults(func=_cmd_score)
 
     rescore_cmd = commands.add_parser(
         "rescore", help="run the hidden tests again on the final code of a finished run")

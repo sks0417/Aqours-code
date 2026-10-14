@@ -191,9 +191,11 @@ python -m aqours_code.taskgraph export-schema [--out <path>]
 python -m aqours_code.taskgraph compare <planner_graph.json> <handwritten_graph.json> --repo <path> [--json <file>]
 python -m aqours_code.taskgraph audit <runs_dir | run_dir> [...]
 python -m aqours_code.taskgraph rescore <run_dir> --hidden-tests <dir> [--sandbox docker|none]
+python -m aqours_code.taskgraph team <request.md> --repo <path> [...]
+python -m aqours_code.taskgraph score <manifest.json> [--exclude <tests.txt>] [--out <dir>]
 ```
 
-`plan`, `run`, `audit` and `rescore` are described in their own sections below. `compare` prints
+`plan`, `run`, `audit`, `rescore`, `team` and `score` are described in their own sections below. `compare` prints
 a Markdown table of both graphs' structure: validation (error count, warning
 codes), node counts by kind, files edited by contract nodes, critical path
 (nodes on the longest chain), maximum parallel width (largest layer when
@@ -902,3 +904,148 @@ commands, with repeated reads counted again. Blocked, failed, and unfinished
 reads do not count. With no soft-wall log, trace accounting requires a
 successful `tool_result` paired with its `read_file` call. First-write model
 call counting retains its existing semantics.
+
+## Team baseline (`team`)
+
+A control for the task graph method: the established fixed workflow in which
+a planner hands out tasks and workers do them in parallel. Its best-known
+forms are Claude Code's agent teams
+(<https://code.claude.com/docs/en/agent-teams>) and Cursor's planner/worker
+agents (<https://cursor.com/blog/scaling-agents>). Neither can be run in
+batch as open source, so `team.py` re-implements their **published workflow
+and best practices** in this runtime: the same model, the same worker
+(`AqoursWorker`), the same Docker sandbox, the same final checks and hidden
+tests. The only variable is the structure.
+
+```bash
+python -m aqours_code.taskgraph team <request.md> --repo <path> [--out runs] [--workers 4]
+    [--max-attempts 2] [--worker-timeout 1800] [--lead-timeout 1800]
+    [--final-check "python -m pytest -q tests"] [--hidden-tests <dir>]
+    [--sandbox docker|none] [--sandbox-image aqours-code-eval:py311]
+```
+
+The options mean what they mean for `run` and `plan`; `--final-check` can be
+repeated, and `--lead-timeout` bounds each of the lead's two calls. The base
+commit is the repository's `HEAD`. Exit codes are those of `run`.
+
+### Flow, and what each step copies
+
+| Step | Here | In the original systems |
+| --- | --- | --- |
+| 1. The lead plans | One agent with read-only tools (`read_file`, `glob`) on the base commit answers with a JSON task list: `id`, `title`, `description`, `files`, `blocked_by`. A list that cannot be used (not JSON, 0 or more than 20 tasks, duplicate ids, a `blocked_by` that names no task, itself, or a cycle, an empty description, a path outside the repository) is asked for once more with the problems listed; after two unusable answers the run fails with `lead_plan_invalid` and no teammate starts | Agent teams: the lead "creates tasks" in a shared task list, and tasks "can also depend on other tasks". Cursor: planners "explore the codebase and create tasks" |
+| The guidelines in the lead's prompt | Self-contained tasks with a clear deliverable; a different set of files for each teammate; sequential, same-file or heavily dependent work stays in one task (one task is a valid plan); neither too small nor too large; `blocked_by` only when needed; a description that says everything, because teammates do not see the lead's conversation | Agent teams, best practices: "Size tasks appropriately", "Avoid file conflicts" ("Two teammates editing the same file leads to overwrites. Break the work so each teammate owns a different set of files"), "Give teammates enough context" (the lead's conversation "does not carry over"), and "For sequential tasks, same-file edits, or work with many dependencies, a single session ... [is] more effective" |
+| 2. Teammates work in parallel | Up to `--workers` teammates at once (default 4). A task starts when every task in its `blocked_by` has finished, in list order. Each teammate is an ordinary worker with its own worktree at the current head of the integration branch; its prompt has the request, the task list with every task's status, the final answers of the teammates that finished (at most 1,500 characters each), and its own task and files | Agent teams: teammates "self-claim" the next unblocked task; each has "its own context window"; "start with 3-5 teammates"; a teammate that stops notifies the lead with "its final answer". Cursor: workers "take assigned tasks and focus only on finishing them" |
+| No locks on files | Two tasks may edit the same file at the same time; nothing checks `files` before a task starts. A file changed outside a task's `files` is recorded (`out_of_scope_files`) and merged like the rest | Agent teams lock only the claiming of a task. Cursor found that file locks cut throughput and replaced them with optimistic concurrency |
+| A teammate that fails | A worker error, a timeout, or no change at all: a new teammate tries again in the same worktree, told why (`--max-attempts`, default 2). Then the task is `failed`; tasks blocked by it still run and see `failed` in the task list | Agent teams: "Spawn a replacement teammate to continue the work" |
+| Merging, and conflicts | A finished task is squash-merged into the integration branch at once. On a conflict, the integration branch is merged into the task's branch with the conflict markers left in the files, and the same task gets one more teammate round to resolve them. Markers still there, or a second conflict: the task is `failed` with `merge_conflict` | Cursor: an integrator role "created more bottlenecks than it solved"; "workers were already capable of handling conflicts themselves" |
+| 3. The lead wraps up | After the last task: the final checks run on the merged work (`wrapup_checks.txt`), then one agent with the ordinary tools gets the request, every task's status and report, and the check output, and finishes or fixes what is missing or broken. Its changes are merged. It runs once | Agent teams: the lead "synthesiz[es] results". Cursor: a judge at the end of each cycle (here: one cycle) |
+| 4. Final stage | As in `run`: `final_checks`, hidden tests, escape audit, `summary.json`, clean-up | |
+
+Deliberate simplifications of the originals: a task is done by a fresh agent
+(a teammate does not keep its context from task to task); teammates do not
+message each other while they work (they share only their final answers);
+a task waits for its blockers to finish, completed or failed, so a failed
+task cannot stall the run (agent teams require the dependency to be
+completed); and each teammate has its own git worktree, so two edits of one
+file meet as a merge conflict instead of one overwriting the other.
+
+### What it does not have
+
+These are the task graph method's parts, left out on purpose:
+
+- no contract nodes, and no distinction between needing an interface and
+  needing an implementation: `blocked_by` is the only dependency;
+- no planner checks (P1-P7), no validation of the plan against the
+  repository index, and no program revision of the plan;
+- no context pack and no soft wall: a teammate reads what it wants;
+- no check of its own for a task: a teammate that ends normally with changes
+  is done;
+- no post-merge check and no merge repair;
+- splitting and conflict avoidance are rules of thumb in the lead's prompt,
+  not rules a program enforces; a conflict is resolved afterwards by the
+  teammate that hit it.
+
+### Run directory and summary.json
+
+The run directory has the layout of a graph run, so `rescore`, `audit` and
+the escape audit work on it: `config.json` (`"method": "team"`),
+`events.jsonl`, `repo/`, `nodes/<id>/` (prompt, worker result, trace, diff of
+each agent; the ids are `lead_plan`, the task ids, and `lead_wrapup`),
+`final/`, `final_checks.txt`, `hidden_tests.*`, `summary.json`, plus
+`lead_plan.json` (the task list and every planning round) and
+`wrapup_checks.txt`.
+
+`summary.json` has the fields of a graph run that `score` and `rescore` use:
+`run_id`, `status`, `wall_time_s` (from the start of the run to its end,
+including both lead calls), `config`, `nodes` (the fields of a graph node;
+`status` is `completed` or `failed`), `totals` (`model_calls`,
+`input_tokens`, `output_tokens`, including the lead), `integration_commit`,
+`final_checks`, `hidden_tests`, `sandbox`, `sandbox_image`, `checks_sandbox`,
+`escape_attempts_total`. `status` follows the rule of a graph run: `success`
+when every task is completed and every final check passes, `failed` when no
+task is completed (with `"reason": "lead_plan_invalid"` when there was no
+plan), `partial` otherwise.
+
+It adds `method` (`"team"`) and `team`: `tasks` (`id`, `title`, `files`,
+`blocked_by`, `status`, `reason`, and whether it had a conflict), `n_tasks`,
+`max_parallel` (the most tasks that ran at the same time), `conflicts`,
+`conflicts_resolved`, `out_of_scope_total`, `failed_tasks`,
+`wrapup_changed_files`.
+
+## Scoring runs (`score`)
+
+```bash
+python -m aqours_code.taskgraph score <manifest.json> [--exclude <tests.txt>] [--out <dir>]
+```
+
+One number per method and task, from quality, time and cost, with the single
+agent as the baseline:
+
+```text
+S = Q × (T_single / T) ^ 0.5 × (C_single / C) ^ 0.5
+```
+
+The **manifest** is a JSON list of objects: `task`, `method` (any name; one
+must be `single`), `run` (a run directory of `run` or `team`), and optionally
+`plan_report` (the planner's `*.report.json`, whose time and tokens are then
+counted). Relative paths are relative to the manifest. Several entries with
+the same task and method are repeated runs.
+
+For each run:
+
+- **Results**: `hidden_tests_rescored.xml` if the run has one, else
+  `hidden_tests.xml`.
+- **Quality Q** = pass rate of the functional tests × pass rate of the
+  regression tests. A regression test is one from the hidden tests'
+  `regression/` directory: pytest writes its JUnit `classname` as the dotted
+  path of the test file (`_hidden_tests.regression.test_utils.test_echo`), so
+  it is a test with `regression` among the parts of its `classname`. All
+  other tests are functional. A pass rate is passed / (passed + failed +
+  errors); skipped tests are not counted, and a kind without tests has the
+  rate 1.
+- `--exclude` names a file of pytest node ids, one per line (`#` starts a
+  comment), such as `test_priority.py::test_tenants_take_turns_within_a_priority`.
+  An id matches a test whose path ends with the id's path, so the directories
+  in front (`_hidden_tests/`) can be left out. An excluded test counts
+  neither as passed nor as failed.
+- **Time T** = `wall_time_s` + the plan report's `duration_s`.
+- **Cost C** = input tokens + 4 × output tokens, the plan report's included.
+
+`T_single` and `C_single` are the means over the `single` runs of the same
+task, so the single agent's S is its own Q. With repeated runs, a method's
+Q, T and C are the means of its runs and its S is computed from those means;
+the range shown beside S is that of the single runs' own S. A task without a
+valid `single` run is an error (exit code 2).
+
+A run is **invalid** and left out, but listed, when it ran with
+`--sandbox none` and has escape attempts, or when it has no readable hidden
+test results.
+
+The output (printed, and with `--out` also written to `score.md` and
+`score.json`):
+
+1. by task: one row per task and method: runs, functional and regression
+   pass rate, Q, T, input and output tokens, C, S;
+2. by method: the number of tasks, mean Q, mean S, and the tasks on which it
+   has the highest S;
+3. the oracle: the mean S when each task takes its best method.
