@@ -56,7 +56,8 @@ from .coordinator import (
 from .escapes import scan_run
 from .line_endings import LineEndings
 from .planner import DraftError, _file_list, extract_json_block
-from .prompting import FAILURE_EXCERPT_CHARS, RETRY_TEMPLATE, SANDBOX_NOTE, AttemptFailure
+from .prompting import (CONFLICT_MARKER, CONFLICT_SECTION, FAILURE_EXCERPT_CHARS,
+                        RETRY_TEMPLATE, SANDBOX_NOTE, AttemptFailure)
 from .repo_index import build_index
 from .schema import NODE_ID_PATTERN, validate_repo_path
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
@@ -68,7 +69,6 @@ DEFAULT_TEAM_WORKERS = 4
 LEAD_ATTEMPTS = 2  # the plan is asked for once more after a format error
 MAX_TASKS = 20
 REPORT_CHARS = 1500
-CONFLICT_MARKER = b"<<<<<<<"
 
 LEAD_PROMPT = Template("""\
 # Request
@@ -173,17 +173,6 @@ Your final answer is shared with the team: say briefly what you built, which
 files you changed, and anything other teammates must know.
 
 $rules$sandbox$extra""")
-
-CONFLICT_SECTION = Template("""
-# Your work conflicts with teammates' work
-
-While you worked, teammates merged changes to some of the same files. Your
-workspace now holds your work merged with theirs; these files contain
-conflict markers (<<<<<<<, =======, >>>>>>>): $files.
-
-Resolve every conflict so that both your work and theirs are kept, run the
-tests that cover your work, and finish.
-""")
 
 WRAPUP_PROMPT = Template("""\
 # Overall request
@@ -717,7 +706,8 @@ class Team:
         self.events.emit("merge_conflict", node=task.id, files=files)
         if files:
             result = self._teammate(state, record, worktree, base,
-                                    CONFLICT_SECTION.substitute(files=", ".join(files)))
+                                    CONFLICT_SECTION.substitute(
+                                        who="teammates", files=", ".join(files)))
             reason = record.worker_reasons[-1]
             if reason:
                 record.error = (result.error or result.final_answer)[-2000:]

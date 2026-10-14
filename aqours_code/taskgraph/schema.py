@@ -172,12 +172,13 @@ class _Model(BaseModel):
 
 
 def _without_unset(data: dict, names: tuple[str, ...]) -> dict:
-    """Leave out optional fields added later while they are unset (None or False).
+    """Leave out optional fields added later while they are unset (None, False or []).
 
     A graph that does not use them then serializes exactly as before they existed.
     """
     for name in names:
-        if name in data and data[name] in (None, False):
+        if name in data and (data[name] is None or data[name] is False
+                             or data[name] == []):
             del data[name]
     return data
 
@@ -231,6 +232,16 @@ class EditSet(_Model):
         default_factory=list,
         description=("Informational only: functions or methods this node changes. "
                      "Each symbol's file must be in this node's modify or create."))
+    shared: UniquePaths = Field(
+        default_factory=list,
+        description=("This node edits these files while other nodes edit other parts of "
+                     "them at the same time; merge conflicts are resolved at merge time. "
+                     "Two nodes that both list a file here may run in parallel on it. "
+                     "Each must also be in modify."))
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        return _without_unset(handler(self), ("shared",))
 
     @model_validator(mode="after")
     def _modify_and_create_disjoint(self) -> "EditSet":

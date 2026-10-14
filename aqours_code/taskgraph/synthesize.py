@@ -173,6 +173,7 @@ class Bucket:
     provides: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)   # sentences added to the goal
     contributors: list[str] = field(default_factory=list)  # PRE/REG: whose parts they took
+    shared: list[str] = field(default_factory=list)  # files edited in parallel with others
 
     def edit_files(self) -> list[str]:
         return list(dict.fromkeys(placed.edit.file for placed in self.edits))
@@ -313,6 +314,7 @@ class _Synthesizer:
         self.registrations: dict[str, list[_Registration]] = {PRE: [], REG: []}
         self.shared_edits: list[_SharedEdit] = []
         self.file_reasons: dict[str, list[str]] = {}
+        self.parallel_files: list[str] = []
 
     # ── records ──
 
@@ -987,6 +989,76 @@ class _Synthesizer:
                     "queue behind it", nodes=[PRE], lines=edit.lines,
                     threshold=SMALL_SHARED_EDIT_LINES)
 
+    def share_files(self) -> None:
+        """Step 3b (P3): nodes changing different symbols of one file run in parallel.
+
+        After the small shared edits went first, a file that two or more nodes
+        (not PRE or REG) still edit is edited in parallel when every edit
+        there is ``logic``, lists its symbols, and no two nodes' symbols
+        overlap (the same symbol, or a class and one of its members). Each
+        node then lists the file in ``edit_set.shared`` and is told which
+        parts the others change; a conflict is resolved when merging.
+        Otherwise the nodes are ordered on the file, as before.
+        """
+        if self.off("p3"):
+            return  # step 3 recorded that these files are only ordered
+        editors: dict[str, list[Bucket]] = {}
+        for bucket in self.buckets:
+            for path in bucket.edit_files():
+                editors.setdefault(path, []).append(bucket)
+        for path, buckets in editors.items():
+            if len(buckets) < 2:
+                continue
+            edits = {bucket.key: [item for item in bucket.edits if item.edit.file == path]
+                     for bucket in buckets}
+            why = self._why_not_parallel(edits)
+            if why:
+                self.file_reasons.setdefault(path, []).append(why)
+                continue
+            symbols = {key: _unique(symbol for item in items for symbol in item.edit.symbols)
+                       for key, items in edits.items()}
+            for bucket in buckets:
+                bucket.shared.append(path)
+                others = [parse_symbol(symbol).qualname for key, own in symbols.items()
+                          if key != bucket.key for symbol in own]
+                bucket.notes.append(
+                    f"Other nodes change {', '.join(others)} in {path} at the same time. "
+                    "Change only your own parts of it and leave theirs as they are; if "
+                    "your changes conflict with theirs when merging, you will be asked to "
+                    "resolve the conflict.")
+            self.parallel_files.append(path)
+            parts = "; ".join(f"{key}: {', '.join(parse_symbol(s).qualname for s in own)}"
+                              for key, own in symbols.items())
+            first = " PRE edits it before all of them." if path in self.pre.files() else ""
+            self.decide("P3", "parallel_different_symbols",
+                        [unit_id for bucket in buckets for unit_id in bucket.units],
+                        f"{', '.join(edits)} edit different parts of {path} ({parts}): "
+                        "they run in parallel, and a conflict between them is resolved "
+                        f"when merging.{first}", files=len(buckets))
+
+    @staticmethod
+    def _why_not_parallel(edits: dict[str, list[Placed]]) -> str:
+        """Why the nodes in ``edits`` must be ordered on their file ('' if they need not)."""
+        registering = [key for key, items in edits.items()
+                       if any(item.edit.kind == "registration" for item in items)]
+        if registering:
+            return f"{', '.join(registering)} register names there, so the nodes queue"
+        bare = [item.unit for items in edits.values() for item in items if not item.edit.symbols]
+        if bare:
+            return (f"{', '.join(bare)} list no symbols for their edit there, so it is not "
+                    "known which parts they change")
+        keys = list(edits)
+        for number, first in enumerate(keys):
+            for second in keys[number + 1:]:
+                for one in (s for item in edits[first] for s in item.edit.symbols):
+                    for two in (s for item in edits[second] for s in item.edit.symbols):
+                        if one == two or two.startswith(f"{one}.") or one.startswith(f"{two}."):
+                            what = ("both change " + parse_symbol(one).qualname if one == two
+                                    else f"change {parse_symbol(one).qualname} and "
+                                         f"{parse_symbol(two).qualname}, which overlap")
+                            return f"{first} and {second} {what}"
+        return ""
+
     def record_order(self) -> None:
         if self.off("p3"):
             return
@@ -996,7 +1068,7 @@ class _Synthesizer:
             for path in bucket.files():
                 editors.setdefault(path, []).append(bucket)
         for path, buckets in editors.items():
-            if len(buckets) < 2:
+            if len(buckets) < 2 or path in self.parallel_files:
                 continue
             keys = [bucket.key for bucket in buckets]
             kept = [bucket.key for bucket in buckets
@@ -1184,7 +1256,8 @@ class _Synthesizer:
             "id": node_id, "title": title, "kind": bucket.kind,
             "goal": self.goal_of(bucket, ids),
             "edit_set": {"modify": _unique([*bucket.edit_files(), *bucket.touch, *bucket.fill]),
-                         "create": list(bucket.create), "symbols": symbols},
+                         "create": list(bucket.create), "symbols": symbols,
+                         "shared": list(bucket.shared)},
             "requires": requires, "requires_impl": requires_impl, "provides": provides,
             "check": check, "context_files": context,
             "run_after_failed_upstream": bucket.key == REG,
@@ -1440,6 +1513,7 @@ def synthesize(facts: Facts, index: RepoIndex, info: GraphInfo,
     synth.check_cycles()
     synth.step3()
     synth.check_invariants("step 3 (shared edits)")
+    synth.share_files()
     synth.record_order()
     return synth.build(info, revised)
 

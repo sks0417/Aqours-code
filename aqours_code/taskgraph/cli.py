@@ -127,6 +127,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return _error("--workers and --max-attempts must be >= 1")
     if args.merge_repairs < 0:
         return _error("--merge-repairs must be >= 0")
+    if args.conflict_repairs < 0:
+        return _error("--conflict-repairs must be >= 0")
     if args.worker == "command":
         if not args.command_map:
             return _error("--worker command needs --command-map")
@@ -146,7 +148,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     options = RunOptions(out_dir=Path(args.out), workers=args.workers,
                          max_attempts=args.max_attempts,
                          worker_timeout_s=args.worker_timeout, hidden_tests=hidden,
-                         merge_repairs=args.merge_repairs)
+                         merge_repairs=args.merge_repairs,
+                         conflict_repairs=args.conflict_repairs)
     try:
         result = run_graph(graph, Path(args.repo), worker, options)
     except GraphInvalid as exc:
@@ -180,6 +183,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     detail = (f" ({', '.join(repaired)}; repaired: {', '.join(fixed) or 'none'})"
               if repaired else "")
     print(f"merge repairs: {summary['merge_repairs_total']}{detail}")
+    conflicted = [node_id for node_id, node in summary["nodes"].items()
+                  if node["merge_conflicts"]]
+    resolved = [node_id for node_id in conflicted
+                if summary["nodes"][node_id]["conflict_resolved"]]
+    detail = (f" ({', '.join(conflicted)}; resolved: {', '.join(resolved) or 'none'})"
+              if conflicted else "")
+    print(f"merge conflicts: {summary['merge_conflicts_total']}{detail}")
     print(f"check timeout retries: {summary['check_timeout_retries_total']}")
     escapes = summary["escape_attempts_total"]
     print(f"sandbox: {summary['sandbox']}  escape attempts: {escapes}")
@@ -573,6 +583,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--hidden-tests")
     run_cmd.add_argument("--merge-repairs", type=int, default=1,
                          help="repair rounds for a node whose post-merge check fails "
+                              "(default 1; 0 fails the node at once)")
+    run_cmd.add_argument("--conflict-repairs", type=int, default=1,
+                         help="conflict resolutions for a node whose merge conflicts "
                               "(default 1; 0 fails the node at once)")
     run_cmd.add_argument("--sandbox", choices=("docker", "none"), default="docker",
                          help="where worker shell commands, checks and hidden tests run "

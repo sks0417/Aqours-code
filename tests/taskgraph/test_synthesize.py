@@ -286,11 +286,12 @@ def test_7_small_standalone_shared_edits_go_first_others_are_ordered(keep_split)
     assert all(d.numbers == {"lines": 10, "threshold": SMALL_SHARED_EDIT_LINES}
                for d in first.decisions if d.rule == "small_shared_edit_first")
 
+    # not standalone: the edits stay with their units; they change different
+    # symbols of config.py, so the units edit it in parallel (task 25c)
     kept = run(shared_facts(standalone=False), index("config.py"))
-    assert kept.pre is None
-    assert edges(kept, "order") == {("A", "B"), ("A", "C"), ("B", "C")}
-    ordered = [d for d in kept.decisions if d.rule == "ordered"]
-    assert len(ordered) == 1 and "cannot be written on its own" in ordered[0].reason
+    assert kept.pre is None and kept.graph.edges == []
+    assert all(node.edit_set.shared == ["config.py"] for node in kept.graph.nodes)
+    assert rules(kept, "P3") == ["P3/parallel_different_symbols"]
     assert all(node.check.post_merge_commands == [FINAL] for node in kept.graph.nodes)
 
 
@@ -784,3 +785,95 @@ def test_ablate_p2_skips_the_class_check():
     result = synthesize(class_facts(logic("models.py", "RateLimit"), "RateLimit"),
                         index("models.py", "ui.py"), INFO, ablate={"p2"})
     assert "class_use_interface" not in [d.rule for d in result.decisions]
+
+
+# ── task 25c, section 4: nodes changing different symbols of one file run in parallel ──
+
+def runner_facts(first: dict, second: dict) -> Facts:
+    return facts(unit("A", edits=[first, logic("a.py", "fa")]),
+                 unit("B", edits=[second, logic("b.py", "fb")]))
+
+
+RUNNER_FILES = ("runner.py", "a.py", "b.py")
+
+
+def test_different_methods_of_one_file_are_edited_in_parallel():
+    result = run(runner_facts(logic("runner.py", "Runner.a"), logic("runner.py", "Runner.b")),
+                 index(*RUNNER_FILES))
+    graph_nodes = nodes(result)
+    assert graph_nodes["A"].edit_set.shared == ["runner.py"]
+    assert graph_nodes["B"].edit_set.shared == ["runner.py"]
+    assert result.graph.edges == []
+    assert ("Other nodes change Runner.b in runner.py at the same time. Change only your "
+            "own parts of it and leave theirs as they are; if your changes conflict with "
+            "theirs when merging, you will be asked to resolve the conflict."
+            ) in graph_nodes["A"].goal
+    assert "Other nodes change Runner.a in runner.py" in graph_nodes["B"].goal
+    decision = [d for d in result.decisions if d.rule == "parallel_different_symbols"]
+    assert len(decision) == 1 and decision[0].units == ["A", "B"]
+    assert "A: Runner.a; B: Runner.b" in decision[0].reason
+    assert "ordered" not in [d.rule for d in result.decisions]
+    # the shared file is edited by two nodes: both check the whole suite after merging
+    assert graph_nodes["A"].check.post_merge_commands == [FINAL]
+
+
+@pytest.mark.parametrize(("first", "second", "why"), [
+    (logic("runner.py", "Runner"), logic("runner.py", "Runner.b"),
+     "change Runner and Runner.b, which overlap"),
+    (logic("runner.py", "Runner.a"), logic("runner.py"),
+     "B list no symbols for their edit there"),
+])
+def test_overlapping_or_unknown_parts_of_one_file_are_ordered(keep_split, first, second, why):
+    result = run(runner_facts(first, second), index(*RUNNER_FILES))
+    assert edges(result, "order") == {("A", "B")}
+    assert all(not node.edit_set.shared for node in result.graph.nodes)
+    ordered = [d for d in result.decisions if d.rule == "ordered"]
+    assert len(ordered) == 1 and why in ordered[0].reason
+
+
+def test_registrations_in_one_file_are_not_edited_in_parallel(keep_split):
+    def registrar(uid: str) -> dict:  # the registered name stands for an unknown symbol
+        return unit(uid, edits=[logic(f"{uid.lower()}.py", "f"),
+                                registration("pkg.py", f"alias_{uid}")],
+                    provides=[f"pkg.py::alias_{uid}"], uses=[use(f"pkg.py::alias_{uid}")])
+
+    result = run(facts(registrar("A"), registrar("B")), index("pkg.py", "a.py", "b.py"))
+    assert edges(result, "order") == {("A", "B")}
+    assert all(not node.edit_set.shared for node in result.graph.nodes)
+    ordered = [d for d in result.decisions if d.rule == "ordered"]
+    assert "A, B register names there" in ordered[0].reason
+
+
+def test_ablate_p3_orders_different_methods_of_one_file(keep_split):
+    result = run(runner_facts(logic("runner.py", "Runner.a"), logic("runner.py", "Runner.b")),
+                 index(*RUNNER_FILES), ablate={"p3"})
+    assert edges(result, "order") == {("A", "B")}
+    assert all(not node.edit_set.shared for node in result.graph.nodes)
+
+
+def test_a_shared_file_must_be_modified():
+    from taskgraph_support import make_graph, make_node
+    node = make_node("A", modify=("a.py",), create=("b.py",))
+    node["edit_set"]["shared"] = ["b.py", "c.py"]
+    report = validate(make_graph([node]))
+    assert [(issue.code, issue.message) for issue in report.errors] == [
+        ("V14", "edit_set.shared lists b.py, c.py, which are not in edit_set.modify")]
+
+
+def test_nodes_sharing_a_file_need_no_order_but_other_overlaps_still_do():
+    from aqours_code.taskgraph import derive_edges
+    from taskgraph_support import make_graph, make_node
+    first = make_node("A", modify=("runner.py", "models.py"))
+    second = make_node("B", modify=("runner.py", "models.py"))
+    third = make_node("C", modify=("runner.py",))
+    for node in (first, second, third):
+        node["edit_set"]["shared"] = ["runner.py"]
+    first["edit_set"]["shared"].append("models.py")
+    graph = make_graph([first, second, third])
+    report = validate(graph)
+    # A and B overlap on models.py, which only A shares: still a conflict
+    assert [(issue.code, issue.nodes) for issue in report.errors] == [("V5", ["A", "B"])]
+    the_index = index("runner.py", "models.py")
+    derived, _ = derive_edges(graph, the_index)
+    assert {(e.from_, e.to) for e in derived.edges} == {("A", "B")}
+    assert validate(derived, the_index).ok

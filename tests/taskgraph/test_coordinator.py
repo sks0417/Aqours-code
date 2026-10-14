@@ -211,13 +211,16 @@ def test_merge_conflict_fails_later_node_and_keeps_integration_clean(toy_repo, t
         "Y": py("import pathlib, time; time.sleep(0.5); pathlib.Path('y.txt').write_text('Y'); "
                 "pathlib.Path('README.md').write_text('from Y')"),
     }
-    result = run(toy_repo, tmp_path, graph, commands, workers=2)
+    # conflict_repairs=0: the conflict fails the node at once, as before task 25c
+    result = run(toy_repo, tmp_path, graph, commands, workers=2, conflict_repairs=0)
     nodes = result.summary["nodes"]
     assert nodes["X"]["status"] == "merged"
     assert nodes["Y"]["status"] == "failed" and nodes["Y"]["reason"] == "merge_conflict"
+    assert (nodes["Y"]["merge_conflicts"], nodes["Y"]["conflict_resolved"]) == (0, None)
     repo = result.run_dir / "repo"
     assert gitops.is_clean(repo)
     assert integration_subjects(result) == ["[taskgraph] X: X"]
+    assert not any(e["type"] == "merge_conflict" for e in events(result))
 
 
 def test_post_merge_check_failure_is_undone(toy_repo, tmp_path):
@@ -406,3 +409,128 @@ def test_a_marked_node_without_failed_upstream_gets_no_note(toy_repo, tmp_path):
     assert result.summary["status"] == "success"
     prompt = (result.run_dir / "nodes" / "R" / "prompt_1.md").read_text(encoding="utf-8")
     assert "Skip the registrations" not in prompt
+
+
+# ── task 25c: nodes editing one file in parallel; a merge conflict is resolved once ──
+
+def script(tmp_path, name: str, code: str) -> str:
+    """A command running a Python script file (the code may use any quotes)."""
+    path = tmp_path / f"{name}.py"
+    path.write_text(code, encoding="utf-8")
+    return f'"{sys.executable}" "{path}"'
+
+
+APPEND = """\
+import os, pathlib, sys, time
+readme = pathlib.Path('README.md')
+if os.environ['TG_ATTEMPT'] == '1':
+    time.sleep({sleep})
+    pathlib.Path('{name}.txt').write_text('{name}')
+    readme.write_bytes(readme.read_bytes() + b'from {name}\\n')
+else:  # the conflict round
+    time.sleep({resolve_sleep})
+    {resolve}
+"""
+DROP_MARKERS = ("readme.write_bytes(b''.join(line for line in "
+                "readme.read_bytes().splitlines(True) "
+                "if not line.startswith((b'<<<<<<<', b'=======', b'>>>>>>>'))))")
+
+
+def appender(tmp_path, name: str, sleep: float = 0, resolve: str = DROP_MARKERS,
+             resolve_sleep: float = 0) -> str:
+    return script(tmp_path, name, APPEND.format(name=name, sleep=sleep, resolve=resolve,
+                                                resolve_sleep=resolve_sleep))
+
+
+def readme_node(node_id: str, check: str | None = None) -> dict:
+    """A node that creates <id>.txt and edits README.md in parallel with others."""
+    data = make_node(node_id, modify=("README.md",), create=(f"{node_id}.txt",),
+                     commands=(check or has(f"{node_id}.txt", node_id),))
+    data["edit_set"]["shared"] = ["README.md"]
+    return data
+
+
+def test_nodes_sharing_a_file_run_together_and_a_conflict_is_resolved(toy_repo, tmp_path):
+    graph = graph_for(toy_repo, [readme_node("x"), readme_node("y")])
+    commands = {"x": appender(tmp_path, "x"), "y": appender(tmp_path, "y", sleep=0.5)}
+    result = run(toy_repo, tmp_path, graph, commands, workers=2)
+    summary, evts = result.summary, events(result)
+    nodes = summary["nodes"]
+    assert summary["status"] == "success", nodes
+    assert (nodes["y"]["merge_conflicts"], nodes["y"]["conflict_resolved"]) == (1, True)
+    assert (nodes["x"]["merge_conflicts"], nodes["x"]["conflict_resolved"]) == (0, None)
+    assert nodes["y"]["attempts"] == 2  # the conflict round is the second attempt
+    assert (summary["merge_conflicts_total"], summary["conflicts_resolved_total"]) == (1, 1)
+    # both edited README.md at the same time
+    x = (event_t(evts, "worker_start", "x"), event_t(evts, "worker_end", "x", 1))
+    y = (event_t(evts, "worker_start", "y"), event_t(evts, "worker_end", "y", 1))
+    assert x[0] < y[1] and y[0] < x[1]
+    conflict = [e for e in evts if e["type"] == "merge_conflict"]
+    assert [(e["node"], e["files"]) for e in conflict] == [("y", ["README.md"])]
+    assert [e["ok"] for e in evts if e["type"] == "merge_conflict_resolved"] == [True]
+    final = (result.run_dir / "repo" / "README.md").read_text(encoding="utf-8")
+    assert "from x" in final and "from y" in final and "<<<<<<<" not in final
+    prompt = (result.run_dir / "nodes" / "y" / "prompt_2.md").read_text(encoding="utf-8")
+    assert "# Your work conflicts with other nodes' work" in prompt
+    assert "conflict markers (<<<<<<<, =======, >>>>>>>): README.md" in prompt
+    assert integration_subjects(result) == ["[taskgraph] x: x", "[taskgraph] y: y"]
+
+
+def test_conflict_markers_left_behind_fail_the_node(toy_repo, tmp_path):
+    graph = graph_for(toy_repo, [readme_node("x"), readme_node("y")])
+    commands = {"x": appender(tmp_path, "x"),
+                "y": appender(tmp_path, "y", sleep=0.5,
+                              resolve="pathlib.Path('y.txt').write_text('y')")}
+    result = run(toy_repo, tmp_path, graph, commands, workers=2)
+    node_y = result.summary["nodes"]["y"]
+    assert (node_y["status"], node_y["reason"]) == ("failed", "merge_conflict")
+    assert (node_y["merge_conflicts"], node_y["conflict_resolved"]) == (1, False)
+    assert gitops.is_clean(result.run_dir / "repo")
+    assert integration_subjects(result) == ["[taskgraph] x: x"]
+
+
+def test_a_failing_check_after_the_resolution_fails_the_node(toy_repo, tmp_path):
+    # y's check passes on its own work and fails once x's line is in README.md
+    check = py("import pathlib, sys; sys.exit(1 if 'from x' in "
+               "pathlib.Path('README.md').read_text() else 0)")
+    graph = graph_for(toy_repo, [readme_node("x"), readme_node("y", check=check)])
+    commands = {"x": appender(tmp_path, "x"), "y": appender(tmp_path, "y", sleep=0.5)}
+    result = run(toy_repo, tmp_path, graph, commands, workers=2)
+    node_y = result.summary["nodes"]["y"]
+    assert (node_y["status"], node_y["reason"]) == ("failed", "conflict_check_failed")
+    assert node_y["conflict_resolved"] is False
+    assert integration_subjects(result) == ["[taskgraph] x: x"]
+
+
+def test_other_merges_wait_until_the_conflict_round_ends(toy_repo, tmp_path):
+    graph = graph_for(toy_repo, [readme_node("x"), readme_node("y"),
+                                 node("Z", create=("z.txt",))])
+    commands = {"x": appender(tmp_path, "x"),
+                "y": appender(tmp_path, "y", sleep=0.5, resolve_sleep=2.0),
+                "Z": script(tmp_path, "z", "import time, pathlib\ntime.sleep(1.5)\n"
+                                           "pathlib.Path('z.txt').write_text('Z')\n")}
+    result = run(toy_repo, tmp_path, graph, commands, workers=3)
+    assert result.summary["status"] == "success", result.summary["nodes"]
+    evts = events(result)
+    resolved = event_t(evts, "merge_conflict_resolved", "y")
+    # Z finished its work during y's conflict round but merged only after it
+    assert event_t(evts, "check_end", "Z") < resolved
+    assert event_t(evts, "merge_start", "Z") > resolved
+
+
+def test_run_command_takes_conflict_repairs(toy_repo, tmp_path, capsys):
+    graph = graph_for(toy_repo, [readme_node("x"), readme_node("y")])
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(graph.model_dump_json(by_alias=True), encoding="utf-8")
+    command_map = tmp_path / "commands.json"
+    command_map.write_text(json.dumps({"x": appender(tmp_path, "x"),
+                                       "y": appender(tmp_path, "y", sleep=0.5)}),
+                           encoding="utf-8")
+    code = main(["run", str(graph_path), "--repo", str(toy_repo.path), "--out",
+                 str(tmp_path / "runs"), "--worker", "command", "--command-map",
+                 str(command_map), "--sandbox", "none", "--conflict-repairs", "1"])
+    output = capsys.readouterr().out
+    assert code == 0 and "merge conflicts: 1 (y; resolved: y)" in output
+    assert main(["run", str(graph_path), "--repo", str(toy_repo.path), "--worker",
+                 "command", "--command-map", str(command_map),
+                 "--conflict-repairs", "-1"]) == 2
