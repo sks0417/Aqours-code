@@ -271,6 +271,10 @@ def _check_commands(graph: Graph, report: ValidationReport) -> None:
         if not any(command.strip() for command in node.check.commands):
             report.errors.append(Issue(
                 "V4", [node.id], "check.commands has no non-empty command"))
+        post_merge = node.check.post_merge_commands
+        if post_merge is not None and not any(command.strip() for command in post_merge):
+            report.errors.append(Issue(
+                "V4", [node.id], "check.post_merge_commands has no non-empty command"))
 
 
 def _check_edit_conflicts(graph: Graph, ancestor_map: dict[str, set[str]],

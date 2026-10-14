@@ -352,3 +352,57 @@ def test_source_state_is_none_outside_a_checkout_root(toy_repo, tmp_path):
     assert state == {"head": toy_repo.commit, "dirty": False}
     (toy_repo.path / "new.txt").write_text("x", encoding="utf-8")
     assert gitops.source_state(toy_repo.path)["dirty"] is True
+
+
+# ── planner v3: post-merge commands and a node that runs after failed upstream nodes ──
+
+def test_post_merge_commands_replace_the_node_check_after_merging(toy_repo, tmp_path):
+    passing = node("A", create=("a.txt",))
+    passing["check"]["post_merge_commands"] = [py("print('POST-MERGE-ONLY')")]
+    failing = node("B", create=("b.txt",))
+    failing["check"]["post_merge_commands"] = [py("import sys; sys.exit(3)")]
+    graph = graph_for(toy_repo, [passing, failing])
+    result = run(toy_repo, tmp_path, graph, {"A": write("a.txt", "A"),
+                                             "B": write("b.txt", "B")}, merge_repairs=0)
+    records = result.summary["nodes"]
+    assert records["A"]["status"] == "merged"
+    assert records["B"]["status"] == "failed"
+    assert records["B"]["reason"] == "post_merge_check_failed"  # its node check passed
+    node_dir = result.run_dir / "nodes"
+    assert "POST-MERGE-ONLY" in (node_dir / "A" / "post_merge_check.txt").read_text(
+        encoding="utf-8")
+    assert "POST-MERGE-ONLY" not in (node_dir / "A" / "check_1.txt").read_text(
+        encoding="utf-8")
+
+
+def test_a_node_marked_to_run_after_failed_upstream_runs_and_names_them(toy_repo, tmp_path):
+    reg = node("R", create=("r.txt",))
+    reg["run_after_failed_upstream"] = True
+    graph = graph_for(toy_repo, [node("A", create=("a.txt",)), node("B", create=("b.txt",)),
+                                 node("C", create=("c.txt",)), reg],
+                      [make_edge("A", "R"), make_edge("B", "R"), make_edge("A", "C")])
+    commands = {"A": py("import sys; sys.exit(1)"), "B": write("b.txt", "B"),
+                "C": write("c.txt", "C"), "R": write("r.txt", "R")}
+    result = run(toy_repo, tmp_path, graph, commands)
+    records = result.summary["nodes"]
+    assert records["A"]["status"] == "failed"
+    assert (records["C"]["status"], records["C"]["reason"]) == ("skipped", "upstream_failed")
+    assert records["B"]["status"] == "merged" and records["R"]["status"] == "merged"
+    evts = events(result)
+    assert event_t(evts, "node_start", "R") >= max(event_t(evts, "node_failed", "A"),
+                                                    event_t(evts, "node_merged", "B"))
+    prompt = (result.run_dir / "nodes" / "R" / "prompt_1.md").read_text(encoding="utf-8")
+    assert prompt.rstrip().endswith("Skip the registrations of these failed sub-tasks: A")
+    assert "Skip the registrations" not in (
+        result.run_dir / "nodes" / "B" / "prompt_1.md").read_text(encoding="utf-8")
+
+
+def test_a_marked_node_without_failed_upstream_gets_no_note(toy_repo, tmp_path):
+    reg = node("R", create=("r.txt",))
+    reg["run_after_failed_upstream"] = True
+    graph = graph_for(toy_repo, [node("A", create=("a.txt",)), reg], [make_edge("A", "R")])
+    result = run(toy_repo, tmp_path, graph, {"A": write("a.txt", "A"),
+                                             "R": write("r.txt", "R")})
+    assert result.summary["status"] == "success"
+    prompt = (result.run_dir / "nodes" / "R" / "prompt_1.md").read_text(encoding="utf-8")
+    assert "Skip the registrations" not in prompt

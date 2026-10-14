@@ -1,4 +1,11 @@
-"""Planner v2: draft from the request, ground it in the code, revise by rules.
+"""The planner: Step 1 (shared by v2 and v3) and planner v2.
+
+``plan --planner v3`` (the default) runs :mod:`planner_v3`: the model reports
+task facts and the program builds the graph (:mod:`synthesize`). This module
+keeps Step 1 and the fast path, which both versions share, and planner v2
+(``plan --planner v2``), unchanged:
+
+Planner v2: draft from the request, ground it in the code, revise by rules.
 
 1. **Draft** (model, request only): one agent without file tools lists the
    pieces of work the request names and estimates the changed lines. A small
@@ -45,7 +52,9 @@ from .single import single_graph
 from .validate import Issue, ancestors, edit_files, unique_nodes, validate
 from .workers import AqoursWorker, Worker, WorkerRequest, WorkerResult, write_json_atomic
 
-PLANNER_VERSION = "planner-v2"
+PLANNER_VERSION = "planner-v3"
+PLANNER_V2_VERSION = "planner-v2"
+PLANNERS = ("v2", "v3")
 # The report lists goals longer than this in long_goals; the terminal notes them.
 REPORTED_GOAL_CHARS = 1500
 PLANNER_ENTRY_MODULE = "aqours_code.taskgraph.planner_entry"
@@ -177,14 +186,14 @@ def extract_json_block(text: str) -> str:
     raise DraftError([_format_issue("the final answer has no ```json code block")])
 
 
-def _location(loc: tuple, node_ids: list[str]) -> str:
+def _location(loc: tuple, node_ids: list[str], key: str = "nodes") -> str:
     parts: list[str] = []
     for i, item in enumerate(loc):
         if isinstance(item, int):
             if not parts:
                 parts.append(f"[{item}]")
-            elif loc[i - 1] == "nodes" and item < len(node_ids):
-                parts[-1] = f"nodes[{item}] (id {node_ids[item]!r})"
+            elif loc[i - 1] == key and item < len(node_ids):
+                parts[-1] = f"{key}[{item}] (id {node_ids[item]!r})"
             else:
                 parts[-1] = f"{parts[-1]}[{item}]"
         elif item != "edit_set":
@@ -192,8 +201,9 @@ def _location(loc: tuple, node_ids: list[str]) -> str:
     return ".".join(parts) or "draft"
 
 
-def _pydantic_issues(exc: ValidationError, node_ids: list[str]) -> list[Issue]:
-    return [_format_issue(f"{_location(tuple(error['loc']), node_ids)}: {error['msg']}")
+def _pydantic_issues(exc: ValidationError, node_ids: list[str],
+                     key: str = "nodes") -> list[Issue]:
+    return [_format_issue(f"{_location(tuple(error['loc']), node_ids, key)}: {error['msg']}")
             for error in exc.errors()]
 
 
@@ -238,8 +248,9 @@ class GraphInfo:
     model: str | None
 
 
-def _generator(info: GraphInfo, revision_mode: str) -> dict:
-    return {"kind": "planner", "planner_version": PLANNER_VERSION, "model": info.model,
+def _generator(info: GraphInfo, revision_mode: str,
+               version: str = PLANNER_V2_VERSION) -> dict:
+    return {"kind": "planner", "planner_version": version, "model": info.model,
             "revision_mode": revision_mode}
 
 
@@ -275,11 +286,12 @@ def draft_to_graph(draft: Draft, info: GraphInfo, *, revised: bool) -> Graph:
         raise DraftError(_pydantic_issues(exc, [node.id for node in draft.nodes])) from None
 
 
-def fast_path_graph(info: GraphInfo, repo: Path, estimate: int, threshold: int) -> Graph:
+def fast_path_graph(info: GraphInfo, repo: Path, estimate: int, threshold: int,
+                    version: str = PLANNER_V2_VERSION) -> Graph:
     """The single-agent graph of the ``single`` command, marked as the planner's choice."""
     graph = single_graph(info.request, repo, info.final_checks)
     data = graph.model_dump(mode="json", by_alias=True)
-    data["generator"] = _generator(info, "none")
+    data["generator"] = _generator(info, "none", version)
     data["revision_log"] = [{
         "action": "other", "nodes": [node["id"] for node in data["nodes"]],
         "reason": f"fast path: estimated {estimate} changed lines < threshold {threshold}"}]
@@ -588,7 +600,9 @@ class PlanOptions:
     """Parameters of one ``plan`` run.
 
     ``fast_path_lines`` is the fast-path threshold (None turns the fast path
-    off); ``merge`` is False for ``--no-merge``.
+    off); ``merge`` is False for ``--no-merge`` (v2 only). ``planner`` picks
+    the version; ``ablate`` (v3 only) names the properties ``p1``-``p4``
+    whose rules are turned off.
     """
 
     request_path: Path
@@ -600,6 +614,8 @@ class PlanOptions:
     request_id: str | None = None
     fast_path_lines: int | None = DEFAULT_FAST_PATH_LINES
     merge: bool = True
+    planner: str = "v3"
+    ablate: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -741,10 +757,21 @@ def revise_checked(graph: Graph, conventions: list[str], index: RepoIndex
 
 def run_plan(options: PlanOptions, worker: Worker,
              draft_stage_worker: Worker | None = None) -> PlanResult:
-    """Run the three planner steps; write the graph, the unmerged graph and the report.
+    """Run the planner version of ``options.planner``.
 
     ``worker`` runs Step 2; ``draft_stage_worker`` runs Step 1 (default: ``worker``).
     """
+    if options.planner not in PLANNERS:
+        raise ValueError(f"unknown planner {options.planner!r} (use {', '.join(PLANNERS)})")
+    if options.planner == "v3":
+        from .planner_v3 import run_plan_v3  # planner_v3 imports this module
+        return run_plan_v3(options, worker, draft_stage_worker)
+    return run_plan_v2(options, worker, draft_stage_worker)
+
+
+def run_plan_v2(options: PlanOptions, worker: Worker,
+                draft_stage_worker: Worker | None = None) -> PlanResult:
+    """Run the three steps of planner v2; write the graph, the unmerged graph and the report."""
     started = time.monotonic()
     draft_stage_worker = draft_stage_worker or worker
     request = options.request_path.read_text(encoding="utf-8")
@@ -839,7 +866,7 @@ def run_plan(options: PlanOptions, worker: Worker,
     stage_totals = {"stage1": _totals(stage1), "stage2": _totals(rounds)}
     goal_chars = {node.id: len(node.goal) for node in graph.nodes} if graph is not None else {}
     report = {
-        "planner_version": PLANNER_VERSION,
+        "planner_version": PLANNER_V2_VERSION,
         "model": info.model,
         "request": str(options.request_path),
         "repo": str(repo),

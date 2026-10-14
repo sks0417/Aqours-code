@@ -19,6 +19,7 @@ from pydantic import (
     StrictBool,
     StrictInt,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -170,6 +171,17 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _without_unset(data: dict, names: tuple[str, ...]) -> dict:
+    """Leave out optional fields added later while they are unset (None or False).
+
+    A graph that does not use them then serializes exactly as before they existed.
+    """
+    for name in names:
+        if name in data and data[name] in (None, False):
+            del data[name]
+    return data
+
+
 class Generator(_Model):
     """Where a graph came from."""
 
@@ -182,6 +194,14 @@ class Generator(_Model):
         default=None,
         description=("How the draft graph was revised: by an LLM ('llm'), by program "
                      "rules plus an LLM ('rule_assisted'), or not at all ('none')."))
+    ablate: list[Literal["p1", "p2", "p3", "p4"]] | None = Field(
+        default=None,
+        description=("Planner v3 only: the properties whose rules were turned off "
+                     "(each falls back to its simplest behaviour)."))
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        return _without_unset(handler(self), ("ablate",))
 
 
 class RevisionEntry(_Model):
@@ -229,6 +249,14 @@ class Check(_Model):
                      "node; at least one must be non-empty."))
     timeout_s: StrictInt = Field(
         default=300, gt=0, description="Timeout in seconds for the check commands.")
+    post_merge_commands: list[str] | None = Field(
+        default=None,
+        description=("Commands run on the integration branch after the node is merged; "
+                     "without them the post-merge check runs `commands`."))
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        return _without_unset(handler(self), ("post_merge_commands",))
 
 
 class Node(_Model):
@@ -273,6 +301,15 @@ class Node(_Model):
                      "commit or be created by an ancestor node."))
     size: Literal["small", "medium", "large"] | None = Field(
         default=None, description="Expected size of the change.")
+    run_after_failed_upstream: StrictBool = Field(
+        default=False,
+        description=("Run once every upstream node has finished, even if some failed or "
+                     "were skipped; the prompt then names them. Other nodes are skipped "
+                     "when an upstream node fails."))
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        return _without_unset(handler(self), ("run_after_failed_upstream",))
 
     @field_validator("goal")
     @classmethod

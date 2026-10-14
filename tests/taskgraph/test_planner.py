@@ -13,7 +13,7 @@ from aqours_code.taskgraph.cli import main
 from aqours_code.taskgraph.outline import build_outline
 from aqours_code.taskgraph.planner import (
     DRAFT_PROMPT_PATH,
-    PLANNER_VERSION,
+    PLANNER_V2_VERSION,
     PROMPT_PATH,
     Draft,
     DraftError,
@@ -181,7 +181,7 @@ def plan(toy_repo, tmp_path: Path, answers: list[str], *, items=None, estimate: 
     worker = ScriptedPlanner(answers)
     drafter = ScriptedDrafter([items if isinstance(items, str)
                                else items_answer(items or implement_ids(answers), estimate)])
-    plan_options = PlanOptions(request_path=request, repo=toy_repo.path,
+    plan_options = PlanOptions(request_path=request, repo=toy_repo.path, planner="v2",
                                out=tmp_path / "out" / "graph.json",
                                final_checks=["python -m pytest -q tests"], timeout_s=60,
                                **options)
@@ -242,7 +242,7 @@ def test_valid_draft_gives_a_valid_planner_graph_with_derived_edges(toy_repo, tm
     assert result.success and len(worker.requests) == 1
     graph = load_graph(options.out)
     assert graph.generator.kind == "planner"
-    assert graph.generator.planner_version == PLANNER_VERSION
+    assert graph.generator.planner_version == PLANNER_V2_VERSION
     assert graph.generator.model == "scripted-model"
     assert graph.generator.revision_mode == "none"
     assert graph.request == REQUEST
@@ -296,8 +296,9 @@ def test_persistent_errors_fail_after_two_revisions_but_still_write_outputs(
     out = tmp_path / "graph.json"
     worker = ScriptedPlanner([answer(INVALID_DRAFT), "no draft at all", answer(INVALID_DRAFT)])
     patch_workers(monkeypatch, worker, [items_answer(["S", "R"])])
-    code = main(["plan", str(request), "--repo", str(toy_repo.path), "--out", str(out),
-                 "--final-check", "python -m pytest -q tests", "--timeout", "60"])
+    code = main(["plan", "--planner", "v2", str(request), "--repo", str(toy_repo.path),
+                 "--out", str(out), "--final-check", "python -m pytest -q tests",
+                 "--timeout", "60"])
     assert code != 0
     assert len(worker.requests) == 3
     graph = load_graph(out)
@@ -394,7 +395,7 @@ def test_agent_failure_is_a_round_error(toy_repo, tmp_path):
 
     request = tmp_path / "request.md"
     request.write_text(REQUEST, encoding="utf-8")
-    options = PlanOptions(request_path=request, repo=toy_repo.path,
+    options = PlanOptions(request_path=request, repo=toy_repo.path, planner="v2",
                           out=tmp_path / "graph.json", max_revisions=0)
     result = run_plan(options, Failing([]), ScriptedDrafter([items_answer(["1"])]))
     assert not result.success and result.graph is None
@@ -652,7 +653,8 @@ def test_long_goal_is_reported_without_failing_plan(toy_repo, tmp_path, monkeypa
     worker = ScriptedPlanner([answer(draft)])
     patch_workers(monkeypatch, worker, [items_answer(['A'])])
     out = tmp_path / 'graph.json'
-    assert main(['plan', str(request), '--repo', str(toy_repo.path), '--out', str(out)]) == 0
+    assert main(['plan', '--planner', 'v2', str(request), '--repo', str(toy_repo.path),
+                 '--out', str(out)]) == 0
     report = json.loads(report_path_for(out).read_text(encoding='utf-8'))
     assert report['success'] and report['goal_chars'] == {'A': length}
     assert report['rounds'][0]['errors'] == []
@@ -737,7 +739,7 @@ def test_draft_stage_is_retried_once_after_a_format_error(toy_repo, tmp_path):
     worker = ScriptedPlanner([answer(VALID_DRAFT)])
     drafter = ScriptedDrafter([answer({"items": [{"id": "S", "title": "s"}]}),
                                items_answer(["S", "R"])])
-    options = PlanOptions(request_path=request, repo=toy_repo.path,
+    options = PlanOptions(request_path=request, repo=toy_repo.path, planner="v2",
                           out=tmp_path / "graph.json")
     result = run_plan(options, worker, drafter)
     assert result.success and len(drafter.requests) == 2 and len(worker.requests) == 1
@@ -758,7 +760,8 @@ def test_plan_fails_when_the_draft_stage_fails_twice(toy_repo, tmp_path, monkeyp
     out.write_text("stale", encoding="utf-8")
     worker = ScriptedPlanner([answer(VALID_DRAFT)])
     drafter = patch_workers(monkeypatch, worker, ["no json", answer({"items": []})])
-    code = main(["plan", str(request), "--repo", str(toy_repo.path), "--out", str(out)])
+    code = main(["plan", "--planner", "v2", str(request), "--repo", str(toy_repo.path),
+                 "--out", str(out)])
     assert code == 1
     assert len(drafter.requests) == 2 and worker.requests == []
     assert not out.exists() and not unmerged_path_for(out).exists()
@@ -833,8 +836,9 @@ def test_fast_path_options_of_the_plan_command(toy_repo, tmp_path, monkeypatch, 
     out = tmp_path / "graph.json"
     worker = ScriptedPlanner([answer(VALID_DRAFT)])
     patch_workers(monkeypatch, worker, [items_answer(["S", "R"], estimate)])
-    assert main(["plan", str(request), "--repo", str(toy_repo.path), "--out", str(out),
-                 "--final-check", "python -m pytest -q tests", *flags]) == 0
+    assert main(["plan", "--planner", "v2", str(request), "--repo", str(toy_repo.path),
+                 "--out", str(out), "--final-check", "python -m pytest -q tests",
+                 *flags]) == 0
     output = capsys.readouterr().out
     assert line in output and f"estimated changed lines: {estimate}" in output
     assert "draft items: 2" in output
@@ -1026,8 +1030,8 @@ def test_no_merge_writes_the_unmerged_graph_only(toy_repo, tmp_path, monkeypatch
     unmerged_path_for(out).write_text("stale", encoding="utf-8")
     worker = ScriptedPlanner([answer(QUEUED_DRAFT)])
     patch_workers(monkeypatch, worker, [items_answer(["P", "Q", "S"])])
-    assert main(["plan", str(request), "--repo", str(toy_repo.path), "--out", str(out),
-                 "--no-merge"]) == 0
+    assert main(["plan", "--planner", "v2", str(request), "--repo", str(toy_repo.path),
+                 "--out", str(out), "--no-merge"]) == 0
     graph = load_graph(out)
     assert [node.id for node in graph.nodes] == ["C", "P", "Q", "S"]
     assert graph.generator.revision_mode == "none"
@@ -1049,7 +1053,8 @@ def test_plan_command_reports_the_merges(toy_repo, tmp_path, monkeypatch, capsys
                          {**QUEUED_DRAFT["nodes"][3], "requires": ["store.py::JobStore.nope"]}]}
     worker = ScriptedPlanner([answer(invalid), answer(QUEUED_DRAFT)])
     patch_workers(monkeypatch, worker, [items_answer(["P", "Q", "S"])])
-    assert main(["plan", str(request), "--repo", str(toy_repo.path), "--out", str(out)]) == 0
+    assert main(["plan", "--planner", "v2", str(request), "--repo", str(toy_repo.path),
+                 "--out", str(out)]) == 0
     output = capsys.readouterr().out
     assert "draft items: 3  estimated changed lines: 800" in output
     assert "fast path: not taken (800 >= 500 lines)" in output
@@ -1363,7 +1368,8 @@ def test_plan_command_prints_the_outline_size(toy_repo, tmp_path, monkeypatch, c
     patch_workers(monkeypatch, ScriptedPlanner([answer(SINGLE_NODE_DRAFT)]),
                   [items_answer(["A"])])
     out = tmp_path / "graph.json"
-    assert main(["plan", str(request), "--repo", str(toy_repo.path), "--out", str(out)]) == 0
+    assert main(["plan", "--planner", "v2", str(request), "--repo", str(toy_repo.path),
+                 "--out", str(out)]) == 0
     report = json.loads(report_path_for(out).read_text(encoding="utf-8"))
     assert (f"outline: {report['outline_chars']} characters (shortened: none)"
             in capsys.readouterr().out)
