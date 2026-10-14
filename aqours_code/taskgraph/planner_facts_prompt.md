@@ -13,9 +13,8 @@ You describe the work; you do not design the task graph. The program
 decides which units become nodes, which shared edits are made first or
 last, what runs in parallel, and how each node is checked, from what you
 report. Report truthfully, even when two units edit the same file or the
-same function. When you are unsure whether an interface is enough, say
-"behavior"; when you are unsure whether an edit can be written on its own,
-say standalone false.
+same function. When you are unsure whether an edit can be written on its
+own, say standalone false.
 
 Look before you describe. Go through the request and the draft items, then
 the repository: its outline, its README, and any specification the README
@@ -56,12 +55,16 @@ symbols a unit needs that another unit provides, or that this unit itself
 registers. A symbol that exists already and that no unit changes is not
 listed.
 
-- `need: "interface"`: to write the code and run its tests, the unit only
-  needs the symbol to exist with its signature; its tests can use a small
-  fake instead of the real behaviour.
-- `need: "behavior"`: the unit needs the symbol to really work, for example
-  because its code builds on the results or its tests check them.
-- When you are unsure, say `"behavior"`.
+- `need: "interface"`: the unit only needs the symbol to exist with its
+  name and signature. This is the usual case: creating, reading or raising
+  a class, a field or an exception, and calling a function or method whose
+  result the unit's tests can replace with a small fake.
+- `need: "behavior"`: the unit's code or tests depend on a result that only
+  the provider's real code produces, so that a fake would make the tests
+  meaningless. Say which result in `why`, in one sentence. If you cannot
+  name such a result, the need is "interface".
+- Name the method you call, not its class: `RecipeBook.rate`, not
+  `RecipeBook`. A use of a class means its constructor and fields only.
 
 When the unit's own code or tests import one of its own symbols through a
 name the unit registers (a test writes `from package import Name`), list that
@@ -71,9 +74,10 @@ registered name in `uses` too.
 using only the code already in the repository: it needs neither the unit's
 other changes nor any other unit's work. When you are unsure, say `false`.
 
-**Together.** Units that are one piece of work logically, where one cannot
-be explained or tested without the other, are listed together with a
-reason. Editing the same file is not a reason to list units together.
+**Together.** Units that cannot be written or tested apart, not even with a
+fake standing in for the other, are listed together with a reason. This is
+rare. Editing the same file, or using another unit's fields, is not a
+reason to list units together.
 
 **Repository conventions.** Most repositories have rules that all their
 code follows, stated in the README or the specification or visible in the
@@ -119,7 +123,9 @@ is read.
       ],
       "create": ["tests/test_name.py"],
       "provides": ["pkg/module.py::Name", "pkg/__init__.py::Name"],
-      "uses": [{"symbol": "pkg/__init__.py::Name", "need": "interface"}],
+      "uses": [{"symbol": "pkg/__init__.py::Name", "need": "interface"},
+               {"symbol": "pkg/store.py::Store.total", "need": "behavior",
+                "why": "The tests check the totals Store.total computes."}],
       "tests": ["tests/test_name.py"],
       "context_files": ["README.md"]
     }
@@ -151,7 +157,9 @@ Field rules:
 - `provides`: each symbol is in a file of the unit's `edits` or `create`; a
   registered name is also in the `symbols` of its registration edit.
 - `uses`: each symbol is provided by some unit (this unit's registered
-  names included); `need` is `"interface"` or `"behavior"`.
+  names included); `need` is `"interface"` or `"behavior"`. `why` is
+  required when `need` is `"behavior"`: one sentence naming the result that
+  only the provider's real code produces.
 - `tests`: the unit's own test files, each in its `create` or `edits`.
   Empty when the unit has no behaviour that can be observed on its own (pure
   wiring).
@@ -207,14 +215,14 @@ functions. The README says that recipes are saved and loaded only through
     },
     {
       "id": "B", "item": "2", "title": "Best-rated list",
-      "goal": "\"Best-rated list\": RecipeBook.best_rated in recipes/book.py, ranking by the mean of Recipe.ratings. Tests in tests/test_best_rated.py.",
+      "goal": "\"Best-rated list\": RecipeBook.best_rated in recipes/book.py, ranking by the mean of Recipe.ratings. Tests in tests/test_best_rated.py build rated recipes themselves.",
       "size": 90,
       "edits": [
         {"file": "recipes/book.py", "kind": "logic", "symbols": ["recipes/book.py::RecipeBook.best_rated"], "lines": 40, "standalone": false}
       ],
       "create": ["tests/test_best_rated.py"],
       "provides": ["recipes/book.py::RecipeBook.best_rated"],
-      "uses": [{"symbol": "recipes/models.py::Recipe.ratings", "need": "behavior"}],
+      "uses": [{"symbol": "recipes/models.py::Recipe.ratings", "need": "interface"}],
       "tests": ["tests/test_best_rated.py"],
       "context_files": ["SPEC.md#Best-rated list"]
     },
@@ -238,14 +246,12 @@ functions. The README says that recipes are saved and loaded only through
       "provides": ["recipes/cli.py::main"],
       "uses": [
         {"symbol": "recipes/__init__.py::rate", "need": "interface"},
-        {"symbol": "recipes/book.py::RecipeBook.best_rated", "need": "behavior"}
+        {"symbol": "recipes/book.py::RecipeBook.best_rated", "need": "behavior",
+         "why": "C's tests check the scores best_rated computes from stored ratings"}
       ],
       "tests": ["tests/test_cli.py"],
       "context_files": ["SPEC.md#Command line"]
     }
-  ],
-  "together": [
-    {"units": ["R", "B"], "reason": "The best-rated list is defined by the stored ratings; neither can be specified or tested without the other."}
   ]
 }
 ```
@@ -257,9 +263,13 @@ What the facts say, and why:
   C also uses that name. Both only call `rate`, so `"interface"` is enough.
 - S registers `shopping_list`, but nobody imports it through the package:
   S's tests import it from `recipes.shopping`.
-- B ranks by real ratings and C's tests check a real ranking, so both say
-  `"behavior"`.
+- B only reads the `Recipe.ratings` field, and its tests build rated
+  recipes themselves, so it says `"interface"`.
+- C's tests check the scores `best_rated` computes from stored ratings, a
+  result only B's real code produces, so C says `"behavior"` and names that
+  result in `why`.
 - R's change to `Recipe` adds one field with only the existing code, so it
-  is `standalone`; B's ranking needs R's ratings, so it is not.
-- R and B are listed `together`: the ranking is meaningless without the
-  ratings it ranks.
+  is `standalone`; B's ranking reads that new field, so it is not.
+- R and B are not listed `together`: B can be written and tested with
+  recipes it rates itself. `together` is only for units that cannot be
+  written or tested apart even with a fake, which is rare.

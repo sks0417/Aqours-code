@@ -199,6 +199,11 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         "facts": facts.model_dump(mode="json") if facts is not None else None,
         "conventions": list(facts.conventions) if facts is not None else [],
         "units": len(facts.units) if facts is not None else 0,
+        # uses the model marked "behavior" without naming the result (recorded only)
+        "behavior_without_why": [{"unit": unit.id, "symbol": use.symbol}
+                                 for unit in (facts.units if facts is not None else [])
+                                 for use in unit.uses
+                                 if use.need == "behavior" and not use.why.strip()],
         "node_units": synthesis.node_units if built else {},
         "decisions": [decision.to_dict() for decision in synthesis.decisions] if built else [],
         "decision_counts": synthesis.counts() if built else {},

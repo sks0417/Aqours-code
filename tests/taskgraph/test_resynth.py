@@ -127,3 +127,14 @@ def test_resynth_reports_facts_that_no_longer_pass_the_checks(toy_repo, tmp_path
     result = run_resynth(path, out)
     assert not result.success and not out.exists()
     assert [issue["code"] for issue in result.report["errors"]] == ["F6"]
+
+
+def test_resynth_reads_facts_saved_before_why_existed(toy_repo, tmp_path):
+    old = json.loads(json.dumps(FACTS))
+    old["units"][1]["uses"][0]["need"] = "behavior"  # no "why": written by planner-v3
+    assert all("why" not in use for unit in old["units"] for use in unit.get("uses", []))
+    _, path = saved_plan(toy_repo, tmp_path, old)
+    result = run_resynth(path, tmp_path / "new" / "graph.json")
+    assert result.success
+    assert result.report["behavior_without_why"] == [
+        {"unit": "R", "symbol": "store.py::JobStore.cancel"}]

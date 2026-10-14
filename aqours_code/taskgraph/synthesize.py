@@ -286,6 +286,8 @@ class _Synthesizer:
         self.decisions: list[Decision] = []
         self.order = {unit.id: position for position, unit in enumerate(facts.units)}
         self.units: dict[str, Unit] = {unit.id: self._normalized(unit) for unit in facts.units}
+        if not self.off("p2"):
+            self._class_uses_as_interface()
         self.providers: dict[str, list[str]] = {}
         for unit in self.units.values():
             for symbol in unit.provides:
@@ -333,6 +335,42 @@ class _Synthesizer:
                 edit = edit.model_copy(update={"kind": "logic", "standalone": False})
             edits.append(edit)
         return unit.model_copy(update={"edits": edits})
+
+    def _class_uses_as_interface(self) -> None:
+        """P2: a ``behavior`` use of a class that only holds data needs its interface.
+
+        A class here is a symbol whose qualified name has no dot, starts with
+        an upper-case letter and has a lower-case one (``RateLimit``, not
+        ``SCHEMA``). It only holds data when no unit lists one of its methods
+        or attributes (``Class.name``) in ``provides`` or in an edit's
+        ``symbols``: its behaviour, if any, would be in those. Using such a
+        class means its constructor and fields, which exist as soon as its
+        interface does.
+        """
+        listed = {symbol for unit in self.units.values()
+                  for symbol in [*unit.provides,
+                                 *(name for edit in unit.edits for name in edit.symbols)]}
+
+        def data_class(symbol: str) -> bool:
+            name = parse_symbol(symbol).qualname
+            if "." in name or not name[:1].isupper() or not any(c.islower() for c in name):
+                return False
+            return not any(other.startswith(f"{symbol}.") for other in listed)
+
+        for unit_id, unit in list(self.units.items()):
+            uses = []
+            for use in unit.uses:
+                if use.need == "behavior" and data_class(use.symbol):
+                    name = parse_symbol(use.symbol).qualname
+                    why = use.why.strip()
+                    said = f" (the facts said behavior: {why})" if why else ""
+                    self.decide("P2", "class_use_interface", [unit_id],
+                                f"{unit_id} uses {name}, a class whose methods no unit "
+                                "changes, so only its constructor and fields are needed: "
+                                f"interface{said}")
+                    use = use.model_copy(update={"need": "interface"})
+                uses.append(use)
+            self.units[unit_id] = unit.model_copy(update={"uses": uses})
 
     # ── groups ──
 

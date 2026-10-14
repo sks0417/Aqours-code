@@ -743,3 +743,44 @@ def test_order_edges_count_for_the_critical_path():
 def test_one_group_has_no_parallelism_figures():
     single = synthesize(facts(unit("A", edits=[logic("a.py", "f")])), index("a.py"), INFO)
     assert single.parallelism is None
+
+
+# ── task 25c, section 3: a behavior use of a class that only holds data ──
+
+def class_facts(provider_edit: dict, used: str, why: str = "") -> Facts:
+    return facts(
+        unit("M", edits=[provider_edit], provides=[f"models.py::{used}"]),
+        unit("U", edits=[logic("ui.py", "page")],
+             uses=[{"symbol": f"models.py::{used}", "need": "behavior", "why": why}]))
+
+
+def test_a_behavior_use_of_a_data_class_is_an_interface_use():
+    result = run(class_facts(logic("models.py", "RateLimit"), "RateLimit"),
+                 index("models.py", "ui.py"))
+    decision = [d for d in result.decisions if d.rule == "class_use_interface"]
+    assert len(decision) == 1 and decision[0].property == "P2" and decision[0].units == ["U"]
+    assert decision[0].reason == ("U uses RateLimit, a class whose methods no unit changes, "
+                                  "so only its constructor and fields are needed: interface")
+    assert "P2/interface_first" in rules(result, "P2")  # no longer a wait
+    assert nodes(result)["U"].requires == ["models.py::RateLimit"]
+
+
+def test_a_class_whose_methods_a_unit_changes_keeps_the_behavior_use():
+    result = run(class_facts(logic("models.py", "RateLimit", "RateLimit.allowed"),
+                             "RateLimit", why="the limits allowed computes"),
+                 index("models.py", "ui.py"))
+    assert "class_use_interface" not in [d.rule for d in result.decisions]
+    assert rules(result, "P2") == ["P2/wait_for_behavior"]
+
+
+@pytest.mark.parametrize("name", ["SCHEMA", "JOB_FIELDS", "_Private", "render"])
+def test_names_that_are_not_classes_keep_the_behavior_use(name):
+    result = synthesize(class_facts(logic("models.py", name), name),
+                        index("models.py", "ui.py"), INFO)
+    assert "class_use_interface" not in [d.rule for d in result.decisions]
+
+
+def test_ablate_p2_skips_the_class_check():
+    result = synthesize(class_facts(logic("models.py", "RateLimit"), "RateLimit"),
+                        index("models.py", "ui.py"), INFO, ablate={"p2"})
+    assert "class_use_interface" not in [d.rule for d in result.decisions]
