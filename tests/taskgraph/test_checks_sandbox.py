@@ -5,6 +5,7 @@ import json
 import shlex
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -20,6 +21,8 @@ from aqours_code.taskgraph.checks import (
     checks_for,
     rescore,
     run_checks,
+    sandbox_timeout,
+    with_sandbox_timeout,
 )
 from aqours_code.taskgraph.cli import main
 from aqours_code.taskgraph.coordinator import RunOptions, run_graph
@@ -66,9 +69,19 @@ class FakeExecutor:
     def start(self) -> None:
         self.container["started"] = True
 
+    def unwrap(self, command: str, timeout: float) -> str:
+        """The check command inside ``timeout -k 5 <seconds> /bin/sh -c '<command>'``."""
+        wrapper = shlex.split(command)
+        assert wrapper[:3] == ["timeout", "-k", "5"] and wrapper[4:6] == ["/bin/sh", "-c"]
+        assert len(wrapper) == 7, wrapper
+        self.container["inner_timeouts"].append(float(wrapper[3]))
+        self.container["host_timeouts"].append(timeout)
+        return wrapper[6]
+
     def execute(self, command: str, cwd, timeout) -> dict:
         assert self.container["started"] and not self.container["stopped"]
         assert Path(cwd) == self.container["workspace"]  # /workspace is the mount itself
+        command = self.unwrap(command, timeout)
         self.container["commands"].append(command)
         args = shlex.split(command)
         if args[0] == "python":
@@ -92,6 +105,7 @@ class FakeSandbox:
     def factory(self, workspace, image, name, *, command_timeout, deadline=None):
         container = {"workspace": Path(workspace), "image": image, "name": name,
                      "command_timeout": command_timeout, "commands": [],
+                     "inner_timeouts": [], "host_timeouts": [],
                      "started": False, "stopped": False}
         self.containers.append(container)
         return self.executor(container)
@@ -120,6 +134,10 @@ class FileWorker:
     def run(self, request: WorkerRequest) -> WorkerResult:
         (request.workspace / f"{request.node_id}.txt").write_text("done\n", encoding="utf-8")
         return WorkerResult(ok=True)
+
+
+def summary_timeouts(summary: dict) -> int:
+    return summary["check_timeout_retries_total"]
 
 
 def one_node_graph(toy_repo, node_check: str = NODE_CHECK, final_check: str = FINAL_CHECK):
@@ -172,6 +190,11 @@ def test_with_a_docker_sandbox_all_four_checks_run_in_the_sandbox(toy_repo, tmp_
             for label in ("check-a", "merge-a", "final", "hidden-tests")] == [
         300, 300, coordinator_module.FINAL_CHECK_TIMEOUT_S,
         checks_module.HIDDEN_TESTS_TIMEOUT_S]
+    # inside the container each command stops 15 s before the host gives up
+    assert [(containers[label]["inner_timeouts"], containers[label]["host_timeouts"])
+            for label in ("check-a", "merge-a", "final", "hidden-tests")] == [
+        ([285.0], [300]), ([285.0], [300]), ([1785.0], [1800.0]), ([1785.0], [1800.0])]
+    assert summary_timeouts(result.summary) == 0
     summary = result.summary
     assert summary["status"] == "success"
     assert summary["final_checks"][0]["ok"]
@@ -278,7 +301,7 @@ def test_a_sandbox_that_fails_gives_a_failed_check_not_an_exception(tmp_path):
 def test_sandbox_results_keep_stderr_and_timeouts(tmp_path):
     class Scripted(FakeExecutor):
         def execute(self, command: str, cwd, timeout) -> dict:
-            if command == "slow":
+            if shlex.split(command)[-1] == "slow":
                 return {"exit_code": None, "stdout": "partial", "stderr": "",
                         "timed_out": True}
             return {"exit_code": 1, "stdout": "out", "stderr": "err\n", "timed_out": False}
@@ -564,3 +587,90 @@ def test_rescore_in_a_real_container(tmp_path, capsys):
     assert summary["hidden_tests_rescored"]["sandbox_image"] == DEFAULT_IMAGE
     assert summary["hidden_tests"] == ORIGINAL
     assert not (run_dir / "final" / "_hidden_tests").exists()
+
+
+# ── a command that hangs in the sandbox still returns its output ──
+
+@pytest.mark.parametrize(("host", "inside"), [
+    (300, 285), (1800, 1785), (40, 25), (30, 15), (20, 10), (10, 5), (1, 0.5)])
+def test_sandbox_timeout_is_15_seconds_shorter_but_at_least_half(host, inside):
+    assert sandbox_timeout(host) == inside
+
+
+def test_check_command_is_wrapped_in_timeout_and_quoted():
+    assert with_sandbox_timeout("python -m pytest -q tests", 285) == (
+        "timeout -k 5 285 /bin/sh -c 'python -m pytest -q tests'")
+    assert with_sandbox_timeout("true", 0.5).startswith("timeout -k 5 0.5 /bin/sh -c ")
+    assert with_sandbox_timeout("true", 123456789.0).startswith("timeout -k 5 123456789 ")
+    for line in ("printf '%s\\n' \"it's $HOME\" && echo a\\b; echo 'x \"y\"' | cat",
+                 "python -c 'print(1)'\necho second line",
+                 'test "$(pwd)" = /workspace && test -f A.txt',
+                 "echo `date` \\ $((1 + 2)) > out.txt 2>&1",
+                 "python -m pytest -q 'tests/test_x.py::test_y[a- b ]'"):
+        wrapped = with_sandbox_timeout(line, 7.5)
+        # a POSIX shell reads it back as: timeout, its options, and the command intact
+        assert shlex.split(wrapped) == ["timeout", "-k", "5", "7.5", "/bin/sh", "-c", line]
+
+
+@pytest.mark.parametrize("code", [124, 137])
+def test_a_command_stopped_inside_the_sandbox_is_a_timeout_that_keeps_its_output(tmp_path,
+                                                                                code):
+    class Stopped(FakeExecutor):
+        def execute(self, command: str, cwd, timeout) -> dict:
+            self.unwrap(command, timeout)
+            return {"exit_code": code, "stdout": "collected 3 items\ntests/test_a.py ..",
+                    "stderr": "", "timed_out": False}
+
+    fake = FakeSandbox(Stopped)
+    outcome = run_checks(["python -m pytest -q tests", "never reached"], tmp_path, 300,
+                         checks=fake.checks())
+    assert not outcome.ok and outcome.timed_out and outcome.timeout_retries == 0
+    assert outcome.results == [{"command": "python -m pytest -q tests", "ok": False,
+                                "exit_code": None, "timed_out": True,
+                                "duration_s": outcome.results[0]["duration_s"]}]
+    assert outcome.text.startswith("$ python -m pytest -q tests\n[timeout, ")
+    assert outcome.text.endswith("collected 3 items\ntests/test_a.py ..\n"
+                                 "[timed out after 285 s inside the sandbox]\n")
+    assert fake.containers[0]["inner_timeouts"] == [285.0]
+    assert fake.containers[0]["host_timeouts"] == [300]  # the host's limit stays
+
+
+def test_other_exit_codes_and_host_checks_are_not_wrapped_or_reinterpreted(tmp_path,
+                                                                            monkeypatch):
+    class Failing(FakeExecutor):
+        def execute(self, command: str, cwd, timeout) -> dict:
+            self.unwrap(command, timeout)
+            return {"exit_code": 1, "stdout": "1 failed", "stderr": "", "timed_out": False}
+
+    failed = run_checks(["python -m pytest -q tests"], tmp_path, 300,
+                        checks=FakeSandbox(Failing).checks())
+    assert not failed.ok and not failed.timed_out
+    assert failed.results[0]["exit_code"] == 1 and "inside the sandbox" not in failed.text
+
+    seen = []
+
+    def recording_shell(command, *, cwd, timeout, **kwargs):
+        seen.append(command)
+        return ProcessResult(command=command, exit_code=124, output="", timed_out=False,
+                             duration_s=0.0)
+
+    monkeypatch.setattr(checks_module, "run_shell", recording_shell)
+    host = run_checks(["python -m pytest -q tests"], tmp_path, 300, checks=HostChecks())
+    assert seen == ["python -m pytest -q tests"]  # as written, no timeout wrapper
+    assert not host.timed_out and host.results[0]["exit_code"] == 124
+
+
+@needs_docker
+def test_real_sandbox_stops_a_hanging_command_and_keeps_what_it_printed(tmp_path):
+    started = time.monotonic()
+    outcome = run_checks(
+        ["echo before; sleep 60; echo after",
+         "printf '%s|%s\\n' \"it's quoted\" \"$(pwd)\""],
+        tmp_path, 8, stop_on_failure=False, checks=SandboxChecks(DEFAULT_IMAGE),
+        label="probe-timeout")
+    assert time.monotonic() - started < 40  # not the 60 s the command wanted
+    assert [(item["timed_out"], item["ok"]) for item in outcome.results] == [
+        (True, False), (False, True)]
+    assert "before\n[timed out after 4 s inside the sandbox]\n" in outcome.text
+    assert "before\nafter" not in outcome.text  # stopped before the second echo
+    assert "it's quoted|/workspace" in outcome.text  # the quoting survives the wrapper

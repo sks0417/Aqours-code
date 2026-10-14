@@ -644,7 +644,7 @@ def test_planner_agent_can_read_part_of_a_file_and_several_files_in_one_turn(toy
     assert "# Toy job queue" in after                     # the second read, same turn
 
 
-@pytest.mark.parametrize('length', [1200, 1201])
+@pytest.mark.parametrize('length', [1500, 1501])
 def test_long_goal_is_reported_without_failing_plan(toy_repo, tmp_path, monkeypatch, capsys, length):
     request = tmp_path / 'request.md'
     request.write_text(REQUEST, encoding='utf-8')
@@ -658,7 +658,12 @@ def test_long_goal_is_reported_without_failing_plan(toy_repo, tmp_path, monkeypa
     assert report['rounds'][0]['errors'] == []
     assert load_graph(out).nodes[0].goal == 'x' * length
     terminal = capsys.readouterr().out
-    assert (f'node A goal has {length} characters' in terminal) == (length > 1200)
+    note = ('note: node A goal has 1501 characters (over 1500): goal repeats the request; '
+            'the worker already receives it')
+    assert (note in terminal) == (length > 1500)
+    assert ('goal has' in terminal) == (length > 1500)
+    assert 'SPEC.md#heading' not in terminal
+    assert report['long_goals'] == ({'A': 1501} if length > 1500 else {})
 
 
 def test_goal_character_report_includes_appended_conventions(toy_repo, tmp_path):

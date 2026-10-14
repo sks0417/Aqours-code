@@ -35,6 +35,16 @@ def git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProces
     return proc
 
 
+def _git_bytes(cwd: Path, *args: str, stdin: bytes | None = None
+               ) -> subprocess.CompletedProcess[bytes]:
+    """Run ``git`` in ``cwd`` without decoding its output."""
+    try:
+        return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                              input=stdin, check=False)
+    except OSError as exc:
+        raise GitError(f"cannot run git: {exc}") from exc
+
+
 def head(cwd: Path, ref: str = "HEAD") -> str:
     """Return the commit id of ``ref``."""
     return git(cwd, "rev-parse", "--verify", f"{ref}^{{commit}}").stdout.strip()
@@ -95,6 +105,58 @@ def changed_files(cwd: Path, start: str, end: str = "HEAD") -> list[str]:
     return sorted(name for name in output.split("\0") if name)
 
 
+def uncommitted_files(worktree: Path) -> list[str]:
+    """Files of ``worktree`` that differ from its last commit, and new files.
+
+    Ignored files are left out; a deleted file is listed although it is gone.
+    """
+    names: set[str] = set()
+    for args in (("diff", "--name-only", "-z", "HEAD"),
+                 ("ls-files", "--others", "--exclude-standard", "-z")):
+        output = git(worktree, "-c", "core.quotepath=off", *args).stdout
+        names.update(name for name in output.split("\0") if name)
+    return sorted(names)
+
+
+def blob_at(repo: Path, commit: str, path: str) -> bytes | None:
+    """The content of ``path`` at ``commit``, or None if it is not there."""
+    proc = _git_bytes(repo, "cat-file", "blob", f"{commit}:{path}")
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def text_files_have_crlf(repo: Path, commit: str) -> bool:
+    """True if a tracked text file of ``commit`` contains ``\\r\\n``.
+
+    A file with a NUL byte is binary and does not count.
+    """
+    listing = _git_bytes(repo, "ls-tree", "-r", "-z", commit)
+    if listing.returncode != 0:
+        raise GitError(f"git ls-tree {commit} failed in {repo}: "
+                       f"{listing.stderr.decode('utf-8', errors='replace').strip()}")
+    blobs = []
+    for entry in listing.stdout.split(b"\0"):
+        fields = entry.partition(b"\t")[0].split()
+        if len(fields) == 3 and fields[1] == b"blob":
+            blobs.append(fields[2])
+    if not blobs:
+        return False
+    batch = _git_bytes(repo, "cat-file", "--batch",
+                       stdin=b"\n".join(dict.fromkeys(blobs)) + b"\n").stdout
+    position = 0
+    while position < len(batch):
+        end = batch.index(b"\n", position)
+        header = batch[position:end].split()
+        if len(header) < 3:  # "<id> missing"
+            position = end + 1
+            continue
+        size = int(header[2])
+        data = batch[end + 1:end + 1 + size]
+        position = end + 1 + size + 1
+        if b"\0" not in data and b"\r\n" in data:
+            return True
+    return False
+
+
 def diff_patch(cwd: Path, start: str, end: str = "HEAD") -> str:
     """Return the patch between ``start`` and ``end``."""
     return git(cwd, "diff", "--binary", start, end).stdout
@@ -126,6 +188,31 @@ def merge_commit_into(worktree: Path, commit: str, message: str) -> bool:
         git(worktree, "reset", "-q", "--hard", "HEAD")
         return False
     return True
+
+
+def merge_keep_conflicts(worktree: Path, commit: str) -> list[str]:
+    """Merge ``commit`` into the branch checked out in ``worktree``, without committing.
+
+    Returns the files with conflicts, which keep their conflict markers
+    (``<<<<<<<``, ``=======``, ``>>>>>>>``); an empty list means the merge was
+    clean. Either way the merge stays open until :func:`commit_merge`.
+    Raises ``GitError`` when git could not start the merge at all.
+    """
+    proc = git(worktree, "merge", "--no-ff", "--no-commit", "--no-verify", commit,
+               check=False)
+    output = git(worktree, "-c", "core.quotepath=off", "diff", "--name-only",
+                 "--diff-filter=U", "-z").stdout
+    conflicts = sorted(name for name in output.split("\0") if name)
+    if proc.returncode != 0 and not conflicts:
+        detail = (proc.stderr or proc.stdout).strip() or f"exit code {proc.returncode}"
+        raise GitError(f"git merge {commit} failed in {worktree}: {detail}")
+    return conflicts
+
+
+def commit_merge(worktree: Path, message: str) -> None:
+    """Stage everything and conclude the merge that ``merge_keep_conflicts`` opened."""
+    git(worktree, "add", "-A")
+    git(worktree, "commit", "-q", "--no-verify", "--allow-empty", "-m", message)
 
 
 def undo_last_commit(repo: Path) -> None:

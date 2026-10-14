@@ -8,7 +8,10 @@ a merge, its post-merge check, and a possible undo run as one unit under
 
 Node checks, post-merge checks, final checks and hidden tests run where the
 workers' shell commands run: in a Docker container with ``--sandbox docker``,
-on the host with ``--sandbox none`` (``checks.py``).
+on the host with ``--sandbox none`` (``checks.py``). A check that times out
+is run once more, unchanged, before the node is retried, repaired or failed.
+After every worker attempt, files the worker turned into CRLF are put back
+to LF (``line_endings.py``).
 """
 from __future__ import annotations
 
@@ -29,13 +32,14 @@ from .checks import (
     CheckOutcome,
     Checks,
     checks_for,
-    run_checks,
+    run_checks_with_retry,
     run_hidden_tests,
 )
 from .cleanup import remove_reserved_files, remove_tree
 from .context_pack import build_context_pack
 from .context_metrics import node_context_metrics
 from .escapes import scan_run
+from .line_endings import LineEndings
 from .prompting import AttemptFailure, build_node_prompt
 from .repo_index import RepoIndex, build_index
 from .sandbox import NO_SANDBOX, SandboxConfig
@@ -44,7 +48,7 @@ from .validate import ValidationReport, edit_files, unique_nodes, usable_edges, 
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
 DEFAULT_MERGE_REPAIRS = 1
-TASKGRAPH_VERSION = "coordinator-v0.6"
+TASKGRAPH_VERSION = "coordinator-v0.7"
 AQOURS_SOURCE = Path(__file__).resolve().parents[2]
 DEFAULT_WORKERS = 2
 DEFAULT_MAX_ATTEMPTS = 2
@@ -106,6 +110,10 @@ class NodeRecord:
     merge_repair_ok: bool | None = None  # None: no repair was needed
     # Files named like a Windows device (nul, con, ...) deleted after a worker.
     removed_reserved_files: list[str] = field(default_factory=list)
+    # Checks (node and post-merge) that timed out and were run once more.
+    check_timeout_retries: int = 0
+    # Files the worker turned into CRLF, put back to LF before the commit.
+    normalized_line_endings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -174,6 +182,8 @@ class Coordinator:
         self.bases: dict[str, str] = {}
         self.sandbox = worker_sandbox(worker)
         self.checks = options.checks or checks_for(self.sandbox)
+        self.line_endings = LineEndings(self.repo)
+        self.final_check_timeout_retries = 0
         self.nodes = unique_nodes(graph)
         self.by_id = {node.id: node for node in self.nodes}
         self.records = {node.id: NodeRecord() for node in self.nodes}
@@ -320,15 +330,36 @@ class Coordinator:
                 path for path in removed if path not in record.removed_reserved_files)
             self.events.emit("reserved_files_removed", node=node.id, attempt=attempt,
                              files=removed)
+        # A file the worker rewrote with CRLF line endings would differ on
+        # every line; it goes back to LF before the commit.
+        with self.git_lock:
+            restored = self.line_endings.restore(worktree, self.bases[node.id])
+        if restored:
+            record.normalized_line_endings.extend(
+                path for path in restored if path not in record.normalized_line_endings)
+            self.events.emit("line_endings_normalized", node=node.id, attempt=attempt,
+                             files=restored)
         return result
+
+    def _note_timeout_retry(self, check: CheckOutcome, kind: str, node_id: str | None,
+                            record: NodeRecord | None) -> None:
+        """Record that a check timed out and was run once more."""
+        if not check.timeout_retries:
+            return
+        if record is not None:
+            record.check_timeout_retries += check.timeout_retries
+        else:
+            self.final_check_timeout_retries += check.timeout_retries
+        self.events.emit("check_timeout_retry", node=node_id, kind=kind, ok=check.ok)
 
     def _run_node_check(self, node: Node, record: NodeRecord, log_dir: Path,
                         worktree: Path, attempt: int) -> CheckOutcome:
         self.events.emit("check_start", node=node.id, attempt=attempt)
-        check = run_checks(node.check.commands, worktree, node.check.timeout_s,
-                           checks=self.checks, label=f"check-{node.id}")
+        check = run_checks_with_retry(node.check.commands, worktree, node.check.timeout_s,
+                                      checks=self.checks, label=f"check-{node.id}")
         (log_dir / f"check_{attempt}.txt").write_text(check.text, encoding="utf-8")
         record.check_time_s += check.duration_s
+        self._note_timeout_retry(check, "node", node.id, record)
         self.events.emit("check_end", node=node.id, attempt=attempt, ok=check.ok,
                          duration_s=round(check.duration_s, 3))
         return check
@@ -358,16 +389,18 @@ class Coordinator:
                 record.reason = ""
                 return True
             record.reason = "check_failed"
-            failure = AttemptFailure("check_failed", check.text)
+            failure = AttemptFailure("check_failed", check.text, timed_out=check.timed_out)
         record.status = "failed"
         return False
 
     def _merge_once(self, node: Node, record: NodeRecord, log_dir: Path,
-                    check_file: str) -> tuple[str, str]:
+                    check_file: str) -> tuple[str, str, bool]:
         """Squash-merge the node and run its post-merge check, as one unit.
 
-        Returns ``("merged", commit)``, ``("merge_conflict", "")``, or
-        ``("post_merge_check_failed", check output)`` with the merge undone.
+        Returns ``("merged", commit, False)``, ``("merge_conflict", "", False)``,
+        or ``("post_merge_check_failed", check output, timed out)`` with the
+        merge undone. A check that times out is run once more first, still
+        under ``merge_lock``.
         """
         branch = gitops.NODE_BRANCH_PREFIX + node.id
         with self.merge_lock:
@@ -378,22 +411,24 @@ class Coordinator:
                 self.events.emit("merge_end", node=node.id, ok=commit is not None,
                                  commit=commit)
             if commit is None:
-                return "merge_conflict", ""
-            check = run_checks(node.check.commands, self.repo, node.check.timeout_s,
-                               checks=self.checks, label=f"merge-{node.id}")
+                return "merge_conflict", "", False
+            check = run_checks_with_retry(node.check.commands, self.repo,
+                                          node.check.timeout_s, checks=self.checks,
+                                          label=f"merge-{node.id}")
             (log_dir / check_file).write_text(check.text, encoding="utf-8")
             record.check_time_s += check.duration_s
+            self._note_timeout_retry(check, "post_merge", node.id, record)
             self.events.emit("post_merge_check_end", node=node.id, ok=check.ok,
                              duration_s=round(check.duration_s, 3))
             with self.git_lock:
                 if not check.ok:
                     gitops.undo_last_commit(self.repo)
-                    return "post_merge_check_failed", check.text
+                    return "post_merge_check_failed", check.text, check.timed_out
                 self.integration_head = commit
-        return "merged", commit
+        return "merged", commit, False
 
     def _repair(self, node: Node, record: NodeRecord, log_dir: Path, worktree: Path,
-                failure_text: str) -> str:
+                failure_text: str, timed_out: bool = False) -> str:
         """One repair round on the merged state; return "" or the failure reason.
 
         The current integration branch is merged into the node's branch, so the
@@ -410,7 +445,8 @@ class Coordinator:
         if not merged:
             return "merge_conflict"
         self.bases[node.id] = target
-        failure = AttemptFailure("post_merge_check_failed", failure_text, after_merge=True)
+        failure = AttemptFailure("post_merge_check_failed", failure_text, after_merge=True,
+                                 timed_out=timed_out)
         result = self._run_worker(node, record, log_dir, worktree, attempt, failure)
         with self.git_lock:
             gitops.commit_all(worktree, f"repair {record.merge_repairs}")
@@ -427,7 +463,7 @@ class Coordinator:
         repairs_left = max(self.options.merge_repairs, 0)
         check_file = "post_merge_check.txt"
         while True:
-            outcome, detail = self._merge_once(node, record, log_dir, check_file)
+            outcome, detail, timed_out = self._merge_once(node, record, log_dir, check_file)
             repairing = record.merge_repairs > 0
             if outcome == "merged":
                 if repairing:
@@ -442,7 +478,7 @@ class Coordinator:
                 if repairing:  # the previous repair did not hold after merging
                     self.events.emit("merge_repair_end", node=node.id, ok=False)
                 repairs_left -= 1
-                reason = self._repair(node, record, log_dir, worktree, detail)
+                reason = self._repair(node, record, log_dir, worktree, detail, timed_out)
                 if not reason:
                     check_file = f"post_merge_check_repair_{record.merge_repairs}.txt"
                     continue
@@ -456,9 +492,11 @@ class Coordinator:
 
     def final_checks(self) -> list[dict]:
         """Run ``final_checks`` on the integration branch; record each command."""
-        outcome = run_checks(self.graph.final_checks, self.repo, FINAL_CHECK_TIMEOUT_S,
-                             stop_on_failure=False, checks=self.checks, label="final")
+        outcome = run_checks_with_retry(
+            self.graph.final_checks, self.repo, FINAL_CHECK_TIMEOUT_S,
+            stop_on_failure=False, checks=self.checks, label="final")
         (self.run_dir / "final_checks.txt").write_text(outcome.text, encoding="utf-8")
+        self._note_timeout_retry(outcome, "final", None, None)
         self.events.emit("final_checks_end", ok=outcome.ok, results=outcome.results)
         return outcome.results
 
@@ -614,6 +652,9 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "checks_sandbox": options.checks.kind,
         "escape_attempts_total": escapes_total,
         "merge_repairs_total": sum(r.merge_repairs for r in records.values()),
+        "check_timeout_retries_total": (
+            sum(r.check_timeout_retries for r in records.values())
+            + coordinator.final_check_timeout_retries),
     }
     write_json_atomic(run_dir / "summary.json", summary)
     # Clean up only now: whatever goes wrong here, the results are on disk.
