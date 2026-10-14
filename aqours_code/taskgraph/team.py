@@ -35,7 +35,14 @@ from pydantic import (
 )
 
 from . import gitops
-from .checks import HIDDEN_TESTS_DIR, Checks, checks_for, run_checks, run_hidden_tests
+from .checks import (
+    HIDDEN_TESTS_DIR,
+    CheckOutcome,
+    Checks,
+    checks_for,
+    run_checks_with_retry,
+    run_hidden_tests,
+)
 from .cleanup import remove_reserved_files, remove_tree
 from .coordinator import (
     AQOURS_SOURCE,
@@ -47,13 +54,14 @@ from .coordinator import (
     worker_sandbox,
 )
 from .escapes import scan_run
+from .line_endings import LineEndings
 from .planner import DraftError, _file_list, extract_json_block
 from .prompting import FAILURE_EXCERPT_CHARS, RETRY_TEMPLATE, SANDBOX_NOTE, AttemptFailure
 from .repo_index import build_index
 from .schema import NODE_ID_PATTERN, validate_repo_path
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
-TEAM_VERSION = "team-v0.1"
+TEAM_VERSION = "team-v0.2"
 LEAD_PLAN = "lead_plan"
 LEAD_WRAPUP = "lead_wrapup"
 DEFAULT_TEAM_WORKERS = 4
@@ -385,7 +393,8 @@ def build_wrapup_prompt(request: str, team: str, checks: str, *,
 def retry_section(attempt: int, failure: AttemptFailure) -> str:
     """The ``# Previous attempt failed`` section of the graph workers."""
     output = failure.output[-FAILURE_EXCERPT_CHARS:].strip() or "(no output)"
-    return RETRY_TEMPLATE.format(attempt=attempt, reason=failure.reason, output=output)
+    return RETRY_TEMPLATE.format(attempt=attempt, reason=failure.reason, output=output,
+                                 timeout_note="")
 
 
 # ── The run ──
@@ -433,6 +442,8 @@ class Team:
         self.max_parallel = 0
         self.plan_problems: list[str] = []
         self.wrapup_changed_files: list[str] = []
+        self.line_endings = LineEndings(self.repo)
+        self.final_check_timeout_retries = 0
 
     # ── one agent call ──
 
@@ -465,13 +476,39 @@ class Team:
                          output_tokens=result.output_tokens)
         return result
 
-    def _remove_reserved(self, node_id: str, record: NodeRecord, worktree: Path) -> None:
+    def _clean_worktree(self, node_id: str, record: NodeRecord, worktree: Path,
+                        base: str) -> None:
+        """What the Coordinator does after every worker attempt, before the commit."""
+        # A Windows host cannot commit or delete files named nul, con, ...
         removed = remove_reserved_files(worktree)
         if removed:
             record.removed_reserved_files.extend(
                 path for path in removed if path not in record.removed_reserved_files)
             self.events.emit("reserved_files_removed", node=node_id,
                              attempt=record.attempts, files=removed)
+        # Files the agent turned into CRLF go back to LF.
+        with self.git_lock:
+            restored = self.line_endings.restore(worktree, base)
+        if restored:
+            record.normalized_line_endings.extend(
+                path for path in restored if path not in record.normalized_line_endings)
+            self.events.emit("line_endings_normalized", node=node_id,
+                             attempt=record.attempts, files=restored)
+
+    def _checks(self, kind: str, label: str, record: NodeRecord | None = None
+                ) -> CheckOutcome:
+        """Run the final checks on the integration branch, once more after a timeout."""
+        outcome = run_checks_with_retry(
+            self.options.final_checks, self.repo, FINAL_CHECK_TIMEOUT_S,
+            stop_on_failure=False, checks=self.checks, label=label)
+        if outcome.timeout_retries:
+            if record is not None:
+                record.check_timeout_retries += outcome.timeout_retries
+            else:
+                self.final_check_timeout_retries += outcome.timeout_retries
+            self.events.emit("check_timeout_retry", node=LEAD_WRAPUP if record else None,
+                             kind=kind, ok=outcome.ok)
+        return outcome
 
     # ── 1. the lead plans ──
 
@@ -589,15 +626,14 @@ class Team:
         return task_list, reports
 
     def _teammate(self, state: TaskState, record: NodeRecord, worktree: Path,
-                  extra: str = "") -> WorkerResult:
+                  base: str, extra: str = "") -> WorkerResult:
         task_list, reports = self._prompt_parts(state)
         prompt = build_teammate_prompt(self.request, state, task_list, reports,
                                        sandbox=self.sandbox.kind, extra=extra)
         result = self._run_agent(state.task.id, record, self.worker, prompt, worktree,
                                  self.options.worker_timeout_s)
         state.report = result.final_answer or result.error
-        # A Windows host cannot commit or delete files named nul, con, ...
-        self._remove_reserved(state.task.id, record, worktree)
+        self._clean_worktree(state.task.id, record, worktree, base)
         return result
 
     def _squash(self, node_id: str, title: str) -> str | None:
@@ -652,7 +688,7 @@ class Team:
         """
         reason, extra = "", ""
         for attempt in range(1, self.options.max_attempts + 1):
-            result = self._teammate(state, record, worktree, extra)
+            result = self._teammate(state, record, worktree, base, extra)
             with self.git_lock:
                 gitops.commit_all(worktree, f"attempt {attempt}")
                 changed = gitops.changed_files(worktree, base)
@@ -680,7 +716,7 @@ class Team:
         state.conflict_files = files
         self.events.emit("merge_conflict", node=task.id, files=files)
         if files:
-            result = self._teammate(state, record, worktree,
+            result = self._teammate(state, record, worktree, base,
                                     CONFLICT_SECTION.substitute(files=", ".join(files)))
             reason = record.worker_reasons[-1]
             if reason:
@@ -717,8 +753,7 @@ class Team:
         record = self.records[LEAD_WRAPUP] = NodeRecord(status="running",
                                                         start_t=self.events.elapsed())
         self.events.emit("node_start", node=LEAD_WRAPUP)
-        outcome = run_checks(self.options.final_checks, self.repo, FINAL_CHECK_TIMEOUT_S,
-                             stop_on_failure=False, checks=self.checks, label="wrapup")
+        outcome = self._checks("wrapup", "wrapup", record)
         (self.run_dir / "wrapup_checks.txt").write_text(outcome.text, encoding="utf-8")
         record.check_time_s += outcome.duration_s
         self.events.emit("wrapup_checks_end", ok=outcome.ok, results=outcome.results)
@@ -734,7 +769,7 @@ class Team:
                                          sandbox=self.sandbox.kind)
             result = self._run_agent(LEAD_WRAPUP, record, self.worker, prompt, worktree,
                                      self.options.lead_timeout_s)
-            self._remove_reserved(LEAD_WRAPUP, record, worktree)
+            self._clean_worktree(LEAD_WRAPUP, record, worktree, base)
             with self.git_lock:
                 gitops.commit_all(worktree, "lead wrap-up")
                 changed = gitops.changed_files(worktree, base)
@@ -767,8 +802,7 @@ class Team:
 
     def final_checks(self) -> list[dict]:
         """Run the final checks on the integration branch; record each command."""
-        outcome = run_checks(self.options.final_checks, self.repo, FINAL_CHECK_TIMEOUT_S,
-                             stop_on_failure=False, checks=self.checks, label="final")
+        outcome = self._checks("final", "final")
         (self.run_dir / "final_checks.txt").write_text(outcome.text, encoding="utf-8")
         self.events.emit("final_checks_end", ok=outcome.ok, results=outcome.results)
         return outcome.results
@@ -907,6 +941,9 @@ def run_team(options: TeamOptions, worker: Worker, lead_worker: Worker) -> RunRe
         **sandbox.to_dict(),
         "checks_sandbox": checks.kind,
         "escape_attempts_total": escapes_total,
+        "check_timeout_retries_total": (
+            sum(record.check_timeout_retries for record in records.values())
+            + team.final_check_timeout_retries),
         "team": {
             "tasks": [state.to_dict() for state in states],
             "n_tasks": len(states),

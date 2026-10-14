@@ -7,6 +7,13 @@ and the hidden tests. They all run code that a worker wrote, so with
 same image and limits, the directory being checked mounted at ``/workspace``,
 no network (:class:`SandboxChecks`). With ``--sandbox none`` they run on the
 host (:class:`HostChecks`).
+
+Two things keep one stuck command from costing a run:
+
+- in the sandbox, every command runs under ``timeout`` with a limit a little
+  below the host's, so that it ends by itself and its output comes back;
+- a check that timed out (not one that failed) is run once more, unchanged,
+  before anything is concluded from it (:func:`run_checks_with_retry`).
 """
 from __future__ import annotations
 
@@ -40,10 +47,32 @@ HIDDEN_TESTS_DIR = "_hidden_tests"
 # that sees only that directory can write it; then moved to the run directory.
 HIDDEN_TESTS_JUNIT = "_hidden_tests.xml"
 CHECK_OUTPUT_LIMIT = 200_000
+# Inside the sandbox a command gets this much less time than on the host, but
+# never less than half of it, and is killed this long after being told to stop.
+SANDBOX_TIMEOUT_MARGIN_S = 15.0
+SANDBOX_KILL_AFTER_S = 5
+# What GNU ``timeout`` returns: the command timed out / it had to be killed.
+TIMEOUT_EXIT_CODES = (124, 137)
+RETRY_NOTE = "[a check command timed out; the check is run once more, unchanged]"
 
 # A shell command line, or an argument list that is run without a shell.
 Command = str | Sequence[str]
 RunCommand = Callable[[Command], ProcessResult]
+
+
+def _seconds(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:.1f}"
+
+
+def sandbox_timeout(timeout: float) -> float:
+    """Seconds a command may run inside the sandbox, given the host's ``timeout``."""
+    return max(timeout - SANDBOX_TIMEOUT_MARGIN_S, timeout / 2)
+
+
+def with_sandbox_timeout(line: str, seconds: float) -> str:
+    """``line`` wrapped so that it is stopped inside the sandbox after ``seconds``."""
+    return (f"timeout -k {SANDBOX_KILL_AFTER_S} {_seconds(seconds)} "
+            f"/bin/sh -c {shlex.quote(line)}")
 
 
 class HostChecks:
@@ -90,9 +119,14 @@ class SandboxChecks:
         The container starts with the first command. A sandbox that cannot
         start or run the command gives a failed result, never an exception:
         a check must not stop the run.
+
+        The command runs under ``timeout`` inside the container, a little
+        shorter than ``timeout`` on the host, which stays as the last resort:
+        a command stopped from inside still returns what it printed.
         """
         name = check_container_name(label, secrets.token_hex(4))
         executor = None
+        inner = sandbox_timeout(timeout)
 
         def run(command: Command) -> ProcessResult:
             nonlocal executor
@@ -102,7 +136,7 @@ class SandboxChecks:
                 if executor is None:
                     executor = self._factory(cwd, self.image, name, command_timeout=timeout)
                     executor.start()
-                result = executor.execute(line, cwd, timeout)
+                result = executor.execute(with_sandbox_timeout(line, inner), cwd, timeout)
             except Exception as exc:  # noqa: BLE001 - reported as a failed check
                 return ProcessResult(
                     command=line, exit_code=None, timed_out=False,
@@ -112,6 +146,9 @@ class SandboxChecks:
                              for part in (result.get("stdout") or "",
                                           result.get("stderr") or ""))
             timed_out = bool(result.get("timed_out"))
+            if not timed_out and result.get("exit_code") in TIMEOUT_EXIT_CODES:
+                timed_out = True
+                output += f"[timed out after {_seconds(inner)} s inside the sandbox]\n"
             return ProcessResult(
                 command=line, exit_code=None if timed_out else result.get("exit_code"),
                 output=output, timed_out=timed_out, duration_s=time.monotonic() - started)
@@ -145,6 +182,8 @@ class CheckOutcome:
     text: str
     duration_s: float
     results: list[dict]
+    timed_out: bool = False  # a command timed out (in the second run, if there were two)
+    timeout_retries: int = 0  # 1 if the check was run again after a timeout
 
 
 def run_checks(commands: list[str], cwd: Path, timeout: float, *,
@@ -168,7 +207,30 @@ def run_checks(commands: list[str], cwd: Path, timeout: float, *,
                 if stop_on_failure:
                     break
     return CheckOutcome(ok=ok, text="\n".join(parts)[-CHECK_OUTPUT_LIMIT:],
-                        duration_s=time.monotonic() - started, results=results)
+                        duration_s=time.monotonic() - started, results=results,
+                        timed_out=any(item["timed_out"] for item in results))
+
+
+def run_checks_with_retry(commands: list[str], cwd: Path, timeout: float, *,
+                          stop_on_failure: bool = True, checks: Checks | None = None,
+                          label: str = "check") -> CheckOutcome:
+    """``run_checks``; a check that timed out is run once more, unchanged.
+
+    A timeout is often a stuck environment, not the code: the same commands
+    on the same files pass seconds later. A check that failed is not run
+    again. The second run decides; the text keeps both runs.
+    """
+    first = run_checks(commands, cwd, timeout, stop_on_failure=stop_on_failure,
+                       checks=checks, label=label)
+    if not first.timed_out:
+        return first
+    second = run_checks(commands, cwd, timeout, stop_on_failure=stop_on_failure,
+                        checks=checks, label=label)
+    text = f"{first.text}\n{RETRY_NOTE}\n{second.text}"
+    return CheckOutcome(ok=second.ok, text=text[-CHECK_OUTPUT_LIMIT:],
+                        duration_s=first.duration_s + second.duration_s,
+                        results=second.results, timed_out=second.timed_out,
+                        timeout_retries=1)
 
 
 def parse_junit(path: Path) -> dict:

@@ -319,6 +319,16 @@ image and limits, no network, and the directory being checked mounted at
 `/workspace`. The container serves the commands of that one check and is then
 removed. A command may run as long as the check's own timeout.
 
+Inside the container every check command runs under `timeout`:
+`timeout -k 5 <seconds> /bin/sh -c '<command>'`, with 15 seconds less than
+the check's timeout (never less than half of it). A command that hangs is
+then stopped from inside, and what it printed comes back: the result is a
+timeout whose output ends with `[timed out after N s inside the sandbox]`
+(`timeout` returned 124, or 137 when the command had to be killed). The
+host's own timeout stays as the last resort; when only that one fires, the
+container is removed and the output is usually lost. Checks on the host
+(`--sandbox none`) are not wrapped.
+
 | Check | Directory mounted at `/workspace` | `--sandbox docker` | `--sandbox none` |
 | --- | --- | --- | --- |
 | node check (after each attempt) | the node's worktree `wt/<id>/` | container | host |
@@ -405,7 +415,8 @@ found, `0` when none is, and `2` when no run directory is found.
    whose post-merge check passed (never from a merge still being checked, so
    an undone merge cannot leak into another branch), write the
    prompt, run the worker, delete reserved-name files (see
-   [Sandbox](#sandbox)), and commit `attempt <n>`. The attempt fails on a
+   [Sandbox](#sandbox)), put line endings back (below), and commit
+   `attempt <n>`. The attempt fails on a
    worker error (`worker_error`), on a timeout without changes
    (`worker_timeout`), on no change since the start
    commit (`no_changes`), or on a failing check command run in the worktree
@@ -414,6 +425,33 @@ found, `0` when none is, and `2` when no run directory is found.
    times out after changing files may have finished its work, so its checks
    still run and decide the attempt. Each attempt's worker outcome is kept in
    `worker_reasons` (`""` when the worker ended normally).
+
+   **Line endings.** An agent sometimes rewrites a file with `\r\n` line
+   endings in a repository that uses `\n`; the diff is then the whole file,
+   and it conflicts with any other change to that file. So after every worker
+   attempt, in the same step that deletes reserved-name files, the
+   Coordinator looks at the files that differ from the worktree's last
+   commit. An existing text file that had no `\r\n` at the commit the node
+   started from and has some now gets `\r\n` replaced by `\n`. So does a new
+   text file, if no tracked text file at that commit has `\r\n`. A file that
+   was CRLF stays CRLF, and a binary file (one with a NUL byte) is never
+   touched. The restored paths are recorded in the node's
+   `normalized_line_endings` and in a `line_endings_normalized` event.
+
+   **A check that times out is run once more.** A timeout is often a stuck
+   environment and not the code: the same commands on the same files pass
+   seconds later. When a node check, a post-merge check or the final checks
+   time out (a command did not finish; not when a test fails), the same check
+   runs again at once, with nothing changed, and the second run decides. A
+   post-merge check is run again while the merge lock is still held. Each
+   check is run again at most once. If it times out again, the usual rule
+   applies (a new attempt, a merge repair, or a failed node), and the prompt
+   of that attempt or repair says that the check timed out and shows what it
+   printed. A failed check is never run again. Each rerun adds one to the
+   node's `check_timeout_retries` (the final checks only count in
+   `check_timeout_retries_total`) and gives a `check_timeout_retry` event
+   with `node`, `kind` (`node`, `post_merge` or `final`) and `ok` (whether
+   the second run passed). The check's log file keeps both runs.
 4. **Merge.** Squash-merge the node branch into `tg/integration` as one commit
    `[taskgraph] <id>: <title>`. A conflict resets the branch and fails the node
    (`merge_conflict`); the node's checks then run again on the integration
@@ -504,6 +542,8 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
 `post_merge_check_end`, `merge_repair_start` (with `attempt`),
 `merge_repair_end` (with `ok`: whether the node was merged after the repair),
 `reserved_files_removed` (with `attempt`, `files`),
+`line_endings_normalized` (with `attempt`, `files`),
+`check_timeout_retry` (with `kind`, `ok`),
 `node_merged`, `node_failed`, `node_skipped`,
 `final_checks_end`, `hidden_tests_end`, `escape_audit_end` (with `total`),
 `cleanup_warning` (with `path`, `error`), `run_end`.
@@ -517,7 +557,9 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
   `out_of_scope_files`, `merge_commit`, `error`, `escape_attempts`,
   `escape_samples`, `merge_repairs` (repair rounds that ran), `merge_repair_ok`
   (`true` if the node was merged after a repair, `false` if it still failed,
-  `null` without a repair), `removed_reserved_files`;
+  `null` without a repair), `removed_reserved_files`,
+  `check_timeout_retries` (node and post-merge checks that timed out and were
+  run once more), `normalized_line_endings` (files put back to LF);
 - `totals`: `model_calls`, `input_tokens`, `output_tokens`;
 - `final_checks`: one entry per command (`command`, `ok`, `exit_code`,
   `timed_out`, `duration_s`);
@@ -527,7 +569,8 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
 - `hidden_tests_rescored`: added by `rescore`: the same fields plus `sandbox`,
   `sandbox_image`, `hidden_tests` (the directory used) and `rescored_at`;
 - `sandbox`, `sandbox_image`, `checks_sandbox`, `escape_attempts_total`,
-  `merge_repairs_total`.
+  `merge_repairs_total`, `check_timeout_retries_total` (all nodes plus the
+  final checks).
 
 ### Rescoring the hidden tests
 
@@ -777,8 +820,8 @@ recipes/ratings.py::rate, which RecipeBook.rate already calls. ...`.
 
 A long goal is never an error. The report's `goal_chars` maps node ids to
 the final goals' character counts, including appended conventions, and
-`long_goals` holds those over 1,500; a goal over 1,200 characters also gets a
-note on the terminal.
+`long_goals` holds those over 1,500, and `plan` prints a note for each of them
+(`goal repeats the request; the worker already receives it`).
 
 ### Step 3: revision (program, `revise.py`)
 
@@ -941,6 +984,13 @@ commit is the repository's `HEAD`. Exit codes are those of `run`.
 | 3. The lead wraps up | After the last task: the final checks run on the merged work (`wrapup_checks.txt`), then one agent with the ordinary tools gets the request, every task's status and report, and the check output, and finishes or fixes what is missing or broken. Its changes are merged. It runs once | Agent teams: the lead "synthesiz[es] results". Cursor: a judge at the end of each cycle (here: one cycle) |
 | 4. Final stage | As in `run`: `final_checks`, hidden tests, escape audit, `summary.json`, clean-up | |
 
+The rules that keep a run of `run` steady hold here too, so that both
+methods run under the same conditions: after every teammate and after the
+lead's wrap-up, reserved-name files are deleted and line endings put back;
+the checks before the wrap-up and the final checks run in the sandbox under
+`timeout`, and one that times out is run once more (`check_timeout_retry`
+with `kind` `wrapup` or `final`).
+
 Deliberate simplifications of the originals: a task is done by a fresh agent
 (a teammate does not keep its context from task to task); teammates do not
 message each other while they work (they share only their final answers);
@@ -981,7 +1031,7 @@ including both lead calls), `config`, `nodes` (the fields of a graph node;
 `status` is `completed` or `failed`), `totals` (`model_calls`,
 `input_tokens`, `output_tokens`, including the lead), `integration_commit`,
 `final_checks`, `hidden_tests`, `sandbox`, `sandbox_image`, `checks_sandbox`,
-`escape_attempts_total`. `status` follows the rule of a graph run: `success`
+`escape_attempts_total`, `check_timeout_retries_total`. `status` follows the rule of a graph run: `success`
 when every task is completed and every final check passes, `failed` when no
 task is completed (with `"reason": "lead_plan_invalid"` when there was no
 plan), `partial` otherwise.

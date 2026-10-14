@@ -102,7 +102,7 @@ RETRY_TEMPLATE = """
 
 This is attempt {attempt}. Your earlier changes are still in the workspace.
 Reason: {reason}
-
+{timeout_note}
 Output excerpt:
 ```
 {output}
@@ -121,11 +121,18 @@ Fix the failure by changing only your own files (listed above). The other
 sub-tasks' code is finished and must stay as it is. If the failure cannot
 be fixed from your own files, change nothing and say why in your final
 answer.
-
+{timeout_note}
 Output excerpt:
 ```
 {output}
 ```
+"""
+
+TIMEOUT_NOTE = """
+The check did not fail an assertion: it timed out. A command did not finish
+within its time limit, and not when it was run a second time either. The
+output below is what it printed before it was stopped. Look for something
+that hangs, waits for input, or runs far longer than the other tests.
 """
 
 IMPLEMENTED = "implemented"
@@ -140,11 +147,13 @@ class AttemptFailure:
 
     ``after_merge`` marks a merge repair: the node's own checks passed, and the
     checks failed once its work was merged with other nodes' work.
+    ``timed_out`` marks a check that timed out (twice) instead of failing.
     """
 
     reason: str
     output: str = ""
     after_merge: bool = False
+    timed_out: bool = False
 
 
 def _bullets(items: list[str]) -> str:
@@ -181,11 +190,12 @@ def build_node_prompt(graph: Graph, node: Node, index: RepoIndex, attempt: int,
     retry = ""
     if failure is not None:
         output = failure.output[-FAILURE_EXCERPT_CHARS:].strip() or "(no output)"
+        timeout_note = TIMEOUT_NOTE if failure.timed_out else ""
         if failure.after_merge:
-            retry = MERGE_REPAIR_TEMPLATE.format(output=output)
+            retry = MERGE_REPAIR_TEMPLATE.format(output=output, timeout_note=timeout_note)
         else:
             retry = RETRY_TEMPLATE.format(attempt=attempt, reason=failure.reason,
-                                          output=output)
+                                          output=output, timeout_note=timeout_note)
     if node.edit_set.any_file:
         file_scope = "You may modify or create any file in the repository."
         context_text = ""

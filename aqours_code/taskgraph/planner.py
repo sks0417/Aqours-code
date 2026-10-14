@@ -46,8 +46,8 @@ from .validate import Issue, ancestors, edit_files, unique_nodes, validate
 from .workers import AqoursWorker, Worker, WorkerRequest, WorkerResult, write_json_atomic
 
 PLANNER_VERSION = "planner-v2"
-LONG_GOAL_CHARS = 1200  # the terminal notes a goal longer than this
-REPORTED_GOAL_CHARS = 1500  # the report lists goals longer than this in long_goals
+# The report lists goals longer than this in long_goals; the terminal notes them.
+REPORTED_GOAL_CHARS = 1500
 PLANNER_ENTRY_MODULE = "aqours_code.taskgraph.planner_entry"
 PROMPT_PATH = Path(__file__).resolve().parent / "planner_prompt.md"
 DRAFT_PROMPT_PATH = Path(__file__).resolve().parent / "planner_draft_prompt.md"

@@ -180,6 +180,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     detail = (f" ({', '.join(repaired)}; repaired: {', '.join(fixed) or 'none'})"
               if repaired else "")
     print(f"merge repairs: {summary['merge_repairs_total']}{detail}")
+    print(f"check timeout retries: {summary['check_timeout_retries_total']}")
     escapes = summary["escape_attempts_total"]
     print(f"sandbox: {summary['sandbox']}  escape attempts: {escapes}")
     print(f"checks ran in: {_where(summary['checks_sandbox'])}")
@@ -243,6 +244,7 @@ def _cmd_team(args: argparse.Namespace) -> int:
     print(f"conflicts: {team['conflicts']} (resolved: {team['conflicts_resolved']})  "
           f"out-of-scope files: {team['out_of_scope_total']}  "
           f"lead wrap-up changed: {len(team['wrapup_changed_files'])} file(s)")
+    print(f"check timeout retries: {summary['check_timeout_retries_total']}")
     totals = summary["totals"]
     print(f"status: {summary['status']}  wall_time: {summary['wall_time_s']:.1f}s  "
           f"model_calls: {totals['model_calls']}  tokens: "
@@ -366,7 +368,7 @@ def _cmd_single(args: argparse.Namespace) -> int:
 def _cmd_plan(args: argparse.Namespace) -> int:
     from .gitops import GitError
     from . import planner
-    from .planner import LONG_GOAL_CHARS, PlanOptions, run_plan
+    from .planner import REPORTED_GOAL_CHARS, PlanOptions, run_plan
 
     request_path = Path(args.request)
     if not request_path.is_file():
@@ -413,10 +415,10 @@ def _cmd_plan(args: argparse.Namespace) -> int:
           f"{totals['output_tokens']} out  time: {report['duration_s']:.1f}s")
     print(f"outline: {report['outline_chars']} characters "
           f"(shortened: {report['outline_reduction']})")
-    for node_id, chars in report["goal_chars"].items():
-        if chars > LONG_GOAL_CHARS:
-            print(f"note: node {node_id} goal has {chars} characters (over {LONG_GOAL_CHARS}); "
-                  "prefer concise implementation scope and SPEC.md#heading references.")
+    for node_id, chars in report["long_goals"].items():
+        print(f"note: node {node_id} goal has {chars} characters (over "
+              f"{REPORTED_GOAL_CHARS}): goal repeats the request; the worker already "
+              "receives it")
     if not result.success:
         print(f"errors in the last round ({len(report['errors'])}):")
         for issue in report["errors"]:
