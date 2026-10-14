@@ -27,7 +27,7 @@ Unknown fields are rejected everywhere.
 | `Graph` | `request_id`, `request`, `repo`, `base_commit`, `final_checks` (default `[]`), `generator`, `nodes` (≥ 1), `edges` (default `[]`), `revision_log` (default `[]`) |
 | `Generator` | `kind`: `manual` \| `planner`; optional `planner_version`, `model`, `revision_mode`: `llm` \| `rule_assisted` \| `none`, `ablate` (planner v3: the properties `p1`-`p4` whose rules were turned off) |
 | `Node` | `id` (`[A-Za-z0-9_-]+`), `title`, `kind`: `contract` \| `implement`, `goal` (non-empty), `edit_set`, `requires`, `requires_impl`, `provides`, `check`, `context_files`, optional `size`: `small` \| `medium` \| `large`, `run_after_failed_upstream` (default `false`; see [Flow](#flow)) |
-| `EditSet` | `any_file` (default `false`; unrestricted files, single-node graphs only), `modify` (existing files), `create` (new files), optional `symbols` (functions/methods the node changes; an implement node listing a symbol here counts as its implementer for `requires_impl`, V12 and W5) |
+| `EditSet` | `any_file` (default `false`; unrestricted files, single-node graphs only), `modify` (existing files), `create` (new files), optional `symbols` (functions/methods the node changes; an implement node listing a symbol here counts as its implementer for `requires_impl`, V12 and W5), optional `shared` (files of `modify` this node edits while other nodes edit other parts of them at the same time; see V5 and [Flow](#flow)) |
 | `Check` | `commands`, `timeout_s` (integer > 0, default 300), optional `post_merge_commands` (the post-merge check; default: `commands`) |
 | `Edge` | `from`, `to`, `type`: `interface` \| `full` \| `order`, `source`: `manual` \| `llm` \| `derived`, `reason` |
 | `RevisionEntry` | `action`: `merge` \| `split` \| `add_edge` \| `remove_edge` \| `add_node` \| `other`, `nodes`, optional `into`, `reason` |
@@ -128,7 +128,7 @@ skipped and listed in `index.warnings`.
 | V2 | The graph, with all edge types, has no cycle. |
 | V3 | Each `modify` file exists at the base commit or is created by an ancestor (a file created only by a non-ancestor is reported with its creator: missing edge?); `create` files do not exist at the base commit; each `context_files` file exists at the base commit or is created by an ancestor (one created by a non-ancestor, including the node itself, is reported with its creator: missing edge?). *Needs an index.* |
 | V4 | Every node has at least one non-empty check command; `check.post_merge_commands`, when given, too. |
-| V5 | Two nodes that edit a common file (`modify ∪ create`) must be ordered: one is an ancestor of the other. |
+| V5 | Two nodes that edit a common file (`modify ∪ create`) must be ordered: one is an ancestor of the other. A file both nodes list in `edit_set.shared` does not count: they edit different parts of it in parallel, and a conflict is resolved when merging. |
 | V6 | Every `requires` symbol exists at the base commit or is provided by an ancestor (contract or implement). A node's own `provides` does not count. *Needs an index.* |
 | V7 | Every node lists at least one file to edit, unless `any_file` is true. |
 | V8 | `requires`, `requires_impl`, `provides` and `edit_set.symbols` are well-formed symbols. |
@@ -137,6 +137,7 @@ skipped and listed in `index.warnings`.
 | V11 | Each new file is created by exactly one node. |
 | V12 | For every `requires_impl` symbol, every implementer is an ancestor (the others are reported together: missing edge?). With no implementer, the symbol must exist at the base commit; a symbol only declared by contract nodes, or not defined anywhere, is an error. *Needs an index.* |
 | V13 | `edit_set.any_file: true` is allowed only in a graph with exactly one node. |
+| V14 | Every file in `edit_set.shared` is also in `edit_set.modify`. |
 | W1 | A `small` node has exactly one distinct direct successor (consider merging). |
 | W2 | A provided symbol is not in any other node's `requires` or `requires_impl`. |
 | W3 | `final_checks` is empty. |
@@ -199,9 +200,10 @@ python -m aqours_code.taskgraph audit <runs_dir | run_dir> [...]
 python -m aqours_code.taskgraph rescore <run_dir> --hidden-tests <dir> [--sandbox docker|none]
 python -m aqours_code.taskgraph team <request.md> --repo <path> [...]
 python -m aqours_code.taskgraph score <manifest.json> [--exclude <tests.txt>] [--out <dir>]
+python -m aqours_code.taskgraph resynth <graph.json> --out <new_graph.json> [--ablate p1,p3]
 ```
 
-`plan`, `run`, `audit`, `rescore`, `team` and `score` are described in their own sections below. `compare` prints
+`plan`, `resynth`, `run`, `audit`, `rescore`, `team` and `score` are described in their own sections below. `compare` prints
 a Markdown table of both graphs' structure: validation (error count, warning
 codes), node counts by kind, files edited by contract nodes, critical path
 (nodes on the longest chain), maximum parallel width (largest layer when
@@ -255,7 +257,7 @@ python -m aqours_code.taskgraph run <graph.json> --repo <path>
     [--worker aqours|command] [--command-map <json>]
     [--worker-timeout 1800]
     [--hidden-tests <dir>]
-    [--merge-repairs 1]
+    [--merge-repairs 1] [--conflict-repairs 1]
     [--sandbox docker|none] [--sandbox-image aqours-code-eval:py311]
 ```
 
@@ -411,8 +413,10 @@ found, `0` when none is, and `2` when no run directory is found.
 2. **Schedule.** A node is ready when every direct upstream node is merged. A
    ready node starts when fewer than `--workers` nodes are running and its
    `modify ∪ create` does not overlap a running node; ties start in `nodes`
-   order. When a node fails, its descendants are `skipped`
-   (`upstream_failed`); unrelated nodes continue.
+   order. A file both nodes list in `edit_set.shared` does not count as an
+   overlap: such nodes edit different parts of it at the same time. When a
+   node fails, its descendants are `skipped` (`upstream_failed`); unrelated
+   nodes continue.
 
    **Running after a failed upstream node.** A node with
    `run_after_failed_upstream: true` is ready once every direct upstream node
@@ -469,14 +473,33 @@ found, `0` when none is, and `2` when no run directory is found.
    with `node`, `kind` (`node`, `post_merge` or `final`) and `ok` (whether
    the second run passed). The check's log file keeps both runs.
 4. **Merge.** Squash-merge the node branch into `tg/integration` as one commit
-   `[taskgraph] <id>: <title>`. A conflict resets the branch and fails the node
-   (`merge_conflict`); the node's checks then run again on the integration
+   `[taskgraph] <id>: <title>`. A conflict resets the branch and, if the node
+   has a conflict resolution left (below), is resolved once; otherwise the
+   node fails (`merge_conflict`). The node's checks then run again on the integration
    branch, and a failure undoes the merge, so the integration branch stays
    clean. The post-merge check runs `check.post_merge_commands` when the node
    has them, and `check.commands` otherwise (planner v3 gives a node a narrow
    node check and the whole suite after merging when its effect is hard to
-   predict). A conflict is not retried; a failed post-merge check gets a
-   repair round (below). Changed files outside `modify ∪ create` are recorded as
+   predict). A failed post-merge check gets a repair round (below).
+
+   **Conflict resolution.** Nodes that edit one file in parallel (`shared`)
+   can conflict when the second one merges. Then, **still holding the merge
+   lock**, the Coordinator merges the integration branch into the node's
+   worktree with the conflict markers kept (the node's changes are measured
+   from that integration commit from now on), and runs the same worker once
+   more, its prompt naming the conflicting files and asking to keep both
+   sides and run the tests that cover its work (the text is team's
+   `CONFLICT_SECTION`, shared in `prompting.py`, with "other nodes" for
+   "teammates"). Markers left in a file fail the node with `merge_conflict`,
+   a worker failure with the worker's reason, and a failing node check with
+   `conflict_check_failed`. Otherwise the merge is committed and the node is
+   squash-merged again, which cannot conflict now, and its post-merge check
+   runs as usual (a failure there gets the usual repair round). Holding the
+   lock means the resolution starts from the newest integration state and
+   nothing else merges meanwhile, so no second conflict can follow; the
+   price is that other nodes' merges wait for that round. A node gets at
+   most `--conflict-repairs` resolutions (default 1; 0 fails the node at
+   once, as before). The round's worker time and tokens count for the node. Changed files outside `modify ∪ create` are recorded as
    `out_of_scope_files` but do not fail the node. For `any_file` nodes, the list
    stays empty.
 
@@ -558,7 +581,8 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
 `node_ready`, `node_start`, `worker_start`, `worker_end` (with `ok`,
 `reason`, `duration_s`, `model_calls`, `input_tokens`, `output_tokens`),
 `check_start`, `check_end`, `merge_start`, `merge_end`,
-`post_merge_check_end`, `merge_repair_start` (with `attempt`),
+`post_merge_check_end`, `merge_conflict` (with `files`),
+`merge_conflict_resolved` (with `ok`), `merge_repair_start` (with `attempt`),
 `merge_repair_end` (with `ok`: whether the node was merged after the repair),
 `reserved_files_removed` (with `attempt`, `files`),
 `line_endings_normalized` (with `attempt`, `files`),
@@ -578,7 +602,9 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
   (`true` if the node was merged after a repair, `false` if it still failed,
   `null` without a repair), `removed_reserved_files`,
   `check_timeout_retries` (node and post-merge checks that timed out and were
-  run once more), `normalized_line_endings` (files put back to LF);
+  run once more), `normalized_line_endings` (files put back to LF),
+  `merge_conflicts` (merges that conflicted) and `conflict_resolved`
+  (`true`/`false`, `null` without a conflict);
 - `totals`: `model_calls`, `input_tokens`, `output_tokens`;
 - `final_checks`: one entry per command (`command`, `ok`, `exit_code`,
   `timed_out`, `duration_s`);
@@ -588,7 +614,8 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
 - `hidden_tests_rescored`: added by `rescore`: the same fields plus `sandbox`,
   `sandbox_image`, `hidden_tests` (the directory used) and `rescored_at`;
 - `sandbox`, `sandbox_image`, `checks_sandbox`, `escape_attempts_total`,
-  `merge_repairs_total`, `check_timeout_retries_total` (all nodes plus the
+  `merge_repairs_total`, `merge_conflicts_total`, `conflicts_resolved_total`,
+  `check_timeout_retries_total` (all nodes plus the
   final checks).
 
 ### Rescoring the hidden tests
@@ -631,7 +658,7 @@ python -m aqours_code.taskgraph plan <request.md> --repo <path> --out <graph.jso
     [--fast-path-lines 500] [--no-fast-path] [--no-merge]
 ```
 
-`--planner v3` (the default, `planner_version` `planner-v3`) is described in
+`--planner v3` (the default, `planner_version` `planner-v3.1`) is described in
 [Planner v3](#planner-v3-the-model-reports-facts-the-program-decides-the-structure);
 `--planner v2` runs planner v2, described in the rest of this section,
 exactly as before (its graphs and reports still say `planner-v2`).
@@ -1005,7 +1032,7 @@ shows facts only, no structure.
 | `edits` | changes to **existing** files, one per file. `kind`: `logic` (implements behaviour) or `registration` (only enters a name into a list or table: an export, `__all__`, a registry, a route table). `symbols`: for `logic`, the classes and functions changed or added (to see whether two units change the same function); a change inside a class names the member (`Class.method`, `Class.field`), and the class itself only when the whole class is new or rewritten; for `registration`, the registered names (`src/click/__init__.py::Duration`), which other units may `use`. `lines`: lines changed in that file. `standalone` (`logic` only): the edit can be written with only the code already in the repository, without the unit's other edits or other units; `false` when unsure. `note`: what a registration registers. |
 | `create` | new files, tests included |
 | `provides` | symbols added or changed for others, registered names included |
-| `uses` | symbols another unit provides, or this unit registers. `need: "interface"`: the name and signature are enough to write the code and run its tests; `need: "behavior"`: the real results are needed; `"behavior"` when unsure. A unit that imports its own symbol through its registered name (a test with `from click import Duration`) lists that name too. |
+| `uses` | symbols another unit provides, or this unit registers. `need: "interface"`: the name and signature are enough; this is the usual case (creating, reading or raising a class, a field or an exception, calling a function whose result a small fake can stand in for). `need: "behavior"`: the unit's code or tests depend on a result only the provider's real code produces, so a fake would make the tests meaningless; `why` names that result in one sentence (no result to name: the need is `interface`). A use names the method called, not its class; a use of a class means its constructor and fields. A unit that imports its own symbol through its registered name (a test with `from click import Duration`) lists that name too. Facts written before `why` existed still read. |
 | `tests` | the unit's own test files; empty when nothing can be observed on its own (pure wiring) |
 | `together` | units that are one piece of work logically, with a reason; editing the same file is not a reason |
 
@@ -1073,6 +1100,18 @@ run again after the merges of step 1, since merges can close new cycles.
 A merged group has its edits by file, its sizes added, and its goals one
 after the other (`merged_goal`, as in v2). From here on, "unit" means group.
 
+**A behavior use of a data class (P2).** Before step 0, the program checks
+one kind of `behavior` use: a use of a class (a qualified name without a
+dot, starting with an upper-case letter and having a lower-case one:
+`RateLimit` and `NotFound`, not `SCHEMA`) that only holds data, because no
+unit lists one of its methods or attributes (`Class.name`) in `provides` or
+in an edit's `symbols`. Using such a class means its constructor and fields,
+which exist as soon as its interface does, so the use counts as `interface`
+(P2/`class_use_interface`). When some unit lists a method, the class's
+behaviour lives there and the model's `behavior` stands. A `behavior` use
+without a `why` is only listed in the report (`behavior_without_why`); it is
+no error and starts no revision round. `--ablate p2` skips this check.
+
 **Step 2, property 2: real dependencies first.** For each use (user B,
 symbol s, provider A):
 
@@ -1130,8 +1169,21 @@ more groups still edit:
    `SMALL_SHARED_EDIT_LINES` lines, `standalone: true`, and another group
    also edits the file (P3/`small_shared_edit_first`). It stays when it is
    all of its group's work. **Few lines alone are no reason to go first;**
-4. everything else stays, and `derive_edges()` orders the nodes on the file
-   (P3/`ordered`, with the file and the reasons).
+4. **different functions of one file run in parallel** (step 3b): a file
+   two or more nodes (not `PRE` or `REG`) still edit is edited in parallel
+   when every edit there is `logic`, lists its `symbols`, and no two nodes'
+   symbols overlap (the same symbol, or a class and one of its members:
+   `runner.py::Runner` and `runner.py::Runner.subscribe` overlap). The file
+   goes into each node's `edit_set.shared`, and each goal says which parts
+   the other nodes change at the same time and that a merge conflict will be
+   handed back to resolve (P3/`parallel_different_symbols`). Ordering such
+   nodes would make whole nodes queue for a file they touch in different
+   places; a rare conflict is cheaper, and the Coordinator resolves it once
+   (see [Flow](#flow)). `PRE` and `REG` keep their order with the others;
+   the same function is still one node (step 1);
+5. everything else (a registration, an edit without `symbols`, overlapping
+   symbols) stays ordered: `derive_edges()` orders the nodes on the file
+   (P3/`ordered`; the reason names which case it is).
 
 **`PRE` and `REG`** exist only when something is put into them, at most one
 of each.
@@ -1194,6 +1246,30 @@ The decisions become explicit edges (`PRE -> X` `interface`, waits `full`,
 rest (the order on shared files, context files), and `validate()` checks
 the graph. Every goal ends with the conventions, as in v2.
 
+**Step 6, property 1: parallel enough?** Splitting pays only when enough of
+the work can run at the same time. Once the graph is built and valid, the
+program measures it:
+
+- a node's work: its units' `size`, less the `lines` of their edits that
+  moved to `PRE` or `REG`; `PRE`: the lines moved into it plus
+  `INTERFACE_LINES` = 5 per interface (an initial assumption); `REG`: the
+  lines of the registrations moved into it;
+- the **critical path**: the chain of nodes along the edges (`interface`,
+  `full` and `order` alike) whose work adds up to the most. However many
+  workers run, the graph takes at least that long;
+- the **ratio**: critical path / all the work. Near 1 the graph is a chain.
+
+When the ratio is above `PARALLEL_PATH_MAX` = 0.7, the single-agent graph is
+used instead (P1/`low_parallelism_single`); the reason names the chain, both
+numbers, the ratio and the threshold. Otherwise P1/`parallel_enough`
+records the same numbers. 0.7 is an initial assumption: at 0.7 the split
+graph is at most 1 / 0.7, about 1.43 times, faster than one agent, which is
+about what the extra nodes' fixed costs (starting, reading the code,
+checking, merging) take away. The decisions recorded before a
+`low_parallelism_single` describe the split graph that was not used.
+`--ablate p1` keeps the graph split (the decision is `ablated`, with the same
+numbers).
+
 **Where a problem comes from** decides who fixes it:
 
 - the program broke one of its own invariants while moving edits or making
@@ -1215,14 +1291,14 @@ back to its simplest behaviour, its decisions are recorded with the rule
 
 | Off | Fallback |
 | --- | --- |
-| `p1` | `together` is ignored and small units are not merged (cycles of `behavior` uses are still merged, or the graph could not hold) |
-| `p2` | every use waits; every registration stays with its unit; no `PRE` for interfaces. A cycle of uses of any need is then merged like a `behavior` cycle, since no interface can open it |
-| `p3` | no merge of units changing the same function, no shared edit moved: the same file is only ordered |
+| `p1` | `together` is ignored, small units are not merged, and a graph that is not parallel enough stays split (cycles of `behavior` uses are still merged, or the graph could not hold) |
+| `p2` | every use waits (no class check); every registration stays with its unit; no `PRE` for interfaces. A cycle of uses of any need is then merged like a `behavior` cycle, since no interface can open it |
+| `p3` | no merge of units changing the same function, no shared edit moved, no parallel edits of one file: the same file is only ordered |
 | `p4` | every node check and every post-merge check runs the whole suite |
 
 #### Output
 
-The graph (`generator`: `planner_version` `planner-v3`, `revision_mode`
+The graph (`generator`: `planner_version` `planner-v3.1`, `revision_mode`
 `llm` after a revision round, else `none`, and `ablate`), and
 `<out>.report.json` with, besides the fields v2 also writes (`draft_items`,
 `fast_path`, `stage1`, `rounds`, `errors`, `goal_chars`, `long_goals`, the
@@ -1234,6 +1310,13 @@ outline fields, `totals`, `stage_totals`, `duration_s`):
 - `node_units` (node id -> the units it is made of; for `PRE` and `REG`, the
   units whose parts they took over), `pre_node` and `reg_node`;
 - `ablate`;
+- `parallelism` (step 6): `node_work`, `total`, `critical`, `ratio`, `path`,
+  `threshold` and `collapsed`, also when the graph became the single-agent
+  graph (the figures are those of the split graph); `null` when the units
+  formed one group before any graph was built;
+- `behavior_without_why`: the `behavior` uses (unit, symbol) the model gave
+  no `why` for;
+- `resynth_of` (only from `resynth`): the graph whose facts were used;
 - `revision_rounds` and `revision_reasons` (the error codes of every round
   that had to be revised);
 - `test_imports` (`files`: test files read, `sources`: other Python files
@@ -1241,18 +1324,40 @@ outline fields, `totals`, `stage_totals`, `duration_s`):
 
 There is no `.unmerged.json`: v3 does not merge after the fact. The terminal
 summary adds the node and edge counts, whether there is a `PRE` and a `REG`,
-and the number of decisions per property:
+the number of decisions per property, and the parallelism of step 6:
 
 ```text
-nodes: 9  edges: 5  PRE: no  REG: REG  revision rounds: 0  success: yes
-units: 8  decisions: P1: 0  P2: 5  P3: 0  P4: 10
+nodes: 7  edges: 16  PRE: PRE  REG: no  revision rounds: 0  success: yes
+units: 8  decisions: P1: 2  P2: 55  P3: 6  P4: 12
+parallelism: critical path 1890 / 2840 lines (0.67 <= 0.70) -> split
 ```
 
 Error codes besides those of v2: `F1`-`F9`, `CONFLICT` and `SYNTH`.
 
 The rules of step 3 listed by name: `registration_too_large`,
 `same_symbol_merged`, `registration_first_shared`,
-`registration_kept_ordered`, `small_shared_edit_first` and `ordered`.
+`registration_kept_ordered`, `small_shared_edit_first`,
+`parallel_different_symbols` and `ordered`. Of P1, besides those of step 1:
+`low_parallelism_single` and `parallel_enough`; of P2, besides those of step
+2: `class_use_interface`.
+
+#### Building a graph again from saved facts (`resynth`)
+
+```bash
+python -m aqours_code.taskgraph resynth <graph.json> --out <new_graph.json> [--ablate p1,p3]
+```
+
+reads the facts from `<graph.json>.report.json` and the request,
+repository, base commit and final checks from the graph, clones the
+repository at that commit as `plan` does, indexes it and reads its imports,
+checks the facts again (F1-F9, against the saved draft items) and runs
+`synthesize()` with the current rules. No model is called: the same facts
+can be built under other rules or another `--ablate` at no planning cost.
+It writes the new graph and a report with the fields of a v3 `plan` report
+(model calls and tokens 0, no rounds) plus `resynth_of`, and prints the
+same summary. Facts saved before `why` existed read as before. Exit codes:
+`0` success, `1` the facts no longer pass the checks or contradict each
+other, `2` a missing graph, report or facts, or a git failure.
 
 ### Worker reading soft wall
 
