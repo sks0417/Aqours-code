@@ -253,7 +253,7 @@ def test_v3_is_the_default_and_builds_the_graph_from_the_facts(toy_repo, tmp_pat
     assert result.success and len(worker.requests) == 1
     assert "You describe the work" in worker.requests[0].prompt
     graph = load_graph(options.out)
-    assert graph.generator.planner_version == "planner-v3"
+    assert graph.generator.planner_version == "planner-v3.1"
     assert graph.generator.revision_mode == "none" and graph.generator.ablate is None
     assert [node.id for node in graph.nodes] == ["S", "R"] and graph.edges == []
     by_id = {node.id: node for node in graph.nodes}
@@ -263,7 +263,7 @@ def test_v3_is_the_default_and_builds_the_graph_from_the_facts(toy_repo, tmp_pat
     assert by_id["S"].goal.endswith("- All storage access goes through JobStore.")
     assert by_id["R"].context_files == ["README.md"]
     report = json.loads(report_path_for(options.out).read_text(encoding="utf-8"))
-    assert report["planner"] == "v3" and report["planner_version"] == "planner-v3"
+    assert report["planner"] == "v3" and report["planner_version"] == "planner-v3.1"
     assert report["success"] and report["revision_rounds"] == 0
     assert report["revision_reasons"] == []
     assert report["facts"]["units"][0]["id"] == "S"
@@ -353,7 +353,7 @@ def test_the_fast_path_of_v3_is_marked_as_v3(toy_repo, tmp_path):
     result = run_plan(options, ScriptedPlanner([]),
                       ScriptedDrafter([items_answer(["1"], estimate=100)]))
     assert result.success and result.report["fast_path"]["taken"]
-    assert load_graph(options.out).generator.planner_version == "planner-v3"
+    assert load_graph(options.out).generator.planner_version == "planner-v3.1"
 
 
 def test_an_unknown_planner_version_is_refused(toy_repo, tmp_path):

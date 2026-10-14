@@ -476,6 +476,26 @@ def _print_plan_v2(args: argparse.Namespace, result) -> int:
     return EXIT_OK if result.success else EXIT_INVALID
 
 
+def _cmd_resynth(args: argparse.Namespace) -> int:
+    from .gitops import GitError
+    from .planner_v3 import ResynthError, run_resynth
+    from .synthesize import parse_ablate
+
+    try:
+        ablate = parse_ablate(args.ablate)
+    except ValueError as exc:
+        return _error(f"--ablate: {exc}")
+    graph_path = Path(args.graph)
+    try:
+        result = run_resynth(graph_path, Path(args.out), ablate)
+    except ResynthError as exc:
+        return _error(str(exc))
+    except (GitError, RuntimeError, OSError, UnicodeDecodeError) as exc:
+        return _error(str(exc))
+    print(f"synthesized again from the facts of {graph_path} (no model calls)")
+    return _print_plan_v3(args, result)
+
+
 def _cmd_compare(args: argparse.Namespace) -> int:
     from .compare import compare_graphs, format_comparison
 
@@ -621,6 +641,15 @@ def build_parser() -> argparse.ArgumentParser:
     plan_cmd.add_argument("--request-id", help="request_id of the graph "
                           "(default: the --out file name without extension)")
     plan_cmd.set_defaults(func=_cmd_plan)
+
+    resynth_cmd = commands.add_parser(
+        "resynth", help="build a v3 graph again from the facts saved with it (no model)")
+    resynth_cmd.add_argument("graph", help="a planner v3 graph; <graph>.report.json has "
+                                          "the facts")
+    resynth_cmd.add_argument("--out", required=True)
+    resynth_cmd.add_argument("--ablate", default="",
+                             help="turn off the rules of properties, e.g. p1,p3")
+    resynth_cmd.set_defaults(func=_cmd_resynth)
 
     compare_cmd = commands.add_parser("compare", help="compare two graphs' structure")
     compare_cmd.add_argument("planner_graph")

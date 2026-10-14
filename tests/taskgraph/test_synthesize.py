@@ -531,7 +531,7 @@ def test_decisions_and_graph_are_deterministic():
     second = synthesize(jp_facts(), index(*JP_FILES), INFO)
     assert [d.to_dict() for d in first.decisions] == [d.to_dict() for d in second.decisions]
     assert graph_to_json(first.graph) == graph_to_json(second.graph)
-    assert first.graph.generator.planner_version == PLANNER_VERSION == "planner-v3"
+    assert first.graph.generator.planner_version == PLANNER_VERSION == "planner-v3.1"
     assert first.graph.generator.ablate is None
     # P3: PRE and M order on jobs/models.py, PRE creates the modules X and Y fill in;
     # P4: one check per node, and a whole-suite post-merge check for PRE, M, X, Y

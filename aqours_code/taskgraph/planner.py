@@ -52,7 +52,7 @@ from .single import single_graph
 from .validate import Issue, ancestors, edit_files, unique_nodes, validate
 from .workers import AqoursWorker, Worker, WorkerRequest, WorkerResult, write_json_atomic
 
-PLANNER_VERSION = "planner-v3"
+PLANNER_VERSION = "planner-v3.1"
 PLANNER_V2_VERSION = "planner-v2"
 PLANNERS = ("v2", "v3")
 # The report lists goals longer than this in long_goals; the terminal notes them.
