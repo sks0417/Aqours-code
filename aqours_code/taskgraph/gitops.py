@@ -209,6 +209,12 @@ def merge_keep_conflicts(worktree: Path, commit: str) -> list[str]:
     return conflicts
 
 
+def abort_merge(worktree: Path) -> None:
+    """Abandon the merge that ``merge_keep_conflicts`` opened; the worktree is as before."""
+    git(worktree, "merge", "--abort", check=False)
+    git(worktree, "reset", "-q", "--hard", "HEAD")
+
+
 def commit_merge(worktree: Path, message: str) -> None:
     """Stage everything and conclude the merge that ``merge_keep_conflicts`` opened."""
     git(worktree, "add", "-A")

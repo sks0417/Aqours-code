@@ -9,11 +9,15 @@ a merge, its post-merge check, and a possible undo run as one unit under
 Two nodes that both list a file in ``edit_set.shared`` may run at the same
 time although they edit it. When a node's squash merge conflicts, the
 Coordinator, still holding ``merge_lock``, merges the integration branch into
-the node's work with the conflict markers, lets the worker resolve them once,
+the node's work with the conflict markers, lets the worker resolve them,
 checks the node, and merges again. Holding the lock means the resolution
 starts from the newest integration state and nothing else merges meanwhile,
 so the second merge cannot conflict; the price is that other nodes' merges
-wait for that round.
+wait for that round. ``conflict_repairs`` resolutions are allowed in every
+round of merging: the first merge, and the merge after each merge repair
+(other nodes may have merged during the repair, which holds no lock). A
+merge repair that starts with a conflict, when it merges the integration
+branch in, hands the conflict markers to the worker too.
 
 The post-merge check runs ``check.post_merge_commands`` when a node has them,
 and ``check.commands`` otherwise. A node with ``run_after_failed_upstream``
@@ -92,7 +96,10 @@ class RunOptions:
     hidden_tests: Path | None = None
     # Repair rounds a node gets when its post-merge check fails (0: none).
     merge_repairs: int = DEFAULT_MERGE_REPAIRS
-    # Conflict resolutions a node gets when its merge conflicts (0: it fails).
+    # Conflict resolutions in each round of merging (the first merge, and the
+    # merge after each merge repair); a node gets at most
+    # (merge_repairs + 1) * conflict_repairs. 0: a conflict fails the node,
+    # also one at the start of a merge repair.
     conflict_repairs: int = DEFAULT_CONFLICT_REPAIRS
     # Where checks run. None: where the worker's shell commands run (Docker
     # with ``--sandbox docker``, the host with ``--sandbox none``).
@@ -128,7 +135,8 @@ class NodeRecord:
     confirmed_reads: list[str] = field(default_factory=list)
     merge_repairs: int = 0
     merge_repair_ok: bool | None = None  # None: no repair was needed
-    # Merges that conflicted, and whether the resolution worked (None: no conflict).
+    # Conflicts met (merges and merge repairs), and whether the last resolution
+    # worked (None: no conflict).
     merge_conflicts: int = 0
     conflict_resolved: bool | None = None
     # Files named like a Windows device (nul, con, ...) deleted after a worker.
@@ -484,8 +492,10 @@ class Coordinator:
                     check_file: str) -> tuple[str, str, bool]:
         """Squash-merge the node and run its post-merge check, as one unit.
 
-        A conflicting merge gets one resolution (``conflict_repairs``), still
-        under ``merge_lock``: see :meth:`_resolve_conflict`. Returns
+        A conflicting merge gets up to ``conflict_repairs`` resolutions in this
+        round, still under ``merge_lock``: see :meth:`_resolve_conflict`. The
+        count is per round, not per node: the merge after a merge repair is a
+        new round. Returns
         ``("merged", commit, False)``, ``(reason, "", False)`` when the merge
         conflicted and was not resolved, or ``("post_merge_check_failed",
         check output, timed out)`` with the merge undone. A check that times
@@ -493,16 +503,17 @@ class Coordinator:
         """
         with self.merge_lock:
             commit = self._squash(node)
-            if commit is None:
-                if record.merge_conflicts >= max(self.options.conflict_repairs, 0):
+            resolved = 0  # resolutions in this round
+            while commit is None:
+                if resolved >= max(self.options.conflict_repairs, 0):
+                    if resolved:  # resolved, yet the merge still conflicts
+                        record.conflict_resolved = False
                     return "merge_conflict", "", False
+                resolved += 1
                 reason = self._resolve_conflict(node, record, log_dir, worktree)
                 if reason:
                     return reason, "", False
                 commit = self._squash(node)  # nothing merged meanwhile: no conflict
-                if commit is None:
-                    record.conflict_resolved = False
-                    return "merge_conflict", "", False
             check = run_checks_with_retry(post_merge_commands(node), self.repo,
                                           node.check.timeout_s, checks=self.checks,
                                           label=f"merge-{node.id}")
@@ -523,28 +534,44 @@ class Coordinator:
         """One repair round on the merged state; return "" or the failure reason.
 
         The current integration branch is merged into the node's branch, so the
-        worktree holds the state whose check just failed. The worker then runs
-        again with the post-merge check output. Runs without ``merge_lock``.
+        worktree holds the state whose check just failed. Other nodes may have
+        merged since that check (a repair holds no lock), so this merge can
+        conflict: the markers are then kept and handed to the worker with the
+        check output; markers left behind fail the repair (``merge_conflict``).
+        Such a conflict counts in ``merge_conflicts`` but belongs to the repair,
+        not to a round of merging. With ``conflict_repairs`` 0 it fails the
+        repair at once. The worker then runs again with the post-merge check
+        output. Runs without ``merge_lock``.
         """
         attempt = record.attempts + 1
         record.merge_repairs += 1
         self.events.emit("merge_repair_start", node=node.id, attempt=attempt)
         with self.git_lock:
             target = self.integration_head
-            merged = gitops.merge_commit_into(
-                worktree, target, f"merge integration for repair {record.merge_repairs}")
-        if not merged:
-            return "merge_conflict"
+            files = gitops.merge_keep_conflicts(worktree, target)
+            if files and self.options.conflict_repairs <= 0:
+                gitops.abort_merge(worktree)
+                return "merge_conflict"
         self.bases[node.id] = target
+        if files:
+            record.merge_conflicts += 1
+            self.events.emit("merge_conflict", node=node.id, files=files)
         failure = AttemptFailure("post_merge_check_failed", failure_text, after_merge=True,
-                                 timed_out=timed_out)
+                                 timed_out=timed_out, conflict_files=files or None)
         result = self._run_worker(node, record, log_dir, worktree, attempt, failure)
-        with self.git_lock:
-            gitops.commit_all(worktree, f"repair {record.merge_repairs}")
         worker_reason = record.worker_reasons[-1]
         if worker_reason and worker_reason != "worker_timeout":
             record.error = (result.error or result.final_answer)[-2000:]
             return worker_reason
+        if files:
+            left = any((worktree / path).is_file()
+                       and CONFLICT_MARKER in (worktree / path).read_bytes() for path in files)
+            record.conflict_resolved = not left
+            self.events.emit("merge_conflict_resolved", node=node.id, ok=not left)
+            if left:
+                return "merge_conflict"
+        with self.git_lock:
+            gitops.commit_merge(worktree, f"repair {record.merge_repairs}")
         check = self._run_node_check(node, record, log_dir, worktree, attempt)
         return "" if check.ok else "repair_check_failed"
 

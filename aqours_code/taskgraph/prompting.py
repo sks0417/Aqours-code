@@ -162,8 +162,10 @@ class AttemptFailure:
     ``after_merge`` marks a merge repair: the node's own checks passed, and the
     checks failed once its work was merged with other nodes' work.
     ``timed_out`` marks a check that timed out (twice) instead of failing.
-    ``conflict_files`` marks a conflict resolution: merging the integration
-    branch into the node's work left conflict markers in these files.
+    ``conflict_files`` names the files where merging the integration branch
+    into the node's work left conflict markers: on its own a conflict
+    resolution, together with ``after_merge`` a merge repair that must also
+    resolve them.
     """
 
     reason: str
@@ -208,11 +210,14 @@ def build_node_prompt(graph: Graph, node: Node, index: RepoIndex, attempt: int,
     if failure is not None:
         output = failure.output[-FAILURE_EXCERPT_CHARS:].strip() or "(no output)"
         timeout_note = TIMEOUT_NOTE if failure.timed_out else ""
-        if failure.conflict_files is not None:
-            retry = CONFLICT_SECTION.substitute(who="other nodes",
-                                                files=", ".join(failure.conflict_files))
-        elif failure.after_merge:
-            retry = MERGE_REPAIR_TEMPLATE.format(output=output, timeout_note=timeout_note)
+        conflicts = (CONFLICT_SECTION.substitute(who="other nodes",
+                                                 files=", ".join(failure.conflict_files))
+                     if failure.conflict_files else "")
+        if failure.after_merge:
+            retry = MERGE_REPAIR_TEMPLATE.format(output=output,
+                                                 timeout_note=timeout_note) + conflicts
+        elif conflicts:
+            retry = conflicts
         else:
             retry = RETRY_TEMPLATE.format(attempt=attempt, reason=failure.reason,
                                           output=output, timeout_note=timeout_note)
