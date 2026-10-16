@@ -3,10 +3,17 @@
     S = Q * (T_single / T) ** 0.5 * (C_single / C) ** 0.5
 
 ``Q`` is the pass rate of the functional hidden tests times the pass rate of
-the regression hidden tests, ``T`` the wall time including planning, and
-``C`` the input tokens plus four times the output tokens, including
+the regression hidden tests, ``T`` the wall time of the method (planning
+included; the hidden tests and the escape audit, which evaluate the run, are
+not), and ``C`` the input tokens plus four times the output tokens, including
 planning. ``T_single`` and ``C_single`` are the means of the ``single`` runs
 of the same task, so the single agent's ``S`` is its own ``Q``.
+
+The evaluation time comes from the run's ``events.jsonl``: the
+``duration_s`` of ``hidden_tests_end`` and ``escape_audit_end`` events, or,
+for an event without one, the time since the event before it. Every method
+(``single``, ``team``, ``run``) writes these events, so all are measured the
+same way.
 """
 from __future__ import annotations
 
@@ -21,8 +28,11 @@ OUTPUT_TOKEN_WEIGHT = 4  # an output token costs about four input tokens
 TIME_EXPONENT = 0.5
 COST_EXPONENT = 0.5
 REGRESSION_DIR = "regression"
-RESULT_FILES = ("hidden_tests_rescored.xml", "hidden_tests.xml")  # the first that exists
+ORIGINAL_RESULTS, RESCORED_RESULTS = "hidden_tests.xml", "hidden_tests_rescored.xml"
 KINDS = ("functional", "regression")
+EVALUATION_EVENTS = ("hidden_tests_end", "escape_audit_end")
+TIME_DEFINITION = ("wall time of the method (planning included, hidden tests and escape "
+                   "audit excluded)")
 
 
 class ScoreError(Exception):
@@ -142,11 +152,72 @@ def _load_json(path: Path, what: str) -> dict:
     return data
 
 
+def evaluation_time(run_dir: Path) -> dict[str, float]:
+    """Seconds a run spent evaluating itself, by event type (empty without events).
+
+    Each ``hidden_tests_end`` and ``escape_audit_end`` event counts with its
+    ``duration_s``; an event without one counts the time since the event
+    before it. Lines that are not JSON objects are skipped.
+    """
+    path = run_dir / "events.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    spent: dict[str, float] = {}
+    previous: float | None = None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        at = event.get("t")
+        at = float(at) if isinstance(at, (int, float)) else None
+        kind = event.get("type")
+        if kind in EVALUATION_EVENTS:
+            duration = event.get("duration_s")
+            if isinstance(duration, (int, float)):
+                seconds = float(duration)
+            elif at is not None and previous is not None:
+                seconds = at - previous
+            else:
+                seconds = 0.0
+            spent[kind] = spent.get(kind, 0.0) + max(seconds, 0.0)
+        if at is not None:
+            previous = at
+    return spent
+
+
+def results_file(run_dir: Path, summary: dict) -> tuple[Path | None, str]:
+    """The newest hidden test results of a run, or None and why there are none.
+
+    After ``rescore``, its results are the newest (each rescore deletes the
+    previous rescored file before it runs): ``hidden_tests_rescored.xml``,
+    and a rescore that left no file means no usable results, not the older
+    ``hidden_tests.xml``. Without a rescore, ``hidden_tests.xml``.
+    """
+    if isinstance(summary.get("hidden_tests_rescored"), dict):
+        path = run_dir / RESCORED_RESULTS
+        if path.is_file():
+            return path, ""
+        return None, (f"the last rescore left no {RESCORED_RESULTS} (see "
+                      "hidden_tests_rescored.txt)")
+    for name in (RESCORED_RESULTS, ORIGINAL_RESULTS):  # a rescored file wins anyway
+        if (run_dir / name).is_file():
+            return run_dir / name, ""
+    return None, f"no hidden test results ({ORIGINAL_RESULTS})"
+
+
 def score_run(entry: Entry, exclusions: list[str]) -> dict:
     """Quality, time and cost of one run; ``valid`` is False when it cannot count."""
     summary = _load_json(entry.run / "summary.json", "summary")
     totals = summary.get("totals") or {}
-    time_s = float(summary.get("wall_time_s") or 0.0)
+    wall_s = float(summary.get("wall_time_s") or 0.0)
+    spent = evaluation_time(entry.run)
+    eval_s = min(sum(spent.values()), wall_s)
+    time_s = wall_s - eval_s
     tokens = {key: int(totals.get(key) or 0) for key in ("input_tokens", "output_tokens")}
     plan = None
     if entry.plan_report is not None:
@@ -161,7 +232,10 @@ def score_run(entry: Entry, exclusions: list[str]) -> dict:
     result = {
         "task": entry.task, "method": entry.method, "run": str(entry.run),
         "run_id": summary.get("run_id") or entry.run.name, "valid": True,
-        "invalid_reason": "", "plan": plan, "time_s": time_s, **tokens,
+        "invalid_reason": "", "plan": plan, "wall_time_s": wall_s,
+        "eval_time_s": round(eval_s, 3),
+        "eval_time": {kind: round(seconds, 3) for kind, seconds in spent.items()},
+        "time_s": time_s, **tokens,
         "cost": tokens["input_tokens"] + OUTPUT_TOKEN_WEIGHT * tokens["output_tokens"],
     }
 
@@ -171,10 +245,9 @@ def score_run(entry: Entry, exclusions: list[str]) -> dict:
     escapes = int(summary.get("escape_attempts_total") or 0)
     if summary.get("sandbox") == "none" and escapes > 0:
         return invalid(f"--sandbox none with {escapes} escape attempt(s)")
-    xml_path = next((entry.run / name for name in RESULT_FILES
-                     if (entry.run / name).is_file()), None)
+    xml_path, missing = results_file(entry.run, summary)
     if xml_path is None:
-        return invalid("no hidden test results (hidden_tests.xml)")
+        return invalid(missing)
     try:
         tests = read_tests(xml_path, exclusions)
     except ET.ParseError as exc:
@@ -252,6 +325,7 @@ def score_manifest(entries: list[Entry], exclusions: list[str] | None = None) ->
             matches[node_id] += count
     return {
         "formula": "S = Q * (T_single / T) ** 0.5 * (C_single / C) ** 0.5",
+        "time": TIME_DEFINITION,
         "baseline": BASELINE, "output_token_weight": OUTPUT_TOKEN_WEIGHT,
         "tasks": detail, "methods": by_method, "best": best,
         "oracle": {"mean_s": fmean(detail[task][best[task]]["s"] for task in tasks),
@@ -273,7 +347,8 @@ def _cell(spread: dict, fmt: str, runs: int) -> str:
 def format_score(result: dict) -> str:
     """The score as Markdown: per task, per method, and the oracle."""
     lines = ["# Score", "", f"`{result['formula']}`, with Q = functional pass rate × "
-             f"regression pass rate, T = wall time + planning time, and C = input tokens + "
+             f"regression pass rate, T = {result.get('time', TIME_DEFINITION)}, and "
+             "C = input tokens + "
              f"{result['output_token_weight']} × output tokens (planning included). "
              f"T_single and C_single are the means of the `{result['baseline']}` runs of the "
              "same task. With several runs, a row shows the mean and (min–max); its S is "
@@ -301,6 +376,17 @@ def format_score(result: dict) -> str:
     choice = ", ".join(f"{task}: {method}" for task, method in result["oracle"]["choice"].items())
     lines += ["", "## Oracle", "", "Taking the method with the highest S on each task "
               f"({choice}): mean S = {result['oracle']['mean_s']:.3f}."]
+    lines += ["", "## Runs", "", "T = wall time - evaluation time (hidden tests and escape "
+              "audit) + planning time.", "",
+              "| Run | Task | Method | Wall time (s) | Evaluation (s) | Planning (s) | T (s) | "
+              "Q | S |", "|" + " --- |" * 9]
+    for run in result["runs"]:
+        planning = run["plan"]["duration_s"] if run["plan"] else 0.0
+        scored = (f"{run['q']:.3f} | {run['s']:.3f}" if run["valid"] and "s" in run
+                  else "invalid | -")
+        lines.append(f"| {run['run_id']} | {run['task']} | {run['method']} | "
+                     f"{run['wall_time_s']:,.0f} | {run['eval_time_s']:,.0f} | "
+                     f"{planning:,.0f} | {run['time_s']:,.0f} | {scored} |")
     if result["excluded_tests"]:
         lines += ["", "## Excluded tests", ""]
         lines += [f"- `{node_id}`: {count} result(s) left out"

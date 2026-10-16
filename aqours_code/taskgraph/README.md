@@ -1540,8 +1540,12 @@ the same task and method are repeated runs.
 
 For each run:
 
-- **Results**: `hidden_tests_rescored.xml` if the run has one, else
-  `hidden_tests.xml`.
+- **Results**: the newest hidden test results. After `rescore` (the
+  summary has `hidden_tests_rescored`), `hidden_tests_rescored.xml`; each
+  rescore deletes the previous one before it runs, so it is the latest. A
+  rescore that left no such file (it timed out, say) makes the run invalid
+  rather than falling back to the older `hidden_tests.xml`. Without a
+  rescore, `hidden_tests.xml`.
 - **Quality Q** = pass rate of the functional tests × pass rate of the
   regression tests. A regression test is one from the hidden tests'
   `regression/` directory: pytest writes its JUnit `classname` as the dotted
@@ -1555,7 +1559,17 @@ For each run:
   An id matches a test whose path ends with the id's path, so the directories
   in front (`_hidden_tests/`) can be left out. An excluded test counts
   neither as passed nor as failed.
-- **Time T** = `wall_time_s` + the plan report's `duration_s`.
+- **Time T** = the wall time of the method: `wall_time_s` − the evaluation
+  time + the plan report's `duration_s`. The hidden tests and the escape
+  audit run inside the run's wall time but evaluate the method; they are not
+  its work (a run done at 438 s whose hidden tests hung in Docker for
+  1,787 s would otherwise count 2,265 s). The evaluation time comes from the
+  run's `events.jsonl`: the `duration_s` of each `hidden_tests_end` and
+  `escape_audit_end` event, or, for an event without one, the time since the
+  event before it; never more than `wall_time_s`. A run without these events
+  keeps its wall time. `single`, `team` and `run` all write them, so every
+  method is measured the same way. `rescore` runs after the run and adds
+  nothing to T.
 - **Cost C** = input tokens + 4 × output tokens, the plan report's included.
 
 `T_single` and `C_single` are the means over the `single` runs of the same
@@ -1565,8 +1579,8 @@ the range shown beside S is that of the single runs' own S. A task without a
 valid `single` run is an error (exit code 2).
 
 A run is **invalid** and left out, but listed, when it ran with
-`--sandbox none` and has escape attempts, or when it has no readable hidden
-test results.
+`--sandbox none` and has escape attempts, when it has no readable hidden
+test results, or when its T is not positive.
 
 The output (printed, and with `--out` also written to `score.md` and
 `score.json`):
@@ -1575,4 +1589,7 @@ The output (printed, and with `--out` also written to `score.md` and
    pass rate, Q, T, input and output tokens, C, S;
 2. by method: the number of tasks, mean Q, mean S, and the tasks on which it
    has the highest S;
-3. the oracle: the mean S when each task takes its best method.
+3. the oracle: the mean S when each task takes its best method;
+4. runs: one row per run: its wall time, evaluation time, planning time, T,
+   Q and S (`invalid` for a run left out). `score.json` has the same per run
+   (`wall_time_s`, `eval_time_s`, `eval_time` by event, `time_s`).
