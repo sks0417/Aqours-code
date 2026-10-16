@@ -40,7 +40,7 @@ class _Facts(BaseModel):
 
 
 class FactEdit(_Facts):
-    """A change to one existing file."""
+    """A change to one file: an existing one, or a new file another unit creates."""
 
     file: RepoPath
     kind: Literal["logic", "registration"]
@@ -140,6 +140,10 @@ def _check_ids(facts: Facts) -> list[Issue]:
 
 
 def _check_edits(facts: Facts, index: RepoIndex) -> list[Issue]:
+    """F3. An edit of a file that does not exist is allowed when another unit
+    creates that file: several units add code to one new file. Several
+    creators are F4's, and a unit that also creates the file it edits is
+    reported by :func:`_check_create`."""
     issues = []
     for unit in facts.units:
         if not unit.edits and not unit.create:
@@ -151,11 +155,15 @@ def _check_edits(facts: Facts, index: RepoIndex) -> list[Issue]:
                 issues.append(Issue("F3", [unit.id], f"lists {path} in {files.count(path)} "
                                     "edits; give one edit per file"))
         for edit in unit.edits:
-            if not index.has_file(edit.file):
+            created_elsewhere = any(edit.file in other.create for other in facts.units
+                                    if other is not unit)
+            if (not index.has_file(edit.file) and not created_elsewhere
+                    and edit.file not in unit.create):
                 issues.append(Issue(
                     "F3", [unit.id],
-                    f"edits {edit.file}, which does not exist. `edits` lists changes to "
-                    "existing files; put a new file in `create`"))
+                    f"edits {edit.file}, which does not exist and no other unit creates it. "
+                    "A new file is listed in the `create` of exactly one unit; other units "
+                    "that add code to it list it in `edits`."))
             for symbol in edit.symbols:
                 if parse_symbol(symbol).path != edit.file:
                     issues.append(Issue(
@@ -177,12 +185,15 @@ def _check_create(facts: Facts, index: RepoIndex) -> list[Issue]:
                                     "`edits` instead"))
             if path in unit.edit_files():
                 issues.append(Issue("F4", [unit.id],
-                                    f"lists {path} both in `edits` and in `create`"))
+                                    f"lists {path} both in `create` and in `edits`; a file "
+                                    "the unit creates is listed only in its `create`"))
     for path, unit_ids in creators.items():
         if len(unit_ids) > 1:
             issues.append(Issue("F4", unit_ids,
-                                f"{path} is created by {len(unit_ids)} units; one unit "
-                                "creates it, the others use what it provides"))
+                                f"{path} is created by {len(unit_ids)} units "
+                                f"({', '.join(unit_ids)}). One unit lists it in `create`; the "
+                                "other units that add code to it list it in `edits`, with "
+                                "the symbols they add."))
     return issues
 
 

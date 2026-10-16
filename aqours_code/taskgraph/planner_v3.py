@@ -15,7 +15,8 @@ v3 does not run the merges M1 and M2 of v2 (:mod:`revise`).
 
 :func:`run_resynth` (the ``resynth`` command) runs Step 3 again on the facts
 saved in a v3 report, without a model: the same facts under other rules or
-another ``--ablate``, at no planning cost.
+another ``--ablate``, at no planning cost. It also reads the report of a
+failed plan, which wrote no graph (the final checks are then given again).
 """
 from __future__ import annotations
 
@@ -302,8 +303,10 @@ class ResynthError(Exception):
     """The saved graph or report cannot be read back."""
 
 
-def _saved_report(graph_path: Path) -> dict:
-    report_path = report_path_for(graph_path)
+REPORT_SUFFIX = ".report.json"
+
+
+def _saved_report(report_path: Path) -> dict:
     try:
         report = json.loads(report_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -311,50 +314,95 @@ def _saved_report(graph_path: Path) -> dict:
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise ResynthError(f"cannot read the plan report {report_path}: {exc}") from None
     if not isinstance(report, dict) or not report.get("facts"):
-        raise ResynthError(f"{report_path} has no facts: only a planner v3 report that "
-                           "built a graph from facts can be synthesized again")
+        raise ResynthError(f"{report_path} has no facts: only a planner v3 report with "
+                           "facts can be synthesized again")
     return report
 
 
-def run_resynth(graph_path: Path, out: Path,
-                ablate: frozenset[str] = frozenset()) -> PlanResult:
-    """Build the graph again from the facts saved with ``graph_path``; no model is called.
+def resynth_paths(path: Path) -> tuple[Path, Path]:
+    """The graph and the report of a plan, given either of them."""
+    if path.name.endswith(REPORT_SUFFIX) and len(path.name) > len(REPORT_SUFFIX):
+        return path.with_name(path.name[:-len(REPORT_SUFFIX)]), path
+    return path, report_path_for(path)
 
-    The facts come from ``<graph>.report.json``; the request, repository,
-    base commit and final checks come from the graph. The repository is
-    cloned at the base commit as in ``plan``. The facts are checked again
-    (F1-F9, against the saved draft items) before the current rules
-    synthesize them. Raises :class:`ResynthError` when the inputs cannot be
-    read, and ``gitops.GitError`` / ``RuntimeError`` on git failures.
-    """
-    started = time.monotonic()
+
+def _info_from_graph(graph_path: Path, final_checks: list[str] | None) -> tuple[GraphInfo,
+                                                                                 bool]:
     try:
         old = load_graph(graph_path)
-    except FileNotFoundError:
-        raise ResynthError(f"graph file not found: {graph_path}") from None
     except (OSError, UnicodeDecodeError, ValidationError) as exc:
         raise ResynthError(f"cannot read the graph {graph_path}: {exc}") from None
-    saved = _saved_report(graph_path)
+    info = GraphInfo(request_id=old.request_id, request=old.request,
+                     repo=str(Path(old.repo).resolve()), base_commit=old.base_commit,
+                     final_checks=list(final_checks or old.final_checks),
+                     model=old.generator.model)
+    return info, old.generator.revision_mode == "llm"
+
+
+def _info_from_report(saved: dict, report_path: Path,
+                      final_checks: list[str] | None) -> tuple[GraphInfo, bool]:
+    """A failed plan wrote only its report: the graph's inputs come from there."""
+    if not final_checks:
+        raise ResynthError(f"there is no graph next to {report_path} (a failed plan writes "
+                           "only its report), so its final checks are not known: give them "
+                           "with --final-check")
+    missing = [key for key in ("request", "repo", "base_commit") if not saved.get(key)]
+    if missing:
+        raise ResynthError(f"{report_path} does not name the {', '.join(missing)} of the "
+                           "plan")
+    request_path = Path(saved["request"])
+    try:
+        request = request_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ResynthError(f"cannot read the request {request_path} named in "
+                           f"{report_path}: {exc}") from None
+    graph_name = Path(saved["out"]).stem if saved.get("out") else report_path.stem
+    info = GraphInfo(request_id=graph_name, request=request,
+                     repo=str(Path(saved["repo"]).resolve()), base_commit=saved["base_commit"],
+                     final_checks=list(final_checks), model=saved.get("model"))
+    # The saved facts are those of the last round, a revision when there were several.
+    return info, (saved.get("revision_rounds") or 0) > 0
+
+
+def run_resynth(path: Path, out: Path, ablate: frozenset[str] = frozenset(),
+                final_checks: list[str] | None = None) -> PlanResult:
+    """Build the graph again from the facts saved with a plan; no model is called.
+
+    ``path`` is the plan's graph or its report (``<graph>.report.json``). The
+    facts and the draft items come from the report (the facts of its last
+    round). The request, repository, base commit and final checks come from
+    the graph; a failed plan has no graph, and then they come from the report
+    (the request is read from the path it names) and from ``final_checks``,
+    which is then required. Given ``final_checks`` also replace those of a
+    saved graph. The repository is cloned at the base commit as in ``plan``.
+    The facts are checked again (F1-F9, against the saved draft items) before
+    the current rules synthesize them. Raises :class:`ResynthError` when the
+    inputs cannot be read, and ``gitops.GitError`` / ``RuntimeError`` on git
+    failures.
+    """
+    started = time.monotonic()
+    graph_path, report_path = resynth_paths(path)
+    saved = _saved_report(report_path)
+    if graph_path.exists():
+        info, revised = _info_from_graph(graph_path, final_checks)
+    else:
+        info, revised = _info_from_report(saved, report_path, final_checks)
     try:
         facts = Facts.model_validate(saved["facts"])
     except ValidationError as exc:
         raise ResynthError(f"the saved facts do not match the facts format: {exc}") from None
     items = [DraftItem.model_validate(item) for item in saved.get("draft_items") or []]
-    repo = Path(old.repo).resolve()
+    repo = Path(info.repo)
     out.parent.mkdir(parents=True, exist_ok=True)
-    info = GraphInfo(request_id=old.request_id, request=old.request, repo=str(repo),
-                     base_commit=old.base_commit, final_checks=list(old.final_checks),
-                     model=old.generator.model)
-    run = _V3Run(info, saved.get("request") or str(graph_path), repo, out,
+    run = _V3Run(info, saved.get("request") or str(path), repo, out,
                  frozenset(ablate), draft_items=[item.model_dump() for item in items],
                  estimate=saved.get("estimated_changed_lines"), facts=facts,
                  threshold=(saved.get("fast_path") or {}).get("threshold"))
-    revised = old.generator.revision_mode == "llm"
     tmp = Path(tempfile.mkdtemp(prefix="tg-resynth-"))
     try:
         clone = tmp / "repo"
-        gitops.clone_for_run(repo, clone, old.base_commit)
-        index = build_index(clone, old.base_commit)
+        gitops.clone_for_run(repo, clone, info.base_commit)
+        index = build_index(clone, info.base_commit)
         run.outline = build_outline(clone, index)
         run.tests = scan_test_imports(clone, index)
         run.errors = [issue for issue in check_facts(facts, items, index)
@@ -370,4 +418,4 @@ def run_resynth(graph_path: Path, out: Path,
                 run.errors = [Issue("SYNTH", [], f"the program broke an invariant {exc}")]
     finally:
         remove_tree(tmp)
-    return _finish(run, started, {"resynth_of": str(graph_path)})
+    return _finish(run, started, {"resynth_of": str(path)})

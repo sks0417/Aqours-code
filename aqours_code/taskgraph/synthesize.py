@@ -963,6 +963,9 @@ class _Synthesizer:
                         reasons.append(f"{placed.unit}'s edit cannot be written on its own")
                     elif set(bucket.files()) == {path}:
                         reasons.append(f"{placed.unit}'s edit is all of {key}'s work")
+                    elif not self.index.has_file(path) and path not in self.pre.create:
+                        reasons.append(f"{path} is new and {self.creator_of(path)} creates "
+                                       "it, so PRE cannot edit it first")
                     else:
                         self.move_shared(bucket, placed, [other for other in keys
                                                           if other != key])
@@ -989,6 +992,29 @@ class _Synthesizer:
                     "queue behind it", nodes=[PRE], lines=edit.lines,
                     threshold=SMALL_SHARED_EDIT_LINES)
 
+    def creator_of(self, path: str) -> str:
+        """The bucket that creates the new file ``path`` (PRE included)."""
+        return next((bucket.key for bucket in self.all_buckets() if path in bucket.create),
+                    "another node")
+
+    def edits_on(self, bucket: Bucket, path: str) -> list[Placed]:
+        """``bucket``'s edits of ``path``.
+
+        Filling in a new file that PRE creates (its creator's part, moved out
+        when an interface in it went first) counts as a ``logic`` edit of the
+        symbols the creator provides there.
+        """
+        items = [item for item in bucket.edits if item.edit.file == path]
+        if path in bucket.fill:
+            for unit_id in bucket.units:
+                unit = self.units[unit_id]
+                if path in unit.create:
+                    symbols = [symbol for symbol in unit.provides
+                               if parse_symbol(symbol).path == path]
+                    items.append(Placed(unit_id, FactEdit(file=path, kind="logic",
+                                                          symbols=symbols, lines=unit.size)))
+        return items
+
     def share_files(self) -> None:
         """Step 3b (P3): nodes changing different symbols of one file run in parallel.
 
@@ -998,19 +1024,21 @@ class _Synthesizer:
         overlap (the same symbol, or a class and one of its members). Each
         node then lists the file in ``edit_set.shared`` and is told which
         parts the others change; a conflict is resolved when merging.
-        Otherwise the nodes are ordered on the file, as before.
+        Otherwise the nodes are ordered on the file, as before. A new file
+        that PRE creates counts as edited by the node that fills it in (see
+        :meth:`edits_on`); a new file that a node creates itself is not
+        shared, since it does not exist until that node is done.
         """
         if self.off("p3"):
             return  # step 3 recorded that these files are only ordered
         editors: dict[str, list[Bucket]] = {}
         for bucket in self.buckets:
-            for path in bucket.edit_files():
+            for path in _unique([*bucket.edit_files(), *bucket.fill]):
                 editors.setdefault(path, []).append(bucket)
         for path, buckets in editors.items():
             if len(buckets) < 2:
                 continue
-            edits = {bucket.key: [item for item in bucket.edits if item.edit.file == path]
-                     for bucket in buckets}
+            edits = {bucket.key: self.edits_on(bucket, path) for bucket in buckets}
             why = self._why_not_parallel(edits)
             if why:
                 self.file_reasons.setdefault(path, []).append(why)
@@ -1076,9 +1104,15 @@ class _Synthesizer:
                            for item in bucket.edits) and bucket.key not in (PRE, REG)]
             parts = list(self.file_reasons.get(path, []))
             others = ", ".join(key for key in keys if key != PRE)
+            creator = next((key for key in keys if path in self.by_key[key].create), None)
             if path in self.pre.create:
                 parts.insert(0, f"PRE creates it with only the interfaces; {others} "
                                 "fill it in")
+            elif creator is not None:
+                adders = [key for key in keys if key != creator]
+                parts.insert(0, f"{creator} creates it, so it goes first; "
+                                f"{', '.join(adders)} {'adds' if len(adders) == 1 else 'add'} "
+                                "to it")
             elif path in self.pre.touch:
                 parts.insert(0, f"PRE adds the interfaces first; {others} build on them")
             if len(kept) > 1:
@@ -1174,9 +1208,12 @@ class _Synthesizer:
         number = 0
         for item in self.interfaces.values():
             number += 1
+            fillers = [bucket.key for bucket in self.buckets
+                       if item.path in bucket.fill or item.path in bucket.edit_files()]
+            verb = "fills" if len(_unique(fillers or item.providers)) == 1 else "fill"
             where = (f"create {item.path} with only this interface; "
-                     f"{self._names(item.providers, ids)} fills in the module later"
-                     if item.new_file else f"in {item.path}")
+                     f"{self._names(fillers or item.providers, ids)} {verb} in the module "
+                     "later" if item.new_file else f"in {item.path}")
             used = []
             if item.users:
                 used.append(f"used by {self._names(item.users, ids)}")
