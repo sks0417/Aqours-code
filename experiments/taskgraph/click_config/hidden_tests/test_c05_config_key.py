@@ -1,9 +1,8 @@
 """Section "Configuration keys of parameters": ``config_key``.
 
-Each docstring quotes the sentence of request.md that the test checks. The
-sentence about ``Parameter.to_info_dict()`` is not tested: click's own
-``tests/test_info_dict.py`` compares whole info dicts, so a new
-``"config_key"`` entry fails it (see README.md).
+Each docstring quotes the sentence of request.md that the test checks. That
+the info dict of a parameter without ``config_key`` is unchanged is checked
+by ``regression/test_info_dict.py``.
 """
 import click
 
@@ -89,3 +88,21 @@ def test_argument_takes_config_key(runner):
     assert result.output == "src=in.txt\n"
     result = runner.invoke(cli, ["other.txt"], config={"paths": {"source": "in.txt"}})
     assert result.output == "src=other.txt\n"
+
+
+def test_info_dict_includes_the_given_config_key():
+    """`Parameter.to_info_dict()` includes `"config_key"`, the given value,
+    when `config_key` is given."""
+    option = click.Option(["--port"], config_key="server.port")
+    assert option.to_info_dict()["config_key"] == "server.port"
+    argument = click.Argument(["src"], config_key="http-server.source")
+    assert argument.to_info_dict()["config_key"] == "http-server.source"
+
+    @click.command()
+    @click.option("--name", config_key="app.name")
+    def cli(name):
+        pass
+
+    with click.Context(cli) as ctx:
+        param = cli.to_info_dict(ctx)["params"][0]
+    assert param["name"] == "name" and param["config_key"] == "app.name"

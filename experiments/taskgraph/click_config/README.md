@@ -140,7 +140,7 @@ batch's) puts `src` on `sys.path` and `PYTHONPATH` and skips the 27 tests of
   byte copy of `click_batch/hidden_tests/regression/` (`tools/verify.py`
   compares the SHA-256 of every file). An agent that edits a public test to
   make it pass is still measured against the original.
-- `test_c01_load.py` ... `test_c10_help.py` are the functional tests: 73
+- `test_c01_load.py` ... `test_c10_help.py` are the functional tests: 74
   tests, one file per section of the request.
 
 | File | Section of the request | Tests |
@@ -149,13 +149,13 @@ batch's) puts `src` on `sys.path` and `PYTHONPATH` and skips the 27 tests of
 | `test_c02_dump.py` | Writing a configuration file | 11 |
 | `test_c03_error.py` | `click.ConfigError` | 4 |
 | `test_c04_context.py` | Configuration in the context | 7 |
-| `test_c05_config_key.py` | Configuration keys of parameters | 5 |
+| `test_c05_config_key.py` | Configuration keys of parameters | 6 |
 | `test_c06_values.py` | Values from the configuration (and the order of the sources) | 10 |
 | `test_c07_unknown.py` | Unknown keys | 7 |
 | `test_c08_config_option.py` | `click.config_option` | 8 |
 | `test_c09_save_config.py` | `click.save_config_option` | 7 |
 | `test_c10_help.py` | Help output | 4 |
-| **total** | | **73** |
+| **total** | | **74** |
 
 The rules are those of click batch:
 
@@ -173,8 +173,6 @@ The rules are those of click batch:
   case is left open, so that test compares case-insensitively.
 - Where the request is silent or unclear, there is no test. Known gaps,
   deliberately untested:
-  - `Parameter.to_info_dict()`: the sentence contradicts "keep every existing
-    test passing" (see [Problems in the request](#problems-in-the-request));
   - `load_config` on Python older than 3.11 (the host and the image run 3.11,
     and the public interface gives no way to pretend otherwise); a file that
     is not valid UTF-8; arrays of tables (whether keys of tables inside a
@@ -203,31 +201,31 @@ The rules are those of click batch:
     string `show_default`, a configured `false` for a boolean flag without a
     secondary name.
 
-On the base repository no functional test passes (65 fail, 8 error in
+On the base repository no functional test passes (66 fail, 8 error in
 fixtures that use the new interface) and `regression/` passes as click's own
 tests do; with the reference every hidden test passes, on the host and in
 the sandbox. [`tools/verify.py`](tools/verify.py) checks this.
 
 ## Problems in the request
 
-Found while writing the tests, on 2026-10-15, before any run. `request.md` is
-kept as written; these are for a decision, and each would change
-`request.md`, the reference and possibly a test.
+Found while writing the tests, on 2026-10-15, before any run.
 
-1. **`Parameter.to_info_dict()` contradicts "Keep every existing test
-   passing".** The request says the info dict includes `"config_key"`: the
-   given value, or `None`. Click's `tests/test_info_dict.py` (and so
-   `hidden_tests/regression/test_info_dict.py`) compares whole info dicts with
-   `==`, so a new key in every parameter's dict fails 7 of its tests
-   (`test_parameter[Option]`, `[Flag Option]`, `[Argument]`,
-   `test_command[Command]`, `[Group]`, `[Nested Group]`, `test_context`). An
-   agent that follows the sentence loses 7 regression tests; an agent that
-   ignores it loses nothing. The reference adds `"config_key"` only when it
-   was given, which keeps the existing tests passing, and no hidden test
-   checks the sentence. A possible rewording: "`Parameter.to_info_dict()`
-   includes `"config_key"` when `config_key` is given." (or leave the
-   sentence out).
-2. **Subcommands whose names contain `-`.** Click names a subcommand
+1. **Amended: `Parameter.to_info_dict()`.** As first written, the request
+   said the info dict includes `"config_key"`: "the given value, or `None`".
+   That contradicted "Keep every existing test passing": click's
+   `tests/test_info_dict.py` (and so `hidden_tests/regression/test_info_dict.py`)
+   compares whole info dicts with `==`, so a new key in every parameter's
+   dict failed 7 of its tests (`test_parameter[Option]`, `[Flag Option]`,
+   `[Argument]`, `test_command[Command]`, `[Group]`, `[Nested Group]`,
+   `test_context`), and an agent that followed the sentence would have lost
+   7 regression tests. On 2026-10-15, before any run, the sentence was changed
+   to "`Parameter.to_info_dict()` includes `"config_key"`, the given value,
+   when `config_key` is given." The reference adds the key only then;
+   `test_c05_config_key.py::test_info_dict_includes_the_given_config_key`
+   checks it, and `regression/test_info_dict.py` checks that the info dict of
+   a parameter without `config_key` is unchanged.
+2. **Open: subcommands whose names contain `-`.** `request.md` is kept as
+   written here; this is for a decision. Click names a subcommand
    `show-all` for a function `show_all`, and `load_config` turns a table
    `[show-all]` into `show_all`. A child context looks up "the parent's value
    under its `info_name`" (`show-all`), so it finds nothing, and the group's
@@ -251,11 +249,11 @@ Results on 2026-10-15 (Windows host, Python 3.11.7; image
 
 | # | Check | Result |
 | --- | --- | --- |
-| 1 | base: functional tests that pass | **0 of 73** (65 failed, 8 errors); `regression/`: 2,184 passed, 103 skipped |
-| 2 | base + reference: hidden tests, host | 2,257 passed, 0 failed, 103 skipped (8.9 s) |
-| 2 | base + reference: hidden tests, sandbox | 2,308 passed, 0 failed, 52 skipped |
+| 1 | base: functional tests that pass | **0 of 74** (66 failed, 8 errors); `regression/`: 2,184 passed, 103 skipped |
+| 2 | base + reference: hidden tests, host | 2,258 passed, 0 failed, 103 skipped (9.8 s) |
+| 2 | base + reference: hidden tests, sandbox | 2,309 passed, 0 failed, 52 skipped |
 | 3 | base + reference: `tests/`, host / sandbox | 2,184 passed, 102 skipped, 1 xfailed / 2,235 passed, 51 skipped, 1 xfailed |
-| 4 | hidden tests in the sandbox | **11.8 s** (`duration_s` of `run_hidden_tests`; 13.9 s wall time), below 60 s |
+| 4 | hidden tests in the sandbox | **12.4 s** (`duration_s` of `run_hidden_tests`; 14.5 s wall time), below 60 s |
 | 5 | reference without `save_config_option` | only `test_c09` fails (0/7); `test_c01` 10/10, `test_c02` 11/11, every other section passes |
 | 5 | reference without the help output | only `test_c10` fails (0/4); every other section passes |
 | 6 | `regression/`, `conftest.py`, `sandbox_skips.txt` against click batch | 61 files, all SHA-256 equal |

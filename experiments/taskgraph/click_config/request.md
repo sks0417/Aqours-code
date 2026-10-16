@@ -108,8 +108,8 @@ from `click`, a subclass of `ClickException` with exit code 2.
   nested tables: `config_key="server.port"` reads
   `[server] port = 8080`. In `config_key`, `-` is replaced by `_` in every
   part, as in loaded files.
-- `Parameter.to_info_dict()` includes `"config_key"`: the given value, or
-  `None`.
+- `Parameter.to_info_dict()` includes `"config_key"`, the given value, when
+  `config_key` is given.
 
 ## Values from the configuration
 
