@@ -43,7 +43,8 @@ other, and in different files, give it several units with the same `item`.
 Every draft item has at least one unit. Do not split an item just because it
 is big, and do not combine different items into one unit.
 
-**Logic and registration edits.** An edit is a change to one existing file.
+**Logic and registration edits.** An edit is a change to one existing file,
+or to a new file that another unit creates.
 A `logic` edit implements behaviour. A `registration` edit only enters a
 name into a list or table: an export, `__all__`, a registry, a route table,
 a few lines that name something defined elsewhere. Say in `note` what it
@@ -141,7 +142,8 @@ Field rules:
 - `id`: unique; letters, digits, `_` and `-`. `item`: the id of the draft
   item the unit belongs to. `title`: a few words.
 - `size`: the number of lines the unit adds or changes, tests included.
-- `edits`: changes to existing files, one entry per file. `kind` is
+- `edits`: changes to existing files (or to a new file that another unit
+  creates, see `create`), one entry per file. `kind` is
   `logic` or `registration`. `symbols`: for `logic`, the classes and
   functions changed or added (so that two units changing the same function
   can be recognised); for `registration`, the registered names, written as
@@ -153,7 +155,9 @@ Field rules:
   that file change. `standalone`: only for `logic` (see above). `note`: for
   `registration`, what it registers.
 - `create`: new files, tests included. They must not exist yet, and each new
-  file is created by exactly one unit.
+  file is created by exactly one unit. When several units add code to the
+  same new file, one unit lists it in `create` and the others list it in
+  `edits`, with the symbols they add.
 - `provides`: each symbol is in a file of the unit's `edits` or `create`; a
   registered name is also in the `symbols` of its registration edit.
 - `uses`: each symbol is provided by some unit (this unit's registered

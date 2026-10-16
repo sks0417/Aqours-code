@@ -877,3 +877,109 @@ def test_nodes_sharing_a_file_need_no_order_but_other_overlaps_still_do():
     derived, _ = derive_edges(graph, the_index)
     assert {(e.from_, e.to) for e in derived.edges} == {("A", "B")}
     assert validate(derived, the_index).ok
+
+
+# ── task 27: several units add code to one new file ──
+
+CONFIG = "pkg/config.py"
+CONFIG_FILES = ("pkg/core.py", "pkg/other.py")
+
+
+def creator(**kw) -> dict:
+    """A creates the new module and provides load_config there."""
+    return unit("A", create=[CONFIG, "tests/test_load.py"],
+                provides=[f"{CONFIG}::load_config"], tests=["tests/test_load.py"], **kw)
+
+
+def adder(uid: str = "B", *symbols: str, uses=(), lines: int = 80, standalone: bool = False,
+          **kw) -> dict:
+    """B adds code to the module A creates."""
+    symbols = symbols or ("dump_config",)
+    own = logic(CONFIG, *symbols, lines=lines, standalone=standalone)
+    return unit(uid, edits=[own, *kw.pop("edits", ())],
+                provides=[f"{CONFIG}::{symbol}" for symbol in symbols], uses=list(uses),
+                create=[f"tests/test_{uid.lower()}.py"], tests=[f"tests/test_{uid.lower()}.py"],
+                **kw)
+
+
+def test_new_file_a_behavior_use_waits_for_the_creator(keep_split):
+    """Case 1: B needs A's real load_config, so A goes first."""
+    result = run(facts(creator(), adder(uses=[{**use(f"{CONFIG}::load_config", "behavior"),
+                                               "why": "B's tests read back what A loads"}])),
+                 index(*CONFIG_FILES))
+    graph_nodes = nodes(result)
+    assert edges(result) == {("A", "B")}
+    assert edges(result, "full") == {("A", "B")}
+    assert graph_nodes["A"].edit_set.create == [CONFIG, "tests/test_load.py"]
+    assert graph_nodes["B"].edit_set.modify == [CONFIG]
+    assert "PRE" not in graph_nodes
+    assert "P2/wait_for_behavior" in rules(result)
+
+
+def test_new_file_an_interface_use_puts_the_file_into_pre_and_both_run_in_parallel():
+    """Case 2: B only needs A's interface; their symbols in the file do not overlap."""
+    result = run(facts(creator(), adder(uses=[use(f"{CONFIG}::load_config")])),
+                 index(*CONFIG_FILES))
+    graph_nodes = nodes(result)
+    assert graph_nodes["PRE"].edit_set.create == [CONFIG]
+    assert graph_nodes["A"].edit_set.create == ["tests/test_load.py"]
+    assert graph_nodes["A"].edit_set.modify == [CONFIG]
+    assert graph_nodes["B"].edit_set.modify == [CONFIG]
+    assert graph_nodes["A"].edit_set.shared == [CONFIG] == graph_nodes["B"].edit_set.shared
+    assert edges(result) == {("PRE", "A"), ("PRE", "B")}
+    assert "P2/interface_first" in rules(result)
+    decision = [d for d in result.decisions if d.rule == "parallel_different_symbols"]
+    assert len(decision) == 1 and decision[0].units == ["A", "B"]
+    assert "A: load_config; B: dump_config" in decision[0].reason
+    assert "Other nodes change dump_config in pkg/config.py at the same time" in (
+        graph_nodes["A"].goal)
+    assert "Other nodes change load_config in pkg/config.py at the same time" in (
+        graph_nodes["B"].goal)
+    assert (f"create {CONFIG} with only this interface; A, B fill in the module later"
+            in graph_nodes["PRE"].goal)
+
+
+def test_new_file_an_interface_use_with_overlapping_symbols_is_ordered(keep_split):
+    """Case 2: B changes a member of the class A creates, so they cannot share the file."""
+    the_facts = facts(
+        unit("A", create=[CONFIG], provides=[f"{CONFIG}::Config"]),
+        adder("B", "Config.dump", uses=[use(f"{CONFIG}::Config")]))
+    result = run(the_facts, index(*CONFIG_FILES))
+    graph_nodes = nodes(result)
+    assert graph_nodes["PRE"].edit_set.create == [CONFIG]
+    assert all(not node.edit_set.shared for node in result.graph.nodes)
+    assert edges(result) == {("PRE", "A"), ("PRE", "B"), ("A", "B")}
+    assert edges(result, "order") == {("A", "B")}
+    ordered = [d for d in result.decisions if d.rule == "ordered"]
+    assert len(ordered) == 1
+    assert "change Config and Config.dump, which overlap" in ordered[0].reason
+
+
+def test_new_file_without_uses_is_ordered_creator_first(keep_split):
+    """Case 3: no uses at all; the file does not exist until A is done."""
+    result = run(facts(creator(), adder()), index(*CONFIG_FILES))
+    graph_nodes = nodes(result)
+    assert edges(result) == {("A", "B")}
+    assert edges(result, "order") == {("A", "B")}
+    assert graph_nodes["A"].edit_set.create == [CONFIG, "tests/test_load.py"]
+    assert graph_nodes["B"].edit_set.modify == [CONFIG]
+    assert all(not node.edit_set.shared for node in result.graph.nodes)
+    ordered = [d for d in result.decisions if d.rule == "ordered"]
+    assert len(ordered) == 1
+    assert f"A, B edit {CONFIG}: A creates it, so it goes first; B adds to it" in (
+        ordered[0].reason)
+
+
+def test_new_file_two_units_add_to_it_after_its_creator(keep_split):
+    """A small standalone edit of a file that A creates cannot go into PRE first."""
+    small = dict(lines=SMALL_SHARED_EDIT_LINES, standalone=True)
+    the_facts = facts(creator(), adder("B", "dump_config", **small,
+                                       edits=[logic("pkg/core.py", "b")]),
+                      adder("C", "check_config", **small, edits=[logic("pkg/other.py", "c")]))
+    result = run(the_facts, index(*CONFIG_FILES))
+    graph_nodes = nodes(result)
+    assert "PRE" not in graph_nodes
+    assert edges(result) == {("A", "B"), ("A", "C")}
+    assert graph_nodes["B"].edit_set.shared == [CONFIG] == graph_nodes["C"].edit_set.shared
+    assert "P3/small_shared_edit_first" not in rules(result)
+    assert "P3/parallel_different_symbols" in rules(result)

@@ -145,6 +145,65 @@ def test_every_facts_check(change, expected):
     assert codes(data) == expected
 
 
+def new_file_facts() -> dict:
+    """S creates config.py; R adds code to it."""
+    data = json.loads(json.dumps(TWO_UNITS))
+    data["units"][0]["create"].append("config.py")
+    data["units"][0]["provides"].append("config.py::load")
+    data["units"][1]["edits"].append(logic("config.py", "dump"))
+    data["units"][1]["provides"].append("config.py::dump")
+    return data
+
+
+def messages(data: dict) -> list[tuple[str, list[str], str]]:
+    the_facts = Facts.model_validate(data)
+    return [(issue.code, issue.nodes, issue.message)
+            for issue in check_facts(the_facts, ITEMS, toy_like_index())]
+
+
+def test_a_unit_may_edit_a_new_file_another_unit_creates():
+    assert codes(new_file_facts()) == []
+
+
+def test_editing_a_new_file_nobody_creates_is_f3():
+    data = new_file_facts()
+    data["units"][0]["create"].remove("config.py")
+    data["units"][0]["provides"].remove("config.py::load")
+    assert messages(data) == [(
+        "F3", ["R"],
+        "edits config.py, which does not exist and no other unit creates it. A new file is "
+        "listed in the `create` of exactly one unit; other units that add code to it list "
+        "it in `edits`.")]
+
+
+def test_a_new_file_created_by_two_units_is_f4():
+    data = new_file_facts()
+    data["units"][1]["edits"].pop()
+    data["units"][1]["create"].append("config.py")
+    assert messages(data) == [(
+        "F4", ["S", "R"],
+        "config.py is created by 2 units (S, R). One unit lists it in `create`; the other "
+        "units that add code to it list it in `edits`, with the symbols they add.")]
+
+
+def test_a_unit_that_creates_and_edits_one_new_file_is_told_to_only_create_it():
+    data = new_file_facts()
+    data["units"][0]["edits"].append(logic("config.py", "load"))
+    assert messages(data) == [(
+        "F4", ["S"],
+        "lists config.py both in `create` and in `edits`; a file the unit creates is listed "
+        "only in its `create`")]
+
+
+def test_facts_prompt_says_how_units_share_a_new_file():
+    text = _flat(load_facts_prompt())
+    assert _flat("""- `create`: new files, tests included. They must not exist yet, and each new
+        file is created by exactly one unit. When several units add code to the
+        same new file, one unit lists it in `create` and the others list it in
+        `edits`, with the symbols they add.""") in text
+    assert "use what it provides" not in text
+
+
 def test_a_registered_name_must_be_in_its_registration_edit():
     index = RepoIndex(commit="abc", files={"pkg/__init__.py", "pkg/a.py"})
     data = {"units": [unit("S", edits=[

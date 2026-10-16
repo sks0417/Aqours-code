@@ -200,7 +200,7 @@ python -m aqours_code.taskgraph audit <runs_dir | run_dir> [...]
 python -m aqours_code.taskgraph rescore <run_dir> --hidden-tests <dir> [--sandbox docker|none]
 python -m aqours_code.taskgraph team <request.md> --repo <path> [...]
 python -m aqours_code.taskgraph score <manifest.json> [--exclude <tests.txt>] [--out <dir>]
-python -m aqours_code.taskgraph resynth <graph.json> --out <new_graph.json> [--ablate p1,p3]
+python -m aqours_code.taskgraph resynth <graph.json | graph.json.report.json> --out <new_graph.json> [--ablate p1,p3] [--final-check <command> ...]
 ```
 
 `plan`, `resynth`, `run`, `audit`, `rescore`, `team` and `score` are described in their own sections below. `compare` prints
@@ -1048,8 +1048,8 @@ shows facts only, no structure.
 | --- | --- |
 | unit | one piece of work. By default one draft item is one unit; an item with large, unrelated parts in different files may have several units (same `item`). Every draft item has at least one. |
 | `size` | estimated changed lines, tests included |
-| `edits` | changes to **existing** files, one per file. `kind`: `logic` (implements behaviour) or `registration` (only enters a name into a list or table: an export, `__all__`, a registry, a route table). `symbols`: for `logic`, the classes and functions changed or added (to see whether two units change the same function); a change inside a class names the member (`Class.method`, `Class.field`), and the class itself only when the whole class is new or rewritten; for `registration`, the registered names (`src/click/__init__.py::Duration`), which other units may `use`. `lines`: lines changed in that file. `standalone` (`logic` only): the edit can be written with only the code already in the repository, without the unit's other edits or other units; `false` when unsure. `note`: what a registration registers. |
-| `create` | new files, tests included |
+| `edits` | changes to **existing** files, or to a new file another unit creates, one per file. `kind`: `logic` (implements behaviour) or `registration` (only enters a name into a list or table: an export, `__all__`, a registry, a route table). `symbols`: for `logic`, the classes and functions changed or added (to see whether two units change the same function); a change inside a class names the member (`Class.method`, `Class.field`), and the class itself only when the whole class is new or rewritten; for `registration`, the registered names (`src/click/__init__.py::Duration`), which other units may `use`. `lines`: lines changed in that file. `standalone` (`logic` only): the edit can be written with only the code already in the repository, without the unit's other edits or other units; `false` when unsure. `note`: what a registration registers. |
+| `create` | new files, tests included. Each new file is created by exactly one unit; other units that add code to it list it in `edits`, with the symbols they add |
 | `provides` | symbols added or changed for others, registered names included |
 | `uses` | symbols another unit provides, or this unit registers. `need: "interface"`: the name and signature are enough; this is the usual case (creating, reading or raising a class, a field or an exception, calling a function whose result a small fake can stand in for). `need: "behavior"`: the unit's code or tests depend on a result only the provider's real code produces, so a fake would make the tests meaningless; `why` names that result in one sentence (no result to name: the need is `interface`). A use names the method called, not its class; a use of a class means its constructor and fields. A unit that imports its own symbol through its registered name (a test with `from click import Duration`) lists that name too. Facts written before `why` existed still read. |
 | `tests` | the unit's own test files; empty when nothing can be observed on its own (pure wiring) |
@@ -1062,8 +1062,8 @@ rounds, at most `MAX_REVISIONS`):
 | --- | --- |
 | `F1` | a unit's `item` is not a draft item, or a draft item has no unit |
 | `F2` | a unit id is repeated |
-| `F3` | an edit names a file that does not exist, the same file twice, or a symbol of another file; a unit edits and creates nothing |
-| `F4` | a created file exists, is created by several units, or is also in `edits` |
+| `F3` | an edit names a file that does not exist and that no other unit creates, the same file twice, or a symbol of another file; a unit edits and creates nothing |
+| `F4` | a created file exists, is created by several units (one creates it, the others list it in `edits`), or is also in the same unit's `edits` (only `create`) |
 | `F5` | a provided symbol is not in a file of the unit's `edits` or `create`; a registered name is not in the `symbols` of its registration edit |
 | `F6` | `need` is neither `interface` nor `behavior`; a used symbol is provided by no unit |
 | `F7` | a test file is neither in the unit's `create` nor in its `edits` |
@@ -1204,6 +1204,18 @@ more groups still edit:
    symbols) stays ordered: `derive_edges()` orders the nodes on the file
    (P3/`ordered`; the reason names which case it is).
 
+**A new file that several units add code to.** One unit creates it, the
+others edit it. When an interface in it goes first (P2), `PRE` creates the
+file with that interface and its creator fills it in afterwards; filling in
+counts as a `logic` edit of the symbols the creator provides there, so the
+creator and the other editors share the file under rule 4 when their symbols
+do not overlap, and are ordered otherwise. When `PRE` does not create it, the
+file does not exist until its creator is done: `derive_edges()` puts the
+creator first (P3/`ordered`: "A creates it, so it goes first"), and rule 3
+does not move another unit's small edit of it into `PRE`, which would then
+have to wait for the creator. A user that needs the creator's real behaviour
+waits for it in any case (P2).
+
 **`PRE` and `REG`** exist only when something is put into them, at most one
 of each.
 
@@ -1335,7 +1347,7 @@ outline fields, `totals`, `stage_totals`, `duration_s`):
   formed one group before any graph was built;
 - `behavior_without_why`: the `behavior` uses (unit, symbol) the model gave
   no `why` for;
-- `resynth_of` (only from `resynth`): the graph whose facts were used;
+- `resynth_of` (only from `resynth`): the graph or report whose facts were used;
 - `revision_rounds` and `revision_reasons` (the error codes of every round
   that had to be revised);
 - `test_imports` (`files`: test files read, `sources`: other Python files
@@ -1363,11 +1375,17 @@ The rules of step 3 listed by name: `registration_too_large`,
 #### Building a graph again from saved facts (`resynth`)
 
 ```bash
-python -m aqours_code.taskgraph resynth <graph.json> --out <new_graph.json> [--ablate p1,p3]
+python -m aqours_code.taskgraph resynth <graph.json | graph.json.report.json> --out <new_graph.json> [--ablate p1,p3] [--final-check <command> ...]
 ```
 
-reads the facts from `<graph.json>.report.json` and the request,
-repository, base commit and final checks from the graph, clones the
+takes the graph of a plan or its report. It reads the facts (those of the
+last round) and the draft items from `<graph.json>.report.json`, and the
+request, repository, base commit and final checks from the graph. A failed
+plan writes no graph, only its report: then the request is read from the path
+the report names (relative to the current directory, as `plan` was given it),
+the repository, base commit and model come from the report, and the final
+checks from `--final-check` (repeatable), which is required then; given with
+a saved graph, `--final-check` replaces its final checks. It clones the
 repository at that commit as `plan` does, indexes it and reads its imports,
 checks the facts again (F1-F9, against the saved draft items) and runs
 `synthesize()` with the current rules. No model is called: the same facts
@@ -1376,7 +1394,8 @@ It writes the new graph and a report with the fields of a v3 `plan` report
 (model calls and tokens 0, no rounds) plus `resynth_of`, and prints the
 same summary. Facts saved before `why` existed read as before. Exit codes:
 `0` success, `1` the facts no longer pass the checks or contradict each
-other, `2` a missing graph, report or facts, or a git failure.
+other, `2` a missing report or facts, a request it cannot read, no
+`--final-check` for a plan without a graph, or a git failure.
 
 ### Worker reading soft wall
 

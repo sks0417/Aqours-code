@@ -138,3 +138,77 @@ def test_resynth_reads_facts_saved_before_why_existed(toy_repo, tmp_path):
     assert result.success
     assert result.report["behavior_without_why"] == [
         {"unit": "R", "symbol": "store.py::JobStore.cancel"}]
+
+
+# ── task 27: a failed plan wrote only its report ──
+
+def failed_plan(toy_repo, tmp_path, facts: dict = FACTS):
+    """The report a failed ``plan`` leaves: no graph, the facts of its last round."""
+    request = tmp_path / "request.md"
+    request.write_text(REQUEST, encoding="utf-8")
+    graph_path = tmp_path / "old" / "graph.json"
+    graph_path.parent.mkdir()
+    report = {"planner": "v3", "model": "some-model", "request": str(request),
+              "repo": str(toy_repo.path), "base_commit": toy_repo.commit,
+              "out": str(graph_path), "success": False, "graph_written": False,
+              "errors": [{"code": "F3", "nodes": ["R"], "message": "..."}],
+              "revision_rounds": 2, "facts": facts,
+              "draft_items": [{"id": "1", "title": "cancel", "description": ""},
+                              {"id": "2", "title": "skip", "description": ""}],
+              "estimated_changed_lines": 900,
+              "fast_path": {"taken": False, "estimated_changed_lines": 900,
+                            "threshold": 500}}
+    report_path = report_path_for(graph_path)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    return graph_path, report_path
+
+
+def test_resynth_builds_the_graph_of_a_failed_plan_from_its_report(toy_repo, tmp_path):
+    graph_path, report_path = failed_plan(toy_repo, tmp_path)
+    out = tmp_path / "new" / "graph.json"
+    result = run_resynth(report_path, out, final_checks=[FINAL])
+    assert result.success and out.exists() and not graph_path.exists()
+    index = build_index(toy_repo.path, toy_repo.commit)
+    info = GraphInfo("graph", REQUEST, str(toy_repo.path.resolve()), toy_repo.commit,
+                     [FINAL], "some-model")
+    expected = synthesize(Facts.model_validate(FACTS), index, info,
+                          scan_test_imports(toy_repo.path, index), revised=True)
+    graph = load_graph(out)
+    assert graph_to_json(graph) == graph_to_json(expected.graph)
+    assert graph.request == REQUEST and graph.final_checks == [FINAL]
+    assert graph.generator.revision_mode == "llm"  # the last round was a revision
+    assert result.report["resynth_of"] == str(report_path)
+    # the graph's path works as well when only its report exists
+    assert run_resynth(graph_path, tmp_path / "again" / "graph.json",
+                       final_checks=[FINAL]).success
+
+
+def test_resynth_of_a_failed_plan_needs_the_final_checks(toy_repo, tmp_path, capsys):
+    _, report_path = failed_plan(toy_repo, tmp_path)
+    out = tmp_path / "new" / "graph.json"
+    with pytest.raises(ResynthError, match="give them with --final-check"):
+        run_resynth(report_path, out)
+    assert main(["resynth", str(report_path), "--out", str(out)]) == 2
+    assert "--final-check" in capsys.readouterr().err
+    assert not out.exists()
+    assert main(["resynth", str(report_path), "--out", str(out),
+                 "--final-check", FINAL]) == 0
+    output = capsys.readouterr().out
+    assert f"synthesized again from the facts of {report_path} (no model calls)" in output
+    assert load_graph(out).final_checks == [FINAL]
+
+
+def test_resynth_of_a_failed_plan_reports_a_request_it_cannot_read(toy_repo, tmp_path):
+    _, report_path = failed_plan(toy_repo, tmp_path)
+    (tmp_path / "request.md").unlink()
+    with pytest.raises(ResynthError, match="cannot read the request"):
+        run_resynth(report_path, tmp_path / "new" / "graph.json", final_checks=[FINAL])
+
+
+def test_given_final_checks_replace_those_of_a_saved_graph(toy_repo, tmp_path):
+    _, path = saved_plan(toy_repo, tmp_path)
+    out = tmp_path / "new" / "graph.json"
+    assert run_resynth(path, out, final_checks=["python -m pytest -q tests/a"]).success
+    assert load_graph(out).final_checks == ["python -m pytest -q tests/a"]
+    assert run_resynth(report_path_for(path), out).success  # the report of a saved graph
+    assert load_graph(out).final_checks == [FINAL]
