@@ -1,0 +1,962 @@
+diff --git a/src/click/__init__.py b/src/click/__init__.py
+index a34ab02..9973f77 100644
+--- a/src/click/__init__.py
++++ b/src/click/__init__.py
+@@ -7,6 +7,8 @@ composable.
+ 
+ from __future__ import annotations
+ 
++from .config import dump_config as dump_config
++from .config import load_config as load_config
+ from .core import Argument as Argument
+ from .core import Command as Command
+ from .core import CommandCollection as CommandCollection
+@@ -17,6 +19,7 @@ from .core import Parameter as Parameter
+ from .core import ParameterSource as ParameterSource
+ from .decorators import argument as argument
+ from .decorators import command as command
++from .decorators import config_option as config_option
+ from .decorators import confirmation_option as confirmation_option
+ from .decorators import custom_version_option as custom_version_option
+ from .decorators import group as group
+@@ -26,12 +29,14 @@ from .decorators import option as option
+ from .decorators import pass_context as pass_context
+ from .decorators import pass_obj as pass_obj
+ from .decorators import password_option as password_option
++from .decorators import save_config_option as save_config_option
+ from .decorators import version_option as version_option
+ from .exceptions import Abort as Abort
+ from .exceptions import BadArgumentUsage as BadArgumentUsage
+ from .exceptions import BadOptionUsage as BadOptionUsage
+ from .exceptions import BadParameter as BadParameter
+ from .exceptions import ClickException as ClickException
++from .exceptions import ConfigError as ConfigError
+ from .exceptions import FileError as FileError
+ from .exceptions import MissingParameter as MissingParameter
+ from .exceptions import NoSuchCommand as NoSuchCommand
+diff --git a/src/click/config.py b/src/click/config.py
+new file mode 100644
+index 0000000..11870ef
+--- /dev/null
++++ b/src/click/config.py
+@@ -0,0 +1,253 @@
++"""Reading and writing configuration files.
++
++A configuration file holds parameter values for a command line program, in
++TOML or JSON, chosen by the file suffix. :func:`load_config` reads one into a
++``dict`` that can be passed as :attr:`Context.config`, and
++:func:`dump_config` writes one.
++
++.. versionadded:: 8.6
++"""
++
++from __future__ import annotations
++
++import collections.abc as cabc
++import os
++import re
++import sys
++import typing as t
++from gettext import gettext as _
++
++from .exceptions import ConfigError
++
++_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
++_ESCAPES = {
++    "\\": "\\\\",
++    '"': '\\"',
++    "\b": "\\b",
++    "\t": "\\t",
++    "\n": "\\n",
++    "\f": "\\f",
++    "\r": "\\r",
++}
++
++
++def _config_format(path: str | os.PathLike[str]) -> str:
++    """Return ``"toml"`` or ``"json"`` for the suffix of ``path``.
++
++    :raise ConfigError: The suffix is neither ``.toml`` nor ``.json``.
++    """
++    suffix = os.path.splitext(os.fspath(path))[1].lower()
++
++    if suffix not in (".toml", ".json"):
++        raise ConfigError(
++            _(
++                "unsupported configuration file type {suffix!r}, expected"
++                " '.toml' or '.json'"
++            ).format(suffix=suffix),
++            path=str(path),
++        )
++
++    return suffix[1:]
++
++
++def _normalize_keys(value: t.Any) -> t.Any:
++    """Replace ``-`` by ``_`` in every key of ``value``, at every level."""
++    if isinstance(value, dict):
++        return {
++            key.replace("-", "_"): _normalize_keys(item) for key, item in value.items()
++        }
++
++    if isinstance(value, list):
++        return [_normalize_keys(item) for item in value]
++
++    return value
++
++
++def load_config(path: str | os.PathLike[str]) -> dict[str, t.Any]:
++    """Read a configuration file and return its content as a ``dict``.
++
++    The format follows the file suffix, ignoring case: ``.toml`` is read with
++    :mod:`tomllib`, ``.json`` with :mod:`json`. The file is read as UTF-8. In
++    every key, at every level of nesting, ``-`` is replaced by ``_``. Values
++    are not changed.
++
++    :param path: The file to read.
++    :raise ConfigError: The suffix is not supported, the file cannot be
++        read, or its content is not valid. :attr:`ConfigError.path` is
++        ``str(path)``.
++
++    .. versionadded:: 8.6
++    """
++    name = str(path)
++    kind = _config_format(path)
++
++    if kind == "toml" and sys.version_info < (3, 11):
++        raise ConfigError(_("reading TOML files requires Python 3.11 or later"), name)
++
++    try:
++        with open(path, encoding="utf-8") as f:
++            text = f.read()
++    except (OSError, UnicodeError) as e:
++        reason = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
++        raise ConfigError(
++            _("cannot read the file: {reason}").format(reason=reason), name
++        ) from e
++
++    data: t.Any
++
++    if kind == "toml":
++        import tomllib
++
++        try:
++            data = tomllib.loads(text)
++        except tomllib.TOMLDecodeError as e:
++            raise ConfigError(_("invalid TOML: {error}").format(error=e), name) from e
++    else:
++        import json
++
++        try:
++            data = json.loads(text)
++        except ValueError as e:
++            raise ConfigError(_("invalid JSON: {error}").format(error=e), name) from e
++
++        if not isinstance(data, dict):
++            raise ConfigError(
++                _("a JSON configuration file must contain a table (an object)"),
++                name,
++            )
++
++    return t.cast("dict[str, t.Any]", _normalize_keys(data))
++
++
++def _writable(value: t.Any, key: str, in_list: bool = False) -> t.Any:
++    """Return ``value`` without the keys whose value is ``None``.
++
++    :raise ConfigError: ``value`` holds something that cannot be written.
++    """
++    if isinstance(value, (str, int, float)):
++        return value
++
++    if isinstance(value, list):
++        return [_writable(item, key, in_list=True) for item in value]
++
++    if isinstance(value, cabc.Mapping) and not in_list:
++        result = {}
++
++        for name, item in value.items():
++            if not isinstance(name, str):
++                raise ConfigError(
++                    _("cannot write key {name!r} of type {type}").format(
++                        name=name, type=type(name).__name__
++                    )
++                )
++
++            if item is not None:
++                result[name] = _writable(item, f"{key}.{name}" if key else name)
++
++        return result
++
++    raise ConfigError(
++        _("cannot write {key!r}: values of type {type} are not supported").format(
++            key=key, type=type(value).__name__
++        )
++    )
++
++
++def _toml_string(value: str) -> str:
++    """Write ``value`` as a TOML basic string."""
++    parts = []
++
++    for char in value:
++        if char in _ESCAPES:
++            parts.append(_ESCAPES[char])
++        elif char < " " or char == "\x7f":
++            parts.append(f"\\u{ord(char):04X}")
++        else:
++            parts.append(char)
++
++    return f'"{"".join(parts)}"'
++
++
++def _toml_key(key: str) -> str:
++    """Write ``key`` bare if TOML allows it, as a quoted string otherwise."""
++    if _BARE_KEY.fullmatch(key):
++        return key
++
++    return _toml_string(key)
++
++
++def _toml_value(value: t.Any) -> str:
++    """Write a value that is not a mapping."""
++    if isinstance(value, bool):
++        return "true" if value else "false"
++
++    if isinstance(value, int):
++        return int.__repr__(value)
++
++    if isinstance(value, float):
++        return float.__repr__(value)
++
++    if isinstance(value, str):
++        return _toml_string(value)
++
++    return f"[{', '.join(_toml_value(item) for item in value)}]"
++
++
++def _toml_table(table: cabc.Mapping[str, t.Any], header: list[str]) -> list[str]:
++    """Write the lines of ``table``, then its nested tables."""
++    lines = []
++
++    if header:
++        lines.extend(["", f"[{'.'.join(_toml_key(part) for part in header)}]"])
++
++    for key, value in table.items():
++        if not isinstance(value, cabc.Mapping):
++            lines.append(f"{_toml_key(key)} = {_toml_value(value)}")
++
++    for key, value in table.items():
++        if isinstance(value, cabc.Mapping):
++            lines.extend(_toml_table(value, [*header, key]))
++
++    return lines
++
++
++def dump_config(data: cabc.Mapping[str, t.Any], path: str | os.PathLike[str]) -> None:
++    """Write the mapping ``data`` to a configuration file.
++
++    The format follows the file suffix as for :func:`load_config`. Values
++    may be ``str``, ``int``, ``float``, ``bool``, lists of such values, and
++    mappings with ``str`` keys. A key whose value is ``None`` is left out.
++    The file is written as UTF-8. JSON is written with an indent of 2; TOML
++    is written by Click, with the values that are not mappings before the
++    tables.
++
++    :param data: The configuration to write.
++    :param path: The file to write.
++    :raise ConfigError: The suffix is not supported, or ``data`` holds a
++        value that cannot be written.
++
++    .. versionadded:: 8.6
++    """
++    name = str(path)
++    kind = _config_format(path)
++
++    try:
++        writable = _writable(data, "")
++    except ConfigError as e:
++        raise ConfigError(e.message, name) from None
++
++    if kind == "json":
++        import json
++
++        text = json.dumps(writable, indent=2, ensure_ascii=False) + "\n"
++    else:
++        lines = _toml_table(writable, [])
++        text = "".join(f"{line}\n" for line in lines)
++
++    try:
++        with open(path, "w", encoding="utf-8") as f:
++            f.write(text)
++    except OSError as e:
++        raise ConfigError(
++            _("cannot write the file: {reason}").format(reason=e.strerror or e), name
++        ) from e
+diff --git a/src/click/core.py b/src/click/core.py
+index 59ed94e..378ba62 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -27,6 +27,7 @@ from ._utils import UNSET
+ from .exceptions import Abort
+ from .exceptions import BadParameter
+ from .exceptions import ClickException
++from .exceptions import ConfigError
+ from .exceptions import Exit
+ from .exceptions import MissingParameter
+ from .exceptions import NoArgsIsHelpError
+@@ -196,6 +197,32 @@ def iter_params_for_processing(
+     return sorted(declaration_order, key=sort_key)
+ 
+ 
++def _unknown_config_keys(
++    config: cabc.Mapping[str, t.Any],
++    keys: cabc.Collection[tuple[str, ...]],
++    prefix: tuple[str, ...] = (),
++) -> list[str]:
++    """The keys in ``config`` that are not one of ``keys`` (configuration
++    keys split at dots) and do not lead to one, as dotted paths.
++    """
++    unknown = []
++
++    for name, value in config.items():
++        path = (*prefix, str(name))
++
++        if path in keys:
++            continue
++
++        if isinstance(value, cabc.Mapping) and any(
++            len(key) > len(path) and key[: len(path)] == path for key in keys
++        ):
++            unknown.extend(_unknown_config_keys(value, keys, path))
++        else:
++            unknown.append(".".join(path))
++
++    return unknown
++
++
+ class ParameterSource(enum.IntEnum):
+     """This is an :class:`~enum.IntEnum` that indicates the source of a
+     parameter's value.
+@@ -212,6 +239,9 @@ class ParameterSource(enum.IntEnum):
+         if source < click.ParameterSource.DEFAULT_MAP:
+             ...  # value was explicitly set
+ 
++    .. versionchanged:: 8.6
++        Added the ``CONFIG`` value.
++
+     .. versionchanged:: 8.3.3
+         Use :class:`~enum.IntEnum` and reorder members from most to
+         least explicit. Supports comparison operators.
+@@ -229,6 +259,8 @@ class ParameterSource(enum.IntEnum):
+     """The value was provided by the command line args."""
+     ENVIRONMENT = enum.auto()
+     """The value was provided with an environment variable."""
++    CONFIG = enum.auto()
++    """The value was provided by a configuration file or :attr:`Context.config`."""
+     DEFAULT_MAP = enum.auto()
+     """Used a default provided by :attr:`Context.default_map`."""
+     DEFAULT = enum.auto()
+@@ -305,6 +337,18 @@ class Context:
+         value is not set, it defaults to the value from the parent
+         context. ``Command.show_default`` overrides this default for the
+         specific command.
++    :param config: A mapping of configuration keys to parameter values for
++        this command. A mapping stored under the name of a subcommand is the
++        configuration of that subcommand. The default is the parent's value
++        under :attr:`info_name`, if that is a mapping.
++    :param config_path: The file the configuration was read from. The
++        default is the parent's.
++    :param ignore_unknown_config: Do not fail when the configuration has
++        keys that no parameter uses. The default is the parent's.
++
++    .. versionchanged:: 8.6
++        Added the ``config``, ``config_path`` and ``ignore_unknown_config``
++        parameters.
+ 
+     .. versionchanged:: 8.2
+         The ``protected_args`` attribute is deprecated and will be removed in
+@@ -349,6 +393,9 @@ class Context:
+     obj: t.Any
+     _meta: dict[str, t.Any]
+     default_map: cabc.MutableMapping[str, t.Any] | None
++    config: cabc.Mapping[str, t.Any] | None
++    config_path: str | None
++    ignore_unknown_config: bool
+     invoked_subcommand: str | None
+     terminal_width: int | None
+     max_content_width: int | None
+@@ -365,6 +412,7 @@ class Context:
+     _depth: int
+     _parameter_source: dict[str, ParameterSource]
+     _param_default_explicit: dict[str, bool]
++    _after_params_callbacks: list[t.Callable[[], t.Any]]
+     _exit_stack: ExitStack
+ 
+     def __init__(
+@@ -385,6 +433,9 @@ class Context:
+         token_normalize_func: t.Callable[[str], str] | None = None,
+         color: bool | None = None,
+         show_default: bool | None = None,
++        config: cabc.Mapping[str, t.Any] | None = None,
++        config_path: str | None = None,
++        ignore_unknown_config: bool | None = None,
+     ) -> None:
+         #: the parent context or `None` if none exists.
+         self.parent = parent
+@@ -423,6 +474,39 @@ class Context:
+ 
+         self.default_map = default_map
+ 
++        if (
++            config is None
++            and info_name is not None
++            and parent is not None
++            and parent.config is not None
++        ):
++            config = parent.config.get(info_name)
++
++            if not isinstance(config, cabc.Mapping):
++                config = None
++
++        #: The configuration of this command: configuration keys mapped to
++        #: parameter values, see :meth:`lookup_config`.
++        #:
++        #: .. versionadded:: 8.6
++        self.config = config
++
++        if config_path is None and parent is not None:
++            config_path = parent.config_path
++
++        #: The file :attr:`config` was read from, or ``None``.
++        #:
++        #: .. versionadded:: 8.6
++        self.config_path = config_path
++
++        if ignore_unknown_config is None:
++            ignore_unknown_config = parent.ignore_unknown_config if parent else False
++
++        #: Do not fail when :attr:`config` has keys that no parameter uses.
++        #:
++        #: .. versionadded:: 8.6
++        self.ignore_unknown_config = ignore_unknown_config
++
+         #: This flag indicates if a subcommand is going to be executed. A
+         #: group callback can use this information to figure out if it's
+         #: being executed directly or because the execution flow passes
+@@ -541,6 +625,9 @@ class Context:
+         # parameter name and both fall back to their default value.
+         # Refs: https://github.com/pallets/click/issues/3403
+         self._param_default_explicit = {}
++        # Called once the command's parameters have been processed, before
++        # the command's callback (see ``save_config_option``).
++        self._after_params_callbacks = []
+         self._exit_stack = ExitStack()
+ 
+     @property
+@@ -834,6 +921,25 @@ class Context:
+ 
+         return value
+ 
++    def lookup_config(self, key: str) -> t.Any | None:
++        """Get the configured value for ``key`` from :attr:`config`.
++
++        :param key: A configuration key. A dotted key looks up nested
++            mappings: ``"server.port"`` is ``config["server"]["port"]``.
++        :return: The value, or ``None`` when there is none.
++
++        .. versionadded:: 8.6
++        """
++        value: t.Any = self.config
++
++        for part in key.split("."):
++            if not isinstance(value, cabc.Mapping) or part not in value:
++                return None
++
++            value = value[part]
++
++        return value
++
+     def fail(self, message: str) -> t.NoReturn:
+         """Aborts the execution of the program with a specific error
+         message.
+@@ -1403,6 +1509,19 @@ class Command:
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             _, args = param.handle_parse_result(ctx, opts, args)
+ 
++        if ctx.config and not ctx.ignore_unknown_config and not ctx.resilient_parsing:
++            unknown = sorted(self._unknown_config_keys(ctx))
++
++            if unknown:
++                raise ConfigError(
++                    ngettext(
++                        "unknown configuration key: {keys}",
++                        "unknown configuration keys: {keys}",
++                        len(unknown),
++                    ).format(keys=", ".join(unknown)),
++                    ctx.config_path,
++                )
++
+         # We now have all parameters' values into `ctx.params`, but the data may contain
+         # the `UNSET` sentinel.
+         # Convert `UNSET` to `None` to ensure that the user doesn't see `UNSET`.
+@@ -1427,8 +1546,25 @@ class Command:
+ 
+         ctx.args = args
+         ctx._opt_prefixes.update(parser._opt_prefixes)
++
++        if not ctx.resilient_parsing:
++            for callback in ctx._after_params_callbacks:
++                callback()
++
+         return args
+ 
++    def _unknown_config_keys(self, ctx: Context) -> list[str]:
++        """The keys of :attr:`Context.config` that none of the command's
++        parameters uses, as dotted paths.
++        """
++        assert ctx.config is not None
++        keys = {
++            tuple(key.split("."))
++            for param in self.get_params(ctx)
++            if (key := param.get_config_key()) is not None
++        }
++        return _unknown_config_keys(ctx.config, keys)
++
+     def invoke(self, ctx: Context) -> t.Any:
+         """Given a context, this invokes the attached callback (if it exists)
+         in the right way.
+@@ -2049,6 +2185,22 @@ class Group(Command):
+ 
+         return ctx.args
+ 
++    def _unknown_config_keys(self, ctx: Context) -> list[str]:
++        """Like :meth:`Command._unknown_config_keys`, but a mapping stored
++        under the name of a subcommand is that subcommand's configuration,
++        which it checks when it runs.
++        """
++        assert ctx.config is not None
++        config = ctx.config
++        return [
++            key
++            for key in super()._unknown_config_keys(ctx)
++            if not (
++                isinstance(config.get(key), cabc.Mapping)
++                and self.get_command(ctx, key) is not None
++            )
++        ]
++
+     def invoke(self, ctx: Context) -> t.Any:
+         def _process_result(value: t.Any) -> t.Any:
+             if self._result_callback is not None:
+@@ -2298,6 +2450,15 @@ class Parameter(ABC):
+                         cannot be required, a ValueError will be raised otherwise.
+     :param help: the help string. It is dedented and get a deprecated label if
+         appropriate.
++    :param config_key: The key of the parameter's value in
++        :attr:`Context.config`. The default is :attr:`name`. A dotted key
++        reads a value from nested tables: ``"server.port"``. ``-`` is
++        replaced by ``_`` in every part.
++
++    .. versionchanged:: 8.6
++        Added the ``config_key`` parameter. A value that is not given on the
++        command line or in the environment is read from
++        :attr:`Context.config`.
+ 
+     .. versionchanged:: 8.5.1
+         New ``help`` parameter to replace the one from :class:`Option` and
+@@ -2388,6 +2549,7 @@ class Parameter(ABC):
+     )
+     deprecated: bool | str
+     help: str | None
++    config_key: str | None
+ 
+     def __init_subclass__(cls, **kwargs: t.Any) -> None:
+         super().__init_subclass__(**kwargs)
+@@ -2432,6 +2594,7 @@ class Parameter(ABC):
+         | None = None,
+         deprecated: bool | str = False,
+         help: str | None = None,
++        config_key: str | None = None,
+     ) -> None:
+         self.name, self.opts, self.secondary_opts = self._parse_decls(
+             param_decls or (), expose_value
+@@ -2463,6 +2626,7 @@ class Parameter(ABC):
+         self.envvar = envvar
+         self._custom_shell_complete = shell_complete
+         self.deprecated = deprecated
++        self.config_key = config_key
+ 
+         if help:
+             help = inspect.cleandoc(help)
+@@ -2502,12 +2666,15 @@ class Parameter(ABC):
+         Use :meth:`click.Context.to_info_dict` to traverse the entire
+         CLI structure.
+ 
++        .. versionchanged:: 8.6
++            Added ``config_key``, when it was given.
++
+         .. versionchanged:: 8.3.0
+             Returns ``None`` for the :attr:`default` if it was not set.
+ 
+         .. versionadded:: 8.0
+         """
+-        return {
++        info_dict = {
+             "name": self.name,
+             "param_type_name": self.param_type_name,
+             "opts": self.opts,
+@@ -2521,6 +2688,13 @@ class Parameter(ABC):
+             "help": self.help,
+         }
+ 
++        # Only when given, so that the info dict of a parameter without one is
++        # unchanged.
++        if self.config_key is not None:
++            info_dict["config_key"] = self.config_key
++
++        return info_dict
++
+     def __repr__(self) -> str:
+         return f"<{self.__class__.__name__} {self.name}>"
+ 
+@@ -2677,14 +2851,51 @@ class Parameter(ABC):
+     @abstractmethod
+     def add_to_parser(self, parser: _OptionParser, ctx: Context) -> None: ...
+ 
++    def get_config_key(self) -> str | None:
++        """The key of this parameter's value in :attr:`Context.config`:
++        :attr:`config_key` with ``-`` replaced by ``_``, or :attr:`name`.
++        ``None`` for a parameter without a name.
++
++        .. versionadded:: 8.6
++        """
++        if self.config_key is not None:
++            return ".".join(
++                part.replace("-", "_") for part in self.config_key.split(".")
++            )
++
++        return self.name or None
++
++    def value_from_config(self, ctx: Context) -> t.Any | None:
++        """The value of this parameter in :attr:`Context.config`, or ``None``.
++
++        For a parameter that takes several values, a string is split like
++        the value of an environment variable.
++
++        .. versionadded:: 8.6
++        """
++        key = self.get_config_key()
++
++        if key is None:
++            return None
++
++        value = ctx.lookup_config(key)
++
++        if isinstance(value, str) and (self.nargs != 1 or self.multiple):
++            value = self.type.split_envvar_value(value)
++
++            if self.multiple and self.nargs != 1:
++                value = batch(value, self.nargs)
++
++        return value
++
+     def consume_value(
+         self, ctx: Context, opts: cabc.Mapping[str, t.Any]
+     ) -> tuple[t.Any, ParameterSource]:
+         """Returns the parameter value produced by the parser.
+ 
+         If the parser did not produce a value from user input, the value is either
+-        sourced from the environment variable, the default map, or the parameter's
+-        default value. In that order of precedence.
++        sourced from the environment variable, the configuration, the default map,
++        or the parameter's default value. In that order of precedence.
+ 
+         If no value is found, an internal sentinel value is returned.
+ 
+@@ -2706,6 +2917,12 @@ class Parameter(ABC):
+                 value = envvar_value
+                 source = ParameterSource.ENVIRONMENT
+ 
++        if value is UNSET:
++            config_value = self.value_from_config(ctx)
++            if config_value is not None:
++                value = config_value
++                source = ParameterSource.CONFIG
++
+         if value is UNSET:
+             default_map_value = ctx.lookup_default(self.name)
+             if default_map_value is not None or ctx._default_map_has(self.name):
+@@ -3653,29 +3870,22 @@ class Option(Parameter):
+         elif ctx.show_default is not None:
+             show_default = ctx.show_default
+ 
+-        if show_default_is_str or (
++        # A configured value is shown instead of the default, whether or not
++        # defaults are shown.
++        config_value = self.value_from_config(ctx)
++
++        if config_value is not None:
++            config_string = self._format_help_default(config_value)
++
++            if config_string:
++                extra["default"] = _("{value} (config)").format(value=config_string)
++        elif show_default_is_str or (
+             show_default and (default_value not in (None, UNSET))
+         ):
+             if show_default_is_str:
+                 default_string = f"({self.show_default})"
+-            elif isinstance(default_value, (list, tuple)):
+-                default_string = ", ".join(str(d) for d in default_value)
+-            elif isinstance(default_value, enum.Enum):
+-                default_string = default_value.name
+-            elif inspect.isfunction(default_value):
+-                default_string = _("(dynamic)")
+-            elif self.is_bool_flag and self.secondary_opts:
+-                # For boolean flags that have distinct True/False opts,
+-                # use the opt without prefix instead of the value.
+-                default_string = _split_opt(
+-                    (self.opts if default_value else self.secondary_opts)[0]
+-                )[1]
+-            elif self.is_bool_flag and not self.secondary_opts and not default_value:
+-                default_string = ""
+-            elif isinstance(default_value, str) and default_value == "":
+-                default_string = '""'
+             else:
+-                default_string = str(default_value)
++                default_string = self._format_help_default(default_value)
+ 
+             if default_string:
+                 extra["default"] = default_string
+@@ -3695,6 +3905,24 @@ class Option(Parameter):
+ 
+         return extra
+ 
++    def _format_help_default(self, value: t.Any) -> str:
++        """Format a default or configured value for the help page."""
++        if isinstance(value, (list, tuple)):
++            return ", ".join(str(d) for d in value)
++        if isinstance(value, enum.Enum):
++            return value.name
++        if inspect.isfunction(value):
++            return _("(dynamic)")
++        if self.is_bool_flag and self.secondary_opts:
++            # For boolean flags that have distinct True/False opts,
++            # use the opt without prefix instead of the value.
++            return _split_opt((self.opts if value else self.secondary_opts)[0])[1]
++        if self.is_bool_flag and not self.secondary_opts and not value:
++            return ""
++        if isinstance(value, str) and value == "":
++            return '""'
++        return str(value)
++
+     def prompt_for_value(self, ctx: Context) -> t.Any:
+         """This is an alternative flow that can be activated in the full
+         value processing if a value does not exist.  It will prompt the
+diff --git a/src/click/decorators.py b/src/click/decorators.py
+index cc42e5d..eca7758 100644
+--- a/src/click/decorators.py
++++ b/src/click/decorators.py
+@@ -1,17 +1,23 @@
+ from __future__ import annotations
+ 
++import collections.abc as cabc
+ import inspect
++import os
+ import typing as t
+ from functools import update_wrapper
+ from gettext import gettext as _
+ 
++from .config import dump_config
++from .config import load_config
+ from .core import Argument
+ from .core import Command
+ from .core import Context
+ from .core import Group
+ from .core import Option
+ from .core import Parameter
++from .core import ParameterSource
+ from .globals import get_current_context
++from .types import Path
+ from .utils import echo
+ 
+ if t.TYPE_CHECKING:
+@@ -625,3 +631,142 @@ def help_option(*param_decls: str, **kwargs: t.Any) -> t.Callable[[FC], FC]:
+     kwargs.setdefault("callback", show_help)
+ 
+     return option(*param_decls, **kwargs)
++
++
++def config_option(
++    *param_decls: str,
++    default_paths: cabc.Sequence[str | os.PathLike[str]] = (),
++    **kwargs: t.Any,
++) -> t.Callable[[FC], FC]:
++    """Add a ``--config`` option which reads a configuration file with
++    :func:`load_config`. The result becomes :attr:`Context.config` and the
++    file :attr:`Context.config_path`, so that the command's parameters, and
++    its subcommands, take their values from the file.
++
++    The option is eager, so the configuration is in place before the other
++    parameters are processed.
++
++    :param param_decls: One or more option names. Defaults to the single
++        value ``"--config"``.
++    :param default_paths: When the option is not given, the first of these
++        files that exists is read (``~`` is expanded). When none exists,
++        the configuration is left as it is.
++    :param kwargs: Extra arguments are passed to :func:`option`.
++
++    .. versionadded:: 8.6
++    """
++
++    def callback(ctx: Context, param: Parameter, value: str | None) -> None:
++        if ctx.resilient_parsing:
++            return
++
++        path = value
++
++        if path is None:
++            for default_path in default_paths:
++                candidate = os.path.expanduser(os.fspath(default_path))
++
++                if os.path.isfile(candidate):
++                    path = candidate
++                    break
++            else:
++                return
++
++        ctx.config = load_config(path)
++        ctx.config_path = path
++
++    if not param_decls:
++        param_decls = ("--config",)
++
++    kwargs.setdefault("type", Path(readable=False))
++    kwargs.setdefault("metavar", "PATH")
++    kwargs.setdefault("expose_value", False)
++    kwargs.setdefault("is_eager", True)
++    kwargs.setdefault("help", _("Read option defaults from a configuration file."))
++    kwargs["callback"] = callback
++    return option(*param_decls, **kwargs)
++
++
++def _config_value(value: t.Any) -> t.Any:
++    """A parameter value as it is written to a configuration file."""
++    if isinstance(value, (list, tuple)):
++        return [_config_value(item) for item in value]
++
++    if isinstance(value, (str, int, float, bool)):
++        return value
++
++    return str(value)
++
++
++def _save_config(ctx: Context, path: str) -> t.NoReturn:
++    """Write the values of the command's parameters that were given on the
++    command line, in the environment, or in the configuration to ``path``,
++    then exit.
++    """
++    sources = (
++        ParameterSource.COMMANDLINE,
++        ParameterSource.ENVIRONMENT,
++        ParameterSource.CONFIG,
++    )
++    data: dict[str, t.Any] = {}
++
++    for param in ctx.command.get_params(ctx):
++        key = param.get_config_key()
++
++        if (
++            key is None
++            or not param.expose_value
++            or param.name not in ctx.params
++            or ctx.get_parameter_source(param.name) not in sources
++        ):
++            continue
++
++        *parents, name = key.split(".")
++        table = data
++
++        for part in parents:
++            if not isinstance(table.get(part), dict):
++                table[part] = {}
++
++            table = table[part]
++
++        table[name] = _config_value(ctx.params[param.name])
++
++    dump_config(data, path)
++    echo(_("Saved configuration to {path}").format(path=path), color=ctx.color)
++    ctx.exit()
++
++
++def save_config_option(*param_decls: str, **kwargs: t.Any) -> t.Callable[[FC], FC]:
++    """Add a ``--save-config`` option which writes the current options to a
++    configuration file with :func:`dump_config` and exits.
++
++    Once all of the command's parameters have been processed, and before the
++    command's callback runs, every other parameter whose value was given on
++    the command line, in the environment, or in the configuration is
++    written under its configuration key. Then the program exits.
++
++    :param param_decls: One or more option names. Defaults to the single
++        value ``"--save-config"``.
++    :param kwargs: Extra arguments are passed to :func:`option`.
++
++    .. versionadded:: 8.6
++    """
++
++    def callback(ctx: Context, param: Parameter, value: str | None) -> None:
++        if value is None or ctx.resilient_parsing:
++            return
++
++        ctx._after_params_callbacks.append(lambda: _save_config(ctx, value))
++
++    if not param_decls:
++        param_decls = ("--save-config",)
++
++    kwargs.setdefault("type", Path(dir_okay=False, readable=False))
++    kwargs.setdefault("metavar", "PATH")
++    kwargs.setdefault("expose_value", False)
++    kwargs.setdefault(
++        "help", _("Save the current options to a configuration file and exit.")
++    )
++    kwargs["callback"] = callback
++    return option(*param_decls, **kwargs)
+diff --git a/src/click/exceptions.py b/src/click/exceptions.py
+index 6272c38..5ea6f47 100644
+--- a/src/click/exceptions.py
++++ b/src/click/exceptions.py
+@@ -359,6 +359,31 @@ class FileError(ClickException):
+         )
+ 
+ 
++class ConfigError(ClickException):
++    """Raised if a configuration file cannot be read or written, or if a
++    command's configuration has keys that none of its parameters use.
++
++    :param message: The error message.
++    :param path: The configuration file the error is about, if any.
++
++    .. versionadded:: 8.6
++    """
++
++    exit_code: t.ClassVar[int] = 2
++
++    path: str | None
++
++    def __init__(self, message: str, path: str | None = None) -> None:
++        super().__init__(message)
++        self.path = path
++
++    def format_message(self) -> str:
++        if self.path is not None:
++            return f"{self.path}: {self.message}"
++
++        return self.message
++
++
+ class Abort(RuntimeError):
+     """An internal signalling exception that signals Click to abort."""
+ 
