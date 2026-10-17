@@ -10,13 +10,16 @@ import pytest
 
 from aqours_code.taskgraph.cli import main
 from aqours_code.taskgraph.score import (
+    Entry,
     OUTPUT_TOKEN_WEIGHT,
     ScoreError,
     excluded_by,
+    format_score,
     junit_key,
     load_exclusions,
     load_manifest,
     score_manifest,
+    score_run,
 )
 
 FUNCTIONAL = "_hidden_tests.test_feature"
@@ -267,3 +270,130 @@ def test_score_command_prints_and_writes_the_three_parts(manifest, tmp_path, cap
     assert saved["best"] == {"A": "graph", "B": "single"}
     assert saved["oracle"]["mean_s"] == pytest.approx(0.8176, abs=1e-3)
     assert len(saved["runs"]) == 7
+
+
+# ── task 25e: T leaves out the hidden tests and the escape audit ──
+
+def write_events(run: Path, events: list[dict]) -> None:
+    (run / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events),
+                                      encoding="utf-8")
+
+
+# The click team run 20261015T224558Z-9398: done at 438 s, hidden tests stuck 1787 s.
+STUCK_EVENTS = [
+    {"t": 427.5, "type": "node_completed", "node": "lead_wrapup"},
+    {"t": 437.828, "type": "final_checks_end", "ok": True},
+    {"t": 2265.156, "type": "hidden_tests_end", "passed": 3, "timed_out": True,
+     "duration_s": 1787.266},
+    {"t": 2265.375, "type": "escape_audit_end", "total": 0},  # no duration: the gap
+    {"t": 2265.453, "type": "run_end", "status": "success", "wall_time_s": 2265.375},
+]
+
+
+def test_time_leaves_out_the_hidden_tests_and_the_escape_audit(tmp_path):
+    run = make_run(tmp_path, "team", cases(FUNCTIONAL, passed=3), wall=2265.375,
+                   tokens=(1000, 100))
+    write_events(run, STUCK_EVENTS)
+    scored = score_run(Entry("click", "team", run), [])
+    assert scored["wall_time_s"] == 2265.375
+    assert scored["eval_time"] == {"hidden_tests_end": 1787.266,
+                                   "escape_audit_end": pytest.approx(0.219)}
+    assert scored["eval_time_s"] == pytest.approx(1787.485)
+    assert scored["time_s"] == pytest.approx(2265.375 - 1787.485)
+    planned = score_run(Entry("click", "graph", run, plan_report=None), [])
+    assert planned["time_s"] == scored["time_s"]
+
+
+def test_planning_time_is_still_added(tmp_path):
+    run = make_run(tmp_path, "graph", cases(FUNCTIONAL, passed=3), wall=600,
+                   tokens=(1000, 100))
+    write_events(run, [{"t": 500.0, "type": "final_checks_end"},
+                       {"t": 590.0, "type": "hidden_tests_end", "duration_s": 80.0},
+                       {"t": 600.0, "type": "escape_audit_end", "total": 0}])
+    report = tmp_path / "plan.json"
+    report.write_text(json.dumps({"duration_s": 50.0, "totals": {}}), encoding="utf-8")
+    scored = score_run(Entry("click", "graph", run, plan_report=report), [])
+    assert scored["eval_time_s"] == 90.0 and scored["time_s"] == 600 - 90 + 50
+
+
+def test_a_run_without_evaluation_events_keeps_its_wall_time(tmp_path):
+    bare = make_run(tmp_path, "bare", cases(FUNCTIONAL, passed=3), wall=300, tokens=(10, 1))
+    other = make_run(tmp_path, "other", cases(FUNCTIONAL, passed=3), wall=300, tokens=(10, 1))
+    write_events(other, [{"t": 1.0, "type": "run_start"}, "not an object",
+                         {"t": 299.0, "type": "final_checks_end"}])
+    (other / "events.jsonl").write_text((other / "events.jsonl").read_text(encoding="utf-8")
+                                        + "{broken\n", encoding="utf-8")
+    for run in (bare, other):
+        scored = score_run(Entry("click", "single", run), [])
+        assert (scored["wall_time_s"], scored["eval_time_s"], scored["time_s"]) == (300, 0, 300)
+        assert scored["eval_time"] == {}
+
+
+def test_the_evaluation_time_never_exceeds_the_wall_time(tmp_path):
+    run = make_run(tmp_path, "odd", cases(FUNCTIONAL, passed=3), wall=100, tokens=(10, 1))
+    write_events(run, [{"t": 100.0, "type": "hidden_tests_end", "duration_s": 500.0}])
+    scored = score_run(Entry("click", "single", run), [])
+    assert scored["eval_time_s"] == 100.0 and not scored["valid"]  # T = 0 cannot count
+
+
+def fake_rescorable_run(tmp_path: Path) -> tuple[Path, Path]:
+    """A finished run whose hidden tests failed, and corrected hidden tests that pass."""
+    run = make_run(tmp_path, "rescored", cases(FUNCTIONAL, failed=2), wall=500,
+                   tokens=(1000, 100))
+    write_events(run, [{"t": 400.0, "type": "final_checks_end"},
+                       {"t": 499.0, "type": "hidden_tests_end", "duration_s": 95.0},
+                       {"t": 500.0, "type": "escape_audit_end", "total": 0}])
+    (run / "final").mkdir()
+    (run / "final" / "calc.py").write_text("def add(a, b):\n    return a + b\n",
+                                           encoding="utf-8")
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    (hidden / "test_calc.py").write_text(
+        "import sys, pathlib\nsys.path.insert(0, str(pathlib.Path(__file__).parents[1]))\n"
+        "from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n\n"
+        "def test_add_more():\n    assert add(2, 2) == 4\n", encoding="utf-8")
+    return run, hidden
+
+
+def test_score_uses_the_results_of_the_latest_rescore(tmp_path):
+    from aqours_code.taskgraph.checks import HostChecks, rescore
+    run, hidden = fake_rescorable_run(tmp_path)
+    before = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    assert score_run(Entry("A", "single", run), [])["q"] == 0.0
+    stats = rescore(run, hidden, HostChecks())
+    assert stats["passed"] == 2
+    after = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    assert {key: value for key, value in after.items() if key != "hidden_tests_rescored"} \
+        == before  # rescore changes no other field of summary.json
+    scored = score_run(Entry("A", "single", run), [])
+    assert scored["results_file"] == "hidden_tests_rescored.xml"
+    assert scored["functional"]["passed"] == 2 and scored["q"] == 1.0
+    assert scored["time_s"] == 500 - 96  # the rescore adds no time to the run
+
+
+def test_a_rescore_that_left_no_results_does_not_fall_back_to_older_ones(tmp_path):
+    run, _ = fake_rescorable_run(tmp_path)
+    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    summary["hidden_tests_rescored"] = {"passed": 0, "timed_out": True,
+                                        "parse_error": "no report"}
+    (run / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    scored = score_run(Entry("A", "single", run), [])
+    assert not scored["valid"]
+    assert "the last rescore left no hidden_tests_rescored.xml" in scored["invalid_reason"]
+
+
+def test_score_md_states_what_t_is_and_lists_every_run(manifest, tmp_path):
+    run = tmp_path / "runs" / "a-single"
+    write_events(run, [{"t": 60.0, "type": "final_checks_end"},
+                       {"t": 99.0, "type": "hidden_tests_end", "duration_s": 39.0},
+                       {"t": 100.0, "type": "escape_audit_end", "total": 0}])
+    result = score_manifest(load_manifest(manifest))
+    text = format_score(result)
+    assert ("T = wall time of the method (planning included, hidden tests and escape audit "
+            "excluded)") in text
+    assert result["time"] == ("wall time of the method (planning included, hidden tests and "
+                              "escape audit excluded)")
+    assert "| a-single | A | single | 100 | 40 | 0 | 60 | 0.640 | 0.640 |" in text
+    assert "| b-team | B | team | 1 | 0 | 0 | 1 | invalid | - |" in text
+    assert "| a-graph-1 | A | graph | 30 | 0 | 20 | 50 |" in text
+    text.encode("cp1252")  # score prints it; a Windows console may not take UTF-8
