@@ -257,7 +257,7 @@ python -m aqours_code.taskgraph run <graph.json> --repo <path>
     [--worker aqours|command] [--command-map <json>]
     [--worker-timeout 1800]
     [--hidden-tests <dir>]
-    [--merge-repairs 1] [--conflict-repairs 1]
+    [--merge-repairs 1] [--conflict-repairs 1] [--no-auto-resolve-imports]
     [--sandbox docker|none] [--sandbox-image aqours-code-eval:py311]
 ```
 
@@ -503,6 +503,49 @@ found, `0` when none is, and `2` when no run directory is found.
    price is that other nodes' merges wait for that round. The round's worker
    time and tokens count for the node.
 
+   **Conflicts in imports only.** Nodes that edit one file in parallel
+   usually each add their module to the same import lines at its top, so
+   every merge after the first conflicts there although nothing else does
+   (in the jp-modular v3 run, four conflicts of this kind took 32 model calls
+   and about 0.76M tokens). So, right after the merge with the markers kept
+   and before any worker round, the Coordinator resolves such hunks itself
+   (`import_merge.py`). A hunk qualifies when the file is `.py` and each of
+   its three sides (ours, the common base, theirs) holds nothing but import
+   statements and blank lines: a comment, any other line of code, a `*`
+   import, or a side that does not parse leaves the hunk to the worker. The
+   base side comes from the same conflict written again with diff3-style
+   markers (`git checkout --conflict=diff3`, after which the file is put back
+   byte for byte); the hunks are analysed there and the result is applied to
+   the file as git wrote it, so a hunk the program leaves keeps its markers
+   exactly as git wrote them, in git's usual style. A qualifying hunk gets a
+   three-way merge of the imported names: a name either side added is kept,
+   a name either side removed is dropped, an alias (`stats as stats_module`)
+   is part of the name. The statements keep the order and blank lines of the
+   integration side; each is written anew, with names sorted when every side
+   had them sorted, aliases on lines of their own unless a side had them
+   together with other names, and a `from` import longer than 79 characters
+   wrapped in parentheses. The file must still compile (with ours for the
+   hunks left), and every merged line must belong to a top-level import, or
+   nothing in that file is changed. Then:
+   - **nothing left in conflict**: no worker round. The node's own check runs
+     (`check_auto_resolved_<k>.txt`, `check_start`/`check_end` with
+     `auto_resolved: true` and the attempt the work came from) and the merge
+     is committed. This is not an attempt and makes no model call; it adds
+     one to the node's `conflicts_auto_resolved`. If the check fails, the
+     files get the markers git wrote back (`merge_conflict_auto_undone`) and
+     the worker resolves the conflict as it would have without the program;
+   - **files left**: the worker round runs as above, its prompt naming only
+     the files that still have conflicts; the hunks already resolved stay
+     resolved.
+
+   The conflict counts in `merge_conflicts` either way, and a
+   `merge_conflict_auto_resolved` event (with `files`, `hunks` and
+   `files_left`) records each resolution that resolved a hunk.
+   `--no-auto-resolve-imports` (config `auto_resolve_imports: false`) hands
+   every conflict to the worker, as before `coordinator-v0.9`, to reproduce
+   earlier runs and to compare. With `--conflict-repairs 0` there is no
+   resolution of any kind.
+
    `--conflict-repairs` (default 1) is the number of resolutions in **each
    round of merging**: the first merge is one round, and the merge after
    each merge repair is another. A repair holds no lock, so other nodes may
@@ -524,11 +567,14 @@ found, `0` when none is, and `2` when no run directory is found.
    - the current integration branch is merged into the node's branch, so its
      worktree holds the other nodes' finished work plus its own: the state
      whose check just failed. Nodes that merged after that check can make
-     this merge conflict: the conflict markers are then kept, and the
-     conflict is handed to the worker with the check output (it counts in
-     `merge_conflicts` and gives `merge_conflict` /
+     this merge conflict: the conflict markers are then kept, the program
+     resolves the hunks that hold only imports (above), and the files still
+     in conflict are handed to the worker with the check output (the
+     conflict counts in `merge_conflicts` and gives `merge_conflict` /
      `merge_conflict_resolved` events, but belongs to the repair, not to a
-     round of merging);
+     round of merging; resolved entirely by the program, it adds one to
+     `conflicts_auto_resolved`, and the repair's prompt has no conflict
+     section);
    - the worker runs once more (the attempt number continues) with the
      post-merge check output under `# Your work broke after merging`: fix it
      in your own files, leave the other sub-tasks' code alone; after a
@@ -587,8 +633,10 @@ runs/<run_id>/            run_id = UTC timestamp + 4 random hex characters
   wt/<node_id>/           node worktrees (removed when the node ends; wt/ when the run ends)
   nodes/<node_id>/        prompt_<n>.md, worker_<n>.json, worker_<n>_config.json,
                           worker_<n>_stdout.txt, trace_<n>.jsonl, aqours_<n>/,
-                          check_<n>.txt, post_merge_check.txt,
-                          post_merge_check_repair_<k>.txt, diff.patch
+                          check_<n>.txt, check_auto_resolved_<k>.txt (the check
+                          after the program resolved the k-th conflict),
+                          post_merge_check.txt, post_merge_check_repair_<k>.txt,
+                          diff.patch
   final/                  clean checkout of the integration HEAD for hidden tests
 ```
 
@@ -598,9 +646,14 @@ One JSON object per line with `ts` (ISO 8601, UTC), `t` (seconds since the
 run started), `type`, and `node` where it applies. Types: `run_start`,
 `node_ready`, `node_start`, `worker_start`, `worker_end` (with `ok`,
 `reason`, `duration_s`, `model_calls`, `input_tokens`, `output_tokens`),
-`check_start`, `check_end`, `merge_start`, `merge_end`,
+`check_start`, `check_end` (with `auto_resolved: true` for the check after
+the program resolved a whole conflict), `merge_start`, `merge_end`,
 `post_merge_check_end`, `merge_conflict` (with `files`),
-`merge_conflict_resolved` (with `ok`), `merge_repair_start` (with `attempt`),
+`merge_conflict_auto_resolved` (with `files`: the files where the program
+resolved hunks, `hunks`: how many, as git wrote them, and `files_left`: the
+files left for the worker), `merge_conflict_auto_undone` (with `files`,
+`reason`: `check_failed`), `merge_conflict_resolved` (with `ok`),
+`merge_repair_start` (with `attempt`),
 `merge_repair_end` (with `ok`: whether the node was merged after the repair),
 `reserved_files_removed` (with `attempt`, `files`),
 `line_endings_normalized` (with `attempt`, `files`),
@@ -622,8 +675,10 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
   `check_timeout_retries` (node and post-merge checks that timed out and were
   run once more), `normalized_line_endings` (files put back to LF),
   `merge_conflicts` (all conflicts met, in rounds of merging and at the start
-  of merge repairs) and `conflict_resolved` (whether the last resolution
-  worked: `true`/`false`, `null` without a conflict);
+  of merge repairs), `conflict_resolved` (whether the last resolution
+  worked: `true`/`false`, `null` without a conflict) and
+  `conflicts_auto_resolved` (of `merge_conflicts`, those the program
+  resolved alone, with no worker round for them);
 - `totals`: `model_calls`, `input_tokens`, `output_tokens`;
 - `final_checks`: one entry per command (`command`, `ok`, `exit_code`,
   `timed_out`, `duration_s`);
@@ -634,7 +689,7 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
   `sandbox_image`, `hidden_tests` (the directory used) and `rescored_at`;
 - `sandbox`, `sandbox_image`, `checks_sandbox`, `escape_attempts_total`,
   `merge_repairs_total`, `merge_conflicts_total`, `conflicts_resolved_total`,
-  `check_timeout_retries_total` (all nodes plus the
+  `conflicts_auto_resolved_total`, `check_timeout_retries_total` (all nodes plus the
   final checks).
 
 ### Rescoring the hidden tests

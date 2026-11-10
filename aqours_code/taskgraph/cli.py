@@ -149,7 +149,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                          max_attempts=args.max_attempts,
                          worker_timeout_s=args.worker_timeout, hidden_tests=hidden,
                          merge_repairs=args.merge_repairs,
-                         conflict_repairs=args.conflict_repairs)
+                         conflict_repairs=args.conflict_repairs,
+                         auto_resolve_imports=args.auto_resolve_imports)
     try:
         result = run_graph(graph, Path(args.repo), worker, options)
     except GraphInvalid as exc:
@@ -189,7 +190,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 if summary["nodes"][node_id]["conflict_resolved"]]
     detail = (f" ({', '.join(conflicted)}; resolved: {', '.join(resolved) or 'none'})"
               if conflicted else "")
-    print(f"merge conflicts: {summary['merge_conflicts_total']}{detail}")
+    print(f"merge conflicts: {summary['merge_conflicts_total']}{detail}  "
+          f"resolved by the program: {summary['conflicts_auto_resolved_total']}")
     print(f"check timeout retries: {summary['check_timeout_retries_total']}")
     escapes = summary["escape_attempts_total"]
     print(f"sandbox: {summary['sandbox']}  escape attempts: {escapes}")
@@ -589,6 +591,11 @@ def build_parser() -> argparse.ArgumentParser:
                          help="conflict resolutions in each round of merging: the first "
                               "merge and the merge after each merge repair (default 1; "
                               "0 fails the node at once on a conflict)")
+    run_cmd.add_argument("--no-auto-resolve-imports", dest="auto_resolve_imports",
+                         action="store_false",
+                         help="hand every conflict to the worker, also hunks that hold "
+                              "only Python imports (by default the program merges those; "
+                              "this reproduces runs before coordinator-v0.9)")
     run_cmd.add_argument("--sandbox", choices=("docker", "none"), default="docker",
                          help="where worker shell commands, checks and hidden tests run "
                               "(none: on this machine, tests only)")

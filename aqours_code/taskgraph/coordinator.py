@@ -10,7 +10,15 @@ Two nodes that both list a file in ``edit_set.shared`` may run at the same
 time although they edit it. When a node's squash merge conflicts, the
 Coordinator, still holding ``merge_lock``, merges the integration branch into
 the node's work with the conflict markers, lets the worker resolve them,
-checks the node, and merges again. Holding the lock means the resolution
+checks the node, and merges again. Conflict hunks that hold only Python
+imports (each side, the base included, nothing but import statements and
+blank lines) are resolved by the program first, by a three-way merge of the
+imported names (``import_merge.py``; ``auto_resolve_imports``, on by
+default). The worker is then named only the files still in conflict; if none
+is left, the node is checked and merged with no worker round, which is no
+attempt and makes no model call, and if that check fails, the files get their
+markers back and the worker resolves the conflict as it would have without
+the program. Holding the lock means the resolution
 starts from the newest integration state and nothing else merges meanwhile,
 so the second merge cannot conflict; the price is that other nodes' merges
 wait for that round. ``conflict_repairs`` resolutions are allowed in every
@@ -57,6 +65,7 @@ from .cleanup import remove_reserved_files, remove_tree
 from .context_pack import build_context_pack
 from .context_metrics import node_context_metrics
 from .escapes import scan_run
+from .import_merge import resolve_import_conflicts
 from .line_endings import LineEndings
 from .prompting import CONFLICT_MARKER, AttemptFailure, build_node_prompt
 from .repo_index import RepoIndex, build_index
@@ -68,7 +77,7 @@ from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
 DEFAULT_MERGE_REPAIRS = 1
 DEFAULT_CONFLICT_REPAIRS = 1
-TASKGRAPH_VERSION = "coordinator-v0.8"
+TASKGRAPH_VERSION = "coordinator-v0.9"
 AQOURS_SOURCE = Path(__file__).resolve().parents[2]
 DEFAULT_WORKERS = 2
 DEFAULT_MAX_ATTEMPTS = 2
@@ -101,6 +110,10 @@ class RunOptions:
     # (merge_repairs + 1) * conflict_repairs. 0: a conflict fails the node,
     # also one at the start of a merge repair.
     conflict_repairs: int = DEFAULT_CONFLICT_REPAIRS
+    # Resolve conflict hunks that hold only Python imports in the program,
+    # before any worker round (import_merge.py). False: every conflict goes
+    # to the worker, as in the runs before coordinator-v0.9.
+    auto_resolve_imports: bool = True
     # Where checks run. None: where the worker's shell commands run (Docker
     # with ``--sandbox docker``, the host with ``--sandbox none``).
     checks: Checks | None = None
@@ -139,6 +152,10 @@ class NodeRecord:
     # worked (None: no conflict).
     merge_conflicts: int = 0
     conflict_resolved: bool | None = None
+    # Of those conflicts, the ones the program resolved alone (every hunk held
+    # only imports): no worker round in a round of merging, no conflict files
+    # for the worker in a merge repair.
+    conflicts_auto_resolved: int = 0
     # Files named like a Windows device (nul, con, ...) deleted after a worker.
     removed_reserved_files: list[str] = field(default_factory=list)
     # Checks (node and post-merge) that timed out and were run once more.
@@ -401,15 +418,19 @@ class Coordinator:
         self.events.emit("check_timeout_retry", node=node_id, kind=kind, ok=check.ok)
 
     def _run_node_check(self, node: Node, record: NodeRecord, log_dir: Path,
-                        worktree: Path, attempt: int) -> CheckOutcome:
-        self.events.emit("check_start", node=node.id, attempt=attempt)
+                        worktree: Path, attempt: int, log_name: str | None = None,
+                        **event_fields) -> CheckOutcome:
+        """Run the node's check in ``worktree``; log it to ``check_<attempt>.txt``
+        unless ``log_name`` is given. ``event_fields`` go into both check events."""
+        self.events.emit("check_start", node=node.id, attempt=attempt, **event_fields)
         check = run_checks_with_retry(node.check.commands, worktree, node.check.timeout_s,
                                       checks=self.checks, label=f"check-{node.id}")
-        (log_dir / f"check_{attempt}.txt").write_text(check.text, encoding="utf-8")
+        (log_dir / (log_name or f"check_{attempt}.txt")).write_text(check.text,
+                                                                     encoding="utf-8")
         record.check_time_s += check.duration_s
         self._note_timeout_retry(check, "node", node.id, record)
         self.events.emit("check_end", node=node.id, attempt=attempt, ok=check.ok,
-                         duration_s=round(check.duration_s, 3))
+                         duration_s=round(check.duration_s, 3), **event_fields)
         return check
 
     def _attempt_until_checked(self, node: Node, record: NodeRecord, log_dir: Path,
@@ -450,16 +471,72 @@ class Coordinator:
             self.events.emit("merge_end", node=node.id, ok=commit is not None, commit=commit)
         return commit
 
+    def _auto_resolve_imports(self, node: Node, worktree: Path,
+                              files: list[str]) -> tuple[list[str], dict[str, bytes]]:
+        """Resolve the import-only hunks of the conflicted ``files`` in the program.
+
+        See ``import_merge.py``; the base side of each hunk comes from the
+        file written again with diff3-style markers. Returns the files the
+        worker still has to resolve (all of ``files`` with
+        ``auto_resolve_imports`` off), and the bytes git wrote for each file
+        that was changed, so that :meth:`_undo_auto_resolution` can put them
+        back. Gives a ``merge_conflict_auto_resolved`` event when a hunk was
+        resolved. Makes no model call and is not an attempt.
+        """
+        if not self.options.auto_resolve_imports:
+            return files, {}
+        left: list[str] = []
+        written: dict[str, bytes] = {}
+        hunks = 0
+        for path in files:
+            outcome = None
+            if path.endswith(".py"):
+                try:
+                    data = (worktree / path).read_bytes()
+                    with self.git_lock:
+                        diff3 = gitops.conflict_diff3(worktree, path)
+                    if diff3 is not None:
+                        outcome = resolve_import_conflicts(path, data.decode("utf-8"),
+                                                           diff3.decode("utf-8"))
+                except (OSError, UnicodeDecodeError):
+                    outcome = None
+            if outcome is None or not outcome.resolved:
+                left.append(path)
+                continue
+            (worktree / path).write_bytes(outcome.text.encode("utf-8"))
+            written[path] = data
+            hunks += outcome.resolved
+            if not outcome.complete:
+                left.append(path)
+        if written:
+            self.events.emit("merge_conflict_auto_resolved", node=node.id,
+                             files=sorted(written), hunks=hunks, files_left=left)
+        return left, written
+
+    def _undo_auto_resolution(self, node: Node, worktree: Path, written: dict[str, bytes],
+                              reason: str) -> None:
+        """Put back the files :meth:`_auto_resolve_imports` changed, markers and all."""
+        for path, data in written.items():
+            (worktree / path).write_bytes(data)
+        self.events.emit("merge_conflict_auto_undone", node=node.id, files=sorted(written),
+                         reason=reason)
+
     def _resolve_conflict(self, node: Node, record: NodeRecord, log_dir: Path,
                           worktree: Path) -> str:
         """One conflict resolution, run while the caller holds ``merge_lock``.
 
         The integration branch is merged into the node's worktree with its
         conflict markers kept (the node's changes are measured from that
-        commit from now on), the worker runs once more with the conflicting
-        files named, and the node's own check runs. Returns "" when the merge
-        can be committed, else ``merge_conflict`` (markers left), the
-        worker's reason, or ``conflict_check_failed``.
+        commit from now on). The program first resolves the hunks that hold
+        only imports (:meth:`_auto_resolve_imports`). If that leaves no
+        conflict, the node's own check runs (``check_auto_resolved_<k>.txt``
+        for the node's k-th conflict) and, if it passes, the merge is
+        committed with no worker round; if it fails, the automatic resolution
+        is undone and the conflict goes to the worker as it would have
+        without it. Otherwise the worker runs once more with the files still
+        in conflict named, and the node's own check runs. Returns "" when
+        the merge can be committed, else ``merge_conflict`` (markers left),
+        the worker's reason, or ``conflict_check_failed``.
         """
         record.merge_conflicts += 1
         with self.git_lock:
@@ -467,10 +544,21 @@ class Coordinator:
             files = gitops.merge_keep_conflicts(worktree, target)
         self.bases[node.id] = target
         self.events.emit("merge_conflict", node=node.id, files=files)
+        left, written = self._auto_resolve_imports(node, worktree, files)
         reason = ""
-        if files:
+        if files and not left:
+            check = self._run_node_check(
+                node, record, log_dir, worktree, record.attempts,
+                log_name=f"check_auto_resolved_{record.merge_conflicts}.txt",
+                auto_resolved=True)
+            if check.ok:
+                record.conflicts_auto_resolved += 1
+            else:
+                self._undo_auto_resolution(node, worktree, written, "check_failed")
+                left = files
+        if left:
             attempt = record.attempts + 1
-            failure = AttemptFailure("merge_conflict", conflict_files=files)
+            failure = AttemptFailure("merge_conflict", conflict_files=left)
             result = self._run_worker(node, record, log_dir, worktree, attempt, failure)
             worker_reason = record.worker_reasons[-1]
             if worker_reason and worker_reason != "worker_timeout":
@@ -536,12 +624,15 @@ class Coordinator:
         The current integration branch is merged into the node's branch, so the
         worktree holds the state whose check just failed. Other nodes may have
         merged since that check (a repair holds no lock), so this merge can
-        conflict: the markers are then kept and handed to the worker with the
-        check output; markers left behind fail the repair (``merge_conflict``).
-        Such a conflict counts in ``merge_conflicts`` but belongs to the repair,
-        not to a round of merging. With ``conflict_repairs`` 0 it fails the
-        repair at once. The worker then runs again with the post-merge check
-        output. Runs without ``merge_lock``.
+        conflict: the markers are then kept, the program resolves the hunks
+        that hold only imports (:meth:`_auto_resolve_imports`), and the files
+        still in conflict are handed to the worker with the check output;
+        markers left behind fail the repair (``merge_conflict``). Such a
+        conflict counts in ``merge_conflicts`` but belongs to the repair, not
+        to a round of merging. With ``conflict_repairs`` 0 it fails the repair
+        at once. The worker then runs again with the post-merge check output,
+        also when the program resolved the whole conflict. Runs without
+        ``merge_lock``.
         """
         attempt = record.attempts + 1
         record.merge_repairs += 1
@@ -553,22 +644,27 @@ class Coordinator:
                 gitops.abort_merge(worktree)
                 return "merge_conflict"
         self.bases[node.id] = target
+        left: list[str] = []
         if files:
             record.merge_conflicts += 1
             self.events.emit("merge_conflict", node=node.id, files=files)
+            left, _ = self._auto_resolve_imports(node, worktree, files)
+            if not left:
+                record.conflicts_auto_resolved += 1
         failure = AttemptFailure("post_merge_check_failed", failure_text, after_merge=True,
-                                 timed_out=timed_out, conflict_files=files or None)
+                                 timed_out=timed_out, conflict_files=left or None)
         result = self._run_worker(node, record, log_dir, worktree, attempt, failure)
         worker_reason = record.worker_reasons[-1]
         if worker_reason and worker_reason != "worker_timeout":
             record.error = (result.error or result.final_answer)[-2000:]
             return worker_reason
         if files:
-            left = any((worktree / path).is_file()
-                       and CONFLICT_MARKER in (worktree / path).read_bytes() for path in files)
-            record.conflict_resolved = not left
-            self.events.emit("merge_conflict_resolved", node=node.id, ok=not left)
-            if left:
+            markers = any((worktree / path).is_file()
+                          and CONFLICT_MARKER in (worktree / path).read_bytes()
+                          for path in files)
+            record.conflict_resolved = not markers
+            self.events.emit("merge_conflict_resolved", node=node.id, ok=not markers)
+            if markers:
                 return "merge_conflict"
         with self.git_lock:
             gitops.commit_merge(worktree, f"repair {record.merge_repairs}")
@@ -721,6 +817,7 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "worker_timeout_s": options.worker_timeout_s,
         "merge_repairs": options.merge_repairs,
         "conflict_repairs": options.conflict_repairs,
+        "auto_resolve_imports": options.auto_resolve_imports,
         "hidden_tests": str(options.hidden_tests) if options.hidden_tests else None,
         "worker": worker.describe(),
         **sandbox.to_dict(),
@@ -774,6 +871,8 @@ def run_graph(graph: Graph, repo: Path, worker: Worker,
         "merge_repairs_total": sum(r.merge_repairs for r in records.values()),
         "merge_conflicts_total": sum(r.merge_conflicts for r in records.values()),
         "conflicts_resolved_total": sum(1 for r in records.values() if r.conflict_resolved),
+        "conflicts_auto_resolved_total": sum(r.conflicts_auto_resolved
+                                             for r in records.values()),
         "check_timeout_retries_total": (
             sum(r.check_timeout_retries for r in records.values())
             + coordinator.final_check_timeout_retries),

@@ -209,6 +209,29 @@ def merge_keep_conflicts(worktree: Path, commit: str) -> list[str]:
     return conflicts
 
 
+def conflict_diff3(worktree: Path, path: str) -> bytes | None:
+    """The conflicted ``path`` written with diff3-style markers (with the base).
+
+    ``git checkout --conflict=diff3`` recreates the merge of ``path`` from the
+    index stages that :func:`merge_keep_conflicts` left; the file is then put
+    back byte for byte, so ``worktree`` is left as it was. Returns None when
+    git cannot recreate it (for example a file one side deleted).
+    """
+    target = worktree / path
+    try:
+        written = target.read_bytes()
+    except OSError:
+        return None
+    try:
+        proc = git(worktree, "--literal-pathspecs", "checkout", "--conflict=diff3", "--",
+                   path, check=False)
+        return target.read_bytes() if proc.returncode == 0 else None
+    except OSError:
+        return None
+    finally:
+        target.write_bytes(written)
+
+
 def abort_merge(worktree: Path) -> None:
     """Abandon the merge that ``merge_keep_conflicts`` opened; the worktree is as before."""
     git(worktree, "merge", "--abort", check=False)
