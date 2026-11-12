@@ -1,0 +1,85 @@
+{
+ "instance_id": "dask__dask_2023.6.1_2023.7.0",
+ "validated_at": "2026-11-12T07:03:34+00:00",
+ "task_commit": "8f253c601b2b214c3ac98d1707381aea7ec727dc",
+ "sandbox_image": "aqours-sweevo:dask__dask_2023.6.1_2023.7.0",
+ "sandbox_env": {
+  "PATH": "/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "CONDA_PREFIX": "/opt/miniconda3/envs/testbed",
+  "CONDA_DEFAULT_ENV": "testbed",
+  "PYTHONPATH": "/workspace",
+  "PYTHONDONTWRITEBYTECODE": "1",
+  "PIP_NO_INDEX": "1",
+  "MPLCONFIGDIR": "/tmp/matplotlib",
+  "XDG_CACHE_HOME": "/tmp/cache",
+  "XDG_CONFIG_HOME": "/tmp/config"
+ },
+ "command": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning --timeout=300 --continue-on-collection-errors -n0 -rA  --color=no dask/dataframe/io/tests/test_io.py dask/dataframe/tests/test_dataframe.py dask/tests/test_cli.py",
+ "f2p_listed": 5,
+ "p2p_listed": 707,
+ "excluded": 0,
+ "excluded_gold_fail": {
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": []
+ },
+ "excluded_gold_status": {},
+ "excluded_f2p_pass_on_base": [],
+ "base": {
+  "f2p": {
+   "total": 5,
+   "passed": 0,
+   "failed": 5,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 0.0
+  },
+  "p2p": {
+   "total": 707,
+   "passed": 707,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "all_f2p_fail": true,
+  "p2p_failing": [],
+  "test_run_s": 73.172,
+  "grading_s": 78.844
+ },
+ "gold": {
+  "f2p": {
+   "total": 5,
+   "passed": 5,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "p2p": {
+   "total": 707,
+   "passed": 707,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "resolved": true,
+  "fix_rate": 1.0,
+  "test_run_s": 74.937,
+  "grading_s": 80.828
+ },
+ "images": {
+  "instance_image": "xingyaoww/sweb.eval.x86_64.dask_s_dask-10380",
+  "instance_image_bytes": 8613691026,
+  "task_image": "aqours-sweevo:dask__dask_2023.6.1_2023.7.0",
+  "task_image_bytes": 8617047448
+ }
+}

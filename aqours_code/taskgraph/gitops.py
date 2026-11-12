@@ -1,6 +1,7 @@
 """Git operations for running a graph. This is the only module that calls git."""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -160,6 +161,102 @@ def text_files_have_crlf(repo: Path, commit: str) -> bool:
 def diff_patch(cwd: Path, start: str, end: str = "HEAD") -> str:
     """Return the patch between ``start`` and ``end``."""
     return git(cwd, "diff", "--binary", start, end).stdout
+
+
+def _git_env(cwd: Path, *args: str, env: dict[str, str], stdin: bytes | None = None
+             ) -> subprocess.CompletedProcess[bytes]:
+    """Run ``git`` in ``cwd`` with extra environment variables; raise on failure."""
+    try:
+        proc = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                              input=stdin, env={**os.environ, **env}, check=False)
+    except OSError as exc:
+        raise GitError(f"cannot run git: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip()
+        raise GitError(f"git {' '.join(args)} failed in {cwd}: "
+                       f"{detail or f'exit code {proc.returncode}'}")
+    return proc
+
+
+def export_commit(repo: Path, commit: str, dest: Path) -> None:
+    """Write the files of ``commit`` to the new directory ``dest``, without ``.git``.
+
+    It goes through a temporary index, so the repository's own index and
+    working tree are not touched, and writes the files as committed: no
+    line-ending conversion and, unlike ``git archive``, no ``export-subst``.
+    """
+    dest = Path(dest).resolve()
+    dest.mkdir(parents=True)
+    index = dest.parent / f".{dest.name}.index"
+    env = {"GIT_INDEX_FILE": str(index)}
+    try:
+        _git_env(repo, "read-tree", f"{commit}^{{tree}}", env=env)
+        _git_env(repo, "-c", "core.autocrlf=false", "checkout-index", "--all", "--force",
+                 f"--prefix={dest.as_posix()}/", env=env)
+    finally:
+        index.unlink(missing_ok=True)
+
+
+def make_git_view(worktree: Path, view: Path) -> str:
+    """A repository at ``view`` through which a container can see ``worktree``'s HEAD.
+
+    A worktree's ``.git`` file names a host path, so git fails in a
+    container that mounts only the worktree. The view is a separate
+    repository (not bare, no work tree of its own) with one commit, the
+    worktree's ``HEAD`` fetched with ``--depth 1``, and an index of that
+    commit: mounted in place of the worktree's ``.git``, git there shows the
+    worktree's changes against its start, and nothing else of the run.
+    Returns that commit.
+    """
+    worktree, view = Path(worktree).resolve(), Path(view).resolve()
+    commit = head(worktree)
+    git(worktree, "init", "-q", "--bare", str(view))
+    in_view = (f"--git-dir={view}",)
+    git(worktree, *in_view, "config", "core.bare", "false")
+    git(worktree, *in_view, "config", "core.autocrlf", "false")
+    git(worktree, *in_view, "fetch", "-q", "--depth", "1", "--no-tags", str(worktree), commit)
+    git(worktree, *in_view, "update-ref", "--no-deref", "HEAD", commit)
+    git(worktree, *in_view, f"--work-tree={worktree}", "read-tree", commit)
+    return commit
+
+
+def attach_repository(directory: Path, source: Path) -> None:
+    """Make ``directory`` a repository at ``source``'s ``HEAD``, its files uncommitted.
+
+    The history of ``source`` is cloned into ``directory/.git`` (no remote)
+    and the index is reset to ``HEAD``; the files already in ``directory``
+    are left as they are, so they show as changes against that commit, the
+    way SWE-bench's ``/testbed`` holds a patched base.
+    """
+    directory = Path(directory).resolve()
+    clone = directory.parent / f".{directory.name}.clone"
+    shutil.rmtree(clone, ignore_errors=True)
+    git(directory.parent, "clone", "-q", "--no-checkout", "--no-hardlinks",
+        "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false",
+        str(Path(source).resolve()), clone.name)
+    try:
+        shutil.move(str(clone / ".git"), str(directory / ".git"))
+    finally:
+        shutil.rmtree(clone, ignore_errors=True)
+    git(directory, "remote", "remove", "origin")
+    git(directory, "config", "user.name", USER_NAME)
+    git(directory, "config", "user.email", USER_EMAIL)
+    git(directory, "reset", "-q")
+
+
+def apply_patch(directory: Path, patch: str) -> None:
+    """Apply a git diff to the files in ``directory``, which is not a repository.
+
+    git does not look for a repository above ``directory``, so a patch can
+    never reach the files of an enclosing checkout.
+    """
+    directory = Path(directory).resolve()
+    if not patch.strip():
+        return
+    data = patch if patch.endswith("\n") else patch + "\n"
+    _git_env(directory, "-c", "core.autocrlf=false", "apply", "--whitespace=nowarn", "-",
+             env={"GIT_CEILING_DIRECTORIES": str(directory.parent)},
+             stdin=data.encode("utf-8"))
 
 
 def squash_merge(repo: Path, branch: str, message: str) -> str | None:

@@ -200,10 +200,11 @@ python -m aqours_code.taskgraph audit <runs_dir | run_dir> [...]
 python -m aqours_code.taskgraph rescore <run_dir> --hidden-tests <dir> [--sandbox docker|none]
 python -m aqours_code.taskgraph team <request.md> --repo <path> [...]
 python -m aqours_code.taskgraph score <manifest.json> [--exclude <tests.txt>] [--out <dir>]
+python -m aqours_code.taskgraph sweevo-eval <run_dir> --task <task_dir> [--exclude <tests.txt>] [--timeout 3600]
 python -m aqours_code.taskgraph resynth <graph.json | graph.json.report.json> --out <new_graph.json> [--ablate p1,p3] [--final-check <command> ...]
 ```
 
-`plan`, `resynth`, `run`, `audit`, `rescore`, `team` and `score` are described in their own sections below. `compare` prints
+`plan`, `resynth`, `run`, `audit`, `rescore`, `team`, `score` and `sweevo-eval` are described in their own sections below. `compare` prints
 a Markdown table of both graphs' structure: validation (error count, warning
 codes), node counts by kind, files edited by contract nodes, critical path
 (nodes on the longest chain), maximum parallel width (largest layer when
@@ -258,7 +259,7 @@ python -m aqours_code.taskgraph run <graph.json> --repo <path>
     [--worker-timeout 1800]
     [--hidden-tests <dir>]
     [--merge-repairs 1] [--conflict-repairs 1]
-    [--sandbox docker|none] [--sandbox-image aqours-code-eval:py311]
+    [--sandbox docker|none] [--sandbox-image aqours-code-eval:py311 | --sandbox-config <sandbox.json>]
 ```
 
 Check commands and `final_checks` run through `/bin/sh` in the sandbox
@@ -318,8 +319,9 @@ The deleted paths are recorded in the node's `removed_reserved_files` and in a
 `reserved_files_removed` event.
 
 Inside the container git commands fail (the worktree's `.git` file points to
-a host path). Workers must not change repository state anyway; the
-coordinator commits on the host.
+a host path), unless the task's `sandbox.json` asks for a git view (below).
+Workers must not change repository state anyway; the coordinator commits on
+the host.
 
 Every check runs code that a worker wrote, so the checks run in the sandbox
 too (`checks.py`). Each one gets a fresh container like a worker's: the same
@@ -369,8 +371,59 @@ It never falls back to `--sandbox none`. `--sandbox none` runs worker
 commands and all checks on the host and is only for unit tests and
 `--worker command` (which always runs on the host, and so do its checks); it
 prints a warning. `config.json` and `summary.json` record `sandbox` (`docker`
-or `none`), `sandbox_image`, and `checks_sandbox` (where the four checks ran:
-`docker` or `none`). The planner needs no sandbox: it has no `bash`.
+or `none`), `sandbox_image`, `sandbox_env`, `sandbox_nofile`, `sandbox_pids`,
+`sandbox_git_view` (the four below), and `checks_sandbox` (where the four
+checks ran: `docker` or `none`). The planner needs no sandbox: it has no
+`bash`.
+
+#### A task's own image and environment (`--sandbox-config`)
+
+A task whose code needs another image than the eval image gives `run`, `team`
+and `rescore` a `sandbox.json` instead of `--sandbox-image`:
+
+```json
+{"image": "aqours-sweevo:dask__dask_2023.8.0_2023.8.1",
+ "env": {"PATH": "/opt/miniconda3/envs/testbed/bin:/usr/bin:/bin", "PYTHONPATH": "/workspace"},
+ "nofile": 4096, "pids": 4096, "git_view": true}
+```
+
+Every container of the run, a worker's and every check's, starts from
+`image` with each `env` variable set (`docker run --env`; commands run by
+`docker exec /bin/sh -lc` inherit them), with `nofile` as its limit of
+open files instead of 256, and with `pids` as its limit of processes and
+threads instead of 256 (a test suite that starts many threads, such as
+dask's, which sizes its pools from the host's CPUs, cannot start processes
+under 256 and hangs).
+
+With `git_view`, git works in a container on a worktree, for code that runs
+git when it is imported (dvc before 2.0 runs `git rev-parse HEAD` in its own
+directory, and its import fails without a repository). When a container is
+started on a directory whose `.git` is a file (a worker's worktree, a node
+check), the sandbox first builds a **git view** in a temporary directory on
+the host (`gitops.make_git_view`): a separate repository holding only the
+worktree's `HEAD` commit (fetched with `--depth 1`) and an index of it. The
+container gets it read-only at `/aqours/git`, and a file `gitdir:
+/aqours/git` over `/workspace/.git`. In the container, git then sees the
+worktree as a checkout of its start commit: `git status` and `git diff` show
+the worker's changes, nothing else of the run's repository is there, and
+anything that writes to the repository (`git commit`) fails, since the view
+is read-only. The host's `.git` file is not touched, and the view is deleted
+when the container's executor stops. A directory with a real `.git`
+directory (the integration clone `repo/`) needs no view. The image must let
+the sandbox user read a repository it does not own (`git config --system
+--add safe.directory '*'` in the image), since the mounted files belong to
+another user on Docker Desktop.
+
+`env`, `nofile`, `pids` and `git_view` are optional, a `comment` key is ignored, and
+any other key is an error. Everything else stays as above: the worktree at
+`/workspace`, no network, read-only root, non-root user, the same CPU,
+memory and process limits. Without `--sandbox-config`, nothing changes (the
+eval image, no extra variables, 256 open files and processes, no git view).
+`sandbox_env`, `sandbox_nofile`, `sandbox_pids` and `sandbox_git_view` in `config.json` and
+`summary.json` record what the run used, and `rescore` reuses them unless it
+is given its own image or `--sandbox-config`. `--sandbox-config` needs `--sandbox docker` and cannot be
+combined with `--sandbox-image`. The SWE-EVO tasks use this (see
+[`experiments/taskgraph/sweevo/README.md`](../../experiments/taskgraph/sweevo/README.md)).
 
 ### Escape audit
 
@@ -631,8 +684,13 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
   `timed_out`, `duration_s`, or `null`; `parse_error` when pytest left no
   report (the counts are then all 0);
 - `hidden_tests_rescored`: added by `rescore`: the same fields plus `sandbox`,
-  `sandbox_image`, `hidden_tests` (the directory used) and `rescored_at`;
-- `sandbox`, `sandbox_image`, `checks_sandbox`, `escape_attempts_total`,
+  `sandbox_image`, `sandbox_env`, `sandbox_nofile`, `sandbox_pids`,
+  `sandbox_git_view`, `hidden_tests` (the
+  directory used) and `rescored_at`;
+- `sweevo`: added by `sweevo-eval` for a SWE-EVO task (see
+  [Grading a SWE-EVO run](#grading-a-swe-evo-run-sweevo-eval));
+- `sandbox`, `sandbox_image`, `sandbox_env`, `sandbox_nofile`, `sandbox_pids`,
+  `sandbox_git_view`, `checks_sandbox`, `escape_attempts_total`,
   `merge_repairs_total`, `merge_conflicts_total`, `conflicts_resolved_total`,
   `check_timeout_retries_total` (all nodes plus the
   final checks).
@@ -641,7 +699,7 @@ run started), `type`, and `node` where it applies. Types: `run_start`,
 
 ```bash
 python -m aqours_code.taskgraph rescore <run directory> --hidden-tests <dir>
-    [--sandbox docker|none] [--sandbox-image <image>]
+    [--sandbox docker|none] [--sandbox-image <image> | --sandbox-config <sandbox.json>]
 ```
 
 runs the hidden tests again on the `final/` of a finished run, for a run
@@ -657,6 +715,76 @@ The results go to `hidden_tests_rescored.txt` and `.xml` and to a new
 entry and files are never changed; a second `rescore` replaces the first. It
 prints the counts and exits with `0` when pytest produced a report, whatever
 the tests' results, and with `1` when it did not (the output file says why).
+
+### Grading a SWE-EVO run (`sweevo-eval`)
+
+```bash
+python -m aqours_code.taskgraph sweevo-eval <run directory> --task <task directory>
+    [--exclude <tests.txt>] [--timeout 3600] [--keep-scratch]
+```
+
+grades the final code of a finished run (`run` or `team`) of a SWE-EVO
+instance with the instance's own tests (`sweevo.py`). The task directory is
+the one `experiments/taskgraph/sweevo/prepare.py` writes; its `grading/`
+holds the test patch, the `FAIL_TO_PASS` (F2P) and `PASS_TO_PASS` (P2P) test
+ids, the test command and the log parser, and workers never see it.
+
+1. Copy `final/` (without `.git`) to `sweevo_eval/` in the run directory; a
+   run without `final/` (no `--hidden-tests`) has its integration commit
+   exported from `repo/` instead.
+2. Put every file the test patch touches back to its version in the task
+   repository (delete it if the base has none), so that a worker's edit of a
+   test file cannot stop the patch from applying, then apply the test patch
+   (as SWE-bench does). Other test files a worker changed or added stay.
+   Last, `sweevo_eval/` becomes a git repository whose `HEAD` is the task's
+   base commit, with all of this as uncommitted changes, the way SWE-bench's
+   `/testbed` holds a patched base (some dvc tests open the repository in the
+   current directory).
+3. Run the instance's test command with SWE-EVO's additions
+   (`pytest --continue-on-collection-errors -W default::DeprecationWarning
+   -W default::pytest.PytestDeprecationWarning ...`) on the test files of
+   the patch, in a container of the task's `sandbox.json` with `sweevo_eval/`
+   at `/workspace`, under `timeout` like every check. Before it,
+   `git config --global --add safe.directory "*"` (as SWE-EVO's script does
+   for its non-root user: the mounted files belong to another user). When
+   the task's `instance.json` has `test_timeout`, `--timeout=<seconds>`
+   (pytest-timeout) is added, so that a test that hangs in the sandbox
+   fails alone instead of stopping the whole command at `--timeout`
+   (default 3600 s).
+4. Read each test's status from pytest's `-rA` summary with the instance's
+   log parser, SWE-EVO's `parse_log_pytest` or `parse_log_pytest_pydantic`
+   reimplemented (an id is the first word after the status, so ids match
+   the dataset's).
+
+A test passes with `PASSED` or `XFAIL`, fails with `FAILED`, `ERROR` or no
+line in the log, and counts neither way when `SKIPPED` (SWE-bench's rules).
+The tests in `<task>/sandbox_skips.txt` (or `--exclude`: one id per line,
+`#` comments) are left out of every count. It reports:
+
+- F2P and P2P: passed / total (total: listed less excluded), with failed,
+  errors, missing and skipped;
+- `resolved`: every counted F2P and P2P test passes;
+- `fix_rate`, SWE-EVO's Fix Rate: the F2P pass rate if no P2P test fails,
+  else 0;
+- `q`: F2P pass rate × P2P pass rate (a list with no counted test has the
+  rate 1), the same form as Q of the other tasks.
+
+It writes `sweevo_tests.txt` (the command and its output),
+`sweevo_results.json` (every listed test's status: `PASSED`, `FAILED`,
+`ERROR`, `SKIPPED`, `XFAIL`, `MISSING` or `EXCLUDED`) and the `sweevo` entry
+of `summary.json` (the counts above, `ok`, `error`, `exit_code`,
+`timed_out`, `duration_s` of the test command, `total_duration_s` of the
+whole grading, `code` (`final` or `integration_commit`), the image and its
+environment, `evaluated_at`), and deletes `sweevo_eval/` unless
+`--keep-scratch`. A second evaluation replaces the first; like `rescore`, it
+adds nothing to the run's T. `ok` is false when the tests timed out or the
+sandbox failed; a test run that fails (the code does not even import) is a
+result, with Q = 0.
+
+Exit codes: `0` with a result, `1` when the tests gave none (`ok` false),
+`2` for a missing run or task directory, an unreadable `summary.json`, a
+test patch that does not apply, or Docker or the image missing (nothing is
+run then).
 
 ### Smoke test on the toy repository
 
@@ -1460,7 +1588,7 @@ tests. The only variable is the structure.
 python -m aqours_code.taskgraph team <request.md> --repo <path> [--out runs] [--workers 4]
     [--max-attempts 2] [--worker-timeout 1800] [--lead-timeout 1800]
     [--final-check "python -m pytest -q tests"] [--hidden-tests <dir>]
-    [--sandbox docker|none] [--sandbox-image aqours-code-eval:py311]
+    [--sandbox docker|none] [--sandbox-image aqours-code-eval:py311 | --sandbox-config <sandbox.json>]
 ```
 
 The options mean what they mean for `run` and `plan`; `--final-check` can be
@@ -1601,11 +1729,25 @@ A run is **invalid** and left out, but listed, when it ran with
 `--sandbox none` and has escape attempts, when it has no readable hidden
 test results, or when its T is not positive.
 
+**SWE-EVO runs.** A run whose `summary.json` has the `sweevo` entry of
+`sweevo-eval` is scored from that entry, not from hidden tests: the
+functional tests are the instance's F2P tests and the regression tests its
+P2P tests, so Q = F2P pass rate × P2P pass rate, with the instance's
+excluded tests already left out (a test missing from the log counts as
+failed). `--exclude` does not apply to them: test ids differ by instance,
+so each task has its own list in its `sandbox_skips.txt`. A run whose entry
+has `ok` false is invalid. The report adds a `SWE-EVO` table after the
+first one: per task and method, F2P and P2P passed / total (the mean over
+the runs), the excluded tests, the runs resolved, the mean fix rate, and Q,
+T, C and S as in the first table; `score.json` has the same under `sweevo`
+of each task and method and of each run.
+
 The output (printed, and with `--out` also written to `score.md` and
 `score.json`):
 
 1. by task: one row per task and method: runs, functional and regression
-   pass rate, Q, T, input and output tokens, C, S;
+   pass rate, Q, T, input and output tokens, C, S; with SWE-EVO runs, the
+   SWE-EVO table follows;
 2. by method: the number of tasks, mean Q, mean S, and the tasks on which it
    has the highest S;
 3. the oracle: the mean S when each task takes its best method;

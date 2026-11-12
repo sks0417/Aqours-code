@@ -1,0 +1,13 @@
+# Tests of pydantic__pydantic_v2.7.0_v2.7.1 left out of every method's score.
+#
+# Made by validate_gold.py, which grades the base commit and the base commit
+# plus the gold patch in the task image, with the release's test patch applied,
+# exactly as sweevo-eval grades a run. One test id per line (as in the dataset),
+# matched exactly; '#' starts a comment.
+
+# Listed tests that do not pass with the gold patch in our sandbox, by their
+# status with the gold patch (MISSING: not in the test log at all).
+# (none)
+
+# FAIL_TO_PASS tests that already pass on the base commit in our sandbox:
+# (none)

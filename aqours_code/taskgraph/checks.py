@@ -80,6 +80,10 @@ class HostChecks:
 
     kind = "none"
     image = None
+    env = ()
+    nofile = None
+    pids = None
+    git_view = False
     # The interpreter for commands the Coordinator builds itself (hidden tests).
     python = sys.executable
 
@@ -107,8 +111,15 @@ class SandboxChecks:
     python = "python"
 
     def __init__(self, image: str = DEFAULT_IMAGE, *, executor_factory=docker_executor,
-                 remove=remove_containers):
+                 remove=remove_containers, env=(), nofile: int | None = None,
+                 pids: int | None = None, git_view: bool = False):
         self.image = image
+        # The task's container options: environment variables as (name, value)
+        # pairs, and the limits of open files and processes (None: the default).
+        self.env = tuple(env.items() if isinstance(env, dict) else env)
+        self.nofile = nofile
+        self.pids = pids
+        self.git_view = git_view  # a worktree's git is seen through a view
         self._factory = executor_factory
         self._remove = remove
 
@@ -134,7 +145,15 @@ class SandboxChecks:
             started = time.monotonic()
             try:
                 if executor is None:
-                    executor = self._factory(cwd, self.image, name, command_timeout=timeout)
+                    extra = {"env": self.env} if self.env else {}
+                    if self.nofile is not None:
+                        extra["nofile"] = self.nofile
+                    if self.pids is not None:
+                        extra["pids"] = self.pids
+                    if self.git_view:
+                        extra["git_view"] = True
+                    executor = self._factory(cwd, self.image, name, command_timeout=timeout,
+                                             **extra)
                     executor.start()
                 result = executor.execute(with_sandbox_timeout(line, inner), cwd, timeout)
             except Exception as exc:  # noqa: BLE001 - reported as a failed check
@@ -170,7 +189,8 @@ Checks = HostChecks | SandboxChecks
 def checks_for(sandbox: SandboxConfig) -> Checks:
     """The checks that go with a worker sandbox: Docker with Docker, host with none."""
     if sandbox.kind == "docker":
-        return SandboxChecks(sandbox.image)
+        return SandboxChecks(sandbox.image, env=sandbox.env, nofile=sandbox.nofile,
+                             pids=sandbox.pids, git_view=sandbox.git_view)
     return HostChecks()
 
 
@@ -308,6 +328,8 @@ def rescore(run_dir: Path, tests_dir: Path, checks: Checks) -> dict:
         except Exception as exc:  # noqa: BLE001 - the results are still worth writing
             cleanup_error = f"{type(exc).__name__}: {exc}"
     stats.update({"sandbox": checks.kind, "sandbox_image": checks.image,
+                  "sandbox_env": dict(checks.env), "sandbox_nofile": checks.nofile,
+                  "sandbox_pids": checks.pids, "sandbox_git_view": checks.git_view,
                   "hidden_tests": str(tests_dir),
                   "rescored_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
     if cleanup_error:

@@ -1,0 +1,85 @@
+{
+ "instance_id": "iterative__dvc_2.19.0_2.20.0",
+ "validated_at": "2026-11-12T07:04:23+00:00",
+ "task_commit": "e7e7746bb71e5ef35fcacf168c6d7b29bd2c25f3",
+ "sandbox_image": "aqours-sweevo:iterative__dvc_2.19.0_2.20.0",
+ "sandbox_env": {
+  "PATH": "/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "CONDA_PREFIX": "/opt/miniconda3/envs/testbed",
+  "CONDA_DEFAULT_ENV": "testbed",
+  "PYTHONPATH": "/workspace",
+  "PYTHONDONTWRITEBYTECODE": "1",
+  "PIP_NO_INDEX": "1",
+  "MPLCONFIGDIR": "/tmp/matplotlib",
+  "XDG_CACHE_HOME": "/tmp/cache",
+  "XDG_CONFIG_HOME": "/tmp/config"
+ },
+ "command": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning --timeout=300 --continue-on-collection-errors -rA tests/func/test_data_cloud.py tests/func/test_import_url.py tests/func/test_update.py tests/unit/command/test_imp.py tests/unit/command/test_imp_url.py tests/unit/command/test_update.py tests/unit/output/test_output.py",
+ "f2p_listed": 14,
+ "p2p_listed": 66,
+ "excluded": 0,
+ "excluded_gold_fail": {
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": []
+ },
+ "excluded_gold_status": {},
+ "excluded_f2p_pass_on_base": [],
+ "base": {
+  "f2p": {
+   "total": 14,
+   "passed": 0,
+   "failed": 14,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 0.0
+  },
+  "p2p": {
+   "total": 66,
+   "passed": 66,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "all_f2p_fail": true,
+  "p2p_failing": [],
+  "test_run_s": 21.578,
+  "grading_s": 28.406
+ },
+ "gold": {
+  "f2p": {
+   "total": 14,
+   "passed": 14,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "p2p": {
+   "total": 66,
+   "passed": 66,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "resolved": true,
+  "fix_rate": 1.0,
+  "test_run_s": 21.265,
+  "grading_s": 26.219
+ },
+ "images": {
+  "instance_image": "xingyaoww/sweb.eval.x86_64.iterative_s_dvc-8024",
+  "instance_image_bytes": 4850192226,
+  "task_image": "aqours-sweevo:iterative__dvc_2.19.0_2.20.0",
+  "task_image_bytes": 4853544054
+ }
+}

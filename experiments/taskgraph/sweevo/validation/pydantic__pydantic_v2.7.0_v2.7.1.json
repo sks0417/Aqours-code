@@ -1,0 +1,85 @@
+{
+ "instance_id": "pydantic__pydantic_v2.7.0_v2.7.1",
+ "validated_at": "2026-11-12T07:03:34+00:00",
+ "task_commit": "c267477bfe922b571d0a7d5a09d37aee59597531",
+ "sandbox_image": "aqours-sweevo:pydantic__pydantic_v2.7.0_v2.7.1",
+ "sandbox_env": {
+  "PATH": "/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "CONDA_PREFIX": "/opt/miniconda3/envs/testbed",
+  "CONDA_DEFAULT_ENV": "testbed",
+  "PYTHONPATH": "/workspace",
+  "PYTHONDONTWRITEBYTECODE": "1",
+  "PIP_NO_INDEX": "1",
+  "MPLCONFIGDIR": "/tmp/matplotlib",
+  "XDG_CACHE_HOME": "/tmp/cache",
+  "XDG_CONFIG_HOME": "/tmp/config"
+ },
+ "command": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning --continue-on-collection-errors -rA --tb=short -vv -o console_output_style=classic --no-header tests/test_construction.py tests/test_discriminated_union.py tests/test_json_schema.py tests/test_main.py tests/test_networks.py tests/test_root_model.py tests/test_types.py",
+ "f2p_listed": 234,
+ "p2p_listed": 1477,
+ "excluded": 0,
+ "excluded_gold_fail": {
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": []
+ },
+ "excluded_gold_status": {},
+ "excluded_f2p_pass_on_base": [],
+ "base": {
+  "f2p": {
+   "total": 234,
+   "passed": 0,
+   "failed": 8,
+   "errors": 0,
+   "missing": 226,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 0.0
+  },
+  "p2p": {
+   "total": 1477,
+   "passed": 1477,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "all_f2p_fail": true,
+  "p2p_failing": [],
+  "test_run_s": 18.047,
+  "grading_s": 24.031
+ },
+ "gold": {
+  "f2p": {
+   "total": 234,
+   "passed": 234,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "p2p": {
+   "total": 1477,
+   "passed": 1477,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "resolved": true,
+  "fix_rate": 1.0,
+  "test_run_s": 18.39,
+  "grading_s": 23.859
+ },
+ "images": {
+  "instance_image": "xingyaoww/sweb.eval.x86_64.pydantic_s_pydantic-9214",
+  "instance_image_bytes": 4899901378,
+  "task_image": "aqours-sweevo:pydantic__pydantic_v2.7.0_v2.7.1",
+  "task_image_bytes": 4903253211
+ }
+}

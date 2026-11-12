@@ -1,0 +1,85 @@
+{
+ "instance_id": "iterative__dvc_1.1.7_1.1.8",
+ "validated_at": "2026-11-12T07:11:53+00:00",
+ "task_commit": "d6ebb168547b9b79ea872ed7f13ab8867737ee33",
+ "sandbox_image": "aqours-sweevo:iterative__dvc_1.1.7_1.1.8",
+ "sandbox_env": {
+  "PATH": "/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "CONDA_PREFIX": "/opt/miniconda3/envs/testbed",
+  "CONDA_DEFAULT_ENV": "testbed",
+  "PYTHONPATH": "/workspace",
+  "PYTHONDONTWRITEBYTECODE": "1",
+  "PIP_NO_INDEX": "1",
+  "MPLCONFIGDIR": "/tmp/matplotlib",
+  "XDG_CACHE_HOME": "/tmp/cache",
+  "XDG_CONFIG_HOME": "/tmp/config"
+ },
+ "command": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning --timeout=300 --continue-on-collection-errors -rA tests/func/test_ignore.py tests/func/test_run_multistage.py tests/remotes/__init__.py tests/remotes/azure.py tests/remotes/oss.py tests/unit/dependency/test_params.py tests/unit/remote/test_azure.py tests/unit/test_ignore.py",
+ "f2p_listed": 8,
+ "p2p_listed": 82,
+ "excluded": 0,
+ "excluded_gold_fail": {
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": []
+ },
+ "excluded_gold_status": {},
+ "excluded_f2p_pass_on_base": [],
+ "base": {
+  "f2p": {
+   "total": 8,
+   "passed": 0,
+   "failed": 8,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 0.0
+  },
+  "p2p": {
+   "total": 82,
+   "passed": 82,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "all_f2p_fail": true,
+  "p2p_failing": [],
+  "test_run_s": 15.609,
+  "grading_s": 21.344
+ },
+ "gold": {
+  "f2p": {
+   "total": 8,
+   "passed": 8,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "p2p": {
+   "total": 82,
+   "passed": 82,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "resolved": true,
+  "fix_rate": 1.0,
+  "test_run_s": 13.047,
+  "grading_s": 17.14
+ },
+ "images": {
+  "instance_image": "xingyaoww/sweb.eval.x86_64.iterative_s_dvc-4166",
+  "instance_image_bytes": 4769268816,
+  "task_image": "aqours-sweevo:iterative__dvc_1.1.7_1.1.8",
+  "task_image_bytes": 4772620644
+ }
+}

@@ -397,3 +397,74 @@ def test_score_md_states_what_t_is_and_lists_every_run(manifest, tmp_path):
     assert "| b-team | B | team | 1 | 0 | 0 | 1 | invalid | - |" in text
     assert "| a-graph-1 | A | graph | 30 | 0 | 20 | 50 |" in text
     text.encode("cp1252")  # score prints it; a Windows console may not take UTF-8
+
+
+def sweevo_run(root: Path, name: str, *, f2p: tuple, p2p: tuple, wall: float, tokens: tuple,
+               ok: bool = True, excluded: int = 0) -> Path:
+    """A run graded by ``sweevo-eval``: ``f2p``/``p2p`` = (passed, failed, missing, total)."""
+    def counts(passed, failed, missing, total):
+        counted = passed + failed + missing
+        return {"total": total, "passed": passed, "failed": failed, "errors": 0,
+                "missing": missing, "skipped": total - counted, "excluded": 1,
+                "rate": passed / counted if counted else 1.0}
+
+    f2p_counts, p2p_counts = counts(*f2p), counts(*p2p)
+    resolved = f2p_counts["rate"] == 1.0 and p2p_counts["rate"] == 1.0
+    run = make_run(root, name, None, wall=wall, tokens=tokens)
+    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    summary["sweevo"] = {
+        "ok": ok, "error": "" if ok else "the tests timed out after 1800 s",
+        "f2p": f2p_counts, "p2p": p2p_counts, "resolved": resolved,
+        "fix_rate": f2p_counts["rate"] if p2p_counts["rate"] == 1.0 else 0.0,
+        "q": f2p_counts["rate"] * p2p_counts["rate"], "excluded_tests": excluded}
+    (run / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    return run
+
+
+def test_sweevo_runs_score_f2p_times_p2p(tmp_path):
+    sweevo_run(tmp_path, "s-single", f2p=(2, 2, 0, 4), p2p=(9, 1, 0, 10), wall=100,
+               tokens=(1000, 100), excluded=3)
+    sweevo_run(tmp_path, "s-graph", f2p=(4, 0, 0, 4), p2p=(10, 0, 0, 10), wall=50,
+               tokens=(1000, 100), excluded=3)
+    sweevo_run(tmp_path, "s-team", f2p=(3, 0, 1, 4), p2p=(10, 0, 0, 10), wall=100,
+               tokens=(1000, 100), excluded=3)
+    sweevo_run(tmp_path, "s-broken", f2p=(0, 0, 0, 4), p2p=(0, 0, 0, 10), wall=100,
+               tokens=(1000, 100), ok=False)
+    # a hidden-tests file left over in a SWE-EVO run is not used
+    (tmp_path / "runs" / "s-graph" / "hidden_tests.xml").write_text(
+        junit(cases(FUNCTIONAL, failed=5)), encoding="utf-8")
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps([
+        {"task": "evo", "method": "single", "run": "runs/s-single"},
+        {"task": "evo", "method": "graph", "run": "runs/s-graph"},
+        {"task": "evo", "method": "team", "run": "runs/s-team"},
+        {"task": "evo", "method": "team", "run": "runs/s-broken"},
+    ]), encoding="utf-8")
+    result = score_manifest(load_manifest(path))
+    evo = result["tasks"]["evo"]
+    assert evo["single"]["q"]["mean"] == pytest.approx(0.5 * 0.9)
+    assert evo["single"]["functional_rate"]["mean"] == 0.5  # functional = F2P
+    assert evo["single"]["regression_rate"]["mean"] == 0.9  # regression = P2P
+    assert evo["graph"]["q"]["mean"] == 1.0
+    assert evo["graph"]["s"] == pytest.approx(1.0 * sqrt(100 / 50))
+    assert evo["team"]["runs"] == 1 and evo["team"]["q"]["mean"] == 0.75  # missing = failed
+    assert evo["single"]["sweevo"]["resolved"] == 0 and evo["graph"]["sweevo"]["resolved"] == 1
+    assert evo["single"]["sweevo"]["fix_rate"]["mean"] == 0.0  # a P2P test fails
+    assert evo["team"]["sweevo"]["fix_rate"]["mean"] == 0.75
+    assert evo["single"]["sweevo"]["f2p_total"] == 4 and evo["single"]["sweevo"]["excluded"] == 3
+    run = next(run for run in result["runs"] if run["run_id"] == "s-graph")
+    assert run["results_file"] == "sweevo_results.json" and run["functional"]["failed"] == 0
+    assert result["invalid_runs"] == [{
+        "task": "evo", "method": "team", "run": str(tmp_path / "runs" / "s-broken"),
+        "invalid_reason": "the SWE-EVO tests gave no result: the tests timed out after 1800 s"}]
+    text = format_score(result)
+    assert "## SWE-EVO" in text
+    assert ("| evo | single | 1 | 2 / 4 | 9 / 10 | 3 | 0 of 1 | 0.000 | 0.450 | 100 | 1,400 | "
+            "0.450 |") in text
+    assert "| evo | graph | 1 | 4 / 4 | 10 / 10 | 3 | 1 of 1 | 1.000 | 1.000 | 50 |" in text
+    assert text.index("## SWE-EVO") < text.index("## By method")
+    text.encode("cp1252")
+
+
+def test_score_without_sweevo_runs_has_no_sweevo_section(manifest):
+    assert "## SWE-EVO" not in format_score(score_manifest(load_manifest(manifest)))

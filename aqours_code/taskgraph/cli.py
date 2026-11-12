@@ -114,10 +114,29 @@ def _banner(lines: list[str]) -> str:
     return "\n".join([rule, *(f"! {line.ljust(width)} !" for line in lines), rule])
 
 
+def _sandbox(args: argparse.Namespace):
+    """The sandbox of ``--sandbox``, ``--sandbox-image`` and ``--sandbox-config``.
+
+    Returns a ``SandboxConfig``, or an error message.
+    """
+    from .sandbox import DEFAULT_IMAGE, SandboxConfig, load_sandbox_config
+
+    if args.sandbox_config:
+        if args.sandbox != "docker":
+            return "--sandbox-config needs --sandbox docker"
+        if args.sandbox_image:
+            return "give the image in --sandbox-config or --sandbox-image, not both"
+        try:
+            return load_sandbox_config(Path(args.sandbox_config))
+        except (OSError, ValueError) as exc:
+            return f"cannot read sandbox config {args.sandbox_config}: {exc}"
+    return SandboxConfig(kind=args.sandbox, image=args.sandbox_image or DEFAULT_IMAGE)
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     from .coordinator import GraphInvalid, RunOptions, run_graph
     from .gitops import GitError
-    from .sandbox import SandboxConfig, SandboxUnavailable
+    from .sandbox import SandboxUnavailable
     from .workers import AqoursWorker, CommandWorker
 
     graph = _load(args.graph)
@@ -138,8 +157,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return _error(f"cannot read command map {args.command_map}: {exc}")
         worker = CommandWorker(commands)  # runs on the host whatever --sandbox says
     else:
-        worker = AqoursWorker(sandbox=SandboxConfig(kind=args.sandbox,
-                                                    image=args.sandbox_image))
+        sandbox = _sandbox(args)
+        if isinstance(sandbox, str):
+            return _error(sandbox)
+        worker = AqoursWorker(sandbox=sandbox)
     if worker.sandbox.kind == "none":
         print(NO_SANDBOX_WARNING, file=sys.stderr)
     hidden = Path(args.hidden_tests) if args.hidden_tests else None
@@ -208,7 +229,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _cmd_team(args: argparse.Namespace) -> int:
     from . import planner
     from .gitops import GitError
-    from .sandbox import SandboxConfig, SandboxUnavailable
+    from .sandbox import SandboxUnavailable
     from .team import TeamOptions, run_team
     from .workers import AqoursWorker
 
@@ -224,7 +245,10 @@ def _cmd_team(args: argparse.Namespace) -> int:
     hidden = Path(args.hidden_tests) if args.hidden_tests else None
     if hidden is not None and not hidden.is_dir():
         return _error(f"hidden tests directory not found: {hidden}")
-    worker = AqoursWorker(sandbox=SandboxConfig(kind=args.sandbox, image=args.sandbox_image))
+    sandbox = _sandbox(args)
+    if isinstance(sandbox, str):
+        return _error(sandbox)
+    worker = AqoursWorker(sandbox=sandbox)
     if worker.sandbox.kind == "none":
         print(NO_SANDBOX_WARNING, file=sys.stderr)
     options = TeamOptions(request_path=request_path, repo=Path(args.repo),
@@ -304,20 +328,42 @@ def _where(checks_sandbox: str) -> str:
 def _cmd_rescore(args: argparse.Namespace) -> int:
     from .checks import checks_for, rescore
     from .sandbox import DEFAULT_IMAGE, SandboxConfig, SandboxUnavailable, check_docker
+    from .sandbox import load_sandbox_config
 
     run_dir, tests_dir = Path(args.run_dir), Path(args.hidden_tests)
     if not run_dir.is_dir():
         return _error(f"run directory not found: {run_dir}")
     if not tests_dir.is_dir():
         return _error(f"hidden tests directory not found: {tests_dir}")
-    image = args.sandbox_image
-    if image is None:  # the image the run itself used, if it used one
+    image, env, nofile, pids, git_view = args.sandbox_image, {}, None, None, False
+    if args.sandbox_config:
+        if args.sandbox_image or args.sandbox != "docker":
+            return _error("--sandbox-config needs --sandbox docker and no --sandbox-image")
+        try:
+            configured = load_sandbox_config(Path(args.sandbox_config))
+        except (OSError, ValueError) as exc:
+            return _error(f"cannot read sandbox config {args.sandbox_config}: {exc}")
+        image, env, nofile = configured.image, configured.env_dict, configured.nofile
+        pids, git_view = configured.pids, configured.git_view
+    elif image is None:  # the image and options the run itself used, if any
         try:
             recorded = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
             image = recorded.get("sandbox_image")
+            env = recorded.get("sandbox_env") or {}
+            nofile = recorded.get("sandbox_nofile")
+            pids = recorded.get("sandbox_pids")
+            git_view = recorded.get("sandbox_git_view") is True
         except (OSError, ValueError, AttributeError):
-            image = None
-    sandbox = SandboxConfig(kind=args.sandbox, image=image or DEFAULT_IMAGE)
+            image, env, nofile, pids, git_view = None, {}, None, None, False
+        if not isinstance(env, dict):
+            env = {}
+        if not isinstance(nofile, int):
+            nofile = None
+        if not isinstance(pids, int):
+            pids = None
+    sandbox = SandboxConfig(kind=args.sandbox, image=image or DEFAULT_IMAGE,
+                            env=tuple(env.items()), nofile=nofile, pids=pids,
+                            git_view=git_view)
     if sandbox.kind == "docker":
         try:
             check_docker(sandbox.image)
@@ -343,6 +389,40 @@ def _cmd_rescore(args: argparse.Namespace) -> int:
         why = "timed out" if stats["timed_out"] else f"exit code {stats['exit_code']}"
         print(f"error: the hidden tests gave no result ({why}); see "
               f"{run_dir / 'hidden_tests_rescored.txt'}", file=sys.stderr)
+        return EXIT_INVALID
+    return EXIT_OK
+
+
+def _cmd_sweevo_eval(args: argparse.Namespace) -> int:
+    from .gitops import GitError
+    from .sandbox import SandboxUnavailable, check_docker
+    from .sweevo import SweevoError, evaluate_run, load_task
+
+    run_dir = Path(args.run_dir)
+    if not run_dir.is_dir():
+        return _error(f"run directory not found: {run_dir}")
+    if args.timeout <= 0:
+        return _error("--timeout must be > 0")
+    try:
+        task = load_task(Path(args.task), Path(args.exclude) if args.exclude else None)
+        check_docker(task.sandbox.image)
+        entry = evaluate_run(run_dir, task, timeout=args.timeout,
+                             keep_scratch=args.keep_scratch)
+    except SandboxUnavailable as exc:
+        return _error(f"{exc} (nothing was run)")
+    except (SweevoError, GitError, OSError) as exc:
+        return _error(str(exc))
+    f2p, p2p = entry["f2p"], entry["p2p"]
+    print(f"{task.instance_id}: F2P {f2p['passed']}/{f2p['total']}  "
+          f"P2P {p2p['passed']}/{p2p['total']}  resolved: {entry['resolved']}  "
+          f"fix rate: {entry['fix_rate']:.3f}  Q: {entry['q']:.3f}")
+    print(f"excluded tests: {entry['excluded_tests']}  tests in the log: "
+          f"{entry['tests_in_log']}  test run: {entry['duration_s']:.1f}s  "
+          f"(evaluation {entry['total_duration_s']:.1f}s, code from {entry['code']})")
+    print(f"wrote {run_dir / 'sweevo_tests.txt'}, {run_dir / 'sweevo_results.json'}, and "
+          f"sweevo in {run_dir / 'summary.json'}")
+    if not entry["ok"]:
+        print(f"error: the SWE-EVO tests gave no result: {entry['error']}", file=sys.stderr)
         return EXIT_INVALID
     return EXIT_OK
 
@@ -592,8 +672,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--sandbox", choices=("docker", "none"), default="docker",
                          help="where worker shell commands, checks and hidden tests run "
                               "(none: on this machine, tests only)")
-    run_cmd.add_argument("--sandbox-image", default="aqours-code-eval:py311",
-                         help="Docker image for --sandbox docker")
+    run_cmd.add_argument("--sandbox-image",
+                         help="Docker image for --sandbox docker "
+                              "(default aqours-code-eval:py311)")
+    run_cmd.add_argument("--sandbox-config",
+                         help="a task's sandbox.json: the image, environment variables, "
+                              "open-files and process limits and git view of every container "
+                              "(instead of --sandbox-image)")
     run_cmd.set_defaults(func=_cmd_run)
 
     team_cmd = commands.add_parser(
@@ -613,8 +698,13 @@ def build_parser() -> argparse.ArgumentParser:
     team_cmd.add_argument("--sandbox", choices=("docker", "none"), default="docker",
                           help="where teammates' shell commands, checks and hidden tests "
                                "run (none: on this machine, tests only)")
-    team_cmd.add_argument("--sandbox-image", default="aqours-code-eval:py311",
-                          help="Docker image for --sandbox docker")
+    team_cmd.add_argument("--sandbox-image",
+                          help="Docker image for --sandbox docker "
+                               "(default aqours-code-eval:py311)")
+    team_cmd.add_argument("--sandbox-config",
+                          help="a task's sandbox.json: the image, environment variables, "
+                               "open-files and process limits and git view of every container "
+                               "(instead of --sandbox-image)")
     team_cmd.set_defaults(func=_cmd_team)
 
     score_cmd = commands.add_parser(
@@ -633,7 +723,23 @@ def build_parser() -> argparse.ArgumentParser:
     rescore_cmd.add_argument("--sandbox-image",
                              help="Docker image (default: the run's own, else "
                                   "aqours-code-eval:py311)")
+    rescore_cmd.add_argument("--sandbox-config",
+                             help="a task's sandbox.json (default: the run's own image "
+                                  "and container options)")
     rescore_cmd.set_defaults(func=_cmd_rescore)
+
+    sweevo_cmd = commands.add_parser(
+        "sweevo-eval", help="grade a run of a SWE-EVO task with the instance's F2P/P2P tests")
+    sweevo_cmd.add_argument("run_dir", help="a finished run directory (final/ or repo/)")
+    sweevo_cmd.add_argument("--task", required=True,
+                            help="the prepared task directory (grading/, sandbox.json)")
+    sweevo_cmd.add_argument("--exclude",
+                            help="test ids to leave out (default <task>/sandbox_skips.txt)")
+    sweevo_cmd.add_argument("--timeout", type=float, default=3600.0,
+                            help="seconds the test command may run (default 3600)")
+    sweevo_cmd.add_argument("--keep-scratch", action="store_true",
+                            help="keep sweevo_eval/, the graded copy of the code")
+    sweevo_cmd.set_defaults(func=_cmd_sweevo_eval)
 
     audit_cmd = commands.add_parser(
         "audit", help="find workers that reached outside their workspace in past runs")

@@ -75,15 +75,21 @@ def command_executor_for(config: dict, deadline: float):
     """The executor for the worker's ``bash`` tool.
 
     ``config["sandbox"]`` of ``{"kind": "docker", "image": ..., "container": ...}``
-    gives a Docker container that sees only ``config["workspace"]``; anything
-    else runs commands on the host (``--sandbox none``).
+    (and optionally ``"env"``, variables set in the container, ``"git_view"``,
+    whether git sees the worktree through a view, and ``"nofile"`` and
+    ``"pids"``, its limits of open files and processes) gives a Docker
+    container that sees only ``config["workspace"]``; anything else runs
+    commands on the host (``--sandbox none``).
     """
     sandbox = config.get("sandbox") or {}
     if sandbox.get("kind") == "docker":
         from .sandbox import docker_executor  # noqa: PLC0415
 
         return docker_executor(config["workspace"], sandbox["image"],
-                               sandbox["container"], deadline=deadline)
+                               sandbox["container"], deadline=deadline,
+                               env=sandbox.get("env") or {},
+                               nofile=sandbox.get("nofile"), pids=sandbox.get("pids"),
+                               git_view=bool(sandbox.get("git_view")))
     from aqours_code.command_executor import LocalCommandExecutor  # noqa: PLC0415
 
     return LocalCommandExecutor()

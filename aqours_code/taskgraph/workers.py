@@ -180,6 +180,8 @@ class AqoursWorker:
         if self.sandbox.kind != "docker":
             return {"kind": "none"}
         return {"kind": "docker", "image": self.sandbox.image,
+                "env": self.sandbox.env_dict, "nofile": self.sandbox.nofile,
+                "pids": self.sandbox.pids, "git_view": self.sandbox.git_view,
                 "container": container_name(request.node_id, request.attempt,
                                             secrets.token_hex(4))}
 

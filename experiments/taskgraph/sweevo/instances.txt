@@ -1,0 +1,12 @@
+# SWE-EVO instances used with the task-graph harness: one instance id per line,
+# then "pilot" for the pilot pair, or "dropped" for an instance left out (the
+# reason follows in a comment and in README.md).
+iterative__dvc_1.1.7_1.1.8
+dask__dask_2023.6.1_2023.7.0
+iterative__dvc_1.6.3_1.6.4
+dask__dask_2023.8.0_2023.8.1 pilot
+iterative__dvc_0.89.0_0.90.0 pilot
+iterative__dvc_3.43.1_3.44.0 dropped  # 20 of its 22 F2P tests fail with the gold patch: the release needs scmrepo 3, which our offline image cannot install
+iterative__dvc_2.19.0_2.20.0
+pydantic__pydantic_v2.7.0_v2.7.1
+dask__dask_2023.6.0_2023.6.1

@@ -1,0 +1,127 @@
+{
+ "instance_id": "iterative__dvc_3.43.1_3.44.0",
+ "validated_at": "2026-11-12T07:05:19+00:00",
+ "task_commit": "50256228cec2f4f6fe19bc1b0c47bdc9d45f72a1",
+ "sandbox_image": "aqours-sweevo:iterative__dvc_3.43.1_3.44.0",
+ "sandbox_env": {
+  "PATH": "/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "CONDA_PREFIX": "/opt/miniconda3/envs/testbed",
+  "CONDA_DEFAULT_ENV": "testbed",
+  "PYTHONPATH": "/workspace",
+  "PYTHONDONTWRITEBYTECODE": "1",
+  "PIP_NO_INDEX": "1",
+  "MPLCONFIGDIR": "/tmp/matplotlib",
+  "XDG_CACHE_HOME": "/tmp/cache",
+  "XDG_CONFIG_HOME": "/tmp/config"
+ },
+ "command": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning --timeout=300 -rA tests/func/test_data_cloud.py tests/func/test_get.py tests/func/test_ls.py tests/func/test_status.py tests/unit/command/test_status.py tests/unit/repo/test_repo.py tests/utils/asserts.py",
+ "f2p_listed": 22,
+ "p2p_listed": 104,
+ "excluded": 20,
+ "excluded_gold_fail": {
+  "FAIL_TO_PASS": [
+   "tests/func/test_data_cloud.py::test_pull_external_dvc_imports",
+   "tests/func/test_data_cloud.py::test_pull_external_dvc_imports_mixed",
+   "tests/func/test_data_cloud.py::test_pull_git_imports[erepo_dir]",
+   "tests/func/test_data_cloud.py::test_pull_git_imports[git_dir]",
+   "tests/func/test_data_cloud.py::test_push_pull_all[all_branches-3]",
+   "tests/func/test_data_cloud.py::test_push_pull_all[all_commits-3]",
+   "tests/func/test_data_cloud.py::test_push_pull_all[all_tags-2]",
+   "tests/func/test_get.py::test_get_from_non_dvc_master",
+   "tests/func/test_get.py::test_get_pipeline_tracked_outs",
+   "tests/func/test_get.py::test_get_repo_rev",
+   "tests/func/test_ls.py::test_ls_remote_git_only_repo_recursive",
+   "tests/func/test_ls.py::test_ls_remote_repo",
+   "tests/func/test_ls.py::test_ls_remote_repo_recursive",
+   "tests/func/test_ls.py::test_ls_remote_repo_with_path_dir",
+   "tests/func/test_ls.py::test_ls_remote_repo_with_rev",
+   "tests/func/test_ls.py::test_ls_remote_repo_with_rev_recursive",
+   "tests/func/test_ls.py::test_ls_repo_with_rev",
+   "tests/func/test_status.py::test_status_before_and_after_dvc_init",
+   "tests/func/test_status.py::test_status_non_dvc_repo_import",
+   "tests/unit/repo/test_repo.py::test_branch_config"
+  ],
+  "PASS_TO_PASS": []
+ },
+ "excluded_gold_status": {
+  "tests/func/test_data_cloud.py::test_pull_external_dvc_imports": "FAILED",
+  "tests/func/test_data_cloud.py::test_pull_external_dvc_imports_mixed": "FAILED",
+  "tests/func/test_data_cloud.py::test_pull_git_imports[erepo_dir]": "FAILED",
+  "tests/func/test_data_cloud.py::test_pull_git_imports[git_dir]": "FAILED",
+  "tests/func/test_data_cloud.py::test_push_pull_all[all_branches-3]": "FAILED",
+  "tests/func/test_data_cloud.py::test_push_pull_all[all_commits-3]": "FAILED",
+  "tests/func/test_data_cloud.py::test_push_pull_all[all_tags-2]": "FAILED",
+  "tests/func/test_get.py::test_get_from_non_dvc_master": "FAILED",
+  "tests/func/test_get.py::test_get_pipeline_tracked_outs": "FAILED",
+  "tests/func/test_get.py::test_get_repo_rev": "FAILED",
+  "tests/func/test_ls.py::test_ls_remote_git_only_repo_recursive": "FAILED",
+  "tests/func/test_ls.py::test_ls_remote_repo": "FAILED",
+  "tests/func/test_ls.py::test_ls_remote_repo_recursive": "FAILED",
+  "tests/func/test_ls.py::test_ls_remote_repo_with_path_dir": "FAILED",
+  "tests/func/test_ls.py::test_ls_remote_repo_with_rev": "FAILED",
+  "tests/func/test_ls.py::test_ls_remote_repo_with_rev_recursive": "FAILED",
+  "tests/func/test_ls.py::test_ls_repo_with_rev": "FAILED",
+  "tests/func/test_status.py::test_status_before_and_after_dvc_init": "FAILED",
+  "tests/func/test_status.py::test_status_non_dvc_repo_import": "MISSING",
+  "tests/unit/repo/test_repo.py::test_branch_config": "FAILED"
+ },
+ "excluded_f2p_pass_on_base": [],
+ "base": {
+  "f2p": {
+   "total": 2,
+   "passed": 0,
+   "failed": 2,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 20,
+   "rate": 0.0
+  },
+  "p2p": {
+   "total": 104,
+   "passed": 104,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "all_f2p_fail": true,
+  "p2p_failing": [],
+  "test_run_s": 25.735,
+  "grading_s": 33.688
+ },
+ "gold": {
+  "f2p": {
+   "total": 2,
+   "passed": 2,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 20,
+   "rate": 1.0
+  },
+  "p2p": {
+   "total": 104,
+   "passed": 104,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 0,
+   "rate": 1.0
+  },
+  "resolved": true,
+  "fix_rate": 1.0,
+  "test_run_s": 26.594,
+  "grading_s": 31.609
+ },
+ "images": {
+  "instance_image": "xingyaoww/sweb.eval.x86_64.iterative_s_dvc-10277",
+  "instance_image_bytes": 4834903420,
+  "task_image": "aqours-sweevo:iterative__dvc_3.43.1_3.44.0",
+  "task_image_bytes": 4838255241
+ }
+}

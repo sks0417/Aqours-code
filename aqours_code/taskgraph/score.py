@@ -9,6 +9,13 @@ not), and ``C`` the input tokens plus four times the output tokens, including
 planning. ``T_single`` and ``C_single`` are the means of the ``single`` runs
 of the same task, so the single agent's ``S`` is its own ``Q``.
 
+For a SWE-EVO task (the run's ``summary.json`` has the ``sweevo`` entry of
+``sweevo-eval``), the functional tests are the instance's FAIL_TO_PASS tests
+and the regression tests its PASS_TO_PASS tests: ``Q`` is the F2P pass rate
+times the P2P pass rate, with the instance's excluded tests left out, and
+the report adds the instance's own measures (F2P and P2P passed / total,
+resolved, SWE-EVO's fix rate).
+
 The evaluation time comes from the run's ``events.jsonl``: the
 ``duration_s`` of ``hidden_tests_end`` and ``escape_audit_end`` events, or,
 for an event without one, the time since the event before it. Every method
@@ -33,6 +40,7 @@ KINDS = ("functional", "regression")
 EVALUATION_EVENTS = ("hidden_tests_end", "escape_audit_end")
 TIME_DEFINITION = ("wall time of the method (planning included, hidden tests and escape "
                    "audit excluded)")
+SWEEVO_KEY, SWEEVO_RESULTS = "sweevo", "sweevo_results.json"
 
 
 class ScoreError(Exception):
@@ -210,6 +218,25 @@ def results_file(run_dir: Path, summary: dict) -> tuple[Path | None, str]:
     return None, f"no hidden test results ({ORIGINAL_RESULTS})"
 
 
+def sweevo_tests(entry: dict) -> dict:
+    """The F2P and P2P counts of a ``sweevo`` entry in the form of ``read_tests``.
+
+    A test missing from the log counts as failed.
+    """
+    counts = {}
+    for kind, key in zip(KINDS, ("f2p", "p2p")):
+        item = entry.get(key) or {}
+        counts[kind] = {
+            "passed": int(item.get("passed") or 0),
+            "failed": int(item.get("failed") or 0) + int(item.get("missing") or 0),
+            "errors": int(item.get("errors") or 0),
+            "skipped": int(item.get("skipped") or 0),
+            "excluded": int(item.get("excluded") or 0),
+            "rate": float(item.get("rate", 1.0)),
+        }
+    return counts
+
+
 def score_run(entry: Entry, exclusions: list[str]) -> dict:
     """Quality, time and cost of one run; ``valid`` is False when it cannot count."""
     summary = _load_json(entry.run / "summary.json", "summary")
@@ -245,6 +272,23 @@ def score_run(entry: Entry, exclusions: list[str]) -> dict:
     escapes = int(summary.get("escape_attempts_total") or 0)
     if summary.get("sandbox") == "none" and escapes > 0:
         return invalid(f"--sandbox none with {escapes} escape attempt(s)")
+    sweevo = summary.get(SWEEVO_KEY)
+    if isinstance(sweevo, dict):
+        if not sweevo.get("ok"):
+            return invalid(f"the SWE-EVO tests gave no result: {sweevo.get('error') or '?'}")
+        if result["time_s"] <= 0 or result["cost"] <= 0:
+            return invalid("summary.json has no time or token counts")
+        tests = sweevo_tests(sweevo)
+        return {**result, "results_file": SWEEVO_RESULTS, **tests, "excluded_matches": {},
+                "q": tests["functional"]["rate"] * tests["regression"]["rate"],
+                "sweevo": {
+                    "f2p_passed": tests["functional"]["passed"],
+                    "f2p_total": int(sweevo["f2p"].get("total") or 0),
+                    "p2p_passed": tests["regression"]["passed"],
+                    "p2p_total": int(sweevo["p2p"].get("total") or 0),
+                    "excluded": int(sweevo.get("excluded_tests") or 0),
+                    "resolved": bool(sweevo.get("resolved")),
+                    "fix_rate": float(sweevo.get("fix_rate") or 0.0)}}
     xml_path, missing = results_file(entry.run, summary)
     if xml_path is None:
         return invalid(missing)
@@ -308,6 +352,15 @@ def score_manifest(entries: list[Entry], exclusions: list[str] | None = None) ->
                                means["cost"]["mean"], base_time, base_cost),
                 "s_runs": _spread([run["s"] for run in group]),
             }
+            graded = [run["sweevo"] for run in group if "sweevo" in run]
+            if graded:
+                detail[task][method]["sweevo"] = {
+                    **{key: _spread([float(item[key]) for item in graded])
+                       for key in ("f2p_passed", "p2p_passed", "fix_rate")},
+                    "f2p_total": graded[0]["f2p_total"], "p2p_total": graded[0]["p2p_total"],
+                    "excluded": graded[0]["excluded"],
+                    "resolved": sum(item["resolved"] for item in graded),
+                    "runs": len(graded)}
     best = {task: max(groups, key=lambda method: groups[method]["s"])
             for task, groups in detail.items()}
     by_method = {}
@@ -368,6 +421,29 @@ def format_score(result: dict) -> str:
                 _cell(group["time_s"], ",.0f", runs), _cell(group["input_tokens"], ",.0f", runs),
                 _cell(group["output_tokens"], ",.0f", runs), _cell(group["cost"], ",.0f", runs),
                 s_text]) + " |")
+    sweevo_rows = [(task, method, group) for task, groups in result["tasks"].items()
+                   for method, group in groups.items() if "sweevo" in group]
+    if sweevo_rows:
+        lines += ["", "## SWE-EVO", "", "For SWE-EVO tasks the functional tests are the "
+                  "FAIL_TO_PASS (F2P) tests and the regression tests the PASS_TO_PASS (P2P) "
+                  "tests, so Q = F2P pass rate × P2P pass rate; the instance's excluded tests "
+                  "are left out of both. Resolved: runs in which every F2P and P2P test "
+                  "passes. Fix rate (SWE-EVO's): the F2P pass rate if no P2P test fails, "
+                  "else 0.", "",
+                  "| Task | Method | Runs | F2P passed / total | P2P passed / total | Excluded | "
+                  "Resolved | Fix rate | Q | T (s) | C | S |", "|" + " --- |" * 12]
+        for task, method, group in sweevo_rows:
+            sweevo, runs = group["sweevo"], group["runs"]
+            lines.append("| " + " | ".join([
+                task, method, str(runs),
+                f"{_cell(sweevo['f2p_passed'], '.1f' if runs > 1 else '.0f', runs)} / "
+                f"{sweevo['f2p_total']}",
+                f"{_cell(sweevo['p2p_passed'], '.1f' if runs > 1 else '.0f', runs)} / "
+                f"{sweevo['p2p_total']}",
+                str(sweevo["excluded"]), f"{sweevo['resolved']} of {sweevo['runs']}",
+                _cell(sweevo["fix_rate"], ".3f", runs), _cell(group["q"], ".3f", runs),
+                _cell(group["time_s"], ",.0f", runs), _cell(group["cost"], ",.0f", runs),
+                format(group["s"], ".3f")]) + " |")
     lines += ["", "## By method", "", "| Method | Tasks | Mean Q | Mean S | Best S on |",
               "| --- | --- | --- | --- | --- |"]
     for method, row in result["methods"].items():
