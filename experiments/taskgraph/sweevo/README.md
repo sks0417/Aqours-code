@@ -17,9 +17,11 @@ README.md            this file
 instances.txt        the nine instance ids; "pilot" marks the pilot pair, "dropped" one left out
 prepare.py           writes the task directories and builds the task images
 validate_gold.py     grades the base and the gold patch; writes the exclusion lists
+validate_interface.py   checks the interface sections (size, test imports, no body or test text)
 instances/<id>/sandbox_skips.txt   tests left out of every method's score
 validation/<id>.json               validation counts, times and image sizes
 validation/README.md               the validation table
+validation/interface.md            the interface table (and interface.json)
 ```
 
 | Instance | F2P | P2P |
@@ -48,8 +50,10 @@ For each instance, `prepare.py` writes `C:\tg\sweevo-tasks\<id>\`:
 | --- | --- |
 | `repo/` | the repository at `base_commit`, fetched from GitHub (`git fetch --depth 1`) and committed once with a fixed author and date: one commit, no history, LF line endings, the test patch not applied |
 | `request.md` | the problem statement (the release notes), verbatim, inside SWE-EVO's SWE-agent instruction (below) |
+| `request_iface.md` | `request.md` plus the section "Interface of this release" (below) |
 | `sandbox.json` | the image and environment of every container (below) |
 | `single.json` | the single-agent graph, with the smoke checks (below) |
+| `single_iface.json` | the same graph with `request_iface.md` (`request_id` `single_iface`) |
 | `Dockerfile` | the task image |
 | `sandbox_skips.txt` | a copy of `instances/<id>/sandbox_skips.txt` |
 | `grading/instance.json` | ids, the test command, the log parser, F2P and P2P |
@@ -69,6 +73,68 @@ taken care of; the `single` graph's goal still ends with the harness's own
 "Keep the existing tests passing and add tests for the new behaviour."
 Tests a worker adds do no harm: grading puts the files of the test patch
 back to the base and applies the patch over them.
+
+## The interface variant (`request_iface.md`)
+
+A release's tests use names the release adds. The single agent's pilot run on
+dvc 0.89 implemented the release notes and still scored F2P 6/27: 19 of the
+F2P tests import `HTTPURLInfo` from `dvc.path_info`, a class whose name only
+the gold patch has (the notes say "import-url: allow queries in URL"), and 2
+call `is_protected`, a method only the gold patch defines. Such a score
+measures whether the agent guessed internal names. So each task also has a
+variant of its request that ends with the interface the release must
+implement, as FeatureBench gives one: names and signatures, no bodies, by a
+fixed rule (`aqours_code/taskgraph/sweevo_interface.py`):
+
+- for every non-test `.py` file the gold patch touches, the public
+  definitions at module level and class level of the base and of the base
+  plus the gold patch are compared with `ast` (nested functions are never
+  read);
+- *added*: classes (with their bases and public methods), functions,
+  methods, and names assigned at module level (the name only); *changed*:
+  functions and methods whose signature differs (the new one is shown);
+  *removed*: classes, functions and methods;
+- a name is public if neither it nor its class starts with `_`; the dunder
+  methods of a new class count;
+- each added or changed item shows its decorators, its signature as written
+  in the gold patch (defaults and annotations included) and its docstring (at
+  most 15 lines), as a stub whose body is `...`; a file that does not parse
+  is reported in the section.
+
+The section, after the request:
+
+````text
+## Interface of this release
+
+The release adds, changes or removes the public definitions below. Use exactly
+these names and signatures, because other code relies on them. How they work
+inside is up to you.
+
+### `dvc/path_info.py`
+
+```python
+# added: class HTTPURLInfo
+class HTTPURLInfo(URLInfo):
+    def __init__(self, url):
+        ...
+...
+```
+````
+
+`single_iface.json` is `single.json` with this request; the planner and team
+are to be given `request_iface.md` the same way. `request.md` and
+`single.json` are unchanged.
+
+`validate_interface.py` (no model, no Docker) checks the sections of the
+eight instances in use and writes [`validation/interface.md`](validation/interface.md):
+their size; that every name the release's test files take from the package
+(`from pkg.mod import Name`, or `pkg.mod.Name` on an imported module) exists
+in the base commit or is an item of the section (through a re-export too);
+that no line of a section is a line the gold patch adds in a body (outside
+headers, decorators and docstrings); and that no test file path, test name or
+line of the test patch is in a section. All eight pass with no miss. What the
+import check cannot see: a method called on an object (`remote.is_protected`)
+and a name reached through a local variable that shadows a module alias.
 
 ## The container: task image and `sandbox.json`
 
@@ -275,6 +341,19 @@ foreach ($id in @("dask__dask_2023.8.0_2023.8.1", "iterative__dvc_0.89.0_0.90.0"
 }
 [System.IO.File]::WriteAllText("C:\tg\runs\sweevo_pilot_manifest.json", (ConvertTo-Json -InputObject $runs))
 python -m aqours_code.taskgraph score C:\tg\runs\sweevo_pilot_manifest.json --out C:\tg\score\sweevo-pilot
+```
+
+The same with the interface variant: `single_iface.json` in place of
+`single.json`, for example for the dvc pilot:
+
+```powershell
+$id = "iterative__dvc_0.89.0_0.90.0"
+$task = "C:\tg\sweevo-tasks\$id"
+python -m aqours_code.taskgraph run "$task\single_iface.json" --repo "$task\repo" --sandbox-config "$task\sandbox.json" --workers 1 --out C:\tg\runs | Tee-Object -Variable log
+$run = ($log | Select-String -Pattern '^run directory: (.+)$').Matches[0].Groups[1].Value
+python -m aqours_code.taskgraph sweevo-eval $run --task $task
+[System.IO.File]::WriteAllText("C:\tg\runs\sweevo_iface_manifest.json", (ConvertTo-Json -InputObject @([pscustomobject]@{ task = $id; method = "single"; run = $run })))
+python -m aqours_code.taskgraph score C:\tg\runs\sweevo_iface_manifest.json --out C:\tg\score\sweevo-iface
 ```
 
 `run` prints its run directory on its last line; `sweevo-eval` grades it

@@ -9,8 +9,10 @@ marked ``dropped``; ``--pilot`` only the two pilot instances. For each instance 
 
     repo/                  the repository at base_commit, as one commit (LF, no history)
     request.md             the release notes in SWE-agent's instruction (see below)
+    request_iface.md       request.md plus the release's interface (sweevo_interface.py)
     sandbox.json           the image and environment workers and checks run in
     single.json            the single-agent graph, with the smoke checks
+    single_iface.json      the same graph with request_iface.md (request_id single_iface)
     sandbox_skips.txt      a copy of instances/<id>/sandbox_skips.txt, if there is one
     grading/instance.json  ids, test command, log parser, FAIL_TO_PASS, PASS_TO_PASS
     grading/test.patch     the release's test changes (never applied in repo/)
@@ -19,6 +21,9 @@ marked ``dropped``; ``--pilot`` only the two pilot instances. For each instance 
 Nothing under ``grading/`` is in ``repo/``, and workers see only a clone of
 ``repo/``, so they can never read the grading data. ``request.md`` contains
 the problem statement verbatim and no test file, test name or patch.
+``request_iface.md`` adds the names and signatures of the public definitions
+the gold patch adds, changes or removes in non-test files (no bodies, no
+test file or text of the test patch).
 
 Then it pulls the instance's image and builds ``aqours-sweevo:<id>`` from it
 (see ``Dockerfile`` below and README.md), and prints both sizes.
@@ -46,6 +51,8 @@ sys.path.insert(0, str(HERE.parents[2]))  # the Aqours checkout, for aqours_code
 from aqours_code.docker_utils import host_container_user  # noqa: E402
 from aqours_code.taskgraph.schema import dump_graph  # noqa: E402
 from aqours_code.taskgraph.single import single_graph  # noqa: E402
+from aqours_code.taskgraph.sweevo_interface import (  # noqa: E402
+    interface_section, item_count, release_interface)
 
 DEFAULT_DATASET = Path(r"C:\tg\sweevo\hf_out\hf_dataset\test")
 DEFAULT_OUT = Path(r"C:\tg\sweevo-tasks")
@@ -353,6 +360,10 @@ def prepare(row: dict, out: Path, *, use_docker: bool) -> dict:
     made = make_repo(row, task_dir / "repo")
     request = REQUEST_TEMPLATE.format(problem_statement=row["problem_statement"])
     (task_dir / "request.md").write_text(request, encoding="utf-8", newline="\n")
+    interface = release_interface(task_dir / "repo", row["patch"])
+    section = interface_section(interface)
+    request_iface = request.rstrip("\n") + "\n\n" + section
+    (task_dir / "request_iface.md").write_text(request_iface, encoding="utf-8", newline="\n")
     instance = {key: row[key] for key in (
         "instance_id", "repo", "base_commit", "image", "test_cmds", "log_parser",
         "start_version", "end_version", "end_version_commit", "version",
@@ -391,8 +402,14 @@ def prepare(row: dict, out: Path, *, use_docker: bool) -> dict:
     (grading / "instance.json").write_text(json.dumps(instance, indent=1) + "\n",
                                            encoding="utf-8", newline="\n")
     result["smoke_ignore"], result["test_timeout"] = ignore, timeout
-    graph = single_graph(request, task_dir / "repo", smoke_checks(row["repo"], ignore))
-    dump_graph(graph, task_dir / "single.json")
+    checks = smoke_checks(row["repo"], ignore)
+    dump_graph(single_graph(request, task_dir / "repo", checks), task_dir / "single.json")
+    graph_iface = single_graph(request_iface, task_dir / "repo", checks)
+    dump_graph(graph_iface.model_copy(update={"request_id": "single_iface"}),
+               task_dir / "single_iface.json")
+    result["interface_items"] = item_count(interface)
+    result["interface_chars"] = len(section)
+    result["interface_errors"] = [item.path for item in interface if item.error]
     return result
 
 
@@ -419,6 +436,10 @@ def main(argv: list[str] | None = None) -> int:
               f"skips: {'yes' if result['skips'] else 'none'}")
         print(f"  per-test timeout when grading: "
               f"{result['test_timeout'] or 'none (no pytest-timeout in the image)'}")
+        print(f"  interface: {result['interface_items']} items, "
+              f"{result['interface_chars']} characters"
+              + (f"; NOT READ: {', '.join(result['interface_errors'])}"
+                 if result["interface_errors"] else ""))
         if result["smoke_ignore"]:
             print(f"  smoke check ignores (no collection on the base): "
                   f"{', '.join(result['smoke_ignore'])}")

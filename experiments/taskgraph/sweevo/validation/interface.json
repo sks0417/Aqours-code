@@ -1,0 +1,230 @@
+[
+ {
+  "instance_id": "iterative__dvc_1.1.7_1.1.8",
+  "package": "dvc",
+  "files": 2,
+  "items": 3,
+  "added": 0,
+  "changed": 3,
+  "removed": 0,
+  "chars": 775,
+  "not_read": [],
+  "imports": {
+   "checked": 35,
+   "in_base": 35,
+   "in_interface": 0,
+   "in_interface_by_reexport": 0,
+   "unchecked": [],
+   "misses": []
+  },
+  "body_lines_in_section": [],
+  "gold_body_lines": 27,
+  "test_text_in_section": [],
+  "coincidences": [],
+  "request_iface_matches": true
+ },
+ {
+  "instance_id": "dask__dask_2023.6.1_2023.7.0",
+  "package": "dask",
+  "files": 2,
+  "items": 2,
+  "added": 0,
+  "changed": 2,
+  "removed": 0,
+  "chars": 1855,
+  "not_read": [],
+  "imports": {
+   "checked": 101,
+   "in_base": 101,
+   "in_interface": 0,
+   "in_interface_by_reexport": 0,
+   "unchecked": [],
+   "misses": []
+  },
+  "body_lines_in_section": [],
+  "gold_body_lines": 13,
+  "test_text_in_section": [],
+  "coincidences": [],
+  "request_iface_matches": true
+ },
+ {
+  "instance_id": "iterative__dvc_1.6.3_1.6.4",
+  "package": "dvc",
+  "files": 5,
+  "items": 6,
+  "added": 4,
+  "changed": 2,
+  "removed": 0,
+  "chars": 1385,
+  "not_read": [],
+  "imports": {
+   "checked": 8,
+   "in_base": 8,
+   "in_interface": 0,
+   "in_interface_by_reexport": 0,
+   "unchecked": [],
+   "misses": []
+  },
+  "body_lines_in_section": [],
+  "gold_body_lines": 79,
+  "test_text_in_section": [],
+  "coincidences": [],
+  "request_iface_matches": true
+ },
+ {
+  "instance_id": "dask__dask_2023.8.0_2023.8.1",
+  "package": "dask",
+  "files": 1,
+  "items": 1,
+  "added": 0,
+  "changed": 1,
+  "removed": 0,
+  "chars": 455,
+  "not_read": [],
+  "imports": {
+   "checked": 126,
+   "in_base": 126,
+   "in_interface": 0,
+   "in_interface_by_reexport": 0,
+   "unchecked": [],
+   "misses": []
+  },
+  "body_lines_in_section": [],
+  "gold_body_lines": 75,
+  "test_text_in_section": [],
+  "coincidences": [],
+  "request_iface_matches": true
+ },
+ {
+  "instance_id": "iterative__dvc_0.89.0_0.90.0",
+  "package": "dvc",
+  "files": 5,
+  "items": 16,
+  "added": 11,
+  "changed": 5,
+  "removed": 0,
+  "chars": 2143,
+  "not_read": [],
+  "imports": {
+   "checked": 160,
+   "in_base": 159,
+   "in_interface": 1,
+   "in_interface_by_reexport": 0,
+   "unchecked": [],
+   "misses": []
+  },
+  "body_lines_in_section": [],
+  "gold_body_lines": 89,
+  "test_text_in_section": [],
+  "coincidences": [],
+  "request_iface_matches": true
+ },
+ {
+  "instance_id": "iterative__dvc_2.19.0_2.20.0",
+  "package": "dvc",
+  "files": 9,
+  "items": 13,
+  "added": 7,
+  "changed": 6,
+  "removed": 0,
+  "chars": 3480,
+  "not_read": [],
+  "imports": {
+   "checked": 28,
+   "in_base": 28,
+   "in_interface": 0,
+   "in_interface_by_reexport": 0,
+   "unchecked": [],
+   "misses": []
+  },
+  "body_lines_in_section": [],
+  "gold_body_lines": 128,
+  "test_text_in_section": [],
+  "coincidences": [
+   "jobs=None,",
+   "no_download=False,",
+   "no_exec=False,",
+   "self,"
+  ],
+  "request_iface_matches": true
+ },
+ {
+  "instance_id": "pydantic__pydantic_v2.7.0_v2.7.1",
+  "package": "pydantic",
+  "files": 3,
+  "items": 5,
+  "added": 4,
+  "changed": 1,
+  "removed": 0,
+  "chars": 2652,
+  "not_read": [],
+  "imports": {
+   "checked": 208,
+   "in_base": 206,
+   "in_interface": 2,
+   "in_interface_by_reexport": 2,
+   "unchecked": [],
+   "misses": []
+  },
+  "body_lines_in_section": [],
+  "gold_body_lines": 68,
+  "test_text_in_section": [],
+  "coincidences": [],
+  "request_iface_matches": true
+ },
+ {
+  "instance_id": "dask__dask_2023.6.0_2023.6.1",
+  "package": "dask",
+  "files": 7,
+  "items": 22,
+  "added": 12,
+  "changed": 3,
+  "removed": 7,
+  "chars": 5217,
+  "not_read": [],
+  "imports": {
+   "checked": 301,
+   "in_base": 293,
+   "in_interface": 4,
+   "in_interface_by_reexport": 1,
+   "unchecked": [
+    {
+     "test_file": "dask/tests/test_distributed.py",
+     "module": "dask.distributed",
+     "name": "futures_of",
+     "how": "from",
+     "star_import_from": "distributed"
+    },
+    {
+     "test_file": "dask/tests/test_distributed.py",
+     "module": "dask.distributed",
+     "name": "wait",
+     "how": "from",
+     "star_import_from": "distributed"
+    },
+    {
+     "test_file": "dask/tests/test_distributed.py",
+     "module": "dask.distributed",
+     "name": "Client",
+     "how": "from",
+     "star_import_from": "distributed"
+    },
+    {
+     "test_file": "dask/tests/test_distributed.py",
+     "module": "dask.distributed.protocol",
+     "name": "dumps",
+     "how": "from",
+     "star_import_from": "distributed"
+    }
+   ],
+   "misses": []
+  },
+  "body_lines_in_section": [],
+  "gold_body_lines": 199,
+  "test_text_in_section": [],
+  "coincidences": [
+   "See Also"
+  ],
+  "request_iface_matches": true
+ }
+]

@@ -716,6 +716,25 @@ entry and files are never changed; a second `rescore` replaces the first. It
 prints the counts and exits with `0` when pytest produced a report, whatever
 the tests' results, and with `1` when it did not (the output file says why).
 
+### The interface of a SWE-EVO release (`sweevo_interface.py`)
+
+`release_interface(repo, gold_patch)` compares the base commit (`HEAD` of
+`repo`) with the base plus the gold patch, for every non-test `.py` file the
+patch touches, and returns the public definitions at module and class level
+that the patch adds (classes with their bases and public methods, functions,
+methods, names assigned at module level), changes (functions and methods
+whose arguments or return annotation differ) and removes (classes, functions,
+methods). A name is public if neither it nor its class starts with `_`; the
+dunder methods of a new class count. Nested functions are never read.
+`interface_section(files)` renders them as the section "Interface of this
+release": per file, a stub with each item's decorators and signature as
+written, its docstring (at most 15 lines) and `...` as its body; a file that
+does not parse is reported. Only the patched files are written to a
+temporary directory to apply the patch; the repository is not touched. The
+module also has the checks `experiments/taskgraph/sweevo/validate_interface.py`
+uses (the names a test file imports, the lines a patch adds outside headers
+and docstrings).
+
 ### Grading a SWE-EVO run (`sweevo-eval`)
 
 ```bash
