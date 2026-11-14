@@ -544,6 +544,9 @@ def summarize_history(
     ).strip()
 
 
+_EMPTY_SUMMARY = "summary model returned empty text"
+
+
 def _summarize_once(
     summary_input: list,
     runtime: AgentRuntime | None,
@@ -563,7 +566,7 @@ def _summarize_once(
         )
         return None, f"{type(exc).__name__}: {exc}"
     if not str(summary or "").strip():
-        return None, "summary model returned empty text"
+        return None, _EMPTY_SUMMARY
     return str(summary).strip(), ""
 
 
@@ -657,6 +660,7 @@ def _record_compact(
     success: bool,
     failure_reason: str = "",
     summary_model_calls: int = 0,
+    summary_retried: bool = False,
 ) -> None:
     try:
         record_event(
@@ -677,6 +681,7 @@ def _record_compact(
             success=success,
             failure_reason=failure_reason,
             summary_model_calls=summary_model_calls,
+            summary_retried=summary_retried,
         )
     except Exception:
         pass
@@ -921,6 +926,12 @@ def _compact(
         return active_messages
 
     summary, failure = _summarize_once(prefix, runtime)
+    summary_calls, retried = 1, False
+    if not summary and failure == _EMPTY_SUMMARY:
+        # An empty answer is asked for once more at once, with the same input;
+        # only a second empty answer takes the failure path (and its cooldown).
+        summary, failure = _summarize_once(prefix, runtime)
+        summary_calls, retried = 2, True
     if not summary:
         _remember_failed_compact(
             runtime,
@@ -941,7 +952,8 @@ def _compact(
             summary="",
             success=False,
             failure_reason=failure,
-            summary_model_calls=1,
+            summary_model_calls=summary_calls,
+            summary_retried=retried,
         )
         return active_messages
 
@@ -968,7 +980,8 @@ def _compact(
             summary=summary,
             success=False,
             failure_reason=failure,
-            summary_model_calls=1,
+            summary_model_calls=summary_calls,
+            summary_retried=retried,
         )
         _remember_failed_compact(
             runtime,
@@ -990,7 +1003,8 @@ def _compact(
         tail=tail,
         summary=summary,
         success=True,
-        summary_model_calls=1,
+        summary_model_calls=summary_calls,
+        summary_retried=retried,
     )
     _clear_failed_compact(runtime)
     if runtime is not None:

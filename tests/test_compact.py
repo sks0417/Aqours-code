@@ -1055,18 +1055,20 @@ def test_candidate_budget_expands_prefix_before_summary(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "summary_behavior",
+    ("summary_behavior", "expected_calls"),
     [
-        lambda _messages, runtime=None: (_ for _ in ()).throw(
+        (lambda _messages, runtime=None: (_ for _ in ()).throw(
             RuntimeError("offline")
-        ),
-        lambda _messages, runtime=None: "   ",
-        lambda _messages, runtime=None: "s" * 130_000,
+        ), 1),
+        # an empty summary is asked for once more before the compaction fails
+        (lambda _messages, runtime=None: "   ", 2),
+        (lambda _messages, runtime=None: "s" * 130_000, 1),
     ],
 )
 def test_compaction_failure_keeps_original_history(
     monkeypatch,
     summary_behavior,
+    expected_calls,
 ):
     calls = 0
 
@@ -1081,7 +1083,7 @@ def test_compaction_failure_keeps_original_history(
 
     result = force_compact(messages)
 
-    assert calls == 1
+    assert calls == expected_calls
     assert result is messages
     assert messages == original
 
@@ -1487,3 +1489,73 @@ def test_list_form_instruction_and_multiple_result_blocks_are_supported(
     assert "small exact" in render(calls[0])
     assert "[Large tool result omitted]" not in render(calls[0])
     assert_tool_pairs(result)
+
+
+def compact_events(monkeypatch) -> list[dict]:
+    events = []
+    original = compact.record_event
+
+    def capture(event_type, **fields):
+        if event_type == "compact":
+            events.append(fields)
+        return original(event_type, **fields)
+
+    monkeypatch.setattr(compact, "record_event", capture)
+    return events
+
+
+def test_an_empty_summary_is_retried_once_and_then_succeeds(tmp_path, monkeypatch):
+    runtime = make_runtime(tmp_path, responses=["", "## Checkpoint\nRetried and done."])
+    events = compact_events(monkeypatch)
+    messages = long_history()
+
+    result = force_compact(messages, runtime=runtime)
+
+    client_calls = runtime.services.model_client.messages.calls
+    assert len(client_calls) == 2
+    assert client_calls[0]["messages"] == client_calls[1]["messages"]  # the same input
+    assert checkpoint_count(result) == 1
+    assert "Retried and done." in render(result)
+    assert events[-1]["success"] is True
+    assert events[-1]["summary_model_calls"] == 2
+    assert events[-1]["summary_retried"] is True
+    assert runtime.state.metadata.get("compact_generation") == 1
+    assert "last_failed_compact_reason" not in runtime.state.metadata
+
+
+def test_two_empty_summaries_fail_as_before(tmp_path, monkeypatch):
+    runtime = make_runtime(tmp_path, responses=["", "  "])
+    events = compact_events(monkeypatch)
+    remembered = []
+    original_remember = compact._remember_failed_compact
+
+    def remember(*args, **kwargs):
+        remembered.append(kwargs["failure"])
+        return original_remember(*args, **kwargs)
+
+    monkeypatch.setattr(compact, "_remember_failed_compact", remember)
+    messages = long_history()
+    original = json.loads(json.dumps(messages))
+
+    result = force_compact(messages, runtime=runtime)
+
+    assert len(runtime.services.model_client.messages.calls) == 2
+    assert result == original  # nothing compacted
+    assert events[-1]["success"] is False
+    assert events[-1]["failure_reason"] == "summary model returned empty text"
+    assert events[-1]["summary_model_calls"] == 2
+    assert events[-1]["summary_retried"] is True
+    # the failure path (which an automatic compaction's cooldown starts from) is taken
+    assert remembered == ["summary model returned empty text"]
+    assert runtime.state.metadata.get("compact_generation", 0) == 0
+
+
+def test_a_summary_that_is_not_empty_is_not_retried(tmp_path, monkeypatch):
+    runtime = make_runtime(tmp_path, responses=["## Checkpoint\nFirst try."])
+    events = compact_events(monkeypatch)
+
+    force_compact(long_history(), runtime=runtime)
+
+    assert len(runtime.services.model_client.messages.calls) == 1
+    assert events[-1]["summary_model_calls"] == 1
+    assert events[-1]["summary_retried"] is False
