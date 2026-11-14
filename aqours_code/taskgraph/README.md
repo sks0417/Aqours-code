@@ -822,6 +822,7 @@ python -m aqours_code.taskgraph plan <request.md> --repo <path> --out <graph.jso
     [--planner v3|v2] [--ablate p1,p2,p3,p4]
     [--final-check "python -m pytest -q tests"] [--timeout 1800] [--request-id <id>]
     [--fast-path-lines 500] [--no-fast-path] [--no-merge] [--outline two-level|full]
+    [--max-calls 150] [--max-input-tokens 6000000] [--max-time 2400]
 ```
 
 `--planner v3` (the default, `planner_version` `planner-v3.1`) is described in
@@ -833,6 +834,29 @@ other options apply to both. v3 plans with the two-level outline by default
 ([below](#the-two-level-outline-v3-default)); `--outline full` gives the full
 outline and the prompt of `planner-v3.1` unchanged, to reproduce earlier
 plans. v2 always has the full outline.
+
+**Limits of one plan** (both planners, `plan_budget.py`). `--max-calls`,
+`--max-input-tokens` and `--max-time` limit the whole plan: every round of
+Step 1 and Step 2 together (0 turns a limit off). Each round gets what is
+left: its timeout is cut to the time left, and the planner agent is given
+the calls and input tokens left as a model budget, through the call-budget
+interface the Aqours loop already reads (`aqours_code/model_budget.py`, the
+one the Docker broker uses): near the end it is told to finish, and its last
+call has no tools, so it gives its answer; an input-token limit counts as the
+calls it leaves at the size of the last request. No round starts once a
+limit is reached (or with less than a minute left); the plan stops with a
+`LIMIT` error naming the limit, the step and round, and what was used. None
+of the plans made before the limits (31 saved reports, the largest
+`sweevo-dvc089-v3b`: 124 calls, 5.27M input tokens, 1108 s) would have
+reached the defaults.
+
+**A failed round is not revised.** When a planner agent fails
+(`worker_error`, such as a provider error after the retries, `worker_timeout`,
+or `model_budget`: the budget ended its loop before it answered), there is
+no answer to check: the plan stops at once with an `AGENT` error (or
+`LIMIT`, when a plan limit ended the round) naming the step and round, the
+reason, and the calls and tokens used so far. Step 1 is not attempted again
+either. A revision round is only for an answer the model gave.
 
 Planner v2 builds the graph in the three steps of the project proposal: a
 draft from the request alone, grounding in the code, and a rule-based
@@ -1159,17 +1183,24 @@ merged, otherwise `llm` after a revision round and `none` without one.
   `goal_chars` and `long_goals`, `outline_chars`, `outline_reduction` and
   `outline_omitted_files` (v3 also `outline_mode`, `file_list_chars` and the
   level fields of the two-level outline), `totals` and `duration_s` (Step 1 included) and
-  `stage_totals` (Step 1 and Step 2 separately);
+  `stage_totals` (Step 1 and Step 2 separately); `limits` (`model_calls`,
+  `input_tokens`, `seconds`), `used` (the same, plus `output_tokens`),
+  `round_usage` (every round of both steps: `step`, `round`, `model_calls`,
+  `input_tokens`, `output_tokens`, `duration_s`, and `ended`: `answer` or the
+  agent's failure reason) and `stopped` (`code`, `step`, `round`, `reason`,
+  `message` when a failure or a limit stopped the plan, else null);
 - `<out>.logs/` (Step 2) and `<out>.logs/draft/` (Step 1): each round's
   config, trace and stdout.
 
 The terminal summary shows the number of draft items and the estimate,
 whether the fast path was taken, the node count before and after merging,
-and the members of each merge. `--timeout` applies to each model round. Exit
+the members of each merge, and one line per round (calls, tokens, time, how
+it ended). `--timeout` applies to each model round. Exit
 codes: `0` success, `1` errors remained, `2` input or git errors. Error codes
 in the report besides V1-V13 and P1-P7: `FORMAT` (no JSON block, invalid
 JSON, or a draft or schema mismatch), `AGENT` (a planner agent failed or
-timed out) and `REVISE`.
+timed out; the plan stops), `LIMIT` (a limit of the plan was reached) and
+`REVISE`.
 
 `experiments/taskgraph/planner_eval/` runs the planner on the experiment
 repositories and compares the result with the hand-written graphs.

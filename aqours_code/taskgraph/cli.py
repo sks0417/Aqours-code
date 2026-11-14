@@ -9,6 +9,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from .derive import derive_edges
+from .plan_budget import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_MODEL_CALLS, DEFAULT_MAX_PLAN_S
 from .repo_index import RepoIndex, build_index
 from .schema import DEFAULT_SCHEMA_PATH, Graph, dump_graph, export_json_schema, load_graph
 from .validate import validate
@@ -470,6 +471,9 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         return _error("--timeout must be > 0")
     if args.fast_path_lines < 0:
         return _error("--fast-path-lines must be >= 0")
+    if args.max_calls < 0 or args.max_input_tokens < 0 or args.max_time < 0:
+        return _error("--max-calls, --max-input-tokens and --max-time must be >= 0 "
+                      "(0: no limit)")
     try:
         ablate = parse_ablate(args.ablate)
     except ValueError as exc:
@@ -487,7 +491,9 @@ def _cmd_plan(args: argparse.Namespace) -> int:
                           timeout_s=args.timeout, request_id=args.request_id,
                           fast_path_lines=None if args.no_fast_path else args.fast_path_lines,
                           merge=not args.no_merge, planner=args.planner, ablate=ablate,
-                          outline=outline)
+                          outline=outline, max_model_calls=args.max_calls or None,
+                          max_input_tokens=args.max_input_tokens or None,
+                          max_plan_s=args.max_time or None)
     try:
         result = run_plan(options, planner.planner_worker(), planner.draft_worker())
     except (GitError, RuntimeError, OSError, UnicodeDecodeError) as exc:
@@ -517,6 +523,10 @@ def _print_plan_end(args: argparse.Namespace, result, report: dict) -> None:
     totals = report["totals"]
     print(f"model calls: {totals['model_calls']}  tokens: {totals['input_tokens']} in / "
           f"{totals['output_tokens']} out  time: {report['duration_s']:.1f}s")
+    for entry in report.get("round_usage", []):
+        print(f"  step {entry['step']} round {entry['round']}: {entry['model_calls']} calls, "
+              f"{entry['input_tokens']:,} in / {entry['output_tokens']:,} out, "
+              f"{entry['duration_s']:.0f}s, {entry['ended']}")
     if report.get("outline_mode") == "two-level":
         cut = report.get("outline_level2_cut") or []
         print(f"outline (two-level): {report['outline_chars']} characters, level 1 "
@@ -775,6 +785,15 @@ def build_parser() -> argparse.ArgumentParser:
                           help="command for the graph's final_checks (repeatable)")
     plan_cmd.add_argument("--timeout", type=float, default=1800.0,
                           help="timeout in seconds of each planner round")
+    plan_cmd.add_argument("--max-calls", type=int, default=DEFAULT_MAX_MODEL_CALLS,
+                          help="model calls of the whole plan, all rounds of both steps "
+                               f"(default {DEFAULT_MAX_MODEL_CALLS}; 0: no limit)")
+    plan_cmd.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS,
+                          help="input tokens of the whole plan "
+                               f"(default {DEFAULT_MAX_INPUT_TOKENS}; 0: no limit)")
+    plan_cmd.add_argument("--max-time", type=float, default=DEFAULT_MAX_PLAN_S,
+                          help="seconds of the whole plan; each round's timeout is cut to "
+                               f"the time left (default {DEFAULT_MAX_PLAN_S:.0f}; 0: no limit)")
     plan_cmd.add_argument("--fast-path-lines", type=int, default=500,
                           help="estimated changed lines below which the request is not "
                                "split (default 500)")

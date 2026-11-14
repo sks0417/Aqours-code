@@ -32,12 +32,13 @@ from . import gitops
 from .affected import TestImports, scan_test_imports
 from .cleanup import remove_tree
 from .facts import Facts, Normalisation, check_facts, read_facts
+from .plan_budget import PlanBudget
 from .outline import Outline, build_outline
 from .outline_levels import (TwoLevelOutline, build_two_level_outline, other_files_list,
                              two_level_instructions)
 from .planner import (DRAFT_ECHO_CHARS, PLANNER_VERSION, REPORTED_GOAL_CHARS, DraftError,
                       DraftItem, GraphInfo, PlanOptions, PlanResult, _agent_dict,
-                      _agent_failure, _file_list, _issue_dict, _totals, extract_json_block,
+                      _file_list, _issue_dict, _totals, extract_json_block,
                       fast_path_graph, file_sizes, report_path_for, run_draft_stage)
 from .repo_index import RepoIndex, build_index
 from .schema import Graph, dump_graph, load_graph
@@ -204,6 +205,8 @@ class _V3Run:
     file_list_chars: int = 0
     # resynth: the outline fields of the plan's own report (it has no prompt)
     saved_outline: dict | None = None
+    # plan: the limits and what the rounds used (resynth makes no model call)
+    budget: PlanBudget | None = None
 
     def outline_fields(self) -> dict:
         """The report's fields about the outline and the file list of the prompt."""
@@ -286,6 +289,7 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         "totals": {key: stage_totals["stage1"][key] + stage_totals["stage2"][key]
                    for key in ("model_calls", "input_tokens", "output_tokens")},
         "stage_totals": stage_totals,
+        **(run.budget or PlanBudget(started=started)).report(),
         "duration_s": round(time.monotonic() - started, 3),
         **(extra or {}),
     }
@@ -311,7 +315,8 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
                      final_checks=list(options.final_checks),
                      model=str(model) if model is not None else None)
     run = _V3Run(info, str(options.request_path), repo, out, frozenset(options.ablate),
-                 threshold=options.fast_path_lines)
+                 threshold=options.fast_path_lines, budget=options.budget(started))
+    budget = run.budget
     tmp = Path(tempfile.mkdtemp(prefix="tg-plan-"))
     try:
         clone = tmp / "repo"
@@ -328,7 +333,7 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
         run.file_list_chars = len(file_list)
         draft_items, run.stage1, run.errors = run_draft_stage(
             request, file_sizes(clone, index), draft_stage_worker, clone,
-            log_dir / "draft", options.timeout_s)
+            log_dir / "draft", options.timeout_s, budget)
         if draft_items is not None:
             run.draft_items = [item.model_dump() for item in draft_items.items]
             run.estimate = draft_items.estimated_changed_lines
@@ -340,21 +345,31 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
         elif draft_items is not None:
             revision: FactsRevision | None = None
             for number in range(options.max_revisions + 1):
+                stop = budget.limit_issue(2, number + 1)
+                if stop is not None:
+                    run.errors = [stop, *run.errors]
+                    break
                 prompt = build_facts_prompt(request, index, draft_items.items,
                                             outline_text, revision,
                                             outline_mode=options.outline, file_list=file_list)
                 result = worker.run(WorkerRequest(
                     node_id="planner", attempt=number + 1, prompt=prompt, workspace=clone,
-                    log_dir=log_dir, timeout_s=options.timeout_s))
+                    log_dir=log_dir, **budget.request_fields(options.timeout_s)))
+                budget.add(2, number + 1, result)
+                if not result.ok:
+                    # no answer the model gave: nothing to check or revise
+                    run.errors = [budget.failure_issue(2, number + 1, result)]
+                    run.rounds.append(_round_record(
+                        number + 1, result.final_answer, FactsEvaluation(result.final_answer),
+                        run.errors, _agent_dict(result)))
+                    break
                 evaluation = evaluate_facts(result.final_answer, info, index,
                                             draft_items.items, run.tests, run.ablate,
                                             revised=number > 0)
                 run.errors = list(evaluation.errors)
-                if not result.ok:
-                    run.errors = [_agent_failure(result), *run.errors]
                 if evaluation.facts is not None:
                     run.facts = evaluation.facts
-                if evaluation.synthesis is not None and result.ok:
+                if evaluation.synthesis is not None:
                     run.synthesis, run.graph_round = evaluation.synthesis, number + 1
                     run.graph = evaluation.synthesis.graph
                 run.rounds.append(_round_record(number + 1, result.final_answer, evaluation,

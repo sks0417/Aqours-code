@@ -64,6 +64,70 @@ class CountingClient:
         return response
 
 
+# Calls left when only a token limit is set and no request size is known yet.
+UNKNOWN_CALLS_LEFT = 1_000_000
+
+
+class BudgetedCountingClient(CountingClient):
+    """A CountingClient that shows the Aqours loop a model-call budget.
+
+    Only the planner gets one: its share of the plan's limits. The loop reads
+    it through ``budget_snapshot()`` (``aqours_code.model_budget``), the
+    interface of the Docker broker's call budget: near the end it asks for
+    the final answer, at the last call it disables tools, and with no call
+    left it stops before sending a request. An input-token limit is shown as
+    the calls it leaves at the size of the last request, at least one while
+    any tokens are left, so the agent is asked for its answer before it runs
+    out.
+    """
+
+    def __init__(self, inner, max_calls: int | None = None,
+                 max_input_tokens: int | None = None):
+        super().__init__(inner)
+        self.max_calls, self.max_input_tokens = max_calls, max_input_tokens
+        self.last_input_tokens = 0
+        self.ran_out = ""  # the limit that stopped the loop before it answered
+
+    def create(self, **kwargs):
+        """Forward one call, remembering the size of its request."""
+        before = self.input_tokens
+        response = super().create(**kwargs)
+        self.last_input_tokens = self.input_tokens - before
+        return response
+
+    def calls_left(self) -> tuple[int, str]:
+        """The calls left and the limit that sets them."""
+        left = [(UNKNOWN_CALLS_LEFT, "")]
+        if self.max_calls is not None:
+            left.append((max(0, self.max_calls - self.call_count), "model_calls"))
+        if self.max_input_tokens is not None:
+            tokens = self.max_input_tokens - self.input_tokens
+            if tokens <= 0:
+                left.append((0, "input_tokens"))
+            elif self.last_input_tokens > 0:
+                left.append((max(1, tokens // self.last_input_tokens), "input_tokens"))
+        return min(left)
+
+    def budget_snapshot(self) -> dict:
+        """What ``model_budget.model_budget_snapshot`` reads."""
+        left, limit = self.calls_left()
+        if left <= 0:
+            self.ran_out = limit
+        # model_budget ignores a maximum of 0, so no call left before the first
+        # one is shown as one call, already used
+        maximum = max(1, self.call_count + left)
+        return {"source": "taskgraph_plan", "max_calls": maximum,
+                "call_count": maximum - left, "max_provider_retries": 0}
+
+
+def counting_client(inner, budget: dict | None) -> CountingClient:
+    """A BudgetedCountingClient for a ``model_budget`` with a limit, else a CountingClient."""
+    budget = budget or {}
+    if budget.get("max_calls") is None and budget.get("max_input_tokens") is None:
+        return CountingClient(inner)
+    return BudgetedCountingClient(inner, budget.get("max_calls"), budget.get("max_input_tokens"))
+
+
 def describe() -> dict:
     """Return the provider and model the worker would use, without calling it."""
     from aqours_code.config import MODEL, MODEL_PROVIDER  # noqa: PLC0415
@@ -159,7 +223,7 @@ def run_worker(config: dict, model_client=None,
         provider = config.get("model_provider", "scripted")
         model = config.get("model", "scripted")
 
-    counting = CountingClient(inner)
+    counting = counting_client(inner, config.get("model_budget"))
     timeout_s = float(config["timeout_s"])
     for key in ("trace_storage_root", "runtime_root"):
         Path(config[key]).mkdir(parents=True, exist_ok=True)
@@ -202,6 +266,11 @@ def run_worker(config: dict, model_client=None,
     if result.ok and (answer.startswith("[Error]")
                       or answer.lower().startswith("permission denied")):
         result.ok, result.reason, result.error = False, "worker_error", answer[:2000]
+    ran_out = getattr(counting, "ran_out", "")
+    if result.ok and ran_out:
+        # the loop stopped before a request over the budget: no answer was given
+        result.ok, result.reason = False, "model_budget"
+        result.error = f"the {ran_out} limit was reached before the agent answered"
     result.model_calls = counting.call_count
     result.input_tokens = counting.input_tokens
     result.output_tokens = counting.output_tokens

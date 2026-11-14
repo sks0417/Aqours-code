@@ -45,6 +45,8 @@ from .cleanup import remove_tree
 from .compare import is_test_only, is_test_path
 from .derive import derive_edges
 from .outline import Outline, build_outline
+from .plan_budget import (DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_MODEL_CALLS, DEFAULT_MAX_PLAN_S,
+                          PlanBudget, PlanLimits)
 from .repo_index import RepoIndex, build_index
 from .revise import RevisedGraph, goal_with_conventions, revise_graph
 from .schema import Graph, RevisionEntry, dump_graph
@@ -604,7 +606,9 @@ class PlanOptions:
     the version; ``ablate`` (v3 only) names the properties ``p1``-``p4``
     whose rules are turned off. ``outline`` (v3 only; v2 always has the full
     outline) is "two-level" (:mod:`outline_levels`) or "full" (the outline of
-    planner v3.1, to reproduce earlier plans).
+    planner v3.1, to reproduce earlier plans). ``max_model_calls``,
+    ``max_input_tokens`` and ``max_plan_s`` limit the whole plan, all rounds
+    of both steps (:mod:`plan_budget`); None turns one off.
     """
 
     request_path: Path
@@ -619,6 +623,14 @@ class PlanOptions:
     planner: str = "v3"
     ablate: frozenset[str] = frozenset()
     outline: str = "two-level"
+    max_model_calls: int | None = DEFAULT_MAX_MODEL_CALLS
+    max_input_tokens: int | None = DEFAULT_MAX_INPUT_TOKENS
+    max_plan_s: float | None = DEFAULT_MAX_PLAN_S
+
+    def budget(self, started: float) -> PlanBudget:
+        """The budget of one run of these options, started at ``started``."""
+        return PlanBudget(PlanLimits(self.max_model_calls, self.max_input_tokens,
+                                     self.max_plan_s), started)
 
 
 @dataclass
@@ -668,37 +680,44 @@ def _totals(rounds: list[dict]) -> dict:
             for key in ("model_calls", "input_tokens", "output_tokens")}
 
 
-def _agent_failure(result: WorkerResult) -> Issue:
-    return Issue("AGENT", [], f"planner agent failed ({result.reason}): "
-                 f"{result.error[-2000:]}")
-
-
 def run_draft_stage(request: str, sizes: list[tuple[str, int | None]], worker: Worker,
-                    clone: Path, log_dir: Path, timeout_s: float
+                    clone: Path, log_dir: Path, timeout_s: float,
+                    budget: PlanBudget | None = None
                     ) -> tuple[DraftItems | None, list[dict], list[Issue]]:
-    """Step 1: ask for the draft items, once more after a format error."""
+    """Step 1: ask for the draft items, once more after a format error.
+
+    A failed agent gave no answer: Step 1 stops without a second attempt.
+    No attempt starts when a limit of ``budget`` is reached.
+    """
+    budget = budget if budget is not None else PlanBudget()
     rounds: list[dict] = []
     errors: list[Issue] = []
     previous: str | None = None
     for attempt in range(1, DRAFT_ATTEMPTS + 1):
+        stop = budget.limit_issue(1, attempt)
+        if stop is not None:
+            return None, rounds, [stop, *errors]
         prompt = build_draft_prompt(request, sizes, previous, errors)
         result = worker.run(WorkerRequest(
             node_id="planner-draft", attempt=attempt, prompt=prompt, workspace=clone,
-            log_dir=log_dir, timeout_s=timeout_s))
+            log_dir=log_dir, **budget.request_fields(timeout_s)))
+        budget.add(1, attempt, result)
         items: DraftItems | None = None
-        try:
-            items = parse_items(result.final_answer)
-            errors = []
-        except DraftError as exc:
-            errors = exc.issues
         if not result.ok:
-            errors = [_agent_failure(result), *errors]
-            items = None
+            errors = [budget.failure_issue(1, attempt, result)]
+        else:
+            try:
+                items = parse_items(result.final_answer)
+                errors = []
+            except DraftError as exc:
+                errors = exc.issues
         rounds.append({"round": attempt, "answer": result.final_answer,
                        "errors": [_issue_dict(issue) for issue in errors],
                        "agent": _agent_dict(result)})
         if items is not None:
             return items, rounds, []
+        if not result.ok:
+            return None, rounds, errors
         previous = result.final_answer
     return None, rounds, errors
 
@@ -802,6 +821,7 @@ def run_plan_v2(options: PlanOptions, worker: Worker,
     revised: RevisedGraph | None = None
     fast_path = False
     outline = Outline("")
+    budget = options.budget(started)
     tmp = Path(tempfile.mkdtemp(prefix="tg-plan-"))
     try:
         clone = tmp / "repo"
@@ -810,7 +830,7 @@ def run_plan_v2(options: PlanOptions, worker: Worker,
         outline = build_outline(clone, index)
         draft_items, stage1, errors = run_draft_stage(
             request, file_sizes(clone, index), draft_stage_worker, clone,
-            log_dir / "draft", options.timeout_s)
+            log_dir / "draft", options.timeout_s, budget)
         if draft_items is not None:
             estimate = draft_items.estimated_changed_lines
             fast_path = threshold is not None and estimate < threshold
@@ -820,16 +840,23 @@ def run_plan_v2(options: PlanOptions, worker: Worker,
         elif draft_items is not None:
             revision: Revision | None = None
             for number in range(options.max_revisions + 1):
+                stop = budget.limit_issue(2, number + 1)
+                if stop is not None:
+                    errors = [stop, *errors]
+                    break
                 prompt = build_prompt(request, index, info.final_checks, revision,
                                       draft_items.items, outline.text)
                 result = worker.run(WorkerRequest(
                     node_id="planner", attempt=number + 1, prompt=prompt, workspace=clone,
-                    log_dir=log_dir, timeout_s=options.timeout_s))
-                evaluation = _evaluate_answer(result.final_answer, info, index,
-                                              revised=number > 0, items=draft_items.items)
-                errors, warnings = evaluation.errors, evaluation.warnings
-                if not result.ok:
-                    errors = [_agent_failure(result), *errors]
+                    log_dir=log_dir, **budget.request_fields(options.timeout_s)))
+                budget.add(2, number + 1, result)
+                if result.ok:
+                    evaluation = _evaluate_answer(result.final_answer, info, index,
+                                                  revised=number > 0, items=draft_items.items)
+                    errors, warnings = evaluation.errors, evaluation.warnings
+                else:  # no answer to check or revise
+                    evaluation = Evaluation(None, result.final_answer, [], [], [])
+                    errors, warnings = [budget.failure_issue(2, number + 1, result)], []
                 if evaluation.graph is not None:
                     graph, graph_round = evaluation.graph, number + 1
                     graph_draft, conventions = evaluation.draft_text, evaluation.conventions
@@ -843,7 +870,7 @@ def run_plan_v2(options: PlanOptions, worker: Worker,
                     "warnings": [_issue_dict(issue) for issue in warnings],
                     "agent": _agent_dict(result),
                 })
-                if not errors:
+                if not errors or not result.ok:
                     break
                 revision = Revision(number=number + 1, draft=evaluation.draft_text,
                                     errors=errors)
@@ -909,6 +936,7 @@ def run_plan_v2(options: PlanOptions, worker: Worker,
         "totals": {key: stage_totals["stage1"][key] + stage_totals["stage2"][key]
                    for key in ("model_calls", "input_tokens", "output_tokens")},
         "stage_totals": stage_totals,
+        **budget.report(),
         "duration_s": round(time.monotonic() - started, 3),
     }
     report_path = report_path_for(out)

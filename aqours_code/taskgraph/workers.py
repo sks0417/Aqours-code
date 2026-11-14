@@ -38,6 +38,9 @@ class WorkerRequest:
     soft_wall_enabled: bool = False
     own_files: list[str] = field(default_factory=list)
     full_files: list[str] = field(default_factory=list)
+    # the planner's share of its plan's limits: {"max_calls", "max_input_tokens"}
+    # (either may be None); None for every other agent (worker_entry.BudgetedCountingClient)
+    model_budget: dict | None = None
 
 
 @dataclass
@@ -45,7 +48,7 @@ class WorkerResult:
     """What a worker reports back."""
 
     ok: bool
-    reason: str = ""  # "", "worker_error", "worker_timeout"
+    reason: str = ""  # "", "worker_error", "worker_timeout", "model_budget"
     exit_code: int | None = None
     duration_s: float = 0.0
     model_calls: int = 0
@@ -174,6 +177,7 @@ class AqoursWorker:
                 "full_files": request.full_files,
                 "log_path": str(log_dir / f"soft_wall_{n}.jsonl"),
             },
+            "model_budget": request.model_budget,
         }
 
     def _sandbox_config(self, request: WorkerRequest) -> dict:

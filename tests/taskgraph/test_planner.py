@@ -387,21 +387,27 @@ def test_planner_checks_stay_out_of_validate():
     assert not {"P1", "P2", "P3"} & set(report.codes() + report.warning_codes())
 
 
-def test_agent_failure_is_a_round_error(toy_repo, tmp_path):
+def test_agent_failure_stops_planning_without_a_revision(toy_repo, tmp_path):
     class Failing(ScriptedPlanner):
         def run(self, request):
             self.requests.append(request)
-            return WorkerResult(ok=False, reason="worker_timeout", error="killed")
+            return WorkerResult(ok=False, reason="worker_timeout", error="killed",
+                                model_calls=7, input_tokens=7000, output_tokens=70)
 
     request = tmp_path / "request.md"
     request.write_text(REQUEST, encoding="utf-8")
     options = PlanOptions(request_path=request, repo=toy_repo.path, planner="v2",
-                          out=tmp_path / "graph.json", max_revisions=0)
-    result = run_plan(options, Failing([]), ScriptedDrafter([items_answer(["1"])]))
+                          out=tmp_path / "graph.json")
+    failing = Failing([])
+    result = run_plan(options, failing, ScriptedDrafter([items_answer(["1"])]))
     assert not result.success and result.graph is None
     assert not options.out.exists()
-    codes = [issue["code"] for issue in result.report["rounds"][0]["errors"]]
-    assert codes == ["AGENT", "FORMAT"]
+    assert len(failing.requests) == 1  # max_revisions is 2, but no revision was started
+    errors = result.report["rounds"][0]["errors"]
+    assert [issue["code"] for issue in errors] == ["AGENT"]  # the error text is not checked
+    assert "step 2 round 1 failed (worker_timeout): killed" in errors[0]["message"]
+    assert "So far: 8 model calls, 7,100 input and 80 output tokens" in errors[0]["message"]
+    assert result.report["stopped"]["reason"] == "worker_timeout"
 
 
 def _snapshot(repo: Path) -> dict:
