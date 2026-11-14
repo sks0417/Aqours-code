@@ -821,15 +821,18 @@ python -m aqours_code.taskgraph run aqours_code/taskgraph/examples/toy_graph.jso
 python -m aqours_code.taskgraph plan <request.md> --repo <path> --out <graph.json>
     [--planner v3|v2] [--ablate p1,p2,p3,p4]
     [--final-check "python -m pytest -q tests"] [--timeout 1800] [--request-id <id>]
-    [--fast-path-lines 500] [--no-fast-path] [--no-merge]
+    [--fast-path-lines 500] [--no-fast-path] [--no-merge] [--outline two-level|full]
 ```
 
 `--planner v3` (the default, `planner_version` `planner-v3.1`) is described in
 [Planner v3](#planner-v3-the-model-reports-facts-the-program-decides-the-structure);
 `--planner v2` runs planner v2, described in the rest of this section,
 exactly as before (its graphs and reports still say `planner-v2`).
-`--ablate` is for v3 only and `--no-merge` for v2 only; the other options
-apply to both.
+`--ablate` and `--outline` are for v3 only and `--no-merge` for v2 only; the
+other options apply to both. v3 plans with the two-level outline by default
+([below](#the-two-level-outline-v3-default)); `--outline full` gives the full
+outline and the prompt of `planner-v3.1` unchanged, to reproduce earlier
+plans. v2 always has the full outline.
 
 Planner v2 builds the graph in the three steps of the project proposal: a
 draft from the request alone, grounding in the code, and a rule-based
@@ -948,6 +951,55 @@ steps, each including the ones before it, until it fits:
 A shortened outline starts with a line that says what is left out. The
 report records `outline_chars`, `outline_reduction` and
 `outline_omitted_files`, and `plan` prints the first two.
+
+#### The two-level outline (v3 default)
+
+On a large repository the full outline was most of the planner's first
+message: 52.7K of 79.9K characters for dvc 0.89 (the instructions and their
+example 15K, the file list 7.5K). That message is kept whole by every
+compaction, so the context stayed at about 48K of the 80K tokens that start
+one, and the planner compacted 11 times while it read code. `outline_levels.py`
+builds a smaller outline, with no model:
+
+- **Level 1**, every source file: its path, line count and the names of its
+  top-level classes and functions (a function's ends in `()`), on one line.
+  No signatures, methods or fields.
+- **Level 2**, the full outline's detail without docstrings (signatures,
+  methods, `fields:`, line numbers), only for files chosen from the request
+  by a fixed rule:
+  - (a) files whose path (also without `src/`) or dotted module name appears
+    in the request; a module name needs two parts, so the word `dvc` does not
+    pick `dvc/__init__.py`. The SWE-EVO interface section names its files;
+  - (b) files that define a class, function or method whose name is a whole
+    word of the request, except names shorter than 4 characters, dunder
+    names, and common names: a name defined in more than 3 source files
+    (`run`, `save`, `get`), or a plain lowercase word (letters only) that is
+    not inside an inline code span of the request (`error`, `remote` are
+    English words of release notes; `` `error` `` counts; a fenced code block
+    does not count as a code span, since its comments and parameter names are
+    words too). Names with an underscore, a capital or a digit
+    (`cpu_count`, `HTTPURLInfo`) count anywhere;
+  - (c) the direct import neighbours of (a) and (b), both ways, from
+    `affected.py`'s import graph.
+
+  Level 2 is filled in that order (within (a) by first mention, within (b) by
+  the number of names matched, within (c) by the number of chosen files a
+  file neighbours, then by path) up to 15,000 characters
+  (`LEVEL2_BUDGET`). A file that does not fit is cut and recorded; smaller
+  files after it may still fit.
+
+The instructions' paragraph about the outline says that level 2 covers only
+some files and that the planner can read any file's definitions with
+`read_file`. The file list in the prompt names only the files that are not
+source files (those are in level 1), and a directory with more than 12 of
+them is one line with its count by extension (`- tests/func/ (62 files: 62
+.py; list them with glob)`).
+
+The report records `outline_mode` (`two-level` or `full`), `outline_chars`,
+`outline_level1_chars`, `outline_level2_chars`, `file_list_chars`,
+`outline_level2_files` (path, rule, why, characters) and `outline_level2_cut`
+(the files the budget left out); in `full` mode the level fields are null.
+`resynth` keeps the outline fields of the plan's report.
 
 #### Reading the code
 
@@ -1105,7 +1157,8 @@ merged, otherwise `llm` after a revision round and `none` without one.
   `reason`), `merges` (members, new id, rule, shared files) and `not_merged`,
   `nodes_before_merge` and `nodes`, `errors` (of the step that failed),
   `goal_chars` and `long_goals`, `outline_chars`, `outline_reduction` and
-  `outline_omitted_files`, `totals` and `duration_s` (Step 1 included) and
+  `outline_omitted_files` (v3 also `outline_mode`, `file_list_chars` and the
+  level fields of the two-level outline), `totals` and `duration_s` (Step 1 included) and
   `stage_totals` (Step 1 and Step 2 separately);
 - `<out>.logs/` (Step 2) and `<out>.logs/draft/` (Step 1): each round's
   config, trace and stdout.

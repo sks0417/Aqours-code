@@ -33,6 +33,8 @@ from .affected import TestImports, scan_test_imports
 from .cleanup import remove_tree
 from .facts import Facts, check_facts, parse_facts
 from .outline import Outline, build_outline
+from .outline_levels import (TwoLevelOutline, build_two_level_outline, other_files_list,
+                             two_level_instructions)
 from .planner import (DRAFT_ECHO_CHARS, PLANNER_VERSION, REPORTED_GOAL_CHARS, DraftError,
                       DraftItem, GraphInfo, PlanOptions, PlanResult, _agent_dict,
                       _agent_failure, _file_list, _issue_dict, _totals, extract_json_block,
@@ -46,9 +48,10 @@ from .workers import Worker, WorkerRequest, write_json_atomic
 FACTS_PROMPT_PATH = Path(__file__).resolve().parent / "planner_facts_prompt.md"
 
 
-def load_facts_prompt() -> str:
-    """Return the instructions of Step 2 in v3."""
-    return FACTS_PROMPT_PATH.read_text(encoding="utf-8")
+def load_facts_prompt(outline_mode: str = "full") -> str:
+    """Return the instructions of Step 2 in v3, for the outline of ``outline_mode``."""
+    prompt = FACTS_PROMPT_PATH.read_text(encoding="utf-8")
+    return two_level_instructions(prompt) if outline_mode == "two-level" else prompt
 
 
 def _items_section(items: list[DraftItem]) -> str:
@@ -71,14 +74,27 @@ class FactsRevision:
 
 def build_facts_prompt(request: str, index: RepoIndex, items: list[DraftItem],
                        outline: str | None = None,
-                       revision: FactsRevision | None = None) -> str:
-    """Return the full prompt of one round of Step 2 in v3."""
+                       revision: FactsRevision | None = None, *,
+                       outline_mode: str = "full", file_list: str | None = None) -> str:
+    """Return the full prompt of one round of Step 2 in v3.
+
+    With ``outline_mode`` "two-level", ``outline`` is the two-level outline
+    (:mod:`outline_levels`), the instructions describe it, and ``file_list``
+    lists the files that are not source files. "full" is the prompt of
+    planner v3.1, unchanged.
+    """
+    if outline_mode == "two-level":
+        files = ("# Repository\n\nThe repository is checked out in your working directory. "
+                 "Its source files are in the outline below; its other files:\n\n"
+                 f"{file_list if file_list is not None else other_files_list(index)}")
+    else:
+        files = ("# Repository\n\nThe repository is checked out in your working directory. "
+                 f"Its files:\n\n{_file_list(index)}")
     parts = [
-        load_facts_prompt().rstrip(),
+        load_facts_prompt(outline_mode).rstrip(),
         "# The request\n\n" + request.strip(),
         _items_section(items),
-        ("# Repository\n\nThe repository is checked out in your working directory. "
-         f"Its files:\n\n{_file_list(index)}"),
+        files,
     ]
     if outline is not None:
         parts.append("# Repository outline\n\n" + outline.strip())
@@ -161,6 +177,28 @@ class _V3Run:
     errors: list[Issue] = field(default_factory=list)
     outline: Outline = field(default_factory=lambda: Outline(""))
     tests: TestImports = field(default_factory=TestImports)
+    outline_mode: str = "full"
+    two_level: TwoLevelOutline | None = None
+    file_list_chars: int = 0
+    # resynth: the outline fields of the plan's own report (it has no prompt)
+    saved_outline: dict | None = None
+
+    def outline_fields(self) -> dict:
+        """The report's fields about the outline and the file list of the prompt."""
+        if self.saved_outline is not None:
+            return self.saved_outline
+        two = self.two_level
+        fields = {
+            "outline_mode": self.outline_mode,
+            "outline_chars": two.chars if two is not None else self.outline.chars,
+            "outline_reduction": None if two is not None else self.outline.reduction,
+            "outline_omitted_files": [] if two is not None else self.outline.omitted_files,
+            "file_list_chars": self.file_list_chars,
+        }
+        fields.update(two.report() if two is not None else {
+            "outline_level1_chars": None, "outline_level2_chars": None,
+            "outline_level2_files": None, "outline_level2_cut": None})
+        return fields
 
 
 def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResult:
@@ -216,9 +254,7 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         "goal_chars": goal_chars,
         "long_goals": {node_id: chars for node_id, chars in goal_chars.items()
                        if chars > REPORTED_GOAL_CHARS},
-        "outline_chars": run.outline.chars,
-        "outline_reduction": run.outline.reduction,
-        "outline_omitted_files": run.outline.omitted_files,
+        **run.outline_fields(),
         "test_imports": {"files": len(run.tests.imports), "sources": len(run.tests.sources),
                          "unresolved": run.tests.unresolved},
         "rounds": run.rounds,
@@ -256,8 +292,15 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
         clone = tmp / "repo"
         gitops.clone_for_run(repo, clone, base_commit)
         index = build_index(clone, base_commit)
-        run.outline = build_outline(clone, index)
         run.tests = scan_test_imports(clone, index)
+        run.outline_mode = options.outline
+        if options.outline == "two-level":
+            run.two_level = build_two_level_outline(clone, index, request, run.tests)
+            outline_text, file_list = run.two_level.text, other_files_list(index)
+        else:
+            run.outline = build_outline(clone, index)
+            outline_text, file_list = run.outline.text, _file_list(index)
+        run.file_list_chars = len(file_list)
         draft_items, run.stage1, run.errors = run_draft_stage(
             request, file_sizes(clone, index), draft_stage_worker, clone,
             log_dir / "draft", options.timeout_s)
@@ -273,7 +316,8 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
             revision: FactsRevision | None = None
             for number in range(options.max_revisions + 1):
                 prompt = build_facts_prompt(request, index, draft_items.items,
-                                            run.outline.text, revision)
+                                            outline_text, revision,
+                                            outline_mode=options.outline, file_list=file_list)
                 result = worker.run(WorkerRequest(
                     node_id="planner", attempt=number + 1, prompt=prompt, workspace=clone,
                     log_dir=log_dir, timeout_s=options.timeout_s))
@@ -403,7 +447,11 @@ def run_resynth(path: Path, out: Path, ablate: frozenset[str] = frozenset(),
         clone = tmp / "repo"
         gitops.clone_for_run(repo, clone, info.base_commit)
         index = build_index(clone, info.base_commit)
-        run.outline = build_outline(clone, index)
+        if "outline_mode" in saved:  # resynth has no prompt: keep what the plan used
+            run.saved_outline = {key: value for key, value in saved.items()
+                                 if key.startswith("outline_") or key == "file_list_chars"}
+        else:
+            run.outline = build_outline(clone, index)
         run.tests = scan_test_imports(clone, index)
         run.errors = [issue for issue in check_facts(facts, items, index)
                       if items or issue.code != "F1"]

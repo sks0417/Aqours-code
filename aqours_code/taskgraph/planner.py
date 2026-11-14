@@ -602,7 +602,9 @@ class PlanOptions:
     ``fast_path_lines`` is the fast-path threshold (None turns the fast path
     off); ``merge`` is False for ``--no-merge`` (v2 only). ``planner`` picks
     the version; ``ablate`` (v3 only) names the properties ``p1``-``p4``
-    whose rules are turned off.
+    whose rules are turned off. ``outline`` (v3 only; v2 always has the full
+    outline) is "two-level" (:mod:`outline_levels`) or "full" (the outline of
+    planner v3.1, to reproduce earlier plans).
     """
 
     request_path: Path
@@ -616,6 +618,7 @@ class PlanOptions:
     merge: bool = True
     planner: str = "v3"
     ablate: frozenset[str] = frozenset()
+    outline: str = "two-level"
 
 
 @dataclass

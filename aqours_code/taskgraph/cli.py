@@ -478,11 +478,16 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         return _error("--ablate applies only to --planner v3")
     if args.planner == "v3" and args.no_merge:
         return _error("--no-merge applies only to --planner v2 (v3 does not merge by M1/M2)")
+    if args.planner == "v2" and args.outline == "two-level":
+        return _error("--outline two-level applies only to --planner v3 "
+                      "(v2 always has the full outline)")
+    outline = args.outline or ("two-level" if args.planner == "v3" else "full")
     options = PlanOptions(request_path=request_path, repo=Path(args.repo),
                           out=Path(args.out), final_checks=list(args.final_check),
                           timeout_s=args.timeout, request_id=args.request_id,
                           fast_path_lines=None if args.no_fast_path else args.fast_path_lines,
-                          merge=not args.no_merge, planner=args.planner, ablate=ablate)
+                          merge=not args.no_merge, planner=args.planner, ablate=ablate,
+                          outline=outline)
     try:
         result = run_plan(options, planner.planner_worker(), planner.draft_worker())
     except (GitError, RuntimeError, OSError, UnicodeDecodeError) as exc:
@@ -512,8 +517,15 @@ def _print_plan_end(args: argparse.Namespace, result, report: dict) -> None:
     totals = report["totals"]
     print(f"model calls: {totals['model_calls']}  tokens: {totals['input_tokens']} in / "
           f"{totals['output_tokens']} out  time: {report['duration_s']:.1f}s")
-    print(f"outline: {report['outline_chars']} characters "
-          f"(shortened: {report['outline_reduction']})")
+    if report.get("outline_mode") == "two-level":
+        cut = report.get("outline_level2_cut") or []
+        print(f"outline (two-level): {report['outline_chars']} characters, level 1 "
+              f"{report['outline_level1_chars']}, level 2 {report['outline_level2_chars']} "
+              f"({len(report['outline_level2_files'])} files; {len(cut)} cut by the budget); "
+              f"file list {report['file_list_chars']}")
+    else:
+        print(f"outline: {report['outline_chars']} characters "
+              f"(shortened: {report['outline_reduction']})")
     for node_id, chars in report["long_goals"].items():
         print(f"note: node {node_id} goal has {chars} characters (over "
               f"{REPORTED_GOAL_CHARS}): goal repeats the request; the worker already "
@@ -774,6 +786,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan_cmd.add_argument("--ablate", default="",
                           help="v3 only: turn off the rules of properties, e.g. p1,p3 "
                                "(each falls back to its simplest behaviour)")
+    plan_cmd.add_argument("--outline", choices=("two-level", "full"),
+                          help="v3 only: the outline in the planner's prompt: two-level "
+                               "(default: every source file's top-level names, details only "
+                               "for files the request is about) or full (every definition, "
+                               "as in planner v3.1)")
     plan_cmd.add_argument("--no-merge", action="store_true",
                           help="v2 only: skip step 3 (rule-based merging)")
     plan_cmd.add_argument("--request-id", help="request_id of the graph "
