@@ -1274,6 +1274,39 @@ One correction the program makes itself and records: a `registration` edit
 of more than 5 lines is treated as `logic` with `standalone: false`
 (P3/`registration_too_large`).
 
+**Normalisation** (`facts.read_facts`). Before the format and F checks, the
+program fixes what it can fix without changing the meaning, so that a
+revision round (a new session that reads the code again) is not spent on it.
+Each fix is a warning in the report (`normalisations`), naming the unit, the
+field, the value and the reason:
+
+| Fixed | Why it keeps the meaning |
+| --- | --- |
+| a symbol of a file that is not `.py` (in `edits[].symbols`, `provides`, `uses`) is dropped; a `uses` entry goes with its symbol | only Python files define symbols; the file stays in the unit's edits |
+| a `registration` whose names were all of non-Python files becomes `logic` | it registers no Python name another unit could use; left a registration, it would move to `REG` |
+| `()` after a symbol name is removed | the same symbol |
+| a path with `\` or a leading `./` is rewritten | the same path |
+| a repeated symbol or path in a list is dropped | the list has no repeats |
+| `need` in another case or spelling (`Behaviour`) is rewritten | the same need |
+| a use of an existing symbol whose file no unit edits or creates, and that no unit provides, is dropped | the code is already there: not a dependency between units |
+
+Left as errors, since a fix would need a guess: a missing or wrong file, a
+symbol of another file than its edit, one file edited twice or both created
+and edited, a created file that exists, a provided symbol outside the unit's
+files, a use of a symbol nobody provides that does not exist or whose file
+another unit edits, an unknown `need`, a test file outside the unit's files,
+an unknown unit in `together`, a missing context file or heading, repeated
+unit ids, an unknown draft item, and any other malformed symbol, path or
+field. A `behavior` use without `why` stays recorded only
+(`behavior_without_why`).
+
+**The revision prompt** keeps the previous answer and lists the problems. It
+says that the rest of the answer passed the checks (after a format error:
+that the rest is well formed, since the F checks have not run), and tells the
+planner to change only what the problems require, keep the units, ids,
+files, symbols and sizes, and read code only when a problem cannot be fixed
+without it (`planner_v3.REVISION_INSTRUCTION`).
+
 #### Step 3: the graph (`synthesize.py`)
 
 Input: the facts, the repository index, `final_checks` and the imports of
@@ -1550,6 +1583,9 @@ outline fields, `totals`, `stage_totals`, `duration_s`):
 - `resynth_of` (only from `resynth`): the graph or report whose facts were used;
 - `revision_rounds` and `revision_reasons` (the error codes of every round
   that had to be revised);
+- `normalisations`: what the program fixed itself in the facts, one entry per
+  fix (`round`, `unit`, `field`, `value`, `action` `dropped` or `rewritten`,
+  `new_value`, `reason`, `message`); each entry of `rounds` has its own list;
 - `test_imports` (`files`: test files read, `sources`: other Python files
   read, `unresolved`: files whose imports could not be read).
 

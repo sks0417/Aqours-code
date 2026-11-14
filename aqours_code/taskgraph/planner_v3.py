@@ -31,7 +31,7 @@ from pydantic import ValidationError
 from . import gitops
 from .affected import TestImports, scan_test_imports
 from .cleanup import remove_tree
-from .facts import Facts, check_facts, parse_facts
+from .facts import Facts, Normalisation, check_facts, read_facts
 from .outline import Outline, build_outline
 from .outline_levels import (TwoLevelOutline, build_two_level_outline, other_files_list,
                              two_level_instructions)
@@ -72,6 +72,26 @@ class FactsRevision:
     errors: list[Issue]
 
 
+REVISION_INSTRUCTION = (
+    "Change only what these problems require, and keep everything else exactly as it "
+    "is: the same units, ids, files, symbols and sizes. You read the code for this "
+    "answer already; read code again only when a problem cannot be fixed without it. "
+    "Answer with the complete corrected description (all units, not only the changed "
+    "ones) as the last ```json block.")
+
+
+def _passed_note(errors: list[Issue]) -> str:
+    """What the program checked in the previous answer, truthfully.
+
+    After a format problem the content checks (F1-F9) could not run yet.
+    """
+    if any(issue.code == "FORMAT" for issue in errors):
+        return ("Only the format problems below were found; everything else in the "
+                "answer is well formed.")
+    return ("The rest of the answer passed the checks: everything that the problems "
+            "below do not name is fine.")
+
+
 def build_facts_prompt(request: str, index: RepoIndex, items: list[DraftItem],
                        outline: str | None = None,
                        revision: FactsRevision | None = None, *,
@@ -105,9 +125,8 @@ def build_facts_prompt(request: str, index: RepoIndex, items: list[DraftItem],
             f"# Fix your previous answer (revision {revision.number} of "
             f"{revision.max_revisions})\n\n"
             "You already described this request once; your answer is below, followed by "
-            "the problems the program found in it. Fix every problem and answer with the "
-            "complete corrected description (all units, not only the changed ones) as the "
-            "last ```json block. Keep the parts that were fine.\n\n"
+            f"the problems the program found in it. {_passed_note(revision.errors)}\n\n"
+            f"{REVISION_INSTRUCTION}\n\n"
             f"## Previous answer\n\n```json\n{facts}\n```\n\n"
             f"## Problems\n\n{problems}")
     return "\n\n".join(parts) + "\n"
@@ -121,6 +140,8 @@ class FactsEvaluation:
     facts: Facts | None = None
     synthesis: Synthesis | None = None
     errors: list[Issue] = field(default_factory=list)
+    # what the program fixed itself before checking (facts.read_facts)
+    normalisations: list[Normalisation] = field(default_factory=list)
     # True when the program, not the facts, failed: another round cannot help.
     program_error: bool = False
 
@@ -131,10 +152,10 @@ def evaluate_facts(answer: str, info: GraphInfo, index: RepoIndex, items: list[D
     """Parse, check and synthesize one answer of Step 2."""
     try:
         facts_text = extract_json_block(answer)
-        facts = parse_facts(answer)
+        facts, normalisations = read_facts(answer, index)
     except DraftError as exc:
         return FactsEvaluation(answer, errors=exc.issues)
-    evaluation = FactsEvaluation(facts_text, facts)
+    evaluation = FactsEvaluation(facts_text, facts, normalisations=normalisations)
     evaluation.errors = check_facts(facts, items, index)
     if evaluation.errors:
         return evaluation
@@ -152,6 +173,7 @@ def evaluate_facts(answer: str, info: GraphInfo, index: RepoIndex, items: list[D
 def _round_record(number: int, answer: str, evaluation: FactsEvaluation,
                   errors: list[Issue], agent: dict) -> dict:
     return {"round": number, "answer": answer, "facts_json": evaluation.facts_text,
+            "normalisations": [fix.to_dict() for fix in evaluation.normalisations],
             "errors": [_issue_dict(issue) for issue in errors], "agent": agent}
 
 
@@ -257,6 +279,9 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         **run.outline_fields(),
         "test_imports": {"files": len(run.tests.imports), "sources": len(run.tests.sources),
                          "unresolved": run.tests.unresolved},
+        # what the program fixed itself in each round's facts instead of asking again
+        "normalisations": [{"round": entry["round"], **fix} for entry in run.rounds
+                           for fix in entry.get("normalisations", [])],
         "rounds": run.rounds,
         "totals": {key: stage_totals["stage1"][key] + stage_totals["stage2"][key]
                    for key in ("model_calls", "input_tokens", "output_tokens")},

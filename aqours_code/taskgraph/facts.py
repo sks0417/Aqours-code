@@ -10,6 +10,8 @@ them back to the model (``F1``-``F9``).
 """
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
 from typing import Annotated, Literal
 
 from pydantic import (AfterValidator, BaseModel, ConfigDict, Field, StrictBool, StrictInt,
@@ -108,13 +110,248 @@ class Facts(_Facts):
 
 def parse_facts(text: str) -> Facts:
     """Parse the model's final answer; format problems raise :class:`DraftError`."""
-    data = _load_json(text)
+    return _validate_facts(_load_json(text))
+
+
+def _validate_facts(data) -> Facts:
     unit_ids = [str(unit.get("id", "?")) if isinstance(unit, dict) else "?"
                 for unit in (data.get("units") if isinstance(data, dict) else None) or []]
     try:
         return Facts.model_validate(data)
     except ValidationError as exc:
         raise DraftError(_pydantic_issues(exc, unit_ids, key="units")) from None
+
+
+# ── normalisation: what the program fixes itself instead of asking again ──
+#
+# Fixed here, because the facts mean the same after the fix:
+# - a symbol whose file is not a .py file (in edits[].symbols, provides or
+#   uses): only Python files define symbols, so it names nothing; dropped, and a
+#   uses entry left without its symbol goes with it. A registration edit whose
+#   names were all of that kind registers nothing a unit could use, and becomes
+#   a logic edit of its unit (a registration of no name would move to REG);
+# - a symbol written with "()" after its name ("x.py::run()"): the same symbol;
+# - a path written with "\" or starting with "./" (in a file, a symbol, create,
+#   tests or context_files): the same path;
+# - an entry repeated in a list that must not repeat (edits[].symbols,
+#   provides, create, tests, context_files): kept once;
+# - a need written "Behaviour", " interface " and the like: the same need;
+# - a uses entry of a symbol that exists in the repository and no unit
+#   provides (after the parse, with the index): the instructions say such a
+#   symbol is not listed, and no dependency can come from it.
+# Left as errors, because a fix would have to guess what was meant: a missing
+# or wrong file, a symbol in another file than its edit, an unknown draft item,
+# repeated unit ids, an edit listed twice for one file, a file both created and
+# edited, a creator of an existing file, provides outside the unit's files, a
+# use that no unit provides and that does not exist, an unknown need value, a
+# test file not created or edited, an unknown unit in `together`, a missing
+# context file or heading, and any other malformed symbol, path or field.
+
+SYMBOL_FIELDS = ("provides",)
+PATH_LIST_FIELDS = ("create", "tests", "context_files")
+_NEEDS_SPELLINGS = {"behaviour": "behavior"}
+
+
+@dataclass
+class Normalisation:
+    """One thing the program fixed in the model's facts, and why."""
+
+    unit: str
+    field: str
+    value: str
+    action: str  # "dropped" or "rewritten"
+    reason: str
+    new_value: str | None = None
+
+    def message(self) -> str:
+        what = f"{self.field} {self.value!r}"
+        if self.action == "rewritten":
+            return f"unit {self.unit}: {what} rewritten as {self.new_value!r} ({self.reason})"
+        return f"unit {self.unit}: {what} dropped ({self.reason})"
+
+    def to_dict(self) -> dict:
+        return {"unit": self.unit, "field": self.field, "value": self.value,
+                "action": self.action, "new_value": self.new_value, "reason": self.reason,
+                "message": self.message()}
+
+
+def _clean_path(value):
+    if not isinstance(value, str):
+        return value
+    path = value.replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def _clean_symbol(value):
+    """The same symbol, written the way the schema reads it."""
+    if not isinstance(value, str) or "::" not in value:
+        return value
+    path, _, name = value.partition("::")
+    name = name.strip()
+    if name.endswith("()"):
+        name = name[:-2]
+    return f"{_clean_path(path.strip())}::{name}"
+
+
+def _not_python(symbol) -> bool:
+    if not isinstance(symbol, str) or symbol.count("::") != 1:
+        return False
+    path = symbol.split("::")[0]
+    return bool(path) and not path.endswith(".py")
+
+
+def normalize_facts_data(data) -> tuple[object, list[Normalisation]]:
+    """A copy of the parsed JSON with what the program can fix fixed, and the list of fixes.
+
+    Shapes it does not expect are left alone, for the schema to report.
+    """
+    fixes: list[Normalisation] = []
+    if not isinstance(data, dict) or not isinstance(data.get("units"), list):
+        return data, fixes
+    data = json.loads(json.dumps(data))  # never change the caller's object
+
+    def record(unit, field, value, action, reason, new=None):
+        fixes.append(Normalisation(unit, field, str(value), action, reason,
+                                   None if new is None else str(new)))
+
+    def symbols(unit_id, field, values):
+        if not isinstance(values, list):
+            return values
+        kept = []
+        for value in values:
+            clean = _clean_symbol(value)
+            if clean != value:
+                record(unit_id, field, value, "rewritten", "the same symbol", clean)
+            if _not_python(clean):
+                record(unit_id, field, clean, "dropped",
+                       "only Python files define symbols; the file stays in the unit")
+                continue
+            if clean in kept:
+                record(unit_id, field, clean, "dropped", "listed twice")
+                continue
+            kept.append(clean)
+        return kept
+
+    def paths(unit_id, field, values):
+        if not isinstance(values, list):
+            return values
+        kept = []
+        for value in values:
+            clean = _clean_path(value)
+            if clean != value:
+                record(unit_id, field, value, "rewritten", "the same path", clean)
+            if clean in kept:
+                record(unit_id, field, clean, "dropped", "listed twice")
+                continue
+            kept.append(clean)
+        return kept
+
+    for unit in data["units"]:
+        if not isinstance(unit, dict):
+            continue
+        unit_id = str(unit.get("id", "?"))
+        for number, edit in enumerate(unit.get("edits") or []):
+            if not isinstance(edit, dict):
+                continue
+            if isinstance(edit.get("file"), str):
+                clean = _clean_path(edit["file"])
+                if clean != edit["file"]:
+                    record(unit_id, f"edits[{number}].file", edit["file"], "rewritten",
+                           "the same path", clean)
+                    edit["file"] = clean
+            if "symbols" in edit:
+                before = edit["symbols"]
+                edit["symbols"] = symbols(unit_id, f"edits[{number}].symbols", before)
+                if (edit.get("kind") == "registration" and isinstance(before, list) and before
+                        and not edit["symbols"]
+                        and all(_not_python(_clean_symbol(value)) for value in before)):
+                    edit["kind"] = "logic"
+                    record(unit_id, f"edits[{number}].kind", "registration", "rewritten",
+                           "it registers no Python name another unit could use; the edit "
+                           "stays with its unit", "logic")
+        for field_name in SYMBOL_FIELDS:
+            if field_name in unit:
+                unit[field_name] = symbols(unit_id, field_name, unit[field_name])
+        for field_name in PATH_LIST_FIELDS:
+            if field_name in unit:
+                unit[field_name] = paths(unit_id, field_name, unit[field_name])
+        uses = unit.get("uses")
+        if isinstance(uses, list):
+            kept_uses = []
+            for use in uses:
+                if not isinstance(use, dict):
+                    kept_uses.append(use)
+                    continue
+                symbol = use.get("symbol")
+                clean = _clean_symbol(symbol)
+                if clean != symbol:
+                    record(unit_id, "uses", symbol, "rewritten", "the same symbol", clean)
+                    use["symbol"] = clean
+                if _not_python(clean):
+                    record(unit_id, "uses", clean, "dropped",
+                           "only Python files define symbols; the uses entry goes with it")
+                    continue
+                need = use.get("need")
+                if isinstance(need, str):
+                    canonical = need.strip().lower()
+                    canonical = _NEEDS_SPELLINGS.get(canonical, canonical)
+                    if canonical != need and canonical in NEEDS:
+                        record(unit_id, "uses.need", need, "rewritten", "the same need",
+                               canonical)
+                        use["need"] = canonical
+                kept_uses.append(use)
+            unit["uses"] = kept_uses
+    return data, fixes
+
+
+def drop_existing_unprovided_uses(facts: Facts, index: RepoIndex
+                                  ) -> tuple[Facts, list[Normalisation]]:
+    """Drop uses of symbols that exist in the repository and that no unit changes.
+
+    The instructions say such a symbol is not listed; no dependency can come
+    from it, so the facts mean the same without it. A use stays (and F6
+    reports it) when some unit edits the symbol's file: that unit may change
+    the symbol and have forgotten to provide it.
+    """
+    provided = {symbol for unit in facts.units for symbol in unit.provides}
+    edited = {path for unit in facts.units for path in unit.edit_files()}
+    edited |= {path for unit in facts.units for path in unit.create}
+    fixes: list[Normalisation] = []
+    units = []
+    for unit in facts.units:
+        kept = []
+        for use in unit.uses:
+            path = use.symbol.split("::")[0]
+            if (use.symbol not in provided and index.has_symbol(use.symbol)
+                    and path not in edited):
+                fixes.append(Normalisation(
+                    unit.id, "uses", use.symbol, "dropped",
+                    "it exists in the repository and no unit changes its file: it is not "
+                    "a dependency between units"))
+                continue
+            kept.append(use)
+        units.append(unit.model_copy(update={"uses": kept}) if len(kept) != len(unit.uses)
+                     else unit)
+    if not fixes:
+        return facts, fixes
+    return facts.model_copy(update={"units": units}), fixes
+
+
+def read_facts(text: str, index: RepoIndex | None = None
+               ) -> tuple[Facts, list[Normalisation]]:
+    """Parse the model's answer after fixing what the program can fix itself.
+
+    Returns the facts and the fixes; what is left wrong raises
+    :class:`DraftError` (format) here or is reported by :func:`check_facts`.
+    """
+    data, fixes = normalize_facts_data(_load_json(text))
+    facts = _validate_facts(data)
+    if index is not None:
+        facts, more = drop_existing_unprovided_uses(facts, index)
+        fixes += more
+    return facts, fixes
 
 
 # ── checks ──
