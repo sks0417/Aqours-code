@@ -931,6 +931,20 @@ A second agent (`read_file`, `glob`, `compact`) gets
 outline and answers with a draft graph: only nodes, no edges; the last
 ```` ```json ```` block of the final answer is the draft.
 
+**Only the repository** (`repo_guard.py`). The planner (both steps, v2 and
+v3) and the team lead (plan and wrap-up) run on the host. Their `read_file`
+and `glob` refuse a path or pattern that is absolute, contains `..`, or
+resolves (after symlinks, or a pattern's part before its first wildcard)
+outside the agent's clone, with "Tool not run: you may only read files of
+the repository ...". It is a PreToolUse hook that `worker_entry` registers
+when `WorkerRequest.repo_guard` is set; workers (graph nodes, teammates,
+single agents, also in Docker) do not get it. Without it the Aqours tools
+already kept their results inside the workspace (`read_file` refuses a path
+that resolves outside; `glob` drops matches outside), but `glob` with an
+absolute pattern ignored its root and walked the host before dropping
+everything: planning dask 2023.8.0 globbed `C:/Users/<user>/**/site-packages/
+dask/...` and got `(no matches)`, whatever was installed.
+
 #### The repository outline
 
 `outline.py` lists, with `ast` and without a model, what every source file

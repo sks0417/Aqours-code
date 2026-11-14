@@ -38,6 +38,9 @@ class WorkerRequest:
     soft_wall_enabled: bool = False
     own_files: list[str] = field(default_factory=list)
     full_files: list[str] = field(default_factory=list)
+    # host-side agents (planner, team lead): read_file and glob only inside the
+    # workspace, given relative and without ".." (repo_guard.py)
+    repo_guard: bool = False
     # the planner's share of its plan's limits: {"max_calls", "max_input_tokens"}
     # (either may be None); None for every other agent (worker_entry.BudgetedCountingClient)
     model_budget: dict | None = None
@@ -177,6 +180,7 @@ class AqoursWorker:
                 "full_files": request.full_files,
                 "log_path": str(log_dir / f"soft_wall_{n}.jsonl"),
             },
+            "repo_guard": request.repo_guard,
             "model_budget": request.model_budget,
         }
 

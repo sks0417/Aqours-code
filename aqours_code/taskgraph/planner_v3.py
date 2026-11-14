@@ -354,7 +354,8 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
                                             outline_mode=options.outline, file_list=file_list)
                 result = worker.run(WorkerRequest(
                     node_id="planner", attempt=number + 1, prompt=prompt, workspace=clone,
-                    log_dir=log_dir, **budget.request_fields(options.timeout_s)))
+                    log_dir=log_dir, repo_guard=True,
+                    **budget.request_fields(options.timeout_s)))
                 budget.add(2, number + 1, result)
                 if not result.ok:
                     # no answer the model gave: nothing to check or revise

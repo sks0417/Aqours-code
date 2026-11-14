@@ -196,6 +196,20 @@ def register_soft_wall(config: dict):
     return wall
 
 
+def register_repo_guard(config: dict):
+    """For the planner and the team lead: read_file and glob only in the workspace."""
+    if not config.get("repo_guard"):
+        return None
+    from aqours_code import bootstrap  # noqa: PLC0415
+    bootstrap()
+    from aqours_code.hooks import register_hook, recoverable_tool_rejection  # noqa: PLC0415
+    from .repo_guard import RepoGuard  # noqa: PLC0415
+
+    guard = RepoGuard(Path(config["workspace"]))
+    register_hook("PreToolUse", lambda block: guard.pre_tool(block, recoverable_tool_rejection))
+    return guard
+
+
 def run_worker(config: dict, model_client=None,
                tool_policy: dict | None = None) -> WorkerResult:
     """Run one node attempt with ``run_agent_task`` and return its result.
@@ -230,6 +244,7 @@ def run_worker(config: dict, model_client=None,
     result = WorkerResult(ok=True)
     deadline = time.monotonic() + timeout_s
     wall = register_soft_wall(config)
+    guard = register_repo_guard(config)
     try:
         executor = command_executor_for(config, deadline)
         if wall is not None:
@@ -261,6 +276,8 @@ def run_worker(config: dict, model_client=None,
             # Production workers exit; in-process scripted tests must not leave
             # active callbacks affecting later workers or planner runs.
             wall.active = False
+        if guard is not None:
+            guard.active = False
 
     answer = result.final_answer.lstrip()
     if result.ok and (answer.startswith("[Error]")

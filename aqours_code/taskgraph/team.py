@@ -447,7 +447,8 @@ class Team:
         self.events.emit("worker_start", node=node_id, attempt=attempt)
         request = WorkerRequest(node_id=node_id, attempt=attempt, prompt=prompt,
                                 workspace=workspace, log_dir=log_dir, timeout_s=timeout_s,
-                                soft_wall_enabled=False)
+                                soft_wall_enabled=False,
+                                repo_guard=node_id in (LEAD_PLAN, LEAD_WRAPUP))
         try:
             result = worker.run(request)
         except Exception as exc:  # noqa: BLE001 - a broken worker fails the attempt

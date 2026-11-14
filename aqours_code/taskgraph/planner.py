@@ -700,7 +700,7 @@ def run_draft_stage(request: str, sizes: list[tuple[str, int | None]], worker: W
         prompt = build_draft_prompt(request, sizes, previous, errors)
         result = worker.run(WorkerRequest(
             node_id="planner-draft", attempt=attempt, prompt=prompt, workspace=clone,
-            log_dir=log_dir, **budget.request_fields(timeout_s)))
+            log_dir=log_dir, repo_guard=True, **budget.request_fields(timeout_s)))
         budget.add(1, attempt, result)
         items: DraftItems | None = None
         if not result.ok:
@@ -848,7 +848,8 @@ def run_plan_v2(options: PlanOptions, worker: Worker,
                                       draft_items.items, outline.text)
                 result = worker.run(WorkerRequest(
                     node_id="planner", attempt=number + 1, prompt=prompt, workspace=clone,
-                    log_dir=log_dir, **budget.request_fields(options.timeout_s)))
+                    log_dir=log_dir, repo_guard=True,
+                    **budget.request_fields(options.timeout_s)))
                 budget.add(2, number + 1, result)
                 if result.ok:
                     evaluation = _evaluate_answer(result.final_answer, info, index,
