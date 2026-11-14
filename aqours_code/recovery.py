@@ -1,4 +1,6 @@
 from .runtime_state import *
+from .provider_errors import is_transient_provider_error as _is_transient_provider_error
+from .provider_errors import provider_error_kind as _provider_error_kind
 
 # ── Error Recovery ──
 
@@ -47,8 +49,26 @@ def with_retry(fn, state: RecoveryState):
                       f"after {delay:.1f}s\033[0m")
                 time.sleep(delay)
                 continue
+            # A timeout, a reset or refused connection, a TLS error or a 5xx:
+            # the same failures the Docker Broker retries (provider_errors).
+            kind = _provider_error_kind(e)
+            if _is_transient_provider_error(kind):
+                delay = retry_delay(attempt)
+                # The last attempt raises the error itself, so the caller sees
+                # what failed; a retry never starts after the agent's deadline.
+                if attempt + 1 >= MAX_RETRIES or _past_deadline(delay):
+                    raise
+                print(f"  \033[33m[{kind}] retry {attempt + 1}/{MAX_RETRIES} "
+                      f"after {delay:.1f}s\033[0m")
+                time.sleep(delay)
+                continue
             raise
     raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
+
+
+def _past_deadline(delay: float) -> bool:
+    """Whether a retry after ``delay`` seconds would start after the run's deadline."""
+    return CASE_DEADLINE is not None and time.monotonic() + delay >= CASE_DEADLINE
 
 
 def is_prompt_too_long_error(e: Exception) -> bool:
