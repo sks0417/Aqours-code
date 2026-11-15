@@ -16,9 +16,14 @@ when a limit is reached.
 A round whose agent failed (``worker_error``, ``worker_timeout``,
 ``model_budget``) gave no answer, so it is not revised: the plan stops with an
 error naming the step and round, the reason, and the calls and tokens used.
+
+With ``plan --facts per-item`` several investigators run at once in Step 2;
+:class:`SharedBudget` keeps the plan's limits for all of them together, and
+:class:`InvestigatorLimits` are the limits of each run.
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import asdict, dataclass
 
@@ -101,17 +106,20 @@ class PlanBudget:
         has_limit = any(value is not None for value in budget.values())
         return {"timeout_s": timeout, "model_budget": budget if has_limit else None}
 
-    def add(self, step: int, number: int, result: WorkerResult) -> None:
-        """Count one finished round."""
+    def add(self, step: int, number: int, result: WorkerResult, item: str | None = None) -> None:
+        """Count one finished round (with ``item``: one investigator of a per-item round)."""
         self.model_calls += result.model_calls
         self.input_tokens += result.input_tokens
         self.output_tokens += result.output_tokens
-        self.rounds.append({"step": step, "round": number,
-                            "model_calls": result.model_calls,
-                            "input_tokens": result.input_tokens,
-                            "output_tokens": result.output_tokens,
-                            "duration_s": round(result.duration_s, 3),
-                            "ended": "answer" if result.ok else (result.reason or "worker_error")})
+        entry = {"step": step, "round": number}
+        if item is not None:
+            entry["item"] = item
+        entry.update({"model_calls": result.model_calls,
+                      "input_tokens": result.input_tokens,
+                      "output_tokens": result.output_tokens,
+                      "duration_s": round(result.duration_s, 3),
+                      "ended": "answer" if result.ok else (result.reason or "worker_error")})
+        self.rounds.append(entry)
 
     def so_far(self) -> str:
         return (f"{self.model_calls} model calls, {self.input_tokens:,} input and "
@@ -121,6 +129,14 @@ class PlanBudget:
         self.stopped = {"code": code, "step": step, "round": number, "reason": reason,
                         "message": message}
         return Issue(code, [], message)
+
+    def stop(self, code: str, step: int, number: int, reason: str, message: str,
+             item: str | None = None) -> Issue:
+        """Record why the plan stopped early (``item``: whose investigator) and return the error."""
+        issue = self._stop(code, step, number, reason, message)
+        if item is not None:
+            self.stopped["item"] = item
+        return issue
 
     def limit_issue(self, step: int, number: int) -> Issue | None:
         """Before a round: a LIMIT error when a limit leaves no room for it."""
@@ -163,3 +179,136 @@ class PlanBudget:
                          "seconds": round(self.elapsed(), 3)},
                 "stopped": self.stopped,
                 "round_usage": self.rounds}
+
+
+# ── investigators running at the same time (``plan --facts per-item``) ──
+
+DEFAULT_INVESTIGATOR_CALLS = 40
+DEFAULT_INVESTIGATOR_INPUT_TOKENS = 1_500_000
+DEFAULT_INVESTIGATOR_S = 900.0
+
+INVESTIGATOR_LIMITS = {"model_calls": "--investigator-max-calls",
+                       "input_tokens": "--investigator-max-input-tokens",
+                       "seconds": "--investigator-max-time"}
+
+
+@dataclass
+class InvestigatorLimits:
+    """Limits of one investigator run; None turns a limit off."""
+
+    model_calls: int | None = DEFAULT_INVESTIGATOR_CALLS
+    input_tokens: int | None = DEFAULT_INVESTIGATOR_INPUT_TOKENS
+    seconds: float | None = DEFAULT_INVESTIGATOR_S
+
+
+def _least(*values):
+    present = [value for value in values if value is not None]
+    return min(present) if present else None
+
+
+@dataclass
+class Reservation:
+    """What one investigator run may use: its limits, cut to what the plan has left."""
+
+    model_calls: int | None
+    input_tokens: int | None
+    timeout_s: float
+    # the part of the plan's limits held for it while it runs (0 when the plan has none)
+    held_calls: int = 0
+    held_tokens: int = 0
+    # which of its limits are smaller than the investigator's own, because of the plan's
+    cut_by_plan: tuple[str, ...] = ()
+
+    def model_budget(self) -> dict | None:
+        """``WorkerRequest.model_budget``."""
+        if self.model_calls is None and self.input_tokens is None:
+            return None
+        return {"max_calls": self.model_calls, "max_input_tokens": self.input_tokens}
+
+    def to_dict(self) -> dict:
+        return {"model_calls": self.model_calls, "input_tokens": self.input_tokens,
+                "seconds": round(self.timeout_s, 3), "cut_by_plan": list(self.cut_by_plan)}
+
+
+class SharedBudget:
+    """The plan's limits shared by investigators that run at the same time.
+
+    The model calls and input tokens of the plan cannot be counted live
+    across child processes, so they are reserved: a starting investigator
+    gets its own limits (:class:`InvestigatorLimits`), cut to what the plan
+    has left after the reservations of the investigators still running, and
+    its reservation is held until it ends. What it used is then counted and
+    the rest is freed. An investigator that finds nothing left waits while
+    others run (they may free some); with none running, it does not start.
+    Its timeout is the round timeout, its own time limit and the plan's time
+    left, whichever is smallest. All of the plan's limits are so kept for all
+    investigators together.
+    """
+
+    def __init__(self, budget: PlanBudget, limits: InvestigatorLimits):
+        self.budget = budget
+        self.limits = limits
+        self.held_calls = self.held_tokens = 0
+        self.running = 0
+        self._condition = threading.Condition()
+
+    def _free(self) -> tuple[int | None, int | None]:
+        plan = self.budget.limits
+        calls = (None if plan.model_calls is None
+                 else plan.model_calls - self.budget.model_calls - self.held_calls)
+        tokens = (None if plan.input_tokens is None
+                  else plan.input_tokens - self.budget.input_tokens - self.held_tokens)
+        return calls, tokens
+
+    def _exhausted(self) -> str:
+        """The plan limit that leaves nothing for another investigator now, or ""."""
+        calls, tokens = self._free()
+        if calls is not None and calls <= 0:
+            return "model_calls"
+        if tokens is not None and tokens <= 0:
+            return "input_tokens"
+        left = self.budget.seconds_left()
+        if left is not None and left < MIN_ROUND_S:
+            return "seconds"
+        return ""
+
+    def reserve(self, timeout_s: float) -> Reservation | str:
+        """A reservation for one investigator, or the plan limit that prevents it."""
+        with self._condition:
+            while True:
+                limit = self._exhausted()
+                if not limit:
+                    break
+                if limit == "seconds" or self.running == 0:
+                    return limit
+                self._condition.wait()
+            calls, tokens = self._free()
+            own = self.limits
+            model_calls = _least(own.model_calls, calls)
+            input_tokens = _least(own.input_tokens, tokens)
+            left = self.budget.seconds_left()
+            timeout = _least(timeout_s, own.seconds, left)
+            cut = tuple(name for name, value, mine in (
+                ("model_calls", model_calls, own.model_calls),
+                ("input_tokens", input_tokens, own.input_tokens),
+                ("seconds", timeout, _least(timeout_s, own.seconds)))
+                if value is not None and (mine is None or value < mine))
+            reservation = Reservation(model_calls, input_tokens, max(0.0, timeout),
+                                      held_calls=model_calls if calls is not None else 0,
+                                      held_tokens=input_tokens if tokens is not None else 0,
+                                      cut_by_plan=cut)
+            self.held_calls += reservation.held_calls
+            self.held_tokens += reservation.held_tokens
+            self.running += 1
+            return reservation
+
+    def release(self, reservation: Reservation, step: int, number: int,
+                result: WorkerResult | None, item: str) -> None:
+        """Count what an investigator used (``result`` None: it raised) and free the rest."""
+        with self._condition:
+            self.held_calls -= reservation.held_calls
+            self.held_tokens -= reservation.held_tokens
+            self.running -= 1
+            if result is not None:
+                self.budget.add(step, number, result, item=item)
+            self._condition.notify_all()

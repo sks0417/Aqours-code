@@ -36,8 +36,8 @@ from .plan_budget import PlanBudget
 from .outline import Outline, build_outline
 from .outline_levels import (TwoLevelOutline, build_two_level_outline, other_files_list,
                              two_level_instructions)
-from .planner import (DRAFT_ECHO_CHARS, PLANNER_VERSION, REPORTED_GOAL_CHARS, DraftError,
-                      DraftItem, GraphInfo, PlanOptions, PlanResult, _agent_dict,
+from .planner import (DRAFT_ECHO_CHARS, FACTS_MODES, PLANNER_VERSION, REPORTED_GOAL_CHARS,
+                      DraftError, DraftItem, GraphInfo, PlanOptions, PlanResult, _agent_dict,
                       _file_list, _issue_dict, _totals, extract_json_block,
                       fast_path_graph, file_sizes, report_path_for, run_draft_stage)
 from .repo_index import RepoIndex, build_index
@@ -207,11 +207,20 @@ class _V3Run:
     saved_outline: dict | None = None
     # plan: the limits and what the rounds used (resynth makes no model call)
     budget: PlanBudget | None = None
+    # Step 2: "single" or "per-item" (planner_items), and the investigators' report fields
+    facts_mode: str = "single"
+    per_item: dict | None = None
 
     def outline_fields(self) -> dict:
         """The report's fields about the outline and the file list of the prompt."""
         if self.saved_outline is not None:
             return self.saved_outline
+        if self.facts_mode == "per-item":  # one outline per item: outline_per_item
+            return {"outline_mode": "per-item", "outline_chars": None,
+                    "outline_reduction": None, "outline_omitted_files": [],
+                    "file_list_chars": self.file_list_chars, "outline_level1_chars": None,
+                    "outline_level2_chars": None, "outline_level2_files": None,
+                    "outline_level2_cut": None}
         two = self.two_level
         fields = {
             "outline_mode": self.outline_mode,
@@ -248,6 +257,7 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         "success": success,
         "errors": [_issue_dict(issue) for issue in run.errors],
         "ablate": sorted(run.ablate),
+        "facts_mode": run.facts_mode,
         "draft_items": run.draft_items,
         "estimated_changed_lines": run.estimate,
         "fast_path": {"taken": run.fast_path, "estimated_changed_lines": run.estimate,
@@ -286,6 +296,8 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         "normalisations": [{"round": entry["round"], **fix} for entry in run.rounds
                            for fix in entry.get("normalisations", [])],
         "rounds": run.rounds,
+        # per-item mode: the investigators, the items that finished, the time of Step 2
+        **(run.per_item or {}),
         "totals": {key: stage_totals["stage1"][key] + stage_totals["stage2"][key]
                    for key in ("model_calls", "input_tokens", "output_tokens")},
         "stage_totals": stage_totals,
@@ -300,7 +312,17 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
 
 def run_plan_v3(options: PlanOptions, worker: Worker,
                 draft_stage_worker: Worker | None = None) -> PlanResult:
-    """Run planner v3; write the graph and the report."""
+    """Run planner v3; write the graph and the report.
+
+    With ``options.facts`` "per-item", Step 2 runs one investigator per draft
+    item (:mod:`planner_items`); Step 1, the fast path and Step 3 are the same.
+    """
+    if options.facts not in FACTS_MODES:
+        raise ValueError(f"unknown facts mode {options.facts!r} (use "
+                         f"{', '.join(FACTS_MODES)})")
+    if options.facts == "per-item" and options.outline != "two-level":
+        raise ValueError("--facts per-item builds a two-level outline for every item; it "
+                         "cannot use --outline full")
     started = time.monotonic()
     draft_stage_worker = draft_stage_worker or worker
     request = options.request_path.read_text(encoding="utf-8")
@@ -324,7 +346,10 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
         index = build_index(clone, base_commit)
         run.tests = scan_test_imports(clone, index)
         run.outline_mode = options.outline
-        if options.outline == "two-level":
+        run.facts_mode = options.facts
+        if options.facts == "per-item":  # the outlines are built per item in Step 2
+            outline_text, file_list = None, other_files_list(index)
+        elif options.outline == "two-level":
             run.two_level = build_two_level_outline(clone, index, request, run.tests)
             outline_text, file_list = run.two_level.text, other_files_list(index)
         else:
@@ -342,6 +367,11 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
             run.graph = fast_path_graph(info, repo, run.estimate, run.threshold,
                                         PLANNER_VERSION)
             run.errors = list(validate(run.graph, index).errors)
+        elif draft_items is not None and options.facts == "per-item":
+            from .planner_items import PerItemStep2  # planner_items imports this module
+
+            PerItemStep2(options, worker, clone, index, run.tests, info, draft_items.items,
+                         request, log_dir, budget, run.ablate).run(run)
         elif draft_items is not None:
             revision: FactsRevision | None = None
             for number in range(options.max_revisions + 1):
@@ -482,7 +512,8 @@ def run_resynth(path: Path, out: Path, ablate: frozenset[str] = frozenset(),
     run = _V3Run(info, saved.get("request") or str(path), repo, out,
                  frozenset(ablate), draft_items=[item.model_dump() for item in items],
                  estimate=saved.get("estimated_changed_lines"), facts=facts,
-                 threshold=(saved.get("fast_path") or {}).get("threshold"))
+                 threshold=(saved.get("fast_path") or {}).get("threshold"),
+                 facts_mode=saved.get("facts_mode") or "single")
     tmp = Path(tempfile.mkdtemp(prefix="tg-resynth-"))
     try:
         clone = tmp / "repo"

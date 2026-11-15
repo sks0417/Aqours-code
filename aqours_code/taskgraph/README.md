@@ -823,7 +823,13 @@ python -m aqours_code.taskgraph plan <request.md> --repo <path> --out <graph.jso
     [--final-check "python -m pytest -q tests"] [--timeout 1800] [--request-id <id>]
     [--fast-path-lines 500] [--no-fast-path] [--no-merge] [--outline two-level|full]
     [--max-calls 150] [--max-input-tokens 6000000] [--max-time 2400]
+    [--facts single|per-item] [--max-investigators 8] [--investigator-max-calls 40]
+    [--investigator-max-input-tokens 1500000] [--investigator-max-time 900]
 ```
+
+`--facts per-item` (v3 only; the default stays `single`) runs Step 2 with one
+investigator per draft item:
+[Step 2 per draft item](#step-2-per-draft-item---facts-per-item-planner_itemspy).
 
 `--planner v3` (the default, `planner_version` `planner-v3.1`) is described in
 [Planner v3](#planner-v3-the-model-reports-facts-the-program-decides-the-structure);
@@ -1352,6 +1358,117 @@ planner to change only what the problems require, keep the units, ids,
 files, symbols and sizes, and read code only when a problem cannot be fixed
 without it (`planner_v3.REVISION_INSTRUCTION`).
 
+#### Step 2 per draft item (`--facts per-item`, `planner_items.py`)
+
+With a vague request or a large repository one agent cannot hold what it
+reads for the whole request: dvc 0.89 took 86 calls and 4.19M input tokens
+with 11 compactions and 445 reads of 59 files; dask 2023.8.0 gave no answer
+in two rounds (251 calls, 10.96M input tokens, 23 compactions in round 2) and
+read `dask/dataframe/core.py` 110 times in one round, again after every
+compaction. Step 1 already splits the request into draft items, so
+`--facts per-item` does Step 2 per item, with small contexts, in parallel.
+Step 1, the fast path, the checks, Step 3 and `resynth` are unchanged.
+
+**Investigators.** One per draft item, at most `--max-investigators` (8) at
+once. Each is a host-side agent like the single planner (read_file and glob,
+`repo_guard` on). They share one read-only clone: an agent's trace and
+runtime state (transcripts, tool results) are under its own log directory
+(`<graph>.logs/items/item-<id>/`), and read_file and glob write nothing into
+the workspace (`test_investigators_can_share_one_read_only_clone`).
+
+**The prompt** of an investigator:
+
+- the facts instructions adapted to one item (`item_instructions()`: the
+  prompt file is the single mode's; three paragraphs are replaced and a
+  `## Your item` section is added): it describes only the units of its own
+  item, the others are investigated at the same time, and it does not
+  describe their work even where it sees it. Unit ids start with the item's
+  id. A `uses` may name a symbol another item provides; it cannot see their
+  answers, so it names the symbol as the request (or its interface section)
+  does. The output format is the same;
+- the whole request, all draft items with its own marked, the other files,
+  and at the end its item again;
+- the two-level outline built for its item (`outline_levels.build_item_outline`).
+
+**The outline of an item.** Its text is the item's title and description
+and the parts of the request about it (`item_texts()`): every section under
+a heading is one part, the text before the first heading one part per line
+(a release's notes give one per change). A part is the item's when it has
+one of the item's words, at least half as many as the item with the most; an
+item's words are the stems of its title and description that are in at most
+a third of the items and half of the parts. Level 2 is then filled to
+`ITEM_LEVEL2_BUDGET` (12,000 characters) by the rules (a) and (b) of the
+two-level outline applied to that text, then (d) files named like one of the
+item's words that also chose a part of the request (`gc` gives
+`dvc/command/gc.py` and `dvc/repo/gc.py`), then (c) the import neighbours of
+the files shown, the nearest directory first. A file of (a), (b) or (d) that
+does not fit is shown shortened to its definitions whose names share a word
+with the item (`dask/dataframe/core.py`, 22K characters, gives an item about
+`groupby` its groupby and sort methods). When level 1 is longer than
+`LEVEL1_COLLAPSE_CHARS` (15,000; dask 2023.8.0 has 32,000), a directory with
+no level-2 file is one line with its numbers of files and lines (the highest
+such directory, when the line is shorter than its files), and (c) takes no
+neighbour outside the directories of the item's files.
+
+**Merging.** The answers are read (format problems belong to their item),
+every unit gets its investigator's item, and a `together` may name only the
+answer's own units (F8). `merge_answers()` makes one description in draft
+order: a unit whose id an earlier item uses is renamed `<item>-<id>`
+(`-2`, `-3` when taken); a new file in the `create` of units of several
+items stays with the first item's unit and becomes a logic edit of the new
+file for the others (with the symbols they provide in it and their share of
+the size); the conventions are the union without repeats. Each is recorded
+as a normalisation with its item. The normalisation, F1-F9 and the synthesis
+then run on the whole. Overlaps across items are left to P1, as in single
+mode.
+
+**Revisions per item.** Each problem goes to the items of the units it names;
+only those investigators run again (in parallel), each with its own previous
+answer (as the program read it, when the merge renamed or moved something),
+its own problems and the narrow revision instruction. A `uses` that no unit
+provides comes with the list of what every other item provides, so it can
+be fixed without reading code. While an answer has a format problem only the
+format problems are sent, since the others cannot be checked without it. A
+problem that names no unit stops the plan (`UNASSIGNED`). An item is revised
+at most `max_revisions` (2) times.
+
+**Limits and failures.** The plan's limits cover all investigators together,
+and each run has its own (`--investigator-max-calls` 40,
+`--investigator-max-input-tokens` 1,500,000, `--investigator-max-time` 900 s;
+0 turns one off). The calls and tokens cannot be counted live across child
+processes, so a starting investigator reserves its own limits cut to what
+the plan has left after the reservations of the others still running, and
+the reservation is freed when it ends (`plan_budget.SharedBudget`); with
+nothing left it waits while others run, and does not start when none does.
+Its timeout is the smallest of `--timeout`, its own time limit and the plan's
+time left. With the default plan limits (150 calls, 6M tokens) about three
+investigators can hold their full limits at once. An investigator that fails
+(`worker_error`, `worker_timeout`) or reaches its limits (`model_budget`)
+runs again once, alone, after the others of its round, if the plan's limits
+allow; a second failure stops the plan with an `AGENT` error (`LIMIT` when
+the plan's limits had cut its own) that names the item, and the answers of
+the others stay in the report and the logs.
+
+**The report** adds `facts_mode` (also `single` in single mode), the
+investigators (`investigators`: per run its item, round, run, whether it ran
+again, calls, input and output tokens, duration, compactions and read_file
+calls from its trace, prompt characters, level-2 files, its limits and how it
+ended), `item_summary`, `items_finished`, `items_unfinished`,
+`revisions_per_item`, `step2_wall_s` next to `step2_investigators_s` (the sum
+of the investigators' durations), `max_investigators`,
+`investigator_limits` and `outline_per_item`; `outline_mode` is `per-item`,
+and a round's record has its items, `facts_json` and `problems` per item.
+`plan` prints one line per investigator.
+
+**A dry run** builds the prompts of the first round without a model:
+
+```bash
+python -m aqours_code.taskgraph item-prompts <request.md> --repo <path> --draft-items <graph.json.report.json | logs/draft/worker_1.json> [--out <dir>]
+```
+
+prints, per investigator, the prompt's and outline's characters and the
+level-2 files, and with `--out` writes `item-<id>.md` and `item_prompts.json`.
+
 #### Step 3: the graph (`synthesize.py`)
 
 Input: the facts, the repository index, `final_checks` and the imports of
@@ -1673,7 +1790,9 @@ checks the facts again (F1-F9, against the saved draft items) and runs
 can be built under other rules or another `--ablate` at no planning cost.
 It writes the new graph and a report with the fields of a v3 `plan` report
 (model calls and tokens 0, no rounds) plus `resynth_of`, and prints the
-same summary. Facts saved before `why` existed read as before. Exit codes:
+same summary. Facts saved before `why` existed read as before. A per-item
+plan's report holds the merged facts, so it is built again the same way.
+Exit codes:
 `0` success, `1` the facts no longer pass the checks or contradict each
 other, `2` a missing report or facts, a request it cannot read, no
 `--final-check` for a plan without a graph, or a git failure.

@@ -9,7 +9,10 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from .derive import derive_edges
-from .plan_budget import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_MODEL_CALLS, DEFAULT_MAX_PLAN_S
+from .plan_budget import (DEFAULT_INVESTIGATOR_CALLS, DEFAULT_INVESTIGATOR_INPUT_TOKENS,
+                          DEFAULT_INVESTIGATOR_S, DEFAULT_MAX_INPUT_TOKENS,
+                          DEFAULT_MAX_MODEL_CALLS, DEFAULT_MAX_PLAN_S)
+from .planner import DEFAULT_MAX_INVESTIGATORS, FACTS_MODES
 from .repo_index import RepoIndex, build_index
 from .schema import DEFAULT_SCHEMA_PATH, Graph, dump_graph, export_json_schema, load_graph
 from .validate import validate
@@ -485,7 +488,36 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     if args.planner == "v2" and args.outline == "two-level":
         return _error("--outline two-level applies only to --planner v3 "
                       "(v2 always has the full outline)")
+    per_item_flags = {"--max-investigators": args.max_investigators,
+                      "--investigator-max-calls": args.investigator_max_calls,
+                      "--investigator-max-input-tokens": args.investigator_max_input_tokens,
+                      "--investigator-max-time": args.investigator_max_time}
+    if args.facts == "per-item":
+        if args.planner == "v2":
+            return _error("--facts per-item applies only to --planner v3")
+        if args.outline == "full":
+            return _error("--facts per-item builds a two-level outline for every item; it "
+                          "cannot use --outline full")
+        if args.max_investigators is not None and args.max_investigators < 1:
+            return _error("--max-investigators must be >= 1")
+        if any(value is not None and value < 0 for flag, value in per_item_flags.items()
+               if flag != "--max-investigators"):
+            return _error("--investigator-max-calls, --investigator-max-input-tokens and "
+                          "--investigator-max-time must be >= 0 (0: no limit)")
+    else:
+        given = [flag for flag, value in per_item_flags.items() if value is not None]
+        if given:
+            return _error(f"{', '.join(given)} applies only to --facts per-item")
     outline = args.outline or ("two-level" if args.planner == "v3" else "full")
+    investigator = {}
+    if args.facts == "per-item":
+        for name, value in (("max_investigators", args.max_investigators),
+                            ("investigator_max_calls", args.investigator_max_calls),
+                            ("investigator_max_input_tokens",
+                             args.investigator_max_input_tokens),
+                            ("investigator_max_s", args.investigator_max_time)):
+            if value is not None:  # 0 turns an investigator limit off
+                investigator[name] = value if name == "max_investigators" else (value or None)
     options = PlanOptions(request_path=request_path, repo=Path(args.repo),
                           out=Path(args.out), final_checks=list(args.final_check),
                           timeout_s=args.timeout, request_id=args.request_id,
@@ -493,7 +525,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
                           merge=not args.no_merge, planner=args.planner, ablate=ablate,
                           outline=outline, max_model_calls=args.max_calls or None,
                           max_input_tokens=args.max_input_tokens or None,
-                          max_plan_s=args.max_time or None)
+                          max_plan_s=args.max_time or None, facts=args.facts,
+                          **investigator)
     try:
         result = run_plan(options, planner.planner_worker(), planner.draft_worker())
     except (GitError, RuntimeError, OSError, UnicodeDecodeError) as exc:
@@ -524,10 +557,17 @@ def _print_plan_end(args: argparse.Namespace, result, report: dict) -> None:
     print(f"model calls: {totals['model_calls']}  tokens: {totals['input_tokens']} in / "
           f"{totals['output_tokens']} out  time: {report['duration_s']:.1f}s")
     for entry in report.get("round_usage", []):
+        if "item" in entry:
+            continue  # an investigator: printed below with its details
         print(f"  step {entry['step']} round {entry['round']}: {entry['model_calls']} calls, "
               f"{entry['input_tokens']:,} in / {entry['output_tokens']:,} out, "
               f"{entry['duration_s']:.0f}s, {entry['ended']}")
-    if report.get("outline_mode") == "two-level":
+    if report.get("facts_mode") == "per-item" and "investigators" in report:
+        _print_investigators(report)
+    elif report.get("outline_mode") == "per-item":  # resynth of a per-item plan
+        print(f"outlines: one per draft item ({len(report.get('outline_per_item') or {})} "
+              "items, see outline_per_item in the plan's report)")
+    elif report.get("outline_mode") == "two-level":
         cut = report.get("outline_level2_cut") or []
         print(f"outline (two-level): {report['outline_chars']} characters, level 1 "
               f"{report['outline_level1_chars']}, level 2 {report['outline_level2_chars']} "
@@ -547,6 +587,38 @@ def _print_plan_end(args: argparse.Namespace, result, report: dict) -> None:
             print(f"[{issue['code']}]{nodes} {issue['message']}")
     if report["graph_written"]:
         print(f"wrote {args.out}")
+
+
+def _count(value) -> str:
+    return "-" if value is None else str(value)
+
+
+def investigator_line(record: dict) -> str:
+    """One investigator run of a per-item plan, on one line."""
+    rerun = ", run again alone" if record["rerun"] else ""
+    return (f"  investigator item {record['item']} (round {record['round']}{rerun}): "
+            f"{record['model_calls']} calls, {record['input_tokens']:,} in / "
+            f"{record['output_tokens']:,} out, {record['duration_s']:.0f}s, "
+            f"{_count(record['compactions'])} compactions, "
+            f"{_count(record['read_file'])} read_file, prompt {record['prompt_chars']:,} "
+            f"characters, level 2: {len(record['level2_files'])} files, {record['ended']}")
+
+
+def _print_investigators(report: dict) -> None:
+    limits = report["investigator_limits"]
+    print(f"facts: per item, at most {report['max_investigators']} investigators at once; "
+          f"each within {_count(limits['model_calls'])} calls, "
+          f"{_count(limits['input_tokens'])} input tokens, {_count(limits['seconds'])} s")
+    for record in report["investigators"]:
+        print(investigator_line(record))
+    print(f"step 2: {report['step2_wall_s']:.0f}s wall time, "
+          f"{report['step2_investigators_s']:.0f}s in investigators together")
+    revisions = "  ".join(f"{item}: {count}"
+                          for item, count in report["revisions_per_item"].items())
+    print(f"revisions per item: {revisions}")
+    print(f"items with an answer: {', '.join(report['items_finished']) or 'none'}"
+          + (f"  without: {', '.join(report['items_unfinished'])}"
+             if report["items_unfinished"] else ""))
 
 
 def _parallelism_line(parallelism: dict, p1_off: bool) -> str:
@@ -603,6 +675,81 @@ def _print_plan_v2(args: argparse.Namespace, result) -> int:
         print(f"wrote {report['unmerged_graph']}")
     print(f"wrote {result.report_path}")
     return EXIT_OK if result.success else EXIT_INVALID
+
+
+def read_draft_items(path: Path):
+    """Draft items from a plan report, a Step 1 result file or a Step 1 answer.
+
+    Raises ``ValueError`` when ``path`` has none.
+    """
+    from .planner import DraftError, DraftItem, parse_items
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and data.get("draft_items"):
+        return [DraftItem.model_validate(item) for item in data["draft_items"]]
+    text = data.get("final_answer") if isinstance(data, dict) else None
+    try:
+        return parse_items(text if isinstance(text, str) else json.dumps(data)).items
+    except DraftError as exc:
+        raise ValueError(f"{path} has no draft items: {exc}") from None
+
+
+def _cmd_item_prompts(args: argparse.Namespace) -> int:
+    import tempfile
+
+    from . import gitops
+    from .cleanup import remove_tree
+    from .planner_items import item_prompts
+    from .workers import write_json_atomic
+
+    request_path, repo = Path(args.request), Path(args.repo)
+    if not request_path.is_file():
+        return _error(f"request file not found: {request_path}")
+    if not repo.is_dir():
+        return _error(f"repository not found: {repo}")
+    try:
+        items = read_draft_items(Path(args.draft_items))
+        request = request_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return _error(str(exc))
+    tmp = Path(tempfile.mkdtemp(prefix="tg-item-prompts-"))
+    try:
+        clone = tmp / "repo"
+        base_commit = gitops.head(repo.resolve())
+        gitops.clone_for_run(repo.resolve(), clone, base_commit)
+        index = build_index(clone, base_commit)
+        prompts = item_prompts(request, clone, index, items)
+    except (gitops.GitError, RuntimeError, OSError) as exc:
+        return _error(str(exc))
+    finally:
+        remove_tree(tmp)
+    out = Path(args.out) if args.out else None
+    if out is not None:
+        out.mkdir(parents=True, exist_ok=True)
+    summary = []
+    print(f"{len(prompts)} investigators (no model is called); base commit {base_commit}")
+    for entry in prompts:
+        outline = entry.outline
+        files = [chosen.path for chosen in outline.chosen]
+        print(f"item {entry.item.id} ({entry.item.title}): prompt {len(entry.prompt):,} "
+              f"characters, outline {outline.chars:,} (level 1 {outline.level1_chars:,}"
+              + (f", {len(outline.collapsed)} directories collapsed" if outline.collapsed
+                 else "")
+              + f", level 2 {outline.level2_chars:,}: {len(files)} files"
+              + (f", {len(outline.cut)} cut" if outline.cut else "") + ")")
+        for path in files:
+            print(f"    {path}")
+        summary.append({"item": entry.item.id, "title": entry.item.title,
+                        "prompt_chars": len(entry.prompt), **outline.report()})
+        if out is not None:
+            name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in entry.item.id)
+            (out / f"item-{name}.md").write_text(entry.prompt, encoding="utf-8")
+    if out is not None:
+        write_json_atomic(out / "item_prompts.json", {
+            "request": str(request_path), "repo": str(repo), "base_commit": base_commit,
+            "draft_items": str(args.draft_items), "items": summary})
+        print(f"wrote the prompts and item_prompts.json to {out}")
+    return EXIT_OK
 
 
 def _cmd_resynth(args: argparse.Namespace) -> int:
@@ -810,11 +957,41 @@ def build_parser() -> argparse.ArgumentParser:
                                "(default: every source file's top-level names, details only "
                                "for files the request is about) or full (every definition, "
                                "as in planner v3.1)")
+    plan_cmd.add_argument("--facts", choices=FACTS_MODES, default="single",
+                          help="v3 only: who describes the work in step 2: single (default: "
+                               "one agent for the whole request) or per-item (one "
+                               "investigator per draft item, in parallel, each with its own "
+                               "outline; the program merges their answers)")
+    plan_cmd.add_argument("--max-investigators", type=int,
+                          help=f"--facts per-item: investigators running at once "
+                               f"(default {DEFAULT_MAX_INVESTIGATORS})")
+    plan_cmd.add_argument("--investigator-max-calls", type=int,
+                          help=f"--facts per-item: model calls of one investigator run "
+                               f"(default {DEFAULT_INVESTIGATOR_CALLS}; 0: no limit); the "
+                               "plan's --max-calls covers all of them together")
+    plan_cmd.add_argument("--investigator-max-input-tokens", type=int,
+                          help=f"--facts per-item: input tokens of one investigator run "
+                               f"(default {DEFAULT_INVESTIGATOR_INPUT_TOKENS}; 0: no limit)")
+    plan_cmd.add_argument("--investigator-max-time", type=float,
+                          help=f"--facts per-item: seconds of one investigator run "
+                               f"(default {DEFAULT_INVESTIGATOR_S:.0f}; 0: no limit)")
     plan_cmd.add_argument("--no-merge", action="store_true",
                           help="v2 only: skip step 3 (rule-based merging)")
     plan_cmd.add_argument("--request-id", help="request_id of the graph "
                           "(default: the --out file name without extension)")
     plan_cmd.set_defaults(func=_cmd_plan)
+
+    prompts_cmd = commands.add_parser(
+        "item-prompts", help="build the prompts of plan --facts per-item for saved draft "
+                             "items, without calling a model (a dry run of step 2)")
+    prompts_cmd.add_argument("request", help="request text (Markdown)")
+    prompts_cmd.add_argument("--repo", required=True)
+    prompts_cmd.add_argument("--draft-items", required=True,
+                             help="a plan report (draft_items), or the result file of a "
+                                  "step 1 agent (its final answer)")
+    prompts_cmd.add_argument("--out", help="directory for the prompts (item-<id>.md) and "
+                                           "item_prompts.json")
+    prompts_cmd.set_defaults(func=_cmd_item_prompts)
 
     resynth_cmd = commands.add_parser(
         "resynth", help="build a v3 graph again from the facts saved with it (no model)")

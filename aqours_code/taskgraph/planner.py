@@ -45,7 +45,9 @@ from .cleanup import remove_tree
 from .compare import is_test_only, is_test_path
 from .derive import derive_edges
 from .outline import Outline, build_outline
-from .plan_budget import (DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_MODEL_CALLS, DEFAULT_MAX_PLAN_S,
+from .plan_budget import (DEFAULT_INVESTIGATOR_CALLS, DEFAULT_INVESTIGATOR_INPUT_TOKENS,
+                          DEFAULT_INVESTIGATOR_S, DEFAULT_MAX_INPUT_TOKENS,
+                          DEFAULT_MAX_MODEL_CALLS, DEFAULT_MAX_PLAN_S, InvestigatorLimits,
                           PlanBudget, PlanLimits)
 from .repo_index import RepoIndex, build_index
 from .revise import RevisedGraph, goal_with_conventions, revise_graph
@@ -57,6 +59,9 @@ from .workers import AqoursWorker, Worker, WorkerRequest, WorkerResult, write_js
 PLANNER_VERSION = "planner-v3.1"
 PLANNER_V2_VERSION = "planner-v2"
 PLANNERS = ("v2", "v3")
+# Step 2 of v3: one agent for the whole request, or one investigator per draft item
+FACTS_MODES = ("single", "per-item")
+DEFAULT_MAX_INVESTIGATORS = 8
 # The report lists goals longer than this in long_goals; the terminal notes them.
 REPORTED_GOAL_CHARS = 1500
 PLANNER_ENTRY_MODULE = "aqours_code.taskgraph.planner_entry"
@@ -609,6 +614,12 @@ class PlanOptions:
     planner v3.1, to reproduce earlier plans). ``max_model_calls``,
     ``max_input_tokens`` and ``max_plan_s`` limit the whole plan, all rounds
     of both steps (:mod:`plan_budget`); None turns one off.
+
+    ``facts`` (v3 only) is "single" (one agent investigates the whole request
+    in Step 2) or "per-item" (:mod:`planner_items`: one investigator per draft
+    item, at most ``max_investigators`` at once, each within
+    ``investigator_max_calls``, ``investigator_max_input_tokens`` and
+    ``investigator_max_s``; None turns one off).
     """
 
     request_path: Path
@@ -626,6 +637,16 @@ class PlanOptions:
     max_model_calls: int | None = DEFAULT_MAX_MODEL_CALLS
     max_input_tokens: int | None = DEFAULT_MAX_INPUT_TOKENS
     max_plan_s: float | None = DEFAULT_MAX_PLAN_S
+    facts: str = "single"
+    max_investigators: int = DEFAULT_MAX_INVESTIGATORS
+    investigator_max_calls: int | None = DEFAULT_INVESTIGATOR_CALLS
+    investigator_max_input_tokens: int | None = DEFAULT_INVESTIGATOR_INPUT_TOKENS
+    investigator_max_s: float | None = DEFAULT_INVESTIGATOR_S
+
+    def investigator_limits(self) -> InvestigatorLimits:
+        """The limits of one investigator run in per-item mode."""
+        return InvestigatorLimits(self.investigator_max_calls,
+                                  self.investigator_max_input_tokens, self.investigator_max_s)
 
     def budget(self, started: float) -> PlanBudget:
         """The budget of one run of these options, started at ``started``."""
