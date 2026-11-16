@@ -648,6 +648,24 @@ def _cmd_compare(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_signals(args: argparse.Namespace) -> int:
+    from .signals import format_signals, load_report, report_path, signals_index, split_signals
+
+    graph = _load(args.graph)
+    if graph is None:
+        return EXIT_INPUT_ERROR
+    path = report_path(Path(args.graph))
+    report, report_note = load_report(path)
+    index, index_info = signals_index(graph, args.repo)
+    result = {"graph": str(Path(args.graph)), "report": str(path), "report_note": report_note,
+              "index": index_info, **split_signals(graph, index, report)}
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(format_signals(result), end="")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for all subcommands."""
     parser = argparse.ArgumentParser(prog="python -m aqours_code.taskgraph")
@@ -836,6 +854,14 @@ def build_parser() -> argparse.ArgumentParser:
     compare_cmd.add_argument("--repo", required=True)
     compare_cmd.add_argument("--json", help="also write the comparison as JSON")
     compare_cmd.set_defaults(func=_cmd_compare)
+
+    signals_cmd = commands.add_parser(
+        "signals", help="split signals A and B of a finished plan (no model calls)")
+    signals_cmd.add_argument("graph", help="a graph; its <graph>.report.json is read too")
+    signals_cmd.add_argument("--repo", help="repository indexed at the graph's base_commit "
+                                            "for derive_edges (default: the graph's repo)")
+    signals_cmd.add_argument("--json", action="store_true", help="print the signals as JSON")
+    signals_cmd.set_defaults(func=_cmd_signals)
     return parser
 
 

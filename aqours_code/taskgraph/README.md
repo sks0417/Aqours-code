@@ -202,9 +202,10 @@ python -m aqours_code.taskgraph team <request.md> --repo <path> [...]
 python -m aqours_code.taskgraph score <manifest.json> [--exclude <tests.txt>] [--out <dir>]
 python -m aqours_code.taskgraph sweevo-eval <run_dir> --task <task_dir> [--exclude <tests.txt>] [--timeout 3600]
 python -m aqours_code.taskgraph resynth <graph.json | graph.json.report.json> --out <new_graph.json> [--ablate p1,p3] [--final-check <command> ...]
+python -m aqours_code.taskgraph signals <graph.json> [--repo <path>] [--json]
 ```
 
-`plan`, `resynth`, `run`, `audit`, `rescore`, `team`, `score` and `sweevo-eval` are described in their own sections below. `compare` prints
+`plan`, `resynth`, `signals`, `run`, `audit`, `rescore`, `team`, `score` and `sweevo-eval` are described in their own sections below. `compare` prints
 a Markdown table of both graphs' structure: validation (error count, warning
 codes), node counts by kind, files edited by contract nodes, critical path
 (nodes on the longest chain), maximum parallel width (largest layer when
@@ -1677,6 +1678,51 @@ same summary. Facts saved before `why` existed read as before. Exit codes:
 `0` success, `1` the facts no longer pass the checks or contradict each
 other, `2` a missing report or facts, a request it cannot read, no
 `--final-check` for a plan without a graph, or a git failure.
+
+### Split signals of a finished plan (`signals`)
+
+```bash
+python -m aqours_code.taskgraph signals <graph.json> [--repo <path>] [--json]
+```
+
+reads a graph and the report next to it (`<graph.json>.report.json`) and
+prints two signals of whether splitting the request paid off, plus a
+prediction. It calls no model and writes nothing; neither the planner nor the
+coordinator reads these signals (`signals.py`).
+
+- **A**, planning calls per node: the report's `totals.model_calls` divided by
+  the number of nodes in the graph, PRE and REG included. The input tokens
+  (`totals.input_tokens`) are printed beside it.
+- **B**, node pairs that may run in parallel on one source file: pairs where
+  neither node is an ancestor of the other along the edges `derive_edges()`
+  gives the graph, and the two edit sets (`modify ∪ create ∪ shared`) have a
+  `.py` file in common whose path does not contain `test`. Each pair is listed
+  with its common files, and each such file with the number of nodes involved.
+  Common files that are not `.py` are listed separately for reference and not
+  counted; common `.py` files whose path contains `test` are neither counted
+  nor listed.
+
+`derive_edges()` needs the repository index: it is built from `--repo`
+(default: the graph's `repo`) at the graph's `base_commit`. When that fails,
+`derive_edges()` runs with every file and symbol treated as present at the
+base commit (no new `requires` or context-file edges; the graph's own edges,
+`requires_impl` and ordering edges still count) and the output says so.
+
+The prediction uses `A_SPLIT_MIN = 1.0`, a **provisional** threshold chosen by
+hand from three plans and not yet checked against run results:
+
+| | B = 0 | B > 0 |
+| --- | --- | --- |
+| A ≥ `A_SPLIT_MIN` | `split` | `split-after-serialising` (the nodes of the B pairs are listed under `serialise`) |
+| A < `A_SPLIT_MIN` | `undetermined` | `single` |
+
+Without the report (or without `totals` in it) B is computed as usual and A,
+the model calls, the input tokens and the prediction are `unknown`; the exit
+code is still `0`. `--json` prints the same content as one JSON object
+(`nodes`, `model_calls`, `input_tokens`, `A`, `B`, `pairs`, `files`,
+`non_py_shared`, `a_split_min`, `prediction`, `serialise`, `provisional`, plus
+`index`, `report_note` and the edge counts). Exit code `2` only for a graph it
+cannot read or that does not match the schema.
 
 ### Worker reading soft wall
 
