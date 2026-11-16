@@ -826,15 +826,17 @@ python -m aqours_code.taskgraph plan <request.md> --repo <path> --out <graph.jso
     [--max-calls 150] [--max-input-tokens 6000000] [--max-time 2400]
 ```
 
-`--planner v3` (the default, `planner_version` `planner-v3.1`) is described in
+`--planner v3` (the default, `planner_version` `planner-v3.2`) is described in
 [Planner v3](#planner-v3-the-model-reports-facts-the-program-decides-the-structure);
 `--planner v2` runs planner v2, described in the rest of this section,
-exactly as before (its graphs and reports still say `planner-v2`).
+as before (its graphs and reports still say `planner-v2`), except that its
+Step 2 agent shares the tool policy of v3's and so can also call `grep`
+([below](#searching-the-repository-grep-planner-v32)).
 `--ablate` and `--outline` are for v3 only and `--no-merge` for v2 only; the
 other options apply to both. v3 plans with the two-level outline by default
 ([below](#the-two-level-outline-v3-default)); `--outline full` gives the full
-outline and the prompt of `planner-v3.1` unchanged, to reproduce earlier
-plans. v2 always has the full outline.
+outline of `planner-v3.1`, to reproduce earlier plans (with the v3.2 prompt
+and tools, which add `grep`). v2 always has the full outline.
 
 **Limits of one plan** (both planners, `plan_budget.py`). `--max-calls`,
 `--max-input-tokens` and `--max-time` limit the whole plan: every round of
@@ -925,7 +927,7 @@ planner makes; nodes carry no size or cost estimates.
 
 ### Step 2: grounding (model, read-only tools)
 
-A second agent (`read_file`, `glob`, `compact`) gets
+A second agent (`read_file`, `glob`, `grep`, `compact`) gets
 [`planner_prompt.md`](planner_prompt.md), the request, the draft items (a
 `# Draft items` section), the file list, the repository outline (a
 `# Repository outline` section) and the final checks. It plans from the
@@ -933,8 +935,8 @@ outline and answers with a draft graph: only nodes, no edges; the last
 ```` ```json ```` block of the final answer is the draft.
 
 **Only the repository** (`repo_guard.py`). The planner (both steps, v2 and
-v3) and the team lead (plan and wrap-up) run on the host. Their `read_file`
-and `glob` refuse a path or pattern that is absolute, contains `..`, or
+v3) and the team lead (plan and wrap-up) run on the host. Their `read_file`,
+`glob` and `grep` (its `path`) refuse a path or pattern that is absolute, contains `..`, or
 resolves (after symlinks, or a pattern's part before its first wildcard)
 outside the agent's clone, with "Tool not run: you may only read files of
 the repository ...". It is a PreToolUse hook that `worker_entry` registers
@@ -1116,6 +1118,40 @@ On any error the agent runs again with its previous draft and the errors (a
 fresh agent; the prompt repeats the request and the draft items), at most
 twice. If errors remain, the run fails: the last graph that could be built
 and the report are still written, and the exit code is 1.
+
+#### Searching the repository (`grep`, planner-v3.2)
+
+Until planner-v3.1 the planner and the team lead had `read_file` and `glob`
+only. To find a definition in a large file they paged through it, forgot it
+after a compaction and read it again: one dask plan read the 8,540 lines of
+`dask/dataframe/core.py` 116 times, and its cost rose from 1.8M to 6.4M
+input tokens. Planner-v3.2 (`PLANNER_VERSION`) gives them a read-only
+`grep`, and one paragraph of each prompt (`planner_facts_prompt.md`, the
+lead's prompt in `team.py`) tells them to find a definition or use with
+`grep` first and then `read_file` only the few dozen lines around it, not
+to page through large files.
+
+`grep` is an Aqours tool (`tool_defs.py`, `run_grep` in `tool_handlers.py`):
+`pattern` (a Python regular expression, required), `path` (a file or
+directory, default the workspace root), `glob` (a file name filter such as
+`*.py`; with a `/`, matched against the path from the workspace root),
+`ignore_case`, `max_results` (default 100, at most 300). Each matching line
+is `path:line: text`, the path relative to the workspace and the text cut
+at 200 characters; past `max_results` lines or about 8,000 characters it
+stops and says how many matches were not shown. No match gives
+`no matches`; an invalid expression, a missing path or a path outside the
+workspace gives an `Error:` line, never an exception. Pure Python (`re`
+and a directory walk, no external command); it skips `.git`, binary files
+(a NUL byte in the first 8 KB) and files over 2 MB.
+
+It is an **opt-in** tool (`ToolSpec.opt_in`): no role offers it by default,
+and only a tool policy that names it in `allowed_tools` gets it. Only
+`PLANNER_TOOL_POLICY` (`planner_entry.py`) does: the planner's Step 2 (v3,
+and v2 through the same policy) and the team lead's plan, which runs through
+the same planner worker. The draft step, the lead's wrap-up, graph nodes,
+teammates, single agents and Aqours subagents have exactly the tools they
+had before. `RepoGuard` checks `grep`'s `path` like `read_file`'s
+([above](#step-2-grounding-model-read-only-tools)).
 
 #### Goals
 
@@ -1608,7 +1644,8 @@ back to its simplest behaviour, its decisions are recorded with the rule
 
 #### Output
 
-The graph (`generator`: `planner_version` `planner-v3.1`, `revision_mode`
+The graph (`generator`: `planner_version` `planner-v3.2`, `planner-v3.1` for
+plans made before `grep`, `revision_mode`
 `llm` after a revision round, else `none`, and `ablate`), and
 `<out>.report.json` with, besides the fields v2 also writes (`draft_items`,
 `fast_path`, `stage1`, `rounds`, `errors`, `goal_chars`, `long_goals`, the
@@ -1798,7 +1835,7 @@ commit is the repository's `HEAD`. Exit codes are those of `run`.
 
 | Step | Here | In the original systems |
 | --- | --- | --- |
-| 1. The lead plans | One agent with read-only tools (`read_file`, `glob`) on the base commit answers with a JSON task list: `id`, `title`, `description`, `files`, `blocked_by`. A list that cannot be used (not JSON, 0 or more than 20 tasks, duplicate ids, a `blocked_by` that names no task, itself, or a cycle, an empty description, a path outside the repository) is asked for once more with the problems listed; after two unusable answers the run fails with `lead_plan_invalid` and no teammate starts | Agent teams: the lead "creates tasks" in a shared task list, and tasks "can also depend on other tasks". Cursor: planners "explore the codebase and create tasks" |
+| 1. The lead plans | One agent with read-only tools (`read_file`, `glob`, `grep`) on the base commit answers with a JSON task list: `id`, `title`, `description`, `files`, `blocked_by`. A list that cannot be used (not JSON, 0 or more than 20 tasks, duplicate ids, a `blocked_by` that names no task, itself, or a cycle, an empty description, a path outside the repository) is asked for once more with the problems listed; after two unusable answers the run fails with `lead_plan_invalid` and no teammate starts | Agent teams: the lead "creates tasks" in a shared task list, and tasks "can also depend on other tasks". Cursor: planners "explore the codebase and create tasks" |
 | The guidelines in the lead's prompt | Self-contained tasks with a clear deliverable; a different set of files for each teammate; sequential, same-file or heavily dependent work stays in one task (one task is a valid plan); neither too small nor too large; `blocked_by` only when needed; a description that says everything, because teammates do not see the lead's conversation | Agent teams, best practices: "Size tasks appropriately", "Avoid file conflicts" ("Two teammates editing the same file leads to overwrites. Break the work so each teammate owns a different set of files"), "Give teammates enough context" (the lead's conversation "does not carry over"), and "For sequential tasks, same-file edits, or work with many dependencies, a single session ... [is] more effective" |
 | 2. Teammates work in parallel | Up to `--workers` teammates at once (default 4). A task starts when every task in its `blocked_by` has finished, in list order. Each teammate is an ordinary worker with its own worktree at the current head of the integration branch; its prompt has the request, the task list with every task's status, the final answers of the teammates that finished (at most 1,500 characters each), and its own task and files | Agent teams: teammates "self-claim" the next unblocked task; each has "its own context window"; "start with 3-5 teammates"; a teammate that stops notifies the lead with "its final answer". Cursor: workers "take assigned tasks and focus only on finishing them" |
 | No locks on files | Two tasks may edit the same file at the same time; nothing checks `files` before a task starts. A file changed outside a task's `files` is recorded (`out_of_scope_files`) and merged like the rest | Agent teams lock only the claiming of a task. Cursor found that file locks cut throughput and replaced them with optimistic concurrency |

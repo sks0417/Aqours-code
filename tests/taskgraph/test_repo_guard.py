@@ -107,6 +107,36 @@ def test_the_guard_checks_only_read_file_and_glob(repo):
     assert guard.check("glob", {"pattern": "**/*.py"}) is None
 
 
+def test_the_guard_checks_the_path_of_grep(repo, tmp_path):
+    link_outside(repo / "link", tmp_path / "outside")
+    guard = RepoGuard(repo)
+    assert guard.check("grep", {"pattern": "x"}) is None  # the workspace root
+    assert guard.check("grep", {"pattern": "x", "path": "pkg", "glob": "*.py"}) is None
+    assert guard.check("grep", {"pattern": "x", "path": "../outside"}) == "parent"
+    assert guard.check("grep", {"pattern": "x", "path": str(tmp_path / "outside")}) == "absolute"
+    assert guard.check("grep", {"pattern": "x", "path": "C:/Users"}) == "absolute"
+    assert guard.check("grep", {"pattern": "x", "path": "link"}) == "outside"
+
+
+def test_the_planner_greps_inside_and_is_refused_outside(repo, tmp_path):
+    link_outside(repo / "link", tmp_path / "outside")
+    client = RecordingClient([
+        tool_use("grep", "inside", pattern="x = 1"),
+        tool_use("grep", "absolute", pattern="host", path=str(tmp_path / "outside")),
+        tool_use("grep", "parent", pattern="host", path="../outside"),
+        tool_use("grep", "link", pattern="host", path="link"),
+        final("the answer"),
+    ])
+    result = run_planner(planner_config(repo, tmp_path / "logs", repo_guard=True),
+                         model_client=client)
+    assert result.ok and result.final_answer == "the answer"
+    seen = tool_results(client.requests[-1])
+    assert seen["inside"] == "pkg/mod.py:1: x = 1"
+    for call in ("absolute", "parent", "link"):
+        assert seen[call] == REFUSAL, call
+    assert "host file" not in " ".join(seen.values())
+
+
 # ── through the planner agent ──
 
 class RecordingClient:

@@ -33,7 +33,11 @@ files: their names in the file list are enough to choose where new tests go.
 `limit` (how many lines to return): for lines 120 to 160, pass `offset` 119
 and `limit` 41. When you need several files, ask for all of them in one turn.
 
-You have read-only tools (read_file, glob). Do not try to change any file.
+To find where something is defined or used, search for it with `grep` first,
+then `read_file` only the few dozen lines around the match. Do not page
+through a large file to find it.
+
+You have read-only tools (read_file, glob, grep). Do not try to change any file.
 
 ## Concepts
 

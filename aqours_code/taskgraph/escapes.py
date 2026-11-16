@@ -29,7 +29,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 FILE_TOOLS = {"read_file": "path", "write_file": "path", "edit_file": "path",
-              "glob": "pattern"}
+              "glob": "pattern", "grep": "path"}
 CONTENT_FIELDS = {"write_file": ("content",), "edit_file": ("new_text",)}
 REFUSAL = "path escapes workspace"
 SAMPLE_LIMIT = 5

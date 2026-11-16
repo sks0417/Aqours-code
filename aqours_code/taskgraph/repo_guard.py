@@ -1,9 +1,9 @@
 """Host-side agents read only their repository: the planner and the team lead.
 
-They run on the host with ``read_file`` and ``glob``. The Aqours file tools
-already keep what they return inside the workspace: ``read_file`` resolves the
-path (following symlinks) and refuses one outside it, and ``glob`` drops
-matches outside it. But ``glob`` with an absolute pattern ignores its root and
+They run on the host with ``read_file``, ``glob`` and ``grep``. The Aqours file tools
+already keep what they return inside the workspace: ``read_file`` and
+``grep`` resolve the path (following symlinks) and refuse one outside it, and
+``glob`` drops matches outside it. But ``glob`` with an absolute pattern ignores its root and
 walks the host (``C:/Users/<user>/**/site-packages/...``), and both accept an
 absolute path or a ``..`` that stays inside. Planning dask 2023.8.0 spent
 glob calls looking for an installed dask that way.
@@ -22,8 +22,9 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 REFUSAL = ("Tool not run: you may only read files of the repository. Give a path or "
            "pattern relative to the repository root, without '..'.")
 
-# the argument each guarded tool reads
-GUARDED_FIELDS = {"read_file": "path", "glob": "pattern"}
+# the argument each guarded tool reads (grep's own ``glob`` only filters file
+# names under ``path``, so it cannot reach outside it)
+GUARDED_FIELDS = {"read_file": "path", "glob": "pattern", "grep": "path"}
 
 
 def _is_absolute(text: str) -> bool:
@@ -71,7 +72,7 @@ def outside_reason(value: str, root: Path, *, pattern: bool = False) -> str | No
 
 
 class RepoGuard:
-    """Refuse ``read_file`` and ``glob`` arguments outside the workspace."""
+    """Refuse ``read_file``, ``glob`` and ``grep`` arguments outside the workspace."""
 
     def __init__(self, workspace: Path):
         self.workspace = Path(workspace).resolve()

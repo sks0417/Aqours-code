@@ -61,6 +61,9 @@ class ToolSpec:
     background_policy: str
     allowed_roles: frozenset[str]
     runtime_aware: bool = False
+    # An opt-in tool is never part of a role's default tool set: only an agent
+    # whose tool policy names it in ``allowed_tools`` is offered it.
+    opt_in: bool = False
 
     def __post_init__(self):
         if self.safety_policy not in KNOWN_SAFETY_POLICIES:
@@ -128,15 +131,23 @@ class ToolRegistry:
         return tuple(self._specs.values())
 
     def names_for_role(self, role: str) -> tuple[str, ...]:
+        """The role's default tools; opt-in tools are left out."""
         return tuple(
             name for name, spec in self._specs.items()
-            if role in spec.allowed_roles
+            if role in spec.allowed_roles and not spec.opt_in
+        )
+
+    def opt_in_names_for_role(self, role: str) -> tuple[str, ...]:
+        """The role's opt-in tools, offered only when a policy names them."""
+        return tuple(
+            name for name, spec in self._specs.items()
+            if role in spec.allowed_roles and spec.opt_in
         )
 
     def schemas_for_role(self, role: str) -> list[dict[str, Any]]:
         return [
             spec.api_schema() for spec in self._specs.values()
-            if role in spec.allowed_roles
+            if role in spec.allowed_roles and not spec.opt_in
         ]
 
     def schemas_for_names(

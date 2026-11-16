@@ -4,9 +4,11 @@
 
 The same child-process runner as ``worker_entry`` (``CountingClient``, model
 configuration, result file), with a tool policy that cannot change files or
-run commands. ``--stage ground`` (the default, Step 2) may read files;
-``--stage draft`` (Step 1) has no file tools at all, so it works from the
-request alone.
+run commands. ``--stage ground`` (the default, Step 2) may read and search
+files (``read_file``, ``glob``, ``grep``); ``--stage draft`` (Step 1) has no
+file tools at all, so it works from the request alone. The team baseline's
+lead plans through the same ground stage (``planner.planner_worker()``), so
+:data:`PLANNER_TOOL_POLICY` is its policy too.
 """
 from __future__ import annotations
 
@@ -21,7 +23,8 @@ from .workers import WorkerResult, write_json_atomic
 
 PLANNER_TOOL_POLICY: dict = {
     "name": "taskgraph_planner",
-    "allowed_tools": ["read_file", "glob", "compact"],
+    # grep is an opt-in tool: no other agent is offered it.
+    "allowed_tools": ["read_file", "glob", "grep", "compact"],
     "allow_mcp": False,
     "allow_memory_context": False,
     "allow_skill_context": False,

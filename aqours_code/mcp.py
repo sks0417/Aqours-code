@@ -113,6 +113,13 @@ def assemble_tool_pool(
     base_handlers = builtin_handlers(runtime)
     handlers = {name: handler for name, handler in base_handlers.items()
                 if allowed is None or name in allowed}
+    if allowed is not None:
+        # Opt-in tools are offered only to a policy that names them.
+        opt_in = [name for name in TOOL_REGISTRY.opt_in_names_for_role("lead")
+                  if name in allowed]
+        tools += TOOL_REGISTRY.schemas_for_names(opt_in, role="lead")
+        handlers.update(TOOL_REGISTRY.handlers_for_names(
+            opt_in, role="lead", runtime=runtime))
     clients = mcp_clients.items() if not policy or policy.get("allow_mcp") else ()
     for server_name, mcp_client in clients:
         safe_server = normalize_mcp_name(server_name)

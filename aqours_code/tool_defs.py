@@ -38,6 +38,7 @@ from .tool_handlers import (
     run_send_message,
     run_spawn_teammate,
     run_delegate_agent,
+    run_grep,
 )
 
 # ── Tool Definitions ──
@@ -73,6 +74,28 @@ _TOOL_SCHEMAS = [
                                       "language extensions."),
      "input_schema": {"type": "object",
                       "properties": {"pattern": {"type": "string"}},
+                      "required": ["pattern"]}},
+    {"name": "grep",
+     "description": ("Search file contents with a Python regular expression. "
+                     "Returns 'path:line: text' for each matching line, paths "
+                     "relative to the workspace. Use it to find where something is "
+                     "defined or used, then read_file only those lines. Skips .git, "
+                     "binary files and files over 2 MB."),
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "pattern": {"type": "string",
+                                      "description": "Python regular expression."},
+                          "path": {"type": "string",
+                                   "description": ("File or directory to search, "
+                                                   "relative to the workspace "
+                                                   "(default: the workspace root).")},
+                          "glob": {"type": "string",
+                                   "description": ("Only files whose name matches, "
+                                                   "e.g. *.py.")},
+                          "ignore_case": {"type": "boolean"},
+                          "max_results": {"type": "integer",
+                                          "description": ("Matching lines to show "
+                                                          "(default 100, at most 300).")}},
                       "required": ["pattern"]}},
     {"name": "todo_write",
                      "description": ("Create and update a lightweight checklist for "
@@ -262,7 +285,7 @@ _TOOL_SCHEMAS = [
 
 _TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,
+    "edit_file": run_edit, "glob": run_glob, "grep": run_grep,
     "todo_write": run_todo_write, "task": spawn_subagent,
     "delegate_agent": run_delegate_agent,
     "load_skill": load_skill,
@@ -299,8 +322,11 @@ _ROLE_ACCESS = {
     "complete_task": frozenset({"lead", "teammate"}),
     "submit_plan": frozenset({"teammate"}),
 }
+# Offered only to an agent whose tool policy lists them in allowed_tools (the
+# taskgraph planner and team lead); no role gets them by default.
+_OPT_IN = frozenset({"grep"})
 _RUNTIME_AWARE = frozenset({
-    "bash", "read_file", "write_file", "edit_file", "glob", "todo_write",
+    "bash", "read_file", "write_file", "edit_file", "glob", "grep", "todo_write",
     "load_skill", "task", "delegate_agent", "spawn_teammate",
     "integrate_worktree",
 })
@@ -325,6 +351,7 @@ TOOL_REGISTRY = ToolRegistry(
         ),
         allowed_roles=_ROLE_ACCESS.get(tool["name"], _LEAD),
         runtime_aware=tool["name"] in _RUNTIME_AWARE,
+        opt_in=tool["name"] in _OPT_IN,
     )
     for tool in _TOOL_SCHEMAS
 )
