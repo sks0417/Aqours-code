@@ -10,3 +10,4 @@ iterative__dvc_3.43.1_3.44.0 dropped  # 20 of its 22 F2P tests fail with the gol
 iterative__dvc_2.19.0_2.20.0
 pydantic__pydantic_v2.7.0_v2.7.1
 dask__dask_2023.6.0_2023.6.1
+iterative__dvc_3.4.0_3.5.0 dropped  # 1 of its 2 F2P tests and 5 of its 26 P2P tests fail with the gold patch: the release needs dvc-data 2.5, which our offline image cannot install

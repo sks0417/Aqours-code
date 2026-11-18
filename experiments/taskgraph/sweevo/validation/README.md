@@ -18,3 +18,4 @@ Made by `validate_gold.py`; one JSON file per instance has the details. Counts a
 With the gold patch and no exclusions (these are not used):
 
 - `iterative__dvc_3.43.1_3.44.0`: F2P 2/22 and P2P 104/104 pass. 20 of its 22 F2P tests fail with the gold patch: the release needs scmrepo 3, which our offline image cannot install
+- `iterative__dvc_3.4.0_3.5.0`: F2P 1/2 and P2P 21/26 pass. 1 of its 2 F2P tests and 5 of its 26 P2P tests fail with the gold patch: the release needs dvc-data 2.5, which our offline image cannot install

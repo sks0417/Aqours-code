@@ -1,0 +1,100 @@
+{
+ "instance_id": "iterative__dvc_3.4.0_3.5.0",
+ "validated_at": "2026-11-18T04:44:38+00:00",
+ "task_commit": "574e597635a7f033cc94f45eb716b478286bb164",
+ "sandbox_image": "aqours-sweevo:iterative__dvc_3.4.0_3.5.0",
+ "sandbox_env": {
+  "PATH": "/opt/miniconda3/envs/testbed/bin:/opt/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "CONDA_PREFIX": "/opt/miniconda3/envs/testbed",
+  "CONDA_DEFAULT_ENV": "testbed",
+  "PYTHONPATH": "/workspace",
+  "PYTHONDONTWRITEBYTECODE": "1",
+  "PIP_NO_INDEX": "1",
+  "MPLCONFIGDIR": "/tmp/matplotlib",
+  "XDG_CACHE_HOME": "/tmp/cache",
+  "XDG_CONFIG_HOME": "/tmp/config"
+ },
+ "command": "pytest --continue-on-collection-errors -W default::DeprecationWarning -W default::pytest.PytestDeprecationWarning --timeout=300 --continue-on-collection-errors -rA tests/func/api/test_data.py tests/unit/command/test_data_sync.py tests/unit/repo/test_graph.py",
+ "f2p_listed": 2,
+ "p2p_listed": 26,
+ "excluded": 6,
+ "excluded_gold_fail": {
+  "FAIL_TO_PASS": [
+   "tests/func/api/test_data.py::test_get_url_subrepos"
+  ],
+  "PASS_TO_PASS": [
+   "tests/func/api/test_data.py::TestAPI::test_open",
+   "tests/func/api/test_data.py::test_api_missing_local_cache_exists_on_remote[inside-dir-False]",
+   "tests/func/api/test_data.py::test_get_url_granular",
+   "tests/func/api/test_data.py::test_open_granular",
+   "tests/func/api/test_data.py::test_read_with_subrepos[True]"
+  ]
+ },
+ "excluded_gold_status": {
+  "tests/func/api/test_data.py::TestAPI::test_open": "FAILED",
+  "tests/func/api/test_data.py::test_api_missing_local_cache_exists_on_remote[inside-dir-False]": "FAILED",
+  "tests/func/api/test_data.py::test_get_url_granular": "FAILED",
+  "tests/func/api/test_data.py::test_get_url_subrepos": "FAILED",
+  "tests/func/api/test_data.py::test_open_granular": "FAILED",
+  "tests/func/api/test_data.py::test_read_with_subrepos[True]": "FAILED"
+ },
+ "excluded_f2p_pass_on_base": [],
+ "base": {
+  "f2p": {
+   "total": 1,
+   "passed": 0,
+   "failed": 1,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 1,
+   "rate": 0.0
+  },
+  "p2p": {
+   "total": 21,
+   "passed": 21,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 5,
+   "rate": 1.0
+  },
+  "all_f2p_fail": true,
+  "p2p_failing": [],
+  "test_run_s": 13.187,
+  "grading_s": 17.828
+ },
+ "gold": {
+  "f2p": {
+   "total": 1,
+   "passed": 1,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 1,
+   "rate": 1.0
+  },
+  "p2p": {
+   "total": 21,
+   "passed": 21,
+   "failed": 0,
+   "errors": 0,
+   "missing": 0,
+   "skipped": 0,
+   "excluded": 5,
+   "rate": 1.0
+  },
+  "resolved": true,
+  "fix_rate": 1.0,
+  "test_run_s": 13.672,
+  "grading_s": 17.531
+ },
+ "images": {
+  "instance_image": "xingyaoww/sweb.eval.x86_64.iterative_s_dvc-9676",
+  "instance_image_bytes": 4671387053,
+  "task_image": "aqours-sweevo:iterative__dvc_3.4.0_3.5.0",
+  "task_image_bytes": 4674738878
+ }
+}

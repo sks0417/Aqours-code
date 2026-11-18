@@ -1,6 +1,6 @@
 # SWE-EVO tasks
 
-Nine instances of [SWE-EVO](https://github.com/SWE-EVO/SWE-EVO) (MIT
+Ten instances of [SWE-EVO](https://github.com/SWE-EVO/SWE-EVO) (MIT
 licence), run with the task-graph harness. A SWE-EVO instance is one real
 release of a Python project: the agent gets the repository at the old version
 and the release notes, and must make the release's changes, which touch
@@ -14,7 +14,7 @@ data) and the Docker images stay outside the repository.
 
 ```text
 README.md            this file
-instances.txt        the nine instance ids; "pilot" marks the pilot pair, "dropped" one left out
+instances.txt        the ten instance ids; "pilot" marks the pilot pair, "dropped" those left out
 prepare.py           writes the task directories and builds the task images
 validate_gold.py     grades the base and the gold patch; writes the exclusion lists
 validate_interface.py   checks the interface sections (size, test imports, no body or test text)
@@ -35,13 +35,14 @@ validation/interface.md            the interface table (and interface.json)
 | iterative__dvc_2.19.0_2.20.0 | 14 | 66 |
 | pydantic__pydantic_v2.7.0_v2.7.1 | 234 | 1,477 |
 | dask__dask_2023.6.0_2023.6.1 | 105 | 3,415 |
+| iterative__dvc_3.4.0_3.5.0 (**dropped**, see below) | 2 | 26 |
 
 ## Preparing the tasks
 
 ```bash
 git clone https://github.com/SWE-EVO/SWE-EVO C:/tg/sweevo
 pip install pyarrow            # to read the dataset (hf_out/hf_dataset/test)
-python experiments/taskgraph/sweevo/prepare.py            # all nine; --pilot for two
+python experiments/taskgraph/sweevo/prepare.py            # all not dropped; --pilot for two
 ```
 
 For each instance, `prepare.py` writes `C:\tg\sweevo-tasks\<id>\`:
@@ -225,7 +226,7 @@ layers (`<task>/Dockerfile`):
    asked for). conda's package cache in the dask images holds
    `dask-core-2024.8.1`, the complete source of a later dask. A worker
    could read either. Afterwards no copy of the package is left outside
-   `/testbed` (checked in all nine images as the sandbox user: only conda's
+   `/testbed` (checked in all ten images as the sandbox user: only conda's
    metadata file of that dask-core, a file list, and scipy's unrelated
    `array_api_compat/dask`).
 2. A passwd entry for the sandbox user. `getpass.getuser()` and git look the
@@ -270,7 +271,7 @@ task image is left out with `--ignore` (found by `prepare.py`, recorded as
 (dvc 1.1.7: networkx imports `fractions.gcd`, gone in Python 3.9),
 `tests/unit/command/test_studio.py` (dvc 3.43.1: `dvc_studio_client` too
 new) and `tests/unit/fs/test_azure.py` (dvc 2.19.0: `dvc_azure` and
-`fsspec` do not match). On all nine bases both checks pass, in 11 to 20 s.
+`fsspec` do not match). On all ten bases both checks pass, in 11 to 20 s.
 
 ## Grading
 
@@ -298,7 +299,7 @@ run".
 ## Validation with the gold patch
 
 ```bash
-python experiments/taskgraph/sweevo/validate_gold.py            # all nine; --pilot for two
+python experiments/taskgraph/sweevo/validate_gold.py            # all not dropped; --pilot for two
 ```
 
 grades two fake runs per instance exactly as `sweevo-eval` grades a real
@@ -323,6 +324,33 @@ containers have no network and keep the image's packages, so these tests
 cannot pass for any method. Installing the release's versions into the image
 would make them pass, but would grade a method that leaves `pyproject.toml`
 alone as if it had raised them, so the instance is left out.
+
+## Dropped: iterative__dvc_3.4.0_3.5.0
+
+On the base both F2P tests fail and all 26 P2P tests pass. With the gold
+patch, 1 of the 2 F2P tests (`test_get_url_subrepos`) and 5 of the 26 P2P
+tests fail in our sandbox (`TestAPI::test_open`, `test_open_granular`,
+`test_get_url_granular`, `test_read_with_subrepos[True]`,
+`test_api_missing_local_cache_exists_on_remote[inside-dir-False]`, all in
+`tests/func/api/test_data.py`), all with `TypeError: _build_file() got an
+unexpected keyword argument 'callback'`. The gold patch adds
+`Output._build`, which passes a progress callback to
+`dvc_data.hashfile.build.build` on every `dvc add`; the image's dvc-data
+2.3.3 hands it on to `_build_file`, which has no such parameter. The release
+raises the dependency in `pyproject.toml` (`dvc-data>=2.3.2,<2.4.0` to
+`>=2.5.0,<2.6.0`), which SWE-EVO's harness installs over the network after
+applying a patch. In a throwaway container of the task image with dvc-data
+2.5.0 installed (pip changed no other package), all 28 listed tests pass with
+the gold patch, so the version is the only cause. As for dvc 3.43.1,
+installing it into the image would grade a method that leaves
+`pyproject.toml` alone as if it had raised it, and leaving the failures out
+would keep one F2P test and drop the P2P tests that go through the changed
+`dvc add`; so the instance is left out. Its task directory and image are
+prepared: the sandbox checks pass in its image (`python` of the testbed
+environment, `ulimit -n` 4096, git through the view, `dvc.__file__` under
+`/workspace`, both smoke checks in a worktree and in the integration clone),
+and its interface section (9 items in 5 files, 4,060 characters) has no
+import-check miss, body line or test text.
 
 ## Running the baseline
 
