@@ -666,6 +666,45 @@ def _cmd_signals(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_gate(args: argparse.Namespace) -> int:
+    from . import gate
+    from . import planner
+    from .gitops import GitError
+
+    if args.timeout <= 0:
+        return _error("--timeout must be > 0")
+    out = Path(args.out) if args.out else None
+    if args.from_report:
+        if args.request or args.repo or args.draft_from:
+            return _error("--from-report takes the request, repository and draft from the "
+                          "report: give no request, --repo or --draft-from with it")
+        try:
+            options = gate.options_from_report(Path(args.from_report), out, args.timeout)
+        except gate.GateError as exc:
+            return _error(str(exc))
+    else:
+        if not args.request or not args.repo:
+            return _error("give a request and --repo, or --from-report")
+        options = gate.GateOptions(request_path=Path(args.request), repo=Path(args.repo),
+                                   out=out, timeout_s=args.timeout,
+                                   draft_from=Path(args.draft_from) if args.draft_from else None)
+    if not options.request_path.is_file():
+        return _error(f"request file not found: {options.request_path}")
+    if not options.repo.is_dir():
+        return _error(f"repository not found: {options.repo}")
+    try:
+        result = gate.run_gate(options, gate.locate_worker(), planner.draft_worker())
+    except (GitError, RuntimeError, OSError, UnicodeDecodeError) as exc:
+        return _error(str(exc))
+    if args.json:
+        print(json.dumps(result.data, indent=2, ensure_ascii=False))
+    else:
+        print(gate.format_gate(result.data), end="")
+        if out is not None:
+            print(f"wrote {out}")
+    return EXIT_OK if result.ok else EXIT_INVALID
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for all subcommands."""
     parser = argparse.ArgumentParser(prog="python -m aqours_code.taskgraph")
@@ -862,6 +901,23 @@ def build_parser() -> argparse.ArgumentParser:
                                             "for derive_edges (default: the graph's repo)")
     signals_cmd.add_argument("--json", action="store_true", help="print the signals as JSON")
     signals_cmd.set_defaults(func=_cmd_signals)
+
+    gate_cmd = commands.add_parser(
+        "gate", help="split or single, from a cheap location of the features "
+                     "(one model call; plans nothing)")
+    gate_cmd.add_argument("request", nargs="?", help="request text (Markdown)")
+    gate_cmd.add_argument("--repo", help="the repository, read at its HEAD")
+    gate_cmd.add_argument("--draft-from",
+                          help="a plan's graph.json: reuse the step-1 draft in "
+                               "<graph.json>.logs/draft (else step 1 runs)")
+    gate_cmd.add_argument("--from-report",
+                          help="a plan's <graph.json>.report.json: the request, repository, "
+                               "base commit and draft of that plan")
+    gate_cmd.add_argument("--json", action="store_true", help="print the result as JSON")
+    gate_cmd.add_argument("--out", help="write the result as JSON to this file")
+    gate_cmd.add_argument("--timeout", type=float, default=600.0,
+                          help="timeout in seconds of each model call (default 600)")
+    gate_cmd.set_defaults(func=_cmd_gate)
     return parser
 
 

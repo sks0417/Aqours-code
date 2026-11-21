@@ -203,9 +203,11 @@ python -m aqours_code.taskgraph score <manifest.json> [--exclude <tests.txt>] [-
 python -m aqours_code.taskgraph sweevo-eval <run_dir> --task <task_dir> [--exclude <tests.txt>] [--timeout 3600]
 python -m aqours_code.taskgraph resynth <graph.json | graph.json.report.json> --out <new_graph.json> [--ablate p1,p3] [--final-check <command> ...]
 python -m aqours_code.taskgraph signals <graph.json> [--repo <path>] [--json]
+python -m aqours_code.taskgraph gate <request.md> --repo <path> [--draft-from <graph.json>] [--json] [--out <gate.json>]
+python -m aqours_code.taskgraph gate --from-report <graph.json.report.json> [--json] [--out <gate.json>]
 ```
 
-`plan`, `resynth`, `signals`, `run`, `audit`, `rescore`, `team`, `score` and `sweevo-eval` are described in their own sections below. `compare` prints
+`plan`, `resynth`, `signals`, `gate`, `run`, `audit`, `rescore`, `team`, `score` and `sweevo-eval` are described in their own sections below. `compare` prints
 a Markdown table of both graphs' structure: validation (error count, warning
 codes), node counts by kind, files edited by contract nodes, critical path
 (nodes on the longest chain), maximum parallel width (largest layer when
@@ -1760,6 +1762,96 @@ code is still `0`. `--json` prints the same content as one JSON object
 `non_py_shared`, `a_split_min`, `prediction`, `serialise`, `provisional`, plus
 `index`, `report_note` and the edge counts). Exit code `2` only for a graph it
 cannot read or that does not match the schema.
+
+### The split gate (`gate`)
+
+```bash
+python -m aqours_code.taskgraph gate <request.md> --repo <path> [--draft-from <graph.json>] [--json] [--out <gate.json>]
+python -m aqours_code.taskgraph gate --from-report <graph.json.report.json> [--json] [--out <gate.json>]
+```
+
+decides "split or single" with few tokens, before any full plan: only a
+`split` would be worth step 2 of the planner (`gate.py`). It plans nothing,
+and neither `plan` nor its fast path calls it yet. The repository is cloned
+at the base commit as in `plan`: the HEAD of `--repo`, or with
+`--from-report` the `base_commit` of that plan.
+
+The gate works in levels, from cheap to less cheap:
+
+- **Level 0** (no model): the characters of every source file (Python, not a
+  test); tokens are estimated as characters / 4, rounded up.
+- **Level 1**, the features: the draft items of step 1. `--from-report` takes
+  the request, repository and base commit from a plan's report (a relative
+  request path, as `plan` records it, is relative to the Aqours-code root)
+  and reuses the plan's draft: the first attempt in
+  `<graph.json>.logs/draft/worker_<n>.json` that answered with a readable
+  draft, else the report's `draft_items`. `--draft-from <graph.json>` reuses
+  a plan's draft the same way with a request and `--repo` of your own.
+  Without a draft to reuse, step 1 runs exactly as in `plan`.
+- **Level 2**, the location: **one** model call, through the planner's child
+  process and model configuration, with no file tools (the tool policy of
+  step 1) and a model budget of one call. First a program search takes each
+  feature's identifiers from its title and description: names in backticks
+  (a dotted name also as a module, a path as a path), words that look like a
+  path (with a slash and a file extension, or `name.py`) or a dotted module,
+  and CamelCase and snake_case words; plain words outside backticks are
+  English. It finds the source files those paths and dotted modules name and
+  the files that define those names (classes, functions, methods,
+  module-level names), with the rules of the two-level outline: names
+  shorter than 4 characters and dunder names are left out, and a name defined
+  in more than 3 files is recorded as common and not searched. Named files
+  come first, then files by the number of names they define, at most 10 per
+  feature. The model gets `gate_locate_prompt.md`, the request, the features,
+  the level-1 outline (every source file with its lines and top-level names)
+  and these search results, and answers with each feature's `modify` files
+  and at most 3 `reference` files it must read, existing paths only and no
+  implementation. Paths that are not in the repository at the base commit
+  are dropped, as are references beyond 3, and each drop is recorded. The
+  prompt may have at most 80K estimated tokens: over that the outline is cut
+  (the lines of the searched files stay, other files follow in path order
+  while they fit) and the files left out are recorded.
+
+The decision uses **provisional** constants, chosen by hand and not fitted
+to any run (`W`, `B0`, `P`, `SHARED_SHARE` in `gate.py`):
+
+| constant | value | meaning |
+| --- | --- | --- |
+| `W` | 37,000 tokens | the context one agent uses well |
+| `B0` | 8,000 tokens | the fixed part of every model call |
+| `P` | 5,000 tokens | what working on one feature adds (edits, test output), an estimate |
+| `SHARED_SHARE` | 0.7 | the share of M at which a group keeps the request in one agent |
+
+- **M** = `B0` + the tokens of every file the features involve (modify and
+  reference, each file once) + features × `P`.
+- Two features are **connected** when both modify one non-test `.py` file
+  other than a package's `__init__.py` (that one usually only gains an
+  export); reading a file does not connect. Connected features form groups
+  (union-find). A group's material is the tokens of its files plus its
+  features × `P`; its share is that over M.
+- M ≤ `W`: `single` (one agent holds it); else the largest group's share ≥
+  `SHARED_SHARE`: `single` (the features concentrate on shared files); else
+  `split`.
+- A file of more than `W` tokens is listed as `oversized`; this does not
+  change the decision. `level0.oversized` lists such files of the whole
+  repository.
+
+The output (`--json`, `--out`) has the `decision`, `reason_code` (`fits`,
+`shared`, `split`) and `reason`; `material` (M, `B0`, `code`,
+`features_x_P`, `W`, `P`); each feature's files with their tokens; the
+`groups` with their shared files, material and share; `oversized`;
+`dropped` paths and `notes` on the answer; the `draft` and where it came
+from; the `search` results; `locate` (the prompt's size, the outline cut,
+the call's input and output tokens and its answer); `level0`; and the model
+calls of this gate (`totals`; a reused draft is not counted again). With
+`--out`, the logs of the model calls are in `<gate.json>.logs/`. Exit codes:
+`0` a decision, `1` no decision (step 1 or the location call failed, or its
+answer could not be read), `2` unusable inputs or a git failure.
+
+`experiments/taskgraph/gate/evaluate.py` compares the gate's results on four
+tasks with their plans and single-agent runs, offline (file hits, the
+decision against the cheaper method in practice, and the decision for other
+`P` and with modified files only); `run_four.ps1` runs the gate on the four
+tasks and then the evaluation. The evaluation does not change the defaults.
 
 ### Worker reading soft wall
 

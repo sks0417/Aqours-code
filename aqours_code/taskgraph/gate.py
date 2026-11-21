@@ -1,0 +1,956 @@
+"""The split gate: decide "split or single" with few tokens, before the full plan.
+
+``python -m aqours_code.taskgraph gate`` asks whether a request is worth the
+full plan (step 2 of the planner) or one agent should do it. It calls the
+model once (plus step 1 when no draft can be reused) and plans nothing.
+Neither ``plan`` nor its fast path uses it yet.
+
+Levels, from cheap to less cheap:
+
+0. **Sizes** (no model): the characters of every source file of the
+   repository at the base commit; tokens are estimated as characters / 4.
+1. **Features**: the draft items of the planner's step 1, reused from an
+   earlier plan (``<graph.json>.logs/draft/worker_<n>.json``, else the
+   report's ``draft_items``); without one, step 1 runs as in ``plan``.
+2. **Location** (one model call, no tools): a program search first takes the
+   identifiers of each feature's title and description (names in backticks,
+   words that look like paths or modules, CamelCase and snake_case words) and
+   finds the source files that define those names or that those paths and
+   modules name (the rules of :mod:`outline_levels`). The model gets the
+   request, the features, the level-1 outline (every source file's top-level
+   names) and the search results, and answers with the files each feature
+   modifies and at most :data:`MAX_REFERENCE` it must read. Paths that are not
+   in the repository are dropped and recorded. A prompt over
+   :data:`LOCATE_INPUT_LIMIT` tokens has its outline cut, and the cut is
+   recorded.
+
+The decision (:func:`decide`) uses provisional constants, chosen by hand and
+not fitted to runs: :data:`W`, :data:`B0`, :data:`P` and :data:`SHARED_SHARE`.
+
+    M = B0 + tokens of every file the features involve (modify and reference,
+        each file once) + features × P
+
+Two features are connected when both modify one non-test ``.py`` file other
+than a package's ``__init__.py`` (it usually only gains an export). Connected
+features form groups (union-find); a group's material is the tokens of its
+files plus its features × P, and its share is that over M.
+
+- M ≤ W: ``single`` (one agent holds it all);
+- the largest group's share ≥ SHARED_SHARE: ``single`` (the features
+  concentrate on shared files);
+- otherwise ``split``.
+
+A file of more than W tokens is listed as oversized; that does not change the
+decision.
+"""
+from __future__ import annotations
+
+import json
+import math
+import re
+import tempfile
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+
+from . import gitops
+from .cleanup import remove_tree
+from .outline import _File, _read, is_source_file
+from .outline_levels import (COMMON_DEFINED_IN, MIN_NAME_CHARS, _path_forms, defined_names,
+                             level1_line, module_name)
+from .plan_budget import PlanBudget
+from .planner import (DRAFT_ATTEMPTS, DraftError, DraftItem, DraftItems, _agent_dict,
+                      _issue_dict, extract_json_block, file_sizes, parse_items,
+                      report_path_for, run_draft_stage)
+from .repo_index import RepoIndex, build_index
+from .validate import Issue
+from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
+
+GATE_VERSION = "gate-v1"
+
+# Provisional values: chosen by hand, not fitted to any run. The evaluation in
+# experiments/taskgraph/gate shows how the decision moves with them.
+W = 37_000  # tokens: the context one agent can use well
+B0 = 8_000  # tokens: the fixed part of every model call (instructions, tools, request)
+P = 5_000  # tokens: what working on one feature adds (edits, test output); an estimate
+SHARED_SHARE = 0.7  # a group holding this share of M or more keeps the request in one agent
+
+CHARS_PER_TOKEN = 4
+MAX_REFERENCE = 3
+LOCATE_INPUT_LIMIT = 80_000  # estimated tokens of the one location prompt
+SEARCH_FILES_PER_FEATURE = 10
+DEFAULT_GATE_TIMEOUT_S = 600.0
+LOCATE_PROMPT_PATH = Path(__file__).resolve().parent / "gate_locate_prompt.md"
+# A relative request path in a plan report is relative to this repository.
+AQOURS_ROOT = Path(__file__).resolve().parents[2]
+# The location is one model call: its budget allows no second one.
+LOCATE_BUDGET = {"max_calls": 1, "max_input_tokens": None}
+
+SINGLE = "single"
+SPLIT = "split"
+
+
+class GateError(Exception):
+    """The inputs of the gate cannot be read."""
+
+
+def estimate_tokens(chars: int) -> int:
+    """Tokens of ``chars`` characters, estimated as characters / 4 (rounded up)."""
+    return math.ceil(chars / CHARS_PER_TOKEN)
+
+
+def file_chars(root: Path, path: str) -> int:
+    """Characters of a file of the checkout (UTF-8, undecodable bytes replaced)."""
+    try:
+        return len((Path(root) / path).read_bytes().decode("utf-8", errors="replace"))
+    except OSError:
+        return 0
+
+
+# ── level 2: identifiers and the program search ──
+
+@dataclass(frozen=True)
+class Identifier:
+    """A name taken from a feature's text, and what it looks like."""
+
+    text: str
+    kind: str  # "quoted" (in backticks), "path", "module", "camel", "snake"
+
+    def to_dict(self) -> dict:
+        return {"text": self.text, "kind": self.kind}
+
+
+_QUOTED = re.compile(r"`+([^`\n]+?)`+")
+# Outside backticks a path has a slash and a file extension (``pkg/mod.py``),
+# or is a bare ``name.py``: ``d/h/m/s`` and ``and/or`` are words.
+_PATH = re.compile(r"(?<![\w./\\-])(?:(?:[\w.-]+[/\\])+[\w-]*\.[A-Za-z]\w*|[\w-]+\.py)"
+                   r"(?![\w/\\])")
+_DOTTED = re.compile(r"(?<![\w./])[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
+_WORD = re.compile(r"(?<![\w])[A-Za-z_]\w*")
+
+
+def normalise_path(text: str) -> str:
+    """``.\\pkg\\mod.py`` -> ``pkg/mod.py``."""
+    path = str(text).strip().strip("`'\"").replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def _is_pathlike(text: str) -> bool:
+    return bool(re.fullmatch(r"[\w./\\-]+", text)) and ("/" in text or "\\" in text
+                                                         or text.endswith(".py"))
+
+
+def _is_camel(word: str) -> bool:
+    """``JobStore``, ``camelCase``, ``HTTPRemote``; not ``Duration`` or ``URL``."""
+    return ("_" not in word and any(ch.islower() for ch in word)
+            and any(ch.isupper() for ch in word[1:]))
+
+
+def _is_snake(word: str) -> bool:
+    return "_" in word and any(ch.isalnum() for ch in word)
+
+
+def _dotted_ok(text: str) -> bool:
+    """Leave out ``e.g`` and ``i.e``: every part of one letter."""
+    return any(len(part) > 1 for part in text.split("."))
+
+
+def extract_identifiers(text: str) -> list[Identifier]:
+    """The identifiers of a feature's text, each once, in the order they appear.
+
+    In backticks every name counts (a dotted name also as a module, a path as
+    a path); outside them only words that look like paths (with a file
+    extension), dotted modules, CamelCase or snake_case names. Plain words
+    outside backticks are English.
+    """
+    found: dict[str, Identifier] = {}
+
+    def add(value: str, kind: str) -> None:
+        value = value.strip().rstrip(".,:;")
+        if value and value not in found:
+            found[value] = Identifier(value, kind)
+
+    for span in _QUOTED.findall(text):
+        span = span.strip()
+        if _is_pathlike(span):
+            add(normalise_path(span), "path")
+            continue
+        for token in re.findall(r"[A-Za-z_][\w.]*", span):
+            token = token.strip(".")
+            if "." in token and _dotted_ok(token):
+                add(token, "module")
+            for part in token.split("."):
+                if part:
+                    add(part, "quoted")
+    rest = _QUOTED.sub(" ", text)
+    for match in _PATH.finditer(rest):
+        add(normalise_path(match.group().rstrip(".")), "path")
+    rest = _PATH.sub(" ", rest)
+    for match in _DOTTED.finditer(rest):
+        if _dotted_ok(match.group()):
+            add(match.group(), "module")
+    for match in _WORD.finditer(rest):
+        word = match.group()
+        if _is_snake(word):
+            add(word, "snake")
+        elif _is_camel(word):
+            add(word, "camel")
+    return list(found.values())
+
+
+def definitions(files: list[_File]) -> dict[str, set[str]]:
+    """Name -> the source files defining it: classes, functions, methods, module names."""
+    definers: dict[str, set[str]] = {}
+    for file in files:
+        names = defined_names(file) | {entry.name for entry in file.entries or []
+                                       if entry.kind == "assign"}
+        for name in names:
+            definers.setdefault(name, set()).add(file.path)
+    return definers
+
+
+def module_paths(files: list[_File]) -> dict[str, str]:
+    """Dotted module name (at least two parts) -> its source file."""
+    modules: dict[str, str] = {}
+    for file in files:
+        name = module_name(file.path)
+        if name.count(".") >= 1:
+            modules.setdefault(name, file.path)
+    return modules
+
+
+def _files_named(text: str, paths: list[str]) -> list[str]:
+    """Source files whose path is ``text`` or ends with ``/text``."""
+    if "/" not in text and text == "__init__.py":
+        return []
+    return [path for path in paths
+            if any(form == text or form.endswith("/" + text) for form in _path_forms(path))]
+
+
+def _module_named(text: str, modules: dict[str, str]) -> tuple[str, str] | None:
+    """The file of the longest module prefix of ``text`` (``pkg.mod.Class`` -> pkg/mod.py)."""
+    parts = text.split(".")
+    for end in range(len(parts), 1, -1):
+        prefix = ".".join(parts[:end])
+        if prefix in modules:
+            return modules[prefix], prefix
+    return None
+
+
+@dataclass
+class SearchHit:
+    """A source file the search found for a feature, and why."""
+
+    path: str
+    why: list[str]
+
+    def to_dict(self) -> dict:
+        return {"path": self.path, "why": self.why}
+
+
+@dataclass
+class FeatureSearch:
+    """What the program search found for one feature."""
+
+    identifiers: list[Identifier]
+    hits: list[SearchHit]
+    common: list[str] = field(default_factory=list)  # names defined in too many files
+    cut: int = 0  # files found beyond SEARCH_FILES_PER_FEATURE, left out
+
+    def to_dict(self) -> dict:
+        return {"identifiers": [ident.to_dict() for ident in self.identifiers],
+                "files": [hit.to_dict() for hit in self.hits],
+                "common": self.common, "cut": self.cut}
+
+
+def search_feature(text: str, files: list[_File], definers: dict[str, set[str]] | None = None,
+                   modules: dict[str, str] | None = None,
+                   limit: int = SEARCH_FILES_PER_FEATURE) -> FeatureSearch:
+    """Find the source files a feature's text points at.
+
+    Files named by a path or module come first, then files by the number of
+    the feature's names they define. A name is left out when it is shorter
+    than ``MIN_NAME_CHARS`` or a dunder name, and recorded as common when more
+    than ``COMMON_DEFINED_IN`` files define it (as in :mod:`outline_levels`).
+    """
+    definers = definers if definers is not None else definitions(files)
+    modules = modules if modules is not None else module_paths(files)
+    paths = [file.path for file in files]
+    identifiers = extract_identifiers(text)
+    reasons: dict[str, list[str]] = {}
+    named: set[str] = set()
+    common: list[str] = []
+    for ident in identifiers:
+        if ident.kind == "path":
+            for path in _files_named(ident.text, paths):
+                reasons.setdefault(path, []).append(f"path {ident.text}")
+                named.add(path)
+            continue
+        if ident.kind == "module":
+            found = _module_named(ident.text, modules)
+            if found is not None:
+                reasons.setdefault(found[0], []).append(f"module {found[1]}")
+                named.add(found[0])
+            continue
+        name = ident.text
+        if len(name) < MIN_NAME_CHARS or (name.startswith("__") and name.endswith("__")):
+            continue
+        defining = definers.get(name)
+        if not defining:
+            continue
+        if len(defining) > COMMON_DEFINED_IN:
+            common.append(name)
+            continue
+        for path in sorted(defining):
+            reasons.setdefault(path, []).append(f"defines {name}")
+    order = sorted(reasons, key=lambda path: (path not in named, -len(reasons[path]), path))
+    hits = [SearchHit(path, list(dict.fromkeys(reasons[path]))) for path in order[:limit]]
+    return FeatureSearch(identifiers, hits, sorted(set(common)), max(0, len(order) - limit))
+
+
+# ── level 2: the location prompt ──
+
+def load_locate_prompt() -> str:
+    """The instructions of the location call."""
+    return LOCATE_PROMPT_PATH.read_text(encoding="utf-8")
+
+
+def _features_section(items: list[DraftItem]) -> str:
+    lines = [f"- {item.id}: **{item.title}**" + (f". {item.description.strip()}"
+                                                 if item.description.strip() else "")
+             for item in items]
+    return ("# Features\n\nThe pieces of work in the request, listed from the request text "
+            "alone.\n\n" + "\n".join(lines))
+
+
+def _outline_section(lines: list[str], omitted: int) -> str:
+    text = ("# Repository outline\n\nEvery source file with its number of lines and the "
+            "names of its top-level classes and functions.\n\n"
+            + ("\n".join(lines) if lines else "(no Python source files)"))
+    if omitted:
+        text += (f"\n\n(Outline cut to fit: {omitted} more source files are not listed; "
+                 "the files of the search results are all listed.)")
+    return text
+
+
+def _search_section(items: list[DraftItem], searches: Mapping[str, FeatureSearch]) -> str:
+    parts = ["# Search results\n\nFor each feature, the source files that define a name its "
+             "text uses, or whose path or module it names (a program search: a hint, not "
+             "the answer)."]
+    for item in items:
+        search = searches.get(item.id)
+        lines = [f"## Feature {item.id}: {item.title}"]
+        if search is None or not search.hits:
+            lines.append("- (no file found)")
+        else:
+            lines += [f"- {hit.path}: {'; '.join(hit.why)}" for hit in search.hits]
+            if search.cut:
+                lines.append(f"- ... and {search.cut} more files")
+        if search is not None and search.common:
+            lines.append(f"- names defined in too many files to search: "
+                         f"{', '.join(search.common)}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def _assemble(request: str, items: list[DraftItem], outline_lines: list[str],
+              searches: Mapping[str, FeatureSearch], omitted: int) -> str:
+    parts = [load_locate_prompt().rstrip(), "# The request\n\n" + request.strip(),
+             _features_section(items), _outline_section(outline_lines, omitted),
+             _search_section(items, searches)]
+    return "\n\n".join(parts) + "\n"
+
+
+@dataclass
+class LocatePrompt:
+    """The location prompt and what had to be cut to fit the input limit."""
+
+    text: str
+    outline_files: int
+    omitted: list[str] = field(default_factory=list)
+    limit: int = LOCATE_INPUT_LIMIT
+
+    @property
+    def estimated_tokens(self) -> int:
+        return estimate_tokens(len(self.text))
+
+    @property
+    def over_limit(self) -> bool:
+        """True when even the cut prompt is over the limit."""
+        return self.estimated_tokens > self.limit
+
+    def report(self) -> dict:
+        return {"prompt_chars": len(self.text), "prompt_tokens_estimate": self.estimated_tokens,
+                "input_limit": self.limit, "outline_files": self.outline_files,
+                "outline_cut": bool(self.omitted), "outline_omitted": self.omitted,
+                "over_limit": self.over_limit}
+
+
+def build_locate_prompt(request: str, items: list[DraftItem], files: list[_File],
+                        searches: Mapping[str, FeatureSearch],
+                        limit: int = LOCATE_INPUT_LIMIT) -> LocatePrompt:
+    """The prompt of the location call, its outline cut when over ``limit`` tokens.
+
+    Cutting keeps the outline lines of the files in the search results, then
+    other files in path order while they fit; the lines stay in path order.
+    """
+    lines = {file.path: level1_line(file) for file in files}
+    text = _assemble(request, items, list(lines.values()), searches, 0)
+    if estimate_tokens(len(text)) <= limit:
+        return LocatePrompt(text, len(lines), [], limit)
+    searched = {hit.path for search in searches.values() for hit in search.hits}
+    kept = {path for path in lines if path in searched}
+    others = [path for path in lines if path not in kept]
+    base = _assemble(request, items, [lines[path] for path in lines if path in kept],
+                     searches, len(others))
+    room = limit * CHARS_PER_TOKEN - len(base)
+    for path in others:
+        cost = len(lines[path]) + 1
+        if cost > room:
+            break
+        room -= cost
+        kept.add(path)
+    omitted = [path for path in lines if path not in kept]
+    text = _assemble(request, items, [lines[path] for path in lines if path in kept],
+                     searches, len(omitted))
+    return LocatePrompt(text, len(kept), omitted, limit)
+
+
+# ── level 2: reading the answer ──
+
+@dataclass
+class FeatureFiles:
+    """The files of one feature: those it modifies and those it must read."""
+
+    id: str
+    title: str
+    modify: list[str] = field(default_factory=list)
+    reference: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LocateAnswer:
+    """The checked answer of the location call."""
+
+    features: list[FeatureFiles]
+    dropped: list[dict] = field(default_factory=list)  # {feature, role, path, why}
+    notes: list[str] = field(default_factory=list)
+
+
+def _as_id(value) -> str:
+    return str(value) if isinstance(value, (int, str)) and not isinstance(value, bool) else ""
+
+
+def _path_list(value, feature: str, role: str, notes: list[str]) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        notes.append(f"feature {feature}: {role} is not a list; left out")
+        return []
+    paths = []
+    for entry in value:
+        if not isinstance(entry, str):
+            notes.append(f"feature {feature}: a {role} entry is not a path; left out")
+            continue
+        path = normalise_path(entry)
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def parse_locations(answer: str, items: list[DraftItem], index: RepoIndex) -> LocateAnswer:
+    """Read the location answer; drop (and record) paths that are not in the repository.
+
+    A feature without an entry modifies nothing (noted). References beyond
+    ``MAX_REFERENCE`` are dropped, and so is a reference the feature also
+    modifies. Format problems raise :class:`DraftError`.
+    """
+    block = extract_json_block(answer)
+    try:
+        data = json.loads(block)
+    except json.JSONDecodeError as exc:
+        raise DraftError([Issue("FORMAT", [], f"the last ```json block is not valid JSON: "
+                                             f"{exc}")]) from None
+    entries = data.get("features") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        raise DraftError([Issue("FORMAT", [], "the answer has no `features` list")])
+    known = {item.id for item in items}
+    by_id: dict[str, dict] = {}
+    notes: list[str] = []
+    for entry in entries:
+        feature = _as_id(entry.get("id")) if isinstance(entry, dict) else ""
+        if not feature:
+            notes.append("an entry without a feature id was left out")
+        elif feature not in known:
+            notes.append(f"entry for unknown feature {feature!r} was left out")
+        elif feature in by_id:
+            notes.append(f"feature {feature} has several entries; the first one counts")
+        else:
+            by_id[feature] = entry
+    answer_out = LocateAnswer([], [], notes)
+    for item in items:
+        entry = by_id.get(item.id)
+        if entry is None:
+            notes.append(f"feature {item.id} has no entry: it modifies no file")
+            answer_out.features.append(FeatureFiles(item.id, item.title))
+            continue
+        kept: dict[str, list[str]] = {}
+        for role in ("modify", "reference"):
+            kept[role] = []
+            for path in _path_list(entry.get(role), item.id, role, notes):
+                if not index.has_file(path):
+                    answer_out.dropped.append({"feature": item.id, "role": role, "path": path,
+                                               "why": "not in the repository"})
+                elif role == "reference" and path in kept["modify"]:
+                    continue
+                elif role == "reference" and len(kept[role]) >= MAX_REFERENCE:
+                    answer_out.dropped.append({"feature": item.id, "role": role, "path": path,
+                                               "why": f"more than {MAX_REFERENCE} references"})
+                else:
+                    kept[role].append(path)
+        answer_out.features.append(FeatureFiles(item.id, item.title, kept["modify"],
+                                                kept["reference"]))
+    return answer_out
+
+
+# ── the decision ──
+
+def connects(path: str) -> bool:
+    """Whether two features modifying ``path`` are connected.
+
+    A non-test ``.py`` file connects them; a package's ``__init__.py`` does not
+    (it usually only gains an export).
+    """
+    return is_source_file(path) and PurePosixPath(path).name != "__init__.py"
+
+
+def feature_groups(features: list[FeatureFiles]) -> list[list[int]]:
+    """Indexes of connected features (union-find), each group in feature order."""
+    parent = list(range(len(features)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    first: dict[str, int] = {}
+    for index, feature in enumerate(features):
+        for path in feature.modify:
+            if not connects(path):
+                continue
+            if path in first:
+                low, high = sorted((find(first[path]), find(index)))
+                parent[high] = low
+            else:
+                first[path] = index
+    groups: dict[int, list[int]] = {}
+    for index in range(len(features)):
+        groups.setdefault(find(index), []).append(index)
+    return sorted(groups.values(), key=lambda members: members[0])
+
+
+def _files_of(feature: FeatureFiles, with_reference: bool) -> list[str]:
+    return list(dict.fromkeys(feature.modify + (feature.reference if with_reference else [])))
+
+
+def decide(features: list[FeatureFiles], tokens: Mapping[str, int], *, p: int = P,
+           w: int = W, b0: int = B0, with_reference: bool = True,
+           shared_share: float = SHARED_SHARE) -> dict:
+    """The decision, its reason and every number it rests on.
+
+    ``tokens`` gives each file's tokens (a missing file counts 0). With
+    ``with_reference`` False only the modified files count as material; the
+    groups always come from the modified files.
+    """
+    def entries(paths: list[str]) -> list[dict]:
+        return [{"path": path, "tokens": tokens.get(path, 0)} for path in paths]
+
+    involved = list(dict.fromkeys(path for feature in features
+                                  for path in _files_of(feature, with_reference)))
+    code = sum(tokens.get(path, 0) for path in involved)
+    work = len(features) * p
+    m = b0 + code + work
+    groups = []
+    for members in feature_groups(features):
+        files = list(dict.fromkeys(path for index in members
+                                   for path in _files_of(features[index], with_reference)))
+        modified: dict[str, int] = {}
+        for index in members:
+            for path in features[index].modify:
+                if connects(path):
+                    modified[path] = modified.get(path, 0) + 1
+        group_code = sum(tokens.get(path, 0) for path in files)
+        material = group_code + len(members) * p
+        groups.append({"features": [features[index].id for index in members],
+                       "shared_files": sorted(path for path, count in modified.items()
+                                              if count > 1),
+                       "files": len(files), "code_tokens": group_code, "material": material,
+                       "share": material / m if m else 0.0})
+    largest = max(groups, key=lambda group: group["share"]) if groups else None
+    share = largest["share"] if largest is not None else 0.0
+    if m <= w:
+        decision, code_name = SINGLE, "fits"
+        reason = f"one agent holds it: M = {m:,} <= W = {w:,} tokens"
+    elif share >= shared_share:
+        decision, code_name = SINGLE, "shared"
+        reason = (f"the features concentrate on shared files: the largest group "
+                  f"({', '.join(largest['features'])}) holds {share:.2f} of M "
+                  f"(>= {shared_share:.2f})")
+    else:
+        decision, code_name = SPLIT, "split"
+        reason = (f"M = {m:,} > W = {w:,} tokens and the largest group holds {share:.2f} "
+                  f"of M (< {shared_share:.2f})")
+    return {
+        "decision": decision,
+        "reason_code": code_name,
+        "reason": reason,
+        "settings": {"P": p, "W": w, "B0": b0, "with_reference": with_reference,
+                     "shared_share": shared_share},
+        "material": {"M": m, "B0": b0, "code": code, "features_x_P": work,
+                     "features": len(features), "files": len(involved), "W": w, "P": p},
+        "features": [{"id": feature.id, "title": feature.title,
+                      "modify": entries(feature.modify), "reference": entries(feature.reference),
+                      "tokens": sum(tokens.get(path, 0)
+                                    for path in _files_of(feature, with_reference))}
+                     for feature in features],
+        "groups": sorted(groups, key=lambda group: -group["share"]),
+        "largest_group": largest["features"] if largest is not None else [],
+        "largest_group_share": share,
+        "oversized": [entry for entry in entries(involved) if entry["tokens"] > w],
+    }
+
+
+def features_from_gate(data: Mapping) -> tuple[list[FeatureFiles], dict[str, int]]:
+    """The features and file tokens recorded in a gate output, for :func:`decide` again."""
+    features, tokens = [], {}
+    for feature in data.get("features") or []:
+        modify = [entry["path"] for entry in feature.get("modify") or []]
+        reference = [entry["path"] for entry in feature.get("reference") or []]
+        for entry in [*(feature.get("modify") or []), *(feature.get("reference") or [])]:
+            tokens[entry["path"]] = int(entry.get("tokens") or 0)
+        features.append(FeatureFiles(str(feature["id"]), str(feature.get("title", "")),
+                                     modify, reference))
+    return features, tokens
+
+
+# ── level 1: the draft ──
+
+@dataclass
+class GateDraft:
+    """The features and where they came from."""
+
+    items: DraftItems | None
+    source: str  # "reused" (a plan's draft log), "report" (its draft_items), "step1"
+    path: str | None = None
+    usage: dict = field(default_factory=lambda: {"model_calls": 0, "input_tokens": 0,
+                                                 "output_tokens": 0})
+    rounds: list[dict] = field(default_factory=list)  # step 1 run by the gate
+    errors: list[Issue] = field(default_factory=list)
+
+    def report(self) -> dict:
+        items = self.items
+        return {"source": self.source, "path": self.path,
+                "estimated_changed_lines": items.estimated_changed_lines if items else None,
+                "items": [item.model_dump() for item in items.items] if items else [],
+                "usage": self.usage, "rounds": self.rounds}
+
+
+def _usage(result: WorkerResult) -> dict:
+    return {"model_calls": result.model_calls, "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens}
+
+
+def reusable_draft(graph_path: Path) -> GateDraft | None:
+    """The step-1 draft of the plan of ``graph_path``, if it kept one.
+
+    First the plan's draft log (``<graph>.logs/draft/worker_<n>.json``, the
+    first attempt that answered with a readable draft), then the
+    ``draft_items`` of its report.
+    """
+    graph_path = Path(graph_path)
+    log_dir = graph_path.with_name(f"{graph_path.name}.logs") / "draft"
+    for attempt in range(1, DRAFT_ATTEMPTS + 1):
+        path = log_dir / f"worker_{attempt}.json"
+        try:
+            result = WorkerResult.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            items = parse_items(result.final_answer) if result.ok else None
+        except (OSError, ValueError, TypeError, AttributeError, DraftError):
+            continue
+        if items is not None:
+            return GateDraft(items, "reused", str(path), _usage(result))
+    report_path = report_path_for(graph_path)
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        items = DraftItems.model_validate({
+            "estimated_changed_lines": report["estimated_changed_lines"],
+            "items": report["draft_items"]})
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    stage1 = (report.get("stage_totals") or {}).get("stage1") or {}
+    usage = {key: int(stage1.get(key) or 0)
+             for key in ("model_calls", "input_tokens", "output_tokens")}
+    return GateDraft(items, "report", str(report_path), usage)
+
+
+# ── running ──
+
+@dataclass
+class GateOptions:
+    """Parameters of one ``gate`` run.
+
+    ``base_commit`` None reads the repository at its HEAD; ``draft_from`` is a
+    plan's graph whose draft is reused when it has one.
+    """
+
+    request_path: Path
+    repo: Path
+    out: Path | None = None
+    base_commit: str | None = None
+    draft_from: Path | None = None
+    from_report: Path | None = None
+    timeout_s: float = DEFAULT_GATE_TIMEOUT_S
+    input_limit: int = LOCATE_INPUT_LIMIT
+
+
+def resolve_request(value: str) -> Path:
+    """A request path from a plan report; a relative one is under the Aqours-code root."""
+    path = Path(str(value).replace("\\", "/"))
+    return path if path.is_absolute() else AQOURS_ROOT / path
+
+
+def options_from_report(report_path: Path, out: Path | None = None,
+                        timeout_s: float = DEFAULT_GATE_TIMEOUT_S) -> GateOptions:
+    """Gate options from a plan report: its request, repository, base commit and draft."""
+    report_path = Path(report_path)
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise GateError(f"plan report not found: {report_path}") from None
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise GateError(f"cannot read the plan report {report_path}: {exc}") from None
+    if not isinstance(report, dict):
+        raise GateError(f"{report_path} is not a JSON object")
+    missing = [key for key in ("request", "repo", "base_commit") if not report.get(key)]
+    if missing:
+        raise GateError(f"{report_path} does not name the {', '.join(missing)} of the plan")
+    name = report_path.name
+    suffix = ".report.json"
+    graph = (report_path.with_name(name[:-len(suffix)])
+             if name.endswith(suffix) and len(name) > len(suffix) else report_path)
+    return GateOptions(request_path=resolve_request(report["request"]),
+                       repo=Path(report["repo"]), out=out, base_commit=report["base_commit"],
+                       draft_from=graph, from_report=report_path, timeout_s=timeout_s)
+
+
+@dataclass
+class GateResult:
+    """Outcome of :func:`run_gate`: ``ok`` when a decision was made."""
+
+    ok: bool
+    data: dict
+
+
+def _draft(options: GateOptions, request: str, clone: Path, index: RepoIndex,
+           worker: Worker, log_dir: Path) -> GateDraft:
+    if options.draft_from is not None:
+        reused = reusable_draft(options.draft_from)
+        if reused is not None:
+            return reused
+    items, rounds, errors = run_draft_stage(request, file_sizes(clone, index), worker, clone,
+                                            log_dir, options.timeout_s, PlanBudget())
+    usage = {key: sum(entry["agent"][key] for entry in rounds)
+             for key in ("model_calls", "input_tokens", "output_tokens")}
+    return GateDraft(items, "step1", None, usage, rounds, list(errors))
+
+
+def run_gate(options: GateOptions, locate_worker: Worker,
+             draft_stage_worker: Worker | None = None) -> GateResult:
+    """Run the gate; write ``options.out`` when given.
+
+    ``locate_worker`` makes the location call; ``draft_stage_worker`` runs
+    step 1 when no draft can be reused (default: ``locate_worker``). Raises
+    ``gitops.GitError`` / ``RuntimeError`` on git failures and ``OSError`` /
+    ``UnicodeDecodeError`` for a request it cannot read.
+    """
+    started = time.monotonic()
+    request = options.request_path.read_text(encoding="utf-8")
+    repo = options.repo.resolve()
+    base = gitops.head(repo, options.base_commit or "HEAD")
+    model = locate_worker.describe().get("model")
+    errors: list[Issue] = []
+    draft: GateDraft | None = None
+    searches: dict[str, FeatureSearch] = {}
+    prompt: LocatePrompt | None = None
+    result: WorkerResult | None = None
+    located: LocateAnswer | None = None
+    decision: dict = {}
+    level0: dict = {}
+    tmp = Path(tempfile.mkdtemp(prefix="tg-gate-"))
+    if options.out is not None:
+        options.out.parent.mkdir(parents=True, exist_ok=True)
+        log_root = options.out.with_name(f"{options.out.name}.logs")
+    else:
+        log_root = tmp / "logs"
+    try:
+        clone = tmp / "repo"
+        gitops.clone_for_run(repo, clone, base)
+        index = build_index(clone, base)
+        files = [_read(clone, path) for path in sorted(index.files) if is_source_file(path)]
+        sizes = {file.path: file_chars(clone, file.path) for file in files}
+        level0 = {"source_files": len(files), "chars": sum(sizes.values()),
+                  "tokens": sum(estimate_tokens(chars) for chars in sizes.values()),
+                  "oversized": [{"path": path, "tokens": estimate_tokens(chars)}
+                                for path, chars in sizes.items() if estimate_tokens(chars) > W],
+                  "sizes": sizes}
+        draft = _draft(options, request, clone, index, draft_stage_worker or locate_worker,
+                       log_root / "draft")
+        errors += draft.errors
+        if draft.items is not None:
+            items = draft.items.items
+            definers, modules = definitions(files), module_paths(files)
+            searches = {item.id: search_feature(f"{item.title}\n{item.description}", files,
+                                                definers, modules) for item in items}
+            prompt = build_locate_prompt(request, items, files, searches, options.input_limit)
+            result = locate_worker.run(WorkerRequest(
+                node_id="gate-locate", attempt=1, prompt=prompt.text, workspace=clone,
+                log_dir=log_root / "locate", timeout_s=options.timeout_s, repo_guard=True,
+                model_budget=dict(LOCATE_BUDGET)))
+            if not result.ok:
+                errors.append(Issue("AGENT", [], f"the location call failed "
+                                                 f"({result.reason or 'worker_error'}): "
+                                                 f"{result.error[-2000:]}"))
+            else:
+                try:
+                    located = parse_locations(result.final_answer, items, index)
+                except DraftError as exc:
+                    errors += exc.issues
+            if located is not None:
+                involved = {path for feature in located.features
+                            for path in feature.modify + feature.reference}
+                tokens = {path: estimate_tokens(sizes[path] if path in sizes
+                                                else file_chars(clone, path))
+                          for path in involved}
+                decision = decide(located.features, tokens)
+    finally:
+        remove_tree(tmp)
+    locate_usage = _usage(result) if result is not None else _usage(WorkerResult(ok=False))
+    draft_usage = draft.usage if draft is not None and draft.source == "step1" else \
+        {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
+    data = {
+        "gate_version": GATE_VERSION,
+        "provisional": True,
+        "model": str(model) if model is not None else None,
+        "request": str(options.request_path),
+        "repo": str(repo),
+        "base_commit": base,
+        "from_report": str(options.from_report) if options.from_report else None,
+        "draft_from": str(options.draft_from) if options.draft_from else None,
+        "out": str(options.out) if options.out else None,
+        "logs": str(log_root) if options.out else None,
+        "ok": bool(decision),
+        "errors": [_issue_dict(issue) for issue in errors],
+        "decision": decision.get("decision"),
+        "reason_code": decision.get("reason_code"),
+        "reason": decision.get("reason"),
+        "constants": {"W": W, "B0": B0, "P": P, "shared_share": SHARED_SHARE,
+                      "chars_per_token": CHARS_PER_TOKEN, "max_reference": MAX_REFERENCE,
+                      "locate_input_limit": options.input_limit, "provisional": True},
+        "material": decision.get("material"),
+        "features": decision.get("features", []),
+        "groups": decision.get("groups", []),
+        "largest_group": decision.get("largest_group", []),
+        "largest_group_share": decision.get("largest_group_share"),
+        "oversized": decision.get("oversized", []),
+        "dropped": located.dropped if located is not None else [],
+        "notes": located.notes if located is not None else [],
+        "draft": draft.report() if draft is not None else None,
+        "search": {key: value.to_dict() for key, value in searches.items()},
+        "locate": {**(prompt.report() if prompt is not None else {}),
+                   "agent": _agent_dict(result) if result is not None else None,
+                   "input_tokens": locate_usage["input_tokens"],
+                   "output_tokens": locate_usage["output_tokens"],
+                   "answer": result.final_answer if result is not None else None},
+        "level0": level0,
+        "totals": {key: draft_usage[key] + locate_usage[key]
+                   for key in ("model_calls", "input_tokens", "output_tokens")},
+        "duration_s": round(time.monotonic() - started, 3),
+    }
+    if options.out is not None:
+        write_json_atomic(options.out, data)
+    return GateResult(ok=bool(decision), data=data)
+
+
+def locate_worker() -> Worker:
+    """The worker of the location call: the planner's child process, no file tools.
+
+    It is the worker of step 1 (``planner_entry --stage draft``), with the same
+    model configuration as ``plan``.
+    """
+    from .planner import draft_worker
+    return draft_worker()
+
+
+# ── output ──
+
+def _file_text(entries: list[dict]) -> str:
+    return ", ".join(f"{entry['path']} ({entry['tokens']:,})" for entry in entries) or "-"
+
+
+def format_gate(data: Mapping) -> str:
+    """The gate's result as readable text."""
+    lines = []
+    draft = data.get("draft") or {}
+    if draft:
+        where = f" from {draft['path']}" if draft.get("path") else ""
+        lines.append(f"features: {len(draft.get('items') or [])} (draft: {draft['source']}"
+                     f"{where})")
+    level0 = data.get("level0") or {}
+    if level0:
+        lines.append(f"repository: {level0['source_files']} source files, "
+                     f"{level0['tokens']:,} tokens (characters / {CHARS_PER_TOKEN})")
+    locate = data.get("locate") or {}
+    if locate.get("prompt_chars") is not None:
+        cut = (f"outline cut: {len(locate['outline_omitted'])} files left out"
+               if locate["outline_cut"] else "outline whole")
+        over = "; still over the limit" if locate["over_limit"] else ""
+        lines.append(f"location call: prompt about {locate['prompt_tokens_estimate']:,} tokens "
+                     f"(limit {locate['input_limit']:,}; {cut}{over}); "
+                     f"{locate['input_tokens']:,} in / {locate['output_tokens']:,} out")
+    for issue in data.get("errors") or []:
+        lines.append(f"error: [{issue['code']}] {issue['message']}")
+    material = data.get("material")
+    if material:
+        lines.append(f"M = B0 {material['B0']:,} + code {material['code']:,} "
+                     f"({material['files']} files) + {material['features']} features x P "
+                     f"{material['P']:,} = {material['M']:,} tokens; W = {material['W']:,}")
+        for feature in data["features"]:
+            lines.append(f"  {feature['id']} {feature['title']}: {feature['tokens']:,} tokens; "
+                         f"modify {_file_text(feature['modify'])}; "
+                         f"reference {_file_text(feature['reference'])}")
+        lines.append(f"groups: {len(data['groups'])}")
+        for group in data["groups"]:
+            shared = (f"; shared {', '.join(group['shared_files'])}"
+                      if group["shared_files"] else "")
+            lines.append(f"  {', '.join(group['features'])}: {group['material']:,} tokens, "
+                         f"{group['share']:.2f} of M{shared}")
+    if data.get("oversized"):
+        lines.append(f"oversized (over W): {_file_text(data['oversized'])}")
+    dropped = data.get("dropped") or []
+    if dropped:
+        lines.append(f"dropped paths: {len(dropped)}")
+        lines += [f"  {entry['feature']} {entry['role']} {entry['path']}: {entry['why']}"
+                  for entry in dropped]
+    lines += [f"note: {note}" for note in data.get("notes") or []]
+    totals = data.get("totals") or {}
+    if totals:
+        lines.append(f"model calls of this gate: {totals['model_calls']}, "
+                     f"{totals['input_tokens']:,} in / {totals['output_tokens']:,} out")
+    if data.get("decision"):
+        lines.append(f"decision (provisional thresholds): {data['decision']}: {data['reason']}")
+    else:
+        lines.append("decision: none (see the errors)")
+    return "\n".join(lines) + "\n"
