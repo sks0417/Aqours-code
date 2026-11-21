@@ -3,9 +3,10 @@
 #   powershell -ExecutionPolicy Bypass -File experiments\taskgraph\gate\run_four.ps1
 #
 # Each gate run reuses the plan's step-1 draft (--from-report) and makes one model
-# call (the location). Results: C:\tg\gate\<task>.json (and <task>.json.logs\),
-# then the evaluation table, printed and written to C:\tg\gate\evaluation.md.
-# A task whose gate fails is reported and the others still run.
+# call (the location). Results: C:\tg\gate\<task>.json (and <task>.json.logs\).
+# Then two evaluations, both printed and written to C:\tg\gate\evaluation.md:
+# first the ideal location (the full plans' files, no gate output), then the
+# gate outputs. A task whose gate fails is reported and the others still run.
 
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
@@ -33,8 +34,11 @@ try {
             $Failed += $Name
         }
     }
-    Write-Host "== evaluation"
-    & $Python experiments\taskgraph\gate\evaluate.py --gate-dir $OutDir --out (Join-Path $OutDir "evaluation.md") --json (Join-Path $OutDir "evaluation.json")
+    $Md = Join-Path $OutDir "evaluation.md"
+    Write-Host "== evaluation: ideal location"
+    & $Python experiments\taskgraph\gate\evaluate.py --ideal --out $Md --json (Join-Path $OutDir "evaluation_ideal.json")
+    Write-Host "== evaluation: gate outputs"
+    & $Python experiments\taskgraph\gate\evaluate.py --gate-dir $OutDir --out $Md --append --json (Join-Path $OutDir "evaluation_gate.json")
     if ($Failed.Count -gt 0) {
         Write-Warning ("gate gave no decision for: " + ($Failed -join ", "))
     }

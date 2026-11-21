@@ -10,12 +10,15 @@ import pytest
 
 import aqours_code.taskgraph.gate as gate
 from aqours_code.taskgraph.cli import main
-from aqours_code.taskgraph.gate import (B0, MAX_REFERENCE, P, SINGLE, SPLIT, W, FeatureFiles,
-                                        FeatureSearch, GateOptions, SearchHit,
+from aqours_code.taskgraph.gate import (B0, CLEAR_SINGLE, CLEAR_SPLIT, COMPACT_TRIGGER_ENV,
+                                        MAX_REFERENCE, SINGLE, SPLIT, UNCLEAR,
+                                        W_AT_DEFAULT_TRIGGER, FeatureFiles, FeatureSearch,
+                                        GateOptions, SearchHit, Window, agent_window,
                                         build_locate_prompt, decide, estimate_tokens,
                                         extract_identifiers, feature_groups, features_from_gate,
                                         options_from_report, parse_locations, resolve_request,
-                                        reusable_draft, run_gate, search_feature)
+                                        reusable_draft, run_gate, search_feature,
+                                        window_for_trigger)
 from aqours_code.taskgraph.outline import _Entry, _File, _read, is_source_file
 from aqours_code.taskgraph.planner import DraftError, DraftItem
 from aqours_code.taskgraph.repo_index import RepoIndex
@@ -26,6 +29,16 @@ from test_planner import REQUEST, ScriptedDrafter, answer, items_answer
 FILE_TOOLS = {"read_file", "glob", "grep", "bash", "write_file", "edit_file"}
 SCRIPT = (Path(__file__).resolve().parents[2] / "experiments" / "taskgraph" / "gate"
           / "evaluate.py")
+REAL_ROOT = gate.AQOURS_ROOT
+W = W_AT_DEFAULT_TRIGGER
+DEFAULT_WINDOW = Window(W_AT_DEFAULT_TRIGGER, 80_000, "default")
+
+
+@pytest.fixture(autouse=True)
+def no_compaction_setting(monkeypatch, tmp_path):
+    """W from the default trigger: no setting in the environment or in a .env."""
+    monkeypatch.delenv(COMPACT_TRIGGER_ENV, raising=False)
+    monkeypatch.setattr(gate, "AQOURS_ROOT", tmp_path / "aqours-root")
 
 
 def kinds(text: str) -> dict[str, str]:
@@ -143,74 +156,102 @@ def test_an_answer_that_cannot_be_read_is_a_format_error(text, message):
 
 # ── the decision ──
 
-def test_m_adds_b0_every_involved_file_once_and_p_per_feature():
+def test_m_is_b0_plus_every_involved_file_once():
     features = [FeatureFiles("A", "a", ["a.py"], ["r.py"]),
                 FeatureFiles("B", "b", ["b.py"], ["r.py"])]
     tokens = {"a.py": 10_000, "b.py": 20_000, "r.py": 5_000}
     result = decide(features, tokens)
-    assert result["material"] == {"M": B0 + 35_000 + 2 * P, "B0": B0, "code": 35_000,
-                                  "features_x_P": 2 * P, "features": 2, "files": 3,
-                                  "W": W, "P": P}
+    assert result["material"] == {"M": B0 + 35_000, "B0": B0, "code": 35_000, "files": 3,
+                                  "W": W, "half_W": W // 2}
     assert [feature["tokens"] for feature in result["features"]] == [15_000, 25_000]
     assert result["features"][0]["reference"] == [{"path": "r.py", "tokens": 5_000}]
     modify_only = decide(features, tokens, with_reference=False)
-    assert modify_only["material"]["code"] == 30_000
+    assert modify_only["material"]["M"] == B0 + 30_000
 
 
-def test_features_modifying_one_source_file_are_one_group():
+def test_the_concentration_is_the_largest_group_of_features_over_all_features():
     features = [FeatureFiles("A", "a", ["x.py", "pkg/__init__.py"]),
                 FeatureFiles("B", "b", ["x.py", "y.py"]),
                 FeatureFiles("C", "c", ["y.py", "tests/test_c.py"]),
                 FeatureFiles("D", "d", ["pkg/__init__.py", "tests/test_c.py", "README.md"]),
-                FeatureFiles("E", "e", ["README.md"], ["x.py"])]
+                FeatureFiles("E", "e", ["README.md"], ["x.py", "y.py"])]
+    # __init__.py, test files, other files and files only read connect nothing
     assert feature_groups(features) == [[0, 1, 2], [3], [4]]
-    tokens = {"x.py": 1000, "y.py": 2000, "pkg/__init__.py": 100, "tests/test_c.py": 400,
-              "README.md": 50}
-    result = decide(features, tokens, p=1000)
-    m = B0 + 3550 + 5 * 1000
-    assert result["material"]["M"] == m
-    largest = result["groups"][0]
-    assert largest["features"] == ["A", "B", "C"]
-    assert largest["shared_files"] == ["x.py", "y.py"]
-    assert largest["material"] == 3500 + 3 * 1000  # x, y, __init__, the test file
-    assert largest["share"] == pytest.approx(6500 / m)
-    assert result["largest_group"] == ["A", "B", "C"]
-    assert result["largest_group_share"] == pytest.approx(6500 / m)
-    # E only reads x.py: reading does not connect
-    assert [group["features"] for group in result["groups"][1:]] == [["E"], ["D"]]
+    result = decide(features, {"x.py": 50_000, "y.py": 50_000})
+    assert result["groups"] == [{"features": ["A", "B", "C"], "shared_files": ["x.py", "y.py"]},
+                                {"features": ["D"], "shared_files": []},
+                                {"features": ["E"], "shared_files": []}]
+    assert result["shared"] is True
+    assert result["concentration"] == {"value": 0.6, "largest_group": ["A", "B", "C"],
+                                       "of": "3/5"}
+    # E reads x.py and y.py, which A, B and C modify: still counted once in M
+    assert result["material"]["M"] == B0 + 100_000
 
 
-def test_a_request_one_agent_holds_is_single():
-    features = [FeatureFiles("A", "a", ["a.py"]), FeatureFiles("B", "b", ["b.py"])]
-    result = decide(features, {"a.py": 1000, "b.py": 1000})
-    assert result["material"]["M"] == B0 + 2000 + 2 * P <= W
-    assert (result["decision"], result["reason_code"]) == (SINGLE, "fits")
-    assert "one agent holds it" in result["reason"]
+def files(*modified: str) -> list[FeatureFiles]:
+    """One feature per argument, modifying the files named in it (``"a.py b.py"``)."""
+    return [FeatureFiles(str(number), str(number), text.split())
+            for number, text in enumerate(modified, start=1)]
 
 
-def test_features_concentrated_on_a_shared_file_are_single():
-    features = [FeatureFiles("A", "a", ["core.py"]), FeatureFiles("B", "b", ["core.py"]),
-                FeatureFiles("C", "c", ["small.py"])]
-    result = decide(features, {"core.py": 60_000, "small.py": 1000})
-    share = (60_000 + 2 * P) / result["material"]["M"]
-    assert share >= 0.7 and result["largest_group_share"] == pytest.approx(share)
-    assert (result["decision"], result["reason_code"]) == (SINGLE, "shared")
-    assert "(A, B)" in result["reason"]
+HALF = 20_000  # W/2 for W = 40000 in these cases
+ZONES = [
+    # M <= W/2: clear single, whatever the concentration
+    ("M == W/2", files("a.py", "b.py"), {"a.py": 6000, "b.py": 6000}, CLEAR_SINGLE, SINGLE),
+    # just over W/2, at most W: unclear, single by default
+    ("M == W/2 + 1", files("a.py", "b.py"), {"a.py": 6000, "b.py": 6001}, UNCLEAR, SINGLE),
+    ("M == W, nothing shared", files("a.py", "b.py"), {"a.py": 16_000, "b.py": 16_000},
+     UNCLEAR, SINGLE),
+    # over W and nothing shared: clear split
+    ("M == W + 1, nothing shared", files("a.py", "b.py"), {"a.py": 16_000, "b.py": 16_001},
+     CLEAR_SPLIT, SPLIT),
+    # concentration exactly 3/4: clear single even far over W
+    ("concentration 3/4", files("core.py", "core.py", "core.py", "d.py"),
+     {"core.py": 90_000, "d.py": 1000}, CLEAR_SINGLE, SINGLE),
+    # over W, shared, concentration exactly 1/2: clear split
+    ("concentration 1/2", files("core.py", "core.py", "c.py", "d.py"),
+     {"core.py": 31_000, "c.py": 1000, "d.py": 1000}, CLEAR_SPLIT, SPLIT),
+    # over W, shared, concentration between 1/2 and 3/4: unclear
+    ("concentration 2/3", files("core.py", "core.py", "c.py"),
+     {"core.py": 30_000, "c.py": 10_000}, UNCLEAR, SINGLE),
+    # one feature: concentration 1
+    ("one feature", files("a.py"), {"a.py": 100_000}, CLEAR_SINGLE, SINGLE),
+]
 
 
-def test_independent_features_over_the_window_are_split():
-    features = [FeatureFiles(name, name, [f"{name}.py"]) for name in "ABC"]
-    result = decide(features, {"A.py": 20_000, "B.py": 20_000, "C.py": 20_000})
-    assert result["material"]["M"] > W and result["largest_group_share"] < 0.7
-    assert (result["decision"], result["reason_code"]) == (SPLIT, "split")
+@pytest.mark.parametrize(("case", "features", "tokens", "zone", "decision"), ZONES,
+                         ids=[case[0] for case in ZONES])
+def test_the_three_zones_and_their_boundaries(case, features, tokens, zone, decision):
+    result = decide(features, tokens, w=2 * HALF)
+    assert (result["zone"], result["decision"]) == (zone, decision)
+    assert result["material"]["half_W"] == HALF
 
 
-def test_a_file_over_the_window_is_oversized_without_changing_the_decision():
-    features = [FeatureFiles(name, name, [f"{name}.py"]) for name in "ABC"]
-    tokens = {"A.py": W + 1, "B.py": W, "C.py": W}
-    result = decide(features, tokens)
-    assert result["oversized"] == [{"path": "A.py", "tokens": W + 1}]
-    assert result["decision"] == SPLIT
+def test_each_zone_says_why():
+    w = 2 * HALF
+    reasons = {case: decide(features, tokens, w=w)["reason"]
+               for case, features, tokens, _, _ in ZONES}
+    assert reasons["M == W/2"] == "M = 20,000 <= W/2 = 20,000: one agent holds it"
+    assert reasons["concentration 3/4"] == (
+        "the largest group holds 3 of 4 features (0.75), at least 3/4: the features "
+        "concentrate on shared files")
+    assert reasons["M == W + 1, nothing shared"] == (
+        "M = 40,001 > W = 40,000 and no two features share a modified file")
+    assert reasons["concentration 1/2"] == (
+        "M = 41,000 > W = 40,000 and the largest group holds 2 of 4 features (0.50), "
+        "at most 1/2")
+    assert reasons["M == W/2 + 1"].startswith(
+        "between the clear zones (W/2 = 20,000 < M = 20,001 <= W = 40,000; the largest group "
+        "holds 1 of 2 features (0.50)): single by default")
+    assert "M = 48,000 > W = 40,000; the largest group holds 2 of 3 features (0.67)" in \
+        reasons["concentration 2/3"]
+
+
+def test_a_file_over_w_is_oversized_without_changing_the_decision():
+    tokens = {"a.py": W + 1, "b.py": W, "c.py": 10}
+    result = decide(files("a.py", "b.py", "c.py"), tokens)
+    assert result["oversized"] == [{"path": "a.py", "tokens": W + 1}]
+    assert (result["zone"], result["decision"]) == (CLEAR_SPLIT, SPLIT)
 
 
 def test_features_and_tokens_are_read_back_from_a_gate_output():
@@ -218,6 +259,46 @@ def test_features_and_tokens_are_read_back_from_a_gate_output():
     data = decide(features, {"a.py": 7, "b.py": 8, "r.py": 9})
     again, tokens = features_from_gate(data)
     assert again == features and tokens == {"a.py": 7, "b.py": 8, "r.py": 9}
+
+
+# ── W from the compaction trigger ──
+
+def test_w_scales_with_the_compaction_trigger():
+    assert window_for_trigger(80_000) == 37_000
+    assert window_for_trigger(120_000) == 55_500
+    assert window_for_trigger(100_000) == 46_250
+    assert window_for_trigger(40_000) == 18_500
+
+
+def test_the_trigger_comes_from_the_environment_then_the_dotenv(tmp_path):
+    dotenv = tmp_path / ".env"
+    missing = tmp_path / "missing.env"
+    assert agent_window({}, missing) == Window(37_000, 80_000, "default")
+    assert agent_window({COMPACT_TRIGGER_ENV: "120000"}, missing) == \
+        Window(55_500, 120_000, "environment")
+    dotenv.write_text(f"# {COMPACT_TRIGGER_ENV}=1\nAQOURS_CODE_MODEL=x\n"
+                      f'export {COMPACT_TRIGGER_ENV}="60000"\n', encoding="utf-8")
+    assert agent_window({}, dotenv) == Window(27_750, 60_000, ".env")
+    # the environment wins, as in aqours_code.config (load_dotenv(override=False))
+    assert agent_window({COMPACT_TRIGGER_ENV: "100000"}, dotenv).trigger == 100_000
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "-5", ""])
+def test_a_trigger_that_is_not_a_positive_number_counts_as_the_default(tmp_path, value):
+    window = agent_window({COMPACT_TRIGGER_ENV: value}, tmp_path / "missing.env")
+    assert (window.tokens, window.trigger, window.source) == (37_000, 80_000, "default")
+    assert "is not a positive whole number; 80000 was used" in window.note
+
+
+def test_the_default_window_reads_the_dotenv_of_the_aqours_root(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / ".env").write_text(f"{COMPACT_TRIGGER_ENV}=40000 # smaller\n", encoding="utf-8")
+    monkeypatch.setattr(gate, "AQOURS_ROOT", root)
+    assert agent_window() == Window(18_500, 40_000, ".env")
+    assert Window(18_500, 40_000, ".env").to_dict() == {
+        "W": 18_500, "half_W": 9_250, "compact_trigger_tokens": 40_000,
+        "trigger_source": ".env", "note": None}
 
 
 # ── the prompt and its input limit ──
@@ -296,15 +377,37 @@ def test_the_gate_runs_step_1_then_one_location_call_without_file_tools(toy_repo
     assert sizes["store.py"] == len((toy_repo.path / "store.py").read_text(encoding="utf-8"))
     assert data["level0"]["tokens"] == sum(estimate_tokens(chars) for chars in sizes.values())
     code = sum(estimate_tokens(sizes[path]) for path in ("store.py", "models.py", "runner.py"))
-    assert data["material"] == {"M": B0 + code + 2 * P, "B0": B0, "code": code,
-                                "features_x_P": 2 * P, "features": 2, "files": 3, "W": W,
-                                "P": P}
-    assert (data["decision"], data["reason_code"]) == (SINGLE, "fits")
+    assert data["material"] == {"M": B0 + code, "B0": B0, "code": code, "files": 3, "W": W,
+                                "half_W": W // 2}
+    assert data["window"] == {"W": W, "half_W": W // 2, "compact_trigger_tokens": 80_000,
+                              "trigger_source": "default", "note": None}
+    assert (data["decision"], data["zone"]) == (SINGLE, CLEAR_SINGLE)
+    assert data["concentration"] == {"value": 0.5, "largest_group": ["S"], "of": "1/2"}
+    assert data["shared"] is False
     assert data["dropped"] == [{"feature": "R", "role": "modify", "path": "nope.py",
                                 "why": "not in the repository"}]
     assert data["locate"]["input_tokens"] == 100 and data["locate"]["output_tokens"] == 10
     assert data["totals"] == {"model_calls": 2, "input_tokens": 200, "output_tokens": 20}
-    assert data["constants"]["provisional"] is True
+    assert data["constants"]["fixed"] is True
+    assert data["constants"]["clear_single_concentration"] == "3/4"
+    assert data["gate_version"] == "gate-v2"
+
+
+def test_the_gate_takes_w_from_the_compaction_trigger(toy_repo, tmp_path, monkeypatch):
+    monkeypatch.setenv(COMPACT_TRIGGER_ENV, "120000")
+    result = run_gate(GateOptions(request_path=write_request(tmp_path), repo=toy_repo.path),
+                      ScriptedDrafter([locate_answer(TOY_LOCATION)]),
+                      ScriptedDrafter([items_answer(["S", "R"])]))
+    window = result.data["window"]
+    assert (window["W"], window["compact_trigger_tokens"], window["trigger_source"]) == \
+        (55_500, 120_000, "environment")
+    assert result.data["material"]["W"] == 55_500
+    given = run_gate(GateOptions(request_path=write_request(tmp_path), repo=toy_repo.path,
+                                 window=Window(10, 20, "test")),
+                     ScriptedDrafter([locate_answer(TOY_LOCATION)]),
+                     ScriptedDrafter([items_answer(["S", "R"])]))
+    # S and R modify different files: over this W of 10 tokens they are split
+    assert given.data["material"]["W"] == 10 and given.data["zone"] == CLEAR_SPLIT
 
 
 def test_a_location_answer_that_cannot_be_read_gives_no_decision(toy_repo, tmp_path):
@@ -394,7 +497,8 @@ def test_the_first_readable_draft_attempt_is_reused_then_the_report(toy_repo, tm
     assert reusable_draft(graph) is None
 
 
-def test_a_relative_request_in_a_report_is_under_the_aqours_root(tmp_path):
+def test_a_relative_request_in_a_report_is_under_the_aqours_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, "AQOURS_ROOT", REAL_ROOT)
     relative = resolve_request("experiments\\taskgraph\\click_batch\\request.md")
     assert relative == gate.AQOURS_ROOT / "experiments" / "taskgraph" / "click_batch" / \
         "request.md"
@@ -436,7 +540,9 @@ def test_gate_command_prints_the_decision_and_writes_the_output(toy_repo, tmp_pa
     assert code == 0 and out.is_file()
     assert "features: 2 (draft: step1)" in output
     assert "dropped paths: 1" in output and "R modify nope.py: not in the repository" in output
-    assert "decision (provisional thresholds): single: one agent holds it" in output
+    assert "W = 37,000 (compaction trigger 80,000 from the default); W/2 = 18,500" in output
+    assert "concentration: 1/2 = 0.50" in output
+    assert "decision: single (clear_single): M = " in output
     assert f"wrote {out}" in output
 
 
@@ -531,68 +637,154 @@ def test_recall_counts_the_reference_files_the_gate_found(evaluate):
     assert evaluate.hits(set(), {})["recall"] is None
 
 
-def gate_output(features: list[FeatureFiles], tokens: dict[str, int]) -> dict:
-    """The decision fields of a gate output (what the evaluation reads)."""
-    return decide(features, tokens)
+def gate_output(features: list[FeatureFiles], tokens: dict[str, int], w: int = W) -> dict:
+    """The fields of a gate output that the evaluation reads."""
+    return {**decide(features, tokens, w=w),
+            "window": {"W": w, "half_W": w / 2, "compact_trigger_tokens": 0,
+                       "trigger_source": "test", "note": None}}
 
 
-def test_the_sensitivity_table_decides_again_for_each_p_and_file_mode(evaluate):
-    features = [FeatureFiles("A", "a", ["a.py"], ["big.py"]),
-                FeatureFiles("B", "b", ["b.py"], ["big.py"])]
-    data = gate_output(features, {"a.py": 4000, "b.py": 4000, "big.py": 20_000})
-    table = evaluate.sensitivity(data)
-    assert set(table) == {(p, mode) for p in (0, 2000, 5000, 10000)
-                          for mode in ("modify+reference", "modify only")}
-    # with the reference: M = 8000 + 28000 + 2P, and each feature's group holds
-    # 24000 + P of it (reading big.py does not connect A and B)
-    assert table[(0, "modify+reference")] == SINGLE  # M = 36000 <= W
-    assert table[(2000, "modify+reference")] == SPLIT  # M = 40000, groups 0.65
-    assert table[(10000, "modify+reference")] == SPLIT  # M = 56000, groups 0.61
-    # modified files only: M = 8000 + 8000 + 2P
-    assert table[(5000, "modify only")] == SINGLE  # M = 26000 <= W
-    assert table[(10000, "modify only")] == SINGLE  # M = 36000 <= W
+def test_outcome_leaves_the_unclear_zone_uncounted(evaluate):
+    assert evaluate.outcome(SINGLE, UNCLEAR, "split") == "default"
+    assert evaluate.outcome(SINGLE, UNCLEAR, "single") == "default"
+    assert evaluate.outcome(SPLIT, CLEAR_SPLIT, "either") == "either is fine"
+    assert evaluate.outcome(SPLIT, CLEAR_SPLIT, "split") == "right"
+    assert evaluate.outcome(SINGLE, CLEAR_SINGLE, "split") == "wrong"
 
 
-def test_evaluate_task_and_the_tables(evaluate, tmp_path):
+def write_plan(tmp_path: Path, graph: dict, report: dict | None = None) -> Path:
     plan = tmp_path / "plan" / "graph.json"
-    plan.parent.mkdir()
-    plan.write_text(json.dumps({"nodes": [
-        {"edit_set": {"modify": ["pkg/a.py"], "create": ["pkg/new.py"]}}]}), encoding="utf-8")
+    plan.parent.mkdir(exist_ok=True)
+    plan.write_text(json.dumps(graph), encoding="utf-8")
+    if report is not None:
+        plan.with_name("graph.json.report.json").write_text(json.dumps(report),
+                                                            encoding="utf-8")
+    return plan
+
+
+def test_evaluate_gate_outputs_hits_and_zones_for_both_materials(evaluate, tmp_path):
+    plan = write_plan(tmp_path, {"nodes": [
+        {"edit_set": {"modify": ["pkg/a.py"], "create": ["pkg/new.py"]}}]})
     run = tmp_path / "run1"
     (run / "nodes" / "solve").mkdir(parents=True)
     (run / "nodes" / "solve" / "diff.patch").write_text(PATCH, encoding="utf-8")
-    task = evaluate.Task("toy", plan, (run, tmp_path / "missing-run"), "split", "v3 1M, single 2M")
     gate_dir = tmp_path / "gate"
     gate_dir.mkdir()
-    data = gate_output([FeatureFiles("A", "a", ["pkg/a.py", "pkg/x.py"]),
-                        FeatureFiles("B", "b", ["pkg/b.py"])],
-                       {"pkg/a.py": 30_000, "pkg/x.py": 1000, "pkg/b.py": 30_000})
-    (gate_dir / "toy.json").write_text(json.dumps(data), encoding="utf-8")
-    row = evaluate.evaluate_task(task, gate_dir)
-    # M = 8000 + 61000 + 2 x 5000 = 79000; groups 36000 (0.46) and 35000 (0.44)
-    assert (row["decision"], row["reason_code"]) == (SPLIT, "split")
-    against_plan, against_run, missing = row["hits"]
+    split_case = [FeatureFiles("A", "a", ["pkg/a.py", "pkg/x.py"], ["pkg/r.py"]),
+                  FeatureFiles("B", "b", ["pkg/b.py"])]
+    tokens = {"pkg/a.py": 30_000, "pkg/x.py": 1000, "pkg/b.py": 30_000, "pkg/r.py": 4000}
+    (gate_dir / "toy.json").write_text(json.dumps(gate_output(split_case, tokens)),
+                                       encoding="utf-8")
+    # the W the gate recorded counts: with W = 200000, M = 73000 <= W/2
+    (gate_dir / "wide.json").write_text(json.dumps(gate_output(split_case, tokens, 200_000)),
+                                        encoding="utf-8")
+    middle = [FeatureFiles("C", "c", ["pkg/c.py"], ["pkg/big.py"]),
+              FeatureFiles("D", "d", ["pkg/d.py"])]
+    (gate_dir / "mid.json").write_text(json.dumps(gate_output(
+        middle, {"pkg/c.py": 15_000, "pkg/big.py": 20_000})), encoding="utf-8")
+    toy = evaluate.evaluate_gate_task(
+        evaluate.Task("toy", plan, (run, tmp_path / "missing-run"), "split", "v3 1M, single 2M"),
+        gate_dir)
+    modes = toy["modes"]
+    assert (modes["modify+reference"]["M"], modes["modify only"]["M"]) == (73_000, 69_000)
+    assert [(mode["decision"], mode["zone"], mode["outcome"]) for mode in modes.values()] == \
+        [(SPLIT, CLEAR_SPLIT, "right")] * 2
+    against_plan, against_run, missing = toy["hits"]
     assert (against_plan["recall"], against_plan["recall_existing"]) == (0.5, 1.0)
     assert against_plan["extra"] == ["pkg/b.py", "pkg/x.py"]
     assert against_run["reference"] == 4 and against_run["hits"] == 1
     assert missing["note"].startswith("cannot read")
-    assert row["sensitivity"]["P=5000 modify+reference"] == SPLIT
-    absent = evaluate.evaluate_task(evaluate.Task("none", plan, (), "single", "-"), gate_dir)
-    assert absent["gate_note"] == "no gate output (not found)"
-    text = evaluate.render([row, absent])
-    for part in ("## 1. File hits", "## 2. Decision", "## 3. Sensitivity",
-                 "| toy | plan | 2 (1) | 3 | 1 | 0.50 | 1.00 | 2 |",
-                 "P=5000 modify+reference (default)", "| none | - |"):
+    wide = evaluate.evaluate_gate_task(evaluate.Task("wide", plan, (), "split", "-"), gate_dir)
+    assert wide["W"] == 200_000 and wide["modes"]["modify+reference"]["zone"] == CLEAR_SINGLE
+    mid = evaluate.evaluate_gate_task(evaluate.Task("mid", plan, (), "split", "-"), gate_dir)
+    # with the reference M = 43000 > W, nothing shared: split; without it 23000: unclear
+    assert mid["modes"]["modify+reference"]["outcome"] == "right"
+    assert (mid["modes"]["modify only"]["zone"], mid["modes"]["modify only"]["outcome"]) == \
+        (UNCLEAR, "default")
+    absent = evaluate.evaluate_gate_task(evaluate.Task("none", plan, (), "single", "-"),
+                                         gate_dir)
+    assert absent["note"] == "no gate output (not found)"
+    text = evaluate.render([toy, mid, absent], ideal=False)
+    for part in ("# Split gate evaluation: gate outputs", "## File hits", "## Decision",
+                 "## Numbers", "| toy | plan | 2 (1) | 3 | 1 | 0.50 | 1.00 | 2 |",
+                 "| toy | v3 1M, single 2M | split | split (clear_split) | right | "
+                 "split (clear_split) | right |",
+                 "| mid | - | split | split (clear_split) | right | single (unclear) | default |",
+                 "- modify+reference: right 2, wrong 0, default 0, either is fine 0",
+                 "- modify only: right 1, wrong 0, default 1, either is fine 0 "
+                 "(default: not counted)",
+                 "| toy | 2 | 1/2 = 0.50 | 73,000 | 69,000 | 18,500 | 37,000 | - |",
+                 "- toy: no two features share a modified file", "- none: no gate output"):
         assert part in text
-    assert "| toy | split | M = 79,000 > W = 37,000" in text
-    assert "| v3 1M, single 2M | split | yes |" in text
+    assert "Sensitivity" not in text and "P=" not in text
 
 
-def test_evaluate_main_writes_the_tables(evaluate, tmp_path, monkeypatch, capsys):
+def test_the_ideal_location_is_the_full_plans_nodes_without_pre_and_reg(evaluate):
+    graph = {"nodes": [
+        {"id": "P0", "edit_set": {"modify": ["models.py"]}},
+        {"id": "S", "title": "s", "edit_set": {"modify": ["store.py", "tests/test_basic.py"],
+                                               "create": ["tests/test_new.py"]},
+         "context_files": ["SPEC.md#Cancel", "store.py", "models.py", "runner.py", "broken.py",
+                           "README.md", "models.py", "extra.py"]},
+        {"id": "R", "edit_set": {"modify": ["runner.py", "later.py"]},
+         "context_files": ["store.py#JobStore"]},
+        {"id": "REG", "edit_set": {"modify": ["runner.py"]}},
+    ]}
+    features = evaluate.ideal_features(graph, {"pre_node": "P0", "reg_node": None})
+    assert features == [
+        FeatureFiles("S", "s", ["store.py"], ["models.py", "runner.py", "broken.py"]),
+        FeatureFiles("R", "", ["runner.py", "later.py"], ["store.py"])]
+    # without a report, PRE and REG are still left out by their names
+    assert [feature.id for feature in evaluate.ideal_features(graph)] == ["P0", "S", "R"]
+
+
+def test_evaluate_ideal_reads_the_sizes_at_the_base_commit(evaluate, toy_repo, tmp_path):
+    from taskgraph_support import TOY_FILES
+    graph = {"repo": str(toy_repo.path), "base_commit": toy_repo.commit, "nodes": [
+        {"id": "PRE", "edit_set": {"modify": ["models.py"]}},
+        {"id": "S", "edit_set": {"modify": ["store.py"]}, "context_files": ["models.py"]},
+        {"id": "R", "edit_set": {"modify": ["runner.py", "later.py"]}},
+    ]}
+    plan = write_plan(tmp_path, graph, {"pre_node": "PRE"})
+    commit_files(toy_repo.path, {"store.py": "x = 1\n" * 10_000, "later.py": "y = 2\n"},
+                 "after the plan")
+    row = evaluate.evaluate_ideal_task(evaluate.Task("toy", plan, (), "single", "-"),
+                                       DEFAULT_WINDOW)
+    size = {name: estimate_tokens(len(TOY_FILES[name])) for name in TOY_FILES}
+    modes = row["modes"]
+    assert modes["modify+reference"]["M"] == B0 + size["store.py"] + size["models.py"] + \
+        size["runner.py"]
+    assert modes["modify only"]["M"] == B0 + size["store.py"] + size["runner.py"]
+    assert row["missing_at_base"] == ["later.py"]
+    assert [(mode["zone"], mode["outcome"]) for mode in modes.values()] == \
+        [(CLEAR_SINGLE, "right")] * 2
+    assert row["location"] == [{"id": "S", "modify": ["store.py"], "reference": ["models.py"]},
+                               {"id": "R", "modify": ["runner.py", "later.py"],
+                                "reference": []}]
+    absent = evaluate.evaluate_ideal_task(
+        evaluate.Task("none", tmp_path / "missing.json", (), "split", "-"), DEFAULT_WINDOW)
+    assert absent["note"].startswith("no plan (not found)")
+    text = evaluate.render([row, absent], ideal=True, window=DEFAULT_WINDOW)
+    for part in ("# Split gate evaluation: ideal location",
+                 "W = 37,000 (compaction trigger 80,000 from the default); W/2 = 18,500.",
+                 "| toy | - | single | single (clear_single) | right | single (clear_single) | "
+                 "right |",
+                 "- toy: not at the base commit (0 tokens): later.py",
+                 "- none: no plan (not found)"):
+        assert part in text
+    assert "## File hits" not in text
+
+
+def test_evaluate_main_writes_the_ideal_tables_then_appends_the_gate_tables(
+        evaluate, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(evaluate, "TASKS", ())
     out = tmp_path / "evaluation.md"
-    assert evaluate.main(["--gate-dir", str(tmp_path), "--out", str(out),
-                          "--json", str(tmp_path / "rows.json")]) == 0
-    assert out.read_text(encoding="utf-8").startswith("# Split gate: offline evaluation")
-    assert json.loads((tmp_path / "rows.json").read_text(encoding="utf-8")) == []
-    assert f"wrote {out}" in capsys.readouterr().out
+    assert evaluate.main(["--ideal", "--out", str(out),
+                          "--json", str(tmp_path / "ideal.json")]) == 0
+    assert evaluate.main(["--gate-dir", str(tmp_path), "--out", str(out), "--append"]) == 0
+    text = out.read_text(encoding="utf-8")
+    assert text.startswith("# Split gate evaluation: ideal location")
+    assert text.index("# Split gate evaluation: gate outputs") > 0
+    assert json.loads((tmp_path / "ideal.json").read_text(encoding="utf-8")) == []
+    printed = capsys.readouterr().out
+    assert f"wrote {out}" in printed and f"added to {out}" in printed

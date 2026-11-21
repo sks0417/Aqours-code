@@ -1811,47 +1811,74 @@ The gate works in levels, from cheap to less cheap:
   (the lines of the searched files stay, other files follow in path order
   while they fit) and the files left out are recorded.
 
-The decision uses **provisional** constants, chosen by hand and not fitted
-to any run (`W`, `B0`, `P`, `SHARED_SHARE` in `gate.py`):
-
-| constant | value | meaning |
-| --- | --- | --- |
-| `W` | 37,000 tokens | the context one agent uses well |
-| `B0` | 8,000 tokens | the fixed part of every model call |
-| `P` | 5,000 tokens | what working on one feature adds (edits, test output), an estimate |
-| `SHARED_SHARE` | 0.7 | the share of M at which a group keeps the request in one agent |
+The decision is a conservative rule of three zones (`decide()` in
+`gate.py`):
 
 - **M** = `B0` + the tokens of every file the features involve (modify and
-  reference, each file once) + features × `P`.
-- Two features are **connected** when both modify one non-test `.py` file
-  other than a package's `__init__.py` (that one usually only gains an
-  export); reading a file does not connect. Connected features form groups
-  (union-find). A group's material is the tokens of its files plus its
-  features × `P`; its share is that over M.
-- M ≤ `W`: `single` (one agent holds it); else the largest group's share ≥
-  `SHARED_SHARE`: `single` (the features concentrate on shared files); else
-  `split`.
-- A file of more than `W` tokens is listed as `oversized`; this does not
-  change the decision. `level0.oversized` lists such files of the whole
-  repository.
+  reference, each file once). `B0` = 8,000 tokens is the fixed part of every
+  model call.
+- **W** is the context one agent works in: 37,000 tokens is the mean context
+  of one agent observed in runs at the default compaction trigger of 80,000
+  tokens, and W scales with the trigger the agents run with: W =
+  round(37000 × trigger / 80000), the trigger being
+  `AQOURS_CODE_COMPACT_TRIGGER_TOKENS` as `aqours_code.config` reads it (the
+  environment, else the `.env` of the Aqours-code root, else 80,000;
+  `agent_window()`). The output records W, W/2, the trigger and where it
+  came from.
+- Two features are **connected** when both modify one source file other
+  than a package's `__init__.py` (that one usually only gains an export);
+  test files and files only read do not connect. Connected features form
+  groups (union-find), and the **concentration** is the largest group's
+  number of features over the number of features. (It counts features, not
+  material, so a reference file read by several features is not counted
+  twice.)
 
-The output (`--json`, `--out`) has the `decision`, `reason_code` (`fits`,
-`shared`, `split`) and `reason`; `material` (M, `B0`, `code`,
-`features_x_P`, `W`, `P`); each feature's files with their tokens; the
-`groups` with their shared files, material and share; `oversized`;
-`dropped` paths and `notes` on the answer; the `draft` and where it came
-from; the `search` results; `locate` (the prompt's size, the outline cut,
-the call's input and output tokens and its answer); `level0`; and the model
-calls of this gate (`totals`; a reused draft is not counted again). With
-`--out`, the logs of the model calls are in `<gate.json>.logs/`. Exit codes:
-`0` a decision, `1` no decision (step 1 or the location call failed, or its
-answer could not be read), `2` unusable inputs or a git failure.
+In this order:
 
-`experiments/taskgraph/gate/evaluate.py` compares the gate's results on four
-tasks with their plans and single-agent runs, offline (file hits, the
-decision against the cheaper method in practice, and the decision for other
-`P` and with modified files only); `run_four.ps1` runs the gate on the four
-tasks and then the evaluation. The evaluation does not change the defaults.
+| zone | condition | decision |
+| --- | --- | --- |
+| `clear_single` | M ≤ W/2, or concentration ≥ 3/4 | `single` |
+| `clear_split` | M > W, and no two features share a modified file or concentration ≤ 1/2 | `split` |
+| `unclear` | anything else | `single` (the default) |
+
+Outside the two clear zones the gate says `single`: splitting wrongly costs
+more than not splitting wrongly (a plan, interfaces, merges and repairs
+spent on a request one agent could have done, against one agent working in
+a fuller context). The threshold of "clearly does not fit" is W itself; it
+was chosen after looking at the four design tasks (click, jp, dvc 0.89,
+dask). dvc 0.89 is a borderline case there: with the full plan's location
+(`evaluate.py --ideal`) its M is 41,206 tokens, only about 11% above W.
+The thresholds are fixed now and are not adjusted to any task's result: dvc
+3.4.0 is the first test task whose decision is predicted before it is run.
+
+A file of more than W tokens is listed as `oversized`; this does not change
+the decision. `level0.oversized` lists such files of the whole repository.
+
+The output (`--json`, `--out`) has the `decision`, its `zone` and `reason`;
+`window` (W, W/2, the compaction trigger and its source); `material` (M,
+`B0`, `code`, the number of files, W, W/2); each feature's files with their
+tokens; the `groups` with their features and shared modified files;
+`shared` (whether two features share one); the `concentration` (value,
+largest group, as a fraction); `oversized`; `dropped` paths and `notes` on
+the answer; the `draft` and where it came from; the `search` results;
+`locate` (the prompt's size, the outline cut, the call's input and output
+tokens and its answer); `level0`; and the model calls of this gate
+(`totals`; a reused draft is not counted again). With `--out`, the logs of
+the model calls are in `<gate.json>.logs/`. Exit codes: `0` a decision, `1`
+no decision (step 1 or the location call failed, or its answer could not be
+read), `2` unusable inputs or a git failure.
+
+`experiments/taskgraph/gate/evaluate.py` evaluates the rule on the four
+design tasks offline. By default it reads the gate outputs: the file hits
+against the full plans and the single-agent runs, then the decision. With
+`--ideal` it reads no gate output and takes the full plan's location
+instead (every node but PRE and REG, with its modified source files and its
+first three source context files; sizes at the plan's base commit). Both
+give the decision and zone for modified plus reference files and for
+modified files only, against the method that was cheaper in practice; a
+task in the `unclear` zone is marked `default` and counted neither right
+nor wrong. `run_four.ps1` runs the gate on the four tasks, then both
+evaluations into one `evaluation.md`.
 
 ### Worker reading soft wall
 

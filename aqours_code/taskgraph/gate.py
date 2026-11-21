@@ -24,21 +24,23 @@ Levels, from cheap to less cheap:
    :data:`LOCATE_INPUT_LIMIT` tokens has its outline cut, and the cut is
    recorded.
 
-The decision (:func:`decide`) uses provisional constants, chosen by hand and
-not fitted to runs: :data:`W`, :data:`B0`, :data:`P` and :data:`SHARED_SHARE`.
+The decision (:func:`decide`) is a conservative rule of three zones, with
+fixed thresholds:
 
     M = B0 + tokens of every file the features involve (modify and reference,
-        each file once) + features × P
+        each file once)
 
-Two features are connected when both modify one non-test ``.py`` file other
-than a package's ``__init__.py`` (it usually only gains an export). Connected
-features form groups (union-find); a group's material is the tokens of its
-files plus its features × P, and its share is that over M.
+W is the context one agent works in (:func:`agent_window`). Two features are
+connected when both modify one source file other than a package's
+``__init__.py`` (it usually only gains an export); test files do not connect
+either. Connected features form groups (union-find), and the concentration is
+the largest group's number of features over the number of features.
 
-- M ≤ W: ``single`` (one agent holds it all);
-- the largest group's share ≥ SHARED_SHARE: ``single`` (the features
-  concentrate on shared files);
-- otherwise ``split``.
+- M ≤ W/2, or concentration ≥ 3/4: ``single`` (zone ``clear_single``);
+- M > W, and no two features share a modified file or concentration ≤ 1/2:
+  ``split`` (zone ``clear_split``);
+- otherwise ``single`` (zone ``unclear``): the default, since a wrong split
+  costs more than a wrong single.
 
 A file of more than W tokens is listed as oversized; that does not change the
 decision.
@@ -47,11 +49,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path, PurePosixPath
 
 from . import gitops
@@ -67,14 +71,22 @@ from .repo_index import RepoIndex, build_index
 from .validate import Issue
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
-GATE_VERSION = "gate-v1"
+# v2: the decision of three zones, W scaled to the compaction trigger
+GATE_VERSION = "gate-v2"
 
-# Provisional values: chosen by hand, not fitted to any run. The evaluation in
-# experiments/taskgraph/gate shows how the decision moves with them.
-W = 37_000  # tokens: the context one agent can use well
+# The thresholds of the decision are fixed: once chosen they are not adjusted
+# to any task's result.
 B0 = 8_000  # tokens: the fixed part of every model call (instructions, tools, request)
-P = 5_000  # tokens: what working on one feature adds (edits, test output); an estimate
-SHARED_SHARE = 0.7  # a group holding this share of M or more keeps the request in one agent
+# W at the default compaction trigger: the mean context of one agent observed
+# in runs with AQOURS_CODE_COMPACT_TRIGGER_TOKENS = 80000. agent_window()
+# scales it to the trigger the agents run with.
+W_AT_DEFAULT_TRIGGER = 37_000  # tokens
+DEFAULT_COMPACT_TRIGGER = 80_000  # tokens, as in aqours_code.config
+COMPACT_TRIGGER_ENV = "AQOURS_CODE_COMPACT_TRIGGER_TOKENS"
+# concentration at or above which the request stays with one agent
+CLEAR_SINGLE_CONCENTRATION = Fraction(3, 4)
+# concentration at or below which a request over W is split
+CLEAR_SPLIT_CONCENTRATION = Fraction(1, 2)
 
 CHARS_PER_TOKEN = 4
 MAX_REFERENCE = 3
@@ -89,10 +101,90 @@ LOCATE_BUDGET = {"max_calls": 1, "max_input_tokens": None}
 
 SINGLE = "single"
 SPLIT = "split"
+CLEAR_SINGLE = "clear_single"
+CLEAR_SPLIT = "clear_split"
+UNCLEAR = "unclear"
 
 
 class GateError(Exception):
     """The inputs of the gate cannot be read."""
+
+
+# ── W: the context of one agent ──
+
+@dataclass(frozen=True)
+class Window:
+    """W and the compaction trigger it was scaled from."""
+
+    tokens: int
+    trigger: int
+    source: str  # "environment", ".env" or "default"
+    note: str = ""  # a value that could not be used
+
+    def to_dict(self) -> dict:
+        return {"W": self.tokens, "half_W": half(self.tokens),
+                "compact_trigger_tokens": self.trigger, "trigger_source": self.source,
+                "note": self.note or None}
+
+
+def window_for_trigger(trigger: int) -> int:
+    """W = round(37000 × trigger / 80000)."""
+    return round(W_AT_DEFAULT_TRIGGER * trigger / DEFAULT_COMPACT_TRIGGER)
+
+
+def half(w: int) -> int | float:
+    """W/2, a whole number when W is even."""
+    return w // 2 if w % 2 == 0 else w / 2
+
+
+def _dotenv_value(path: Path, name: str) -> str | None:
+    """The value of ``name`` in a ``.env`` file (the last assignment), or None."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    value = None
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, rest = line.partition("=")
+        if not sep or key.strip() != name:
+            continue
+        rest = rest.strip()
+        if rest[:1] in ("'", '"') and rest.endswith(rest[:1]) and len(rest) > 1:
+            rest = rest[1:-1]
+        else:
+            rest = rest.split(" #", 1)[0].strip()
+        value = rest
+    return value
+
+
+def agent_window(environ: Mapping[str, str] | None = None,
+                 dotenv: Path | None = None) -> Window:
+    """W for the compaction trigger the agents run with.
+
+    The trigger is ``AQOURS_CODE_COMPACT_TRIGGER_TOKENS`` as the agents read
+    it (``aqours_code.config``): from the environment, else from the ``.env``
+    of the Aqours-code root, else 80000. A value that is not a positive whole
+    number counts as 80000 and is noted.
+    """
+    environ = os.environ if environ is None else environ
+    dotenv = AQOURS_ROOT / ".env" if dotenv is None else dotenv
+    raw, source = environ.get(COMPACT_TRIGGER_ENV), "environment"
+    if raw is None:
+        raw, source = _dotenv_value(dotenv, COMPACT_TRIGGER_ENV), ".env"
+    if raw is None:
+        return Window(W_AT_DEFAULT_TRIGGER, DEFAULT_COMPACT_TRIGGER, "default")
+    try:
+        trigger = int(raw)
+    except ValueError:
+        trigger = 0
+    if trigger <= 0:
+        return Window(W_AT_DEFAULT_TRIGGER, DEFAULT_COMPACT_TRIGGER, "default",
+                      f"{COMPACT_TRIGGER_ENV}={raw!r} in the {source} is not a positive whole "
+                      f"number; {DEFAULT_COMPACT_TRIGGER} was used")
+    return Window(window_for_trigger(trigger), trigger, source)
 
 
 def estimate_tokens(chars: int) -> int:
@@ -521,8 +613,8 @@ def parse_locations(answer: str, items: list[DraftItem], index: RepoIndex) -> Lo
 def connects(path: str) -> bool:
     """Whether two features modifying ``path`` are connected.
 
-    A non-test ``.py`` file connects them; a package's ``__init__.py`` does not
-    (it usually only gains an export).
+    A source file (a ``.py`` file that is not a test) connects them; a
+    package's ``__init__.py`` does not (it usually only gains an export).
     """
     return is_source_file(path) and PurePosixPath(path).name != "__init__.py"
 
@@ -557,14 +649,13 @@ def _files_of(feature: FeatureFiles, with_reference: bool) -> list[str]:
     return list(dict.fromkeys(feature.modify + (feature.reference if with_reference else [])))
 
 
-def decide(features: list[FeatureFiles], tokens: Mapping[str, int], *, p: int = P,
-           w: int = W, b0: int = B0, with_reference: bool = True,
-           shared_share: float = SHARED_SHARE) -> dict:
-    """The decision, its reason and every number it rests on.
+def decide(features: list[FeatureFiles], tokens: Mapping[str, int], *,
+           w: int = W_AT_DEFAULT_TRIGGER, b0: int = B0, with_reference: bool = True) -> dict:
+    """The decision, its zone, its reason and every number it rests on.
 
     ``tokens`` gives each file's tokens (a missing file counts 0). With
-    ``with_reference`` False only the modified files count as material; the
-    groups always come from the modified files.
+    ``with_reference`` False only the modified files count in M; the groups
+    always come from the modified files.
     """
     def entries(paths: list[str]) -> list[dict]:
         return [{"path": path, "tokens": tokens.get(path, 0)} for path in paths]
@@ -572,54 +663,58 @@ def decide(features: list[FeatureFiles], tokens: Mapping[str, int], *, p: int = 
     involved = list(dict.fromkeys(path for feature in features
                                   for path in _files_of(feature, with_reference)))
     code = sum(tokens.get(path, 0) for path in involved)
-    work = len(features) * p
-    m = b0 + code + work
+    m = b0 + code
     groups = []
     for members in feature_groups(features):
-        files = list(dict.fromkeys(path for index in members
-                                   for path in _files_of(features[index], with_reference)))
-        modified: dict[str, int] = {}
+        counts: dict[str, int] = {}
         for index in members:
-            for path in features[index].modify:
+            for path in dict.fromkeys(features[index].modify):
                 if connects(path):
-                    modified[path] = modified.get(path, 0) + 1
-        group_code = sum(tokens.get(path, 0) for path in files)
-        material = group_code + len(members) * p
+                    counts[path] = counts.get(path, 0) + 1
         groups.append({"features": [features[index].id for index in members],
-                       "shared_files": sorted(path for path, count in modified.items()
-                                              if count > 1),
-                       "files": len(files), "code_tokens": group_code, "material": material,
-                       "share": material / m if m else 0.0})
-    largest = max(groups, key=lambda group: group["share"]) if groups else None
-    share = largest["share"] if largest is not None else 0.0
-    if m <= w:
-        decision, code_name = SINGLE, "fits"
-        reason = f"one agent holds it: M = {m:,} <= W = {w:,} tokens"
-    elif share >= shared_share:
-        decision, code_name = SINGLE, "shared"
-        reason = (f"the features concentrate on shared files: the largest group "
-                  f"({', '.join(largest['features'])}) holds {share:.2f} of M "
-                  f"(>= {shared_share:.2f})")
+                       "shared_files": sorted(path for path, count in counts.items()
+                                              if count > 1)})
+    groups.sort(key=lambda group: -len(group["features"]))  # ties keep the feature order
+    largest = groups[0]["features"] if groups else []
+    count = len(features)
+    concentration = Fraction(len(largest), count) if count else Fraction(0)
+    shared = any(len(group["features"]) > 1 for group in groups)
+    held = (f"the largest group holds {len(largest)} of {count} features "
+            f"({float(concentration):.2f})")
+    if 2 * m <= w:
+        decision, zone = SINGLE, CLEAR_SINGLE
+        reason = f"M = {m:,} <= W/2 = {half(w):,}: one agent holds it"
+    elif concentration >= CLEAR_SINGLE_CONCENTRATION:
+        decision, zone = SINGLE, CLEAR_SINGLE
+        reason = f"{held}, at least 3/4: the features concentrate on shared files"
+    elif m > w and not shared:
+        decision, zone = SPLIT, CLEAR_SPLIT
+        reason = f"M = {m:,} > W = {w:,} and no two features share a modified file"
+    elif m > w and concentration <= CLEAR_SPLIT_CONCENTRATION:
+        decision, zone = SPLIT, CLEAR_SPLIT
+        reason = f"M = {m:,} > W = {w:,} and {held}, at most 1/2"
     else:
-        decision, code_name = SPLIT, "split"
-        reason = (f"M = {m:,} > W = {w:,} tokens and the largest group holds {share:.2f} "
-                  f"of M (< {shared_share:.2f})")
+        decision, zone = SINGLE, UNCLEAR
+        where = (f"W/2 = {half(w):,} < M = {m:,} <= W = {w:,}" if m <= w
+                 else f"M = {m:,} > W = {w:,}")
+        reason = (f"between the clear zones ({where}; {held}): single by default, since a "
+                  "wrong split costs more than a wrong single")
     return {
         "decision": decision,
-        "reason_code": code_name,
+        "zone": zone,
         "reason": reason,
-        "settings": {"P": p, "W": w, "B0": b0, "with_reference": with_reference,
-                     "shared_share": shared_share},
-        "material": {"M": m, "B0": b0, "code": code, "features_x_P": work,
-                     "features": len(features), "files": len(involved), "W": w, "P": p},
+        "settings": {"W": w, "B0": b0, "with_reference": with_reference},
+        "material": {"M": m, "B0": b0, "code": code, "files": len(involved), "W": w,
+                     "half_W": half(w)},
         "features": [{"id": feature.id, "title": feature.title,
                       "modify": entries(feature.modify), "reference": entries(feature.reference),
                       "tokens": sum(tokens.get(path, 0)
                                     for path in _files_of(feature, with_reference))}
                      for feature in features],
-        "groups": sorted(groups, key=lambda group: -group["share"]),
-        "largest_group": largest["features"] if largest is not None else [],
-        "largest_group_share": share,
+        "groups": groups,
+        "shared": shared,
+        "concentration": {"value": float(concentration),
+                          "largest_group": largest, "of": f"{len(largest)}/{count}"},
         "oversized": [entry for entry in entries(involved) if entry["tokens"] > w],
     }
 
@@ -703,7 +798,8 @@ class GateOptions:
     """Parameters of one ``gate`` run.
 
     ``base_commit`` None reads the repository at its HEAD; ``draft_from`` is a
-    plan's graph whose draft is reused when it has one.
+    plan's graph whose draft is reused when it has one; ``window`` None takes
+    W from the compaction trigger (:func:`agent_window`).
     """
 
     request_path: Path
@@ -714,6 +810,7 @@ class GateOptions:
     from_report: Path | None = None
     timeout_s: float = DEFAULT_GATE_TIMEOUT_S
     input_limit: int = LOCATE_INPUT_LIMIT
+    window: Window | None = None
 
 
 def resolve_request(value: str) -> Path:
@@ -781,6 +878,7 @@ def run_gate(options: GateOptions, locate_worker: Worker,
     repo = options.repo.resolve()
     base = gitops.head(repo, options.base_commit or "HEAD")
     model = locate_worker.describe().get("model")
+    window = options.window if options.window is not None else agent_window()
     errors: list[Issue] = []
     draft: GateDraft | None = None
     searches: dict[str, FeatureSearch] = {}
@@ -804,7 +902,8 @@ def run_gate(options: GateOptions, locate_worker: Worker,
         level0 = {"source_files": len(files), "chars": sum(sizes.values()),
                   "tokens": sum(estimate_tokens(chars) for chars in sizes.values()),
                   "oversized": [{"path": path, "tokens": estimate_tokens(chars)}
-                                for path, chars in sizes.items() if estimate_tokens(chars) > W],
+                                for path, chars in sizes.items()
+                                if estimate_tokens(chars) > window.tokens],
                   "sizes": sizes}
         draft = _draft(options, request, clone, index, draft_stage_worker or locate_worker,
                        log_root / "draft")
@@ -834,7 +933,7 @@ def run_gate(options: GateOptions, locate_worker: Worker,
                 tokens = {path: estimate_tokens(sizes[path] if path in sizes
                                                 else file_chars(clone, path))
                           for path in involved}
-                decision = decide(located.features, tokens)
+                decision = decide(located.features, tokens, w=window.tokens)
     finally:
         remove_tree(tmp)
     locate_usage = _usage(result) if result is not None else _usage(WorkerResult(ok=False))
@@ -842,7 +941,6 @@ def run_gate(options: GateOptions, locate_worker: Worker,
         {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
     data = {
         "gate_version": GATE_VERSION,
-        "provisional": True,
         "model": str(model) if model is not None else None,
         "request": str(options.request_path),
         "repo": str(repo),
@@ -854,16 +952,20 @@ def run_gate(options: GateOptions, locate_worker: Worker,
         "ok": bool(decision),
         "errors": [_issue_dict(issue) for issue in errors],
         "decision": decision.get("decision"),
-        "reason_code": decision.get("reason_code"),
+        "zone": decision.get("zone"),
         "reason": decision.get("reason"),
-        "constants": {"W": W, "B0": B0, "P": P, "shared_share": SHARED_SHARE,
+        "window": window.to_dict(),
+        "constants": {"B0": B0, "W_at_default_trigger": W_AT_DEFAULT_TRIGGER,
+                      "default_compact_trigger": DEFAULT_COMPACT_TRIGGER,
+                      "clear_single_concentration": str(CLEAR_SINGLE_CONCENTRATION),
+                      "clear_split_concentration": str(CLEAR_SPLIT_CONCENTRATION),
                       "chars_per_token": CHARS_PER_TOKEN, "max_reference": MAX_REFERENCE,
-                      "locate_input_limit": options.input_limit, "provisional": True},
+                      "locate_input_limit": options.input_limit, "fixed": True},
         "material": decision.get("material"),
         "features": decision.get("features", []),
         "groups": decision.get("groups", []),
-        "largest_group": decision.get("largest_group", []),
-        "largest_group_share": decision.get("largest_group_share"),
+        "shared": decision.get("shared"),
+        "concentration": decision.get("concentration"),
         "oversized": decision.get("oversized", []),
         "dropped": located.dropped if located is not None else [],
         "notes": located.notes if located is not None else [],
@@ -922,21 +1024,30 @@ def format_gate(data: Mapping) -> str:
                      f"{locate['input_tokens']:,} in / {locate['output_tokens']:,} out")
     for issue in data.get("errors") or []:
         lines.append(f"error: [{issue['code']}] {issue['message']}")
+    window = data.get("window") or {}
+    if window:
+        note = f"; {window['note']}" if window.get("note") else ""
+        trigger = window["compact_trigger_tokens"]
+        lines.append(f"W = {window['W']:,} (compaction trigger {trigger:,} from the "
+                     f"{window['trigger_source']}{note}); W/2 = {window['half_W']:,}")
     material = data.get("material")
     if material:
         lines.append(f"M = B0 {material['B0']:,} + code {material['code']:,} "
-                     f"({material['files']} files) + {material['features']} features x P "
-                     f"{material['P']:,} = {material['M']:,} tokens; W = {material['W']:,}")
+                     f"({material['files']} files) = {material['M']:,} tokens")
         for feature in data["features"]:
             lines.append(f"  {feature['id']} {feature['title']}: {feature['tokens']:,} tokens; "
                          f"modify {_file_text(feature['modify'])}; "
                          f"reference {_file_text(feature['reference'])}")
-        lines.append(f"groups: {len(data['groups'])}")
-        for group in data["groups"]:
-            shared = (f"; shared {', '.join(group['shared_files'])}"
-                      if group["shared_files"] else "")
-            lines.append(f"  {', '.join(group['features'])}: {group['material']:,} tokens, "
-                         f"{group['share']:.2f} of M{shared}")
+        shared = [group for group in data["groups"] if group["shared_files"]]
+        if shared:
+            lines.append(f"groups: {len(data['groups'])}; sharing modified files:")
+            lines += [f"  {', '.join(group['features'])}: {', '.join(group['shared_files'])}"
+                      for group in shared]
+        else:
+            lines.append(f"groups: {len(data['groups'])} (no two features share a modified "
+                         "file)")
+        concentration = data["concentration"]
+        lines.append(f"concentration: {concentration['of']} = {concentration['value']:.2f}")
     if data.get("oversized"):
         lines.append(f"oversized (over W): {_file_text(data['oversized'])}")
     dropped = data.get("dropped") or []
@@ -950,7 +1061,7 @@ def format_gate(data: Mapping) -> str:
         lines.append(f"model calls of this gate: {totals['model_calls']}, "
                      f"{totals['input_tokens']:,} in / {totals['output_tokens']:,} out")
     if data.get("decision"):
-        lines.append(f"decision (provisional thresholds): {data['decision']}: {data['reason']}")
+        lines.append(f"decision: {data['decision']} ({data['zone']}): {data['reason']}")
     else:
         lines.append("decision: none (see the errors)")
     return "\n".join(lines) + "\n"

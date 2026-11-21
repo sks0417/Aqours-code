@@ -1,30 +1,39 @@
 r"""Evaluate the split gate on four tasks, offline: no model is called.
 
     python experiments/taskgraph/gate/evaluate.py [--gate-dir C:\tg\gate] [--out <file.md>]
+        [--append] [--json <file>]
+    python experiments/taskgraph/gate/evaluate.py --ideal [--out <file.md>] [--append]
+        [--json <file>]
 
-Reads the gate output of each task (``<gate-dir>/<task>.json``, written by
-``python -m aqours_code.taskgraph gate --from-report ... --out``), the task's
-full plan and its single-agent runs, and prints three tables (also written to
-``--out``, default ``<gate-dir>/evaluation.md``):
+Two modes; each prints its tables and writes them to ``--out`` (default
+``<gate-dir>/evaluation.md``; ``--append`` adds them after what is there).
 
-1. **File hits.** The files the gate says the features modify, against
-   (a) the ``modify`` and ``create`` files of every node of the full plan and
-   (b) the files each single-agent run changed (``<run>/nodes/solve/diff.patch``).
-   Only non-test ``.py`` files count on both sides (``outline.is_source_file``).
-   Recall is the share of the reference files the gate found; "recall of
-   existing" leaves out files that did not exist at the base commit (the gate
-   names only existing files); "extra" counts the gate's files the reference
-   does not have.
-2. **Decision.** The gate's decision against the method that was cheaper in
-   practice (the run costs below, input tokens); dask is close, so either
-   decision is accepted and only recorded.
-3. **Sensitivity.** The decision again, from the same location, for P in
-   0, 2000, 5000 and 10000 and with the material of modified plus reference
-   files or of modified files only. The gate's default is P = 5000 with
-   reference files; this table does not change it.
+- **Gate outputs** (default): the location the gate found, read from
+  ``<gate-dir>/<task>.json`` (``python -m aqours_code.taskgraph gate
+  --from-report ... --out``). First the file hits: the files the gate says
+  the features modify, against (a) the ``modify`` and ``create`` files of
+  every node of the full plan and (b) the files each single-agent run changed
+  (``<run>/nodes/solve/diff.patch``). Recall is the share of the reference
+  files the gate found; "recall of existing" leaves out files that did not
+  exist at the base commit (the gate names only existing files); "extra"
+  counts the gate's files the reference does not have. Then the decision,
+  made again from the gate's location with the W it recorded.
+- **Ideal location** (``--ideal``): no gate output; the location is the full
+  plan's. Every node except PRE and REG is a feature: its ``modify`` source
+  files are the files it modifies, and its first three ``context_files``
+  that are source files (other than its own) are its references. File sizes
+  are read from the plan's repository at its base commit. W comes from the
+  compaction trigger (``gate.agent_window``).
 
-A task without a gate output, or whose gate made no decision, is reported as
-such and the others are still evaluated.
+Only source files count (``.py`` files that are not tests). The decision is
+given for two kinds of material: modified plus reference files (the gate's
+rule) and modified files only. It is compared with the method that was
+cheaper in practice (the run costs below, input tokens): a decision in the
+``unclear`` zone is the default and counted neither right nor wrong; dask is
+close, so either decision is accepted there.
+
+A task whose data is missing is reported as such and the others are still
+evaluated.
 """
 from __future__ import annotations
 
@@ -39,13 +48,17 @@ HERE = Path(__file__).resolve().parent
 AQOURS_ROOT = HERE.parents[2]
 sys.path.insert(0, str(AQOURS_ROOT))
 
-from aqours_code.taskgraph.gate import P, decide, features_from_gate  # noqa: E402
+from aqours_code.taskgraph import gitops  # noqa: E402
+from aqours_code.taskgraph.gate import (MAX_REFERENCE, UNCLEAR, FeatureFiles,  # noqa: E402
+                                        Window, agent_window, decide, estimate_tokens,
+                                        features_from_gate, half)
 from aqours_code.taskgraph.outline import is_source_file  # noqa: E402
 
 DEFAULT_GATE_DIR = Path(r"C:\tg\gate")
-P_VALUES = (0, 2000, 5000, 10000)
-FILE_MODES = (("modify+reference", True), ("modify only", False))
+MODES = (("modify+reference", True), ("modify only", False))
 EITHER = "either"
+DEFAULT = "default"
+PLAN_ONLY_NODES = ("PRE", "REG")
 
 
 @dataclass(frozen=True)
@@ -77,6 +90,16 @@ TASKS: tuple[Task, ...] = (
 
 
 # ── reading the data ──
+
+def _read_json(path: Path) -> tuple[dict | None, str | None]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, "not found"
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return None, f"cannot read: {exc}"
+    return (data, None) if isinstance(data, dict) else (None, "not a JSON object")
+
 
 def plan_files(graph: dict) -> dict[str, str]:
     """Source files of a plan's nodes: path -> "modify", or "create" when no node modifies it."""
@@ -120,17 +143,48 @@ def gate_modified(data: dict) -> set[str]:
             for entry in feature.get("modify") or [] if is_source_file(entry["path"])}
 
 
-def _read_json(path: Path) -> tuple[dict | None, str | None]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None, "not found"
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
-        return None, f"cannot read: {exc}"
-    return (data, None) if isinstance(data, dict) else (None, "not a JSON object")
+def ideal_features(graph: dict, report: dict | None = None) -> list[FeatureFiles]:
+    """The full plan's location: every node but PRE and REG, as a feature.
+
+    Its modified source files, and as references its first ``MAX_REFERENCE``
+    context files that are source files and not among its own (a context
+    file's ``#section`` is left out).
+    """
+    excluded = set(PLAN_ONLY_NODES)
+    if report is not None:
+        excluded |= {report.get(key) for key in ("pre_node", "reg_node")} - {None}
+    features = []
+    for node in graph.get("nodes") or []:
+        if node.get("id") in excluded:
+            continue
+        edit_set = node.get("edit_set") or {}
+        modify = list(dict.fromkeys(path for path in edit_set.get("modify") or []
+                                    if is_source_file(path)))
+        references: list[str] = []
+        for entry in node.get("context_files") or []:
+            path = str(entry).split("#", 1)[0]
+            if is_source_file(path) and path not in modify and path not in references:
+                references.append(path)
+        features.append(FeatureFiles(str(node["id"]), str(node.get("title", "")), modify,
+                                     references[:MAX_REFERENCE]))
+    return features
 
 
-# ── the three evaluations ──
+def tokens_at(repo: Path, commit: str, paths) -> tuple[dict[str, int], list[str]]:
+    """Estimated tokens of each file at ``commit``; files not there count 0 and are listed."""
+    tokens: dict[str, int] = {}
+    missing: list[str] = []
+    for path in dict.fromkeys(paths):
+        blob = gitops.blob_at(repo, commit, path)
+        if blob is None:
+            missing.append(path)
+            tokens[path] = 0
+        else:
+            tokens[path] = estimate_tokens(len(blob.decode("utf-8", errors="replace")))
+    return tokens, missing
+
+
+# ── the evaluations ──
 
 NEW_KINDS = ("create", "new")
 
@@ -147,31 +201,74 @@ def hits(found: set[str], reference: dict[str, str]) -> dict:
             "missed": sorted(set(reference) - found)}
 
 
-def sensitivity(data: dict) -> dict[tuple[int, str], str]:
-    """(P, file mode) -> the decision from the gate's location."""
-    features, tokens = features_from_gate(data)
-    return {(p, mode): decide(features, tokens, p=p, with_reference=with_reference)["decision"]
-            for p in P_VALUES for mode, with_reference in FILE_MODES}
+def outcome(decision: str, zone: str, expected: str) -> str:
+    """right / wrong; "default" in the unclear zone; "either is fine" when both are."""
+    if zone == UNCLEAR:
+        return DEFAULT
+    if expected == EITHER:
+        return "either is fine"
+    return "right" if decision == expected else "wrong"
 
 
-def evaluate_task(task: Task, gate_dir: Path) -> dict:
-    """Every number of the three tables for one task."""
-    row: dict = {"task": task.name, "expected": task.expected, "costs": task.costs,
-                 "gate_path": str(gate_dir / f"{task.name}.json")}
+def decisions(features: list[FeatureFiles], tokens: dict[str, int], w: int,
+              expected: str) -> dict:
+    """The decision for both kinds of material, and how each compares with ``expected``."""
+    modes = {}
+    for mode, with_reference in MODES:
+        result = decide(features, tokens, w=w, with_reference=with_reference)
+        modes[mode] = {"decision": result["decision"], "zone": result["zone"],
+                       "reason": result["reason"], "M": result["material"]["M"],
+                       "outcome": outcome(result["decision"], result["zone"], expected),
+                       "oversized": result["oversized"]}
+        if with_reference:
+            groups, concentration = result["groups"], result["concentration"]
+            shared = result["shared"]
+    return {"modes": modes, "features": len(features), "groups": groups,
+            "concentration": concentration, "shared": shared, "W": w, "half_W": half(w)}
+
+
+def _base_row(task: Task) -> dict:
+    return {"task": task.name, "expected": task.expected, "costs": task.costs}
+
+
+def evaluate_ideal_task(task: Task, window: Window) -> dict:
+    """The decision from the full plan's location, sizes read at its base commit."""
+    row = _base_row(task)
+    graph, note = _read_json(task.plan)
+    if graph is None:
+        row["note"] = f"no plan ({note}): {task.plan}"
+        return row
+    report, _ = _read_json(task.plan.with_name(task.plan.name + ".report.json"))
+    features = ideal_features(graph, report)
+    paths = [path for feature in features for path in feature.modify + feature.reference]
+    try:
+        tokens, missing = tokens_at(Path(graph["repo"]), graph["base_commit"], paths)
+    except (KeyError, gitops.GitError, OSError) as exc:
+        row["note"] = f"cannot read the plan's repository: {exc}"
+        return row
+    row.update(decisions(features, tokens, window.tokens, task.expected))
+    row["missing_at_base"] = missing
+    row["location"] = [{"id": feature.id, "modify": feature.modify,
+                        "reference": feature.reference} for feature in features]
+    return row
+
+
+def evaluate_gate_task(task: Task, gate_dir: Path) -> dict:
+    """File hits and the decision from the gate's location."""
+    row = _base_row(task)
     data, note = _read_json(gate_dir / f"{task.name}.json")
     if data is None:
-        row["gate_note"] = f"no gate output ({note})"
+        row["note"] = f"no gate output ({note})"
         return row
-    row["decision"] = data.get("decision")
-    if not row["decision"]:
+    if not data.get("decision"):
         errors = "; ".join(f"[{issue.get('code')}] {issue.get('message')}"
                            for issue in data.get("errors") or [])
-        row["gate_note"] = f"the gate made no decision: {errors or 'no error recorded'}"
+        row["note"] = f"the gate made no decision: {errors or 'no error recorded'}"
         return row
-    row.update(reason=data.get("reason"), reason_code=data.get("reason_code"),
-               M=(data.get("material") or {}).get("M"),
-               share=data.get("largest_group_share"),
-               locate_tokens=(data.get("locate") or {}).get("input_tokens"))
+    w = ((data.get("window") or {}).get("W") or (data.get("material") or {}).get("W")
+         or agent_window().tokens)
+    features, tokens = features_from_gate(data)
+    row.update(decisions(features, tokens, w, task.expected))
     found = gate_modified(data)
     comparisons = []
     graph, graph_note = _read_json(task.plan)
@@ -187,17 +284,7 @@ def evaluate_task(task: Task, gate_dir: Path) -> dict:
         comparisons.append({"against": f"single {run.name}", "path": str(patch_path),
                             "note": run_note, **result})
     row["hits"] = comparisons
-    row["sensitivity"] = {f"P={p} {mode}": decision
-                          for (p, mode), decision in sensitivity(data).items()}
     return row
-
-
-def match(decision: str | None, expected: str) -> str:
-    if not decision:
-        return "-"
-    if expected == EITHER:
-        return "either is fine"
-    return "yes" if decision == expected else "no"
 
 
 # ── output ──
@@ -206,23 +293,15 @@ def _ratio(value: float | None) -> str:
     return "-" if value is None else f"{value:.2f}"
 
 
-def _number(value) -> str:
-    return "-" if value is None else f"{value:,}"
-
-
-def render(rows: list[dict]) -> str:
-    """The three tables and the file details as Markdown."""
-    lines = ["# Split gate: offline evaluation", "",
-             "No model was called: the gate outputs, the plans and the single-agent runs were "
-             "read. Non-test `.py` files only.", "",
-             "## 1. File hits", "",
+def _hits_table(rows: list[dict]) -> list[str]:
+    lines = ["## File hits", "",
              "| task | compared with | reference files (new) | gate files | hits | recall | "
              "recall of existing | extra |",
              "| --- | --- | --- | --- | --- | --- | --- | --- |"]
     details = []
     for row in rows:
         if "hits" not in row:
-            lines.append(f"| {row['task']} | - | - | - | - | - | - | {row['gate_note']} |")
+            lines.append(f"| {row['task']} | - | - | - | - | - | - | {row['note']} |")
             continue
         for item in row["hits"]:
             if item.get("note"):
@@ -236,47 +315,118 @@ def render(rows: list[dict]) -> str:
             details.append(f"- {row['task']} vs {item['against']}: missed "
                            f"{', '.join(item['missed']) or 'none'}; extra "
                            f"{', '.join(item['extra']) or 'none'}")
-    lines += ["", "Files missed and extra:", "", *details, "",
-              "## 2. Decision", "",
-              "| task | gate | reason | M | largest group share | cheaper in practice | "
-              "expected | match |",
-              "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    return lines + ["", "Files missed and extra:", "", *(details or ["- (none)"]), ""]
+
+
+def _cell(mode: dict) -> str:
+    return f"{mode['decision']} ({mode['zone']})"
+
+
+def _oversized(entries: list[dict]) -> str:
+    return ", ".join(f"{entry['path']} ({entry['tokens']:,})" for entry in entries) or "-"
+
+
+def _counts(rows: list[dict], mode: str) -> str:
+    counted = [row["modes"][mode]["outcome"] for row in rows if "modes" in row]
+    parts = [f"{name} {counted.count(name)}"
+             for name in ("right", "wrong", DEFAULT, "either is fine")]
+    return f"{mode}: " + ", ".join(parts) + f" ({DEFAULT}: not counted)"
+
+
+def _decision_tables(rows: list[dict]) -> list[str]:
+    names = [mode for mode, _ in MODES]
+    lines = ["## Decision", "",
+             "| task | cheaper in practice | expected | " +
+             " | ".join(f"{name} | result" for name in names) + " |",
+             "| --- | --- | --- | " + " | ".join("--- | ---" for _ in names) + " |"]
     for row in rows:
-        if not row.get("decision"):
-            lines.append(f"| {row['task']} | - | {row['gate_note']} | - | - | {row['costs']} | "
-                         f"{row['expected']} | - |")
+        if "modes" not in row:
+            cells = " | ".join("- | -" for _ in names)
+            lines.append(f"| {row['task']} | {row['costs']} | {row['expected']} | {cells} |")
             continue
-        lines.append(f"| {row['task']} | {row['decision']} | {row['reason']} | "
-                     f"{_number(row['M'])} | {_ratio(row['share'])} | {row['costs']} | "
-                     f"{row['expected']} | {match(row['decision'], row['expected'])} |")
-    columns = [f"P={p} {mode}" for p in P_VALUES for mode, _ in FILE_MODES]
-    default = f"P={P} {FILE_MODES[0][0]}"
-    header = [f"{column} (default)" if column == default else column for column in columns]
-    lines += ["", "## 3. Sensitivity", "",
-              "The decision from the same location; the default rule is unchanged.", "",
-              "| task | " + " | ".join(header) + " | expected |",
-              "| --- | " + " | ".join("---" for _ in columns) + " | --- |"]
+        cells = " | ".join(f"{_cell(row['modes'][name])} | {row['modes'][name]['outcome']}"
+                           for name in names)
+        lines.append(f"| {row['task']} | {row['costs']} | {row['expected']} | {cells} |")
+    lines += ["", *[f"- {_counts(rows, name)}" for name in names], "",
+              "## Numbers", "",
+              "| task | features | largest group | M (" + names[0] + ") | M (" + names[1] +
+              ") | W/2 | W | over W |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    notes, reasons, groups = [], [], []
     for row in rows:
-        cells = [row.get("sensitivity", {}).get(column, "-") for column in columns]
-        lines.append(f"| {row['task']} | " + " | ".join(cells) + f" | {row['expected']} |")
+        if "modes" not in row:
+            lines.append(f"| {row['task']} | - | - | - | - | - | - | - |")
+            notes.append(f"- {row['task']}: {row['note']}")
+            continue
+        modes, concentration = row["modes"], row["concentration"]
+        lines.append(f"| {row['task']} | {row['features']} | {concentration['of']} = "
+                     f"{concentration['value']:.2f} | {modes[names[0]]['M']:,} | "
+                     f"{modes[names[1]]['M']:,} | {row['half_W']:,} | {row['W']:,} | "
+                     f"{_oversized(modes[names[0]]['oversized'])} |")
+        reasons += [f"- {row['task']}, {name}: {modes[name]['reason']}" for name in names]
+        shared = [group for group in row["groups"] if group["shared_files"]]
+        groups += [f"- {row['task']}: {', '.join(group['features'])}: shared "
+                   f"{', '.join(group['shared_files'])}" for group in shared]
+        if not shared:
+            groups.append(f"- {row['task']}: no two features share a modified file")
+        if row.get("missing_at_base"):
+            notes.append(f"- {row['task']}: not at the base commit (0 tokens): "
+                         f"{', '.join(row['missing_at_base'])}")
+    lines += ["", "Reasons:", "", *reasons, "", "Groups with shared modified files:", "",
+              *groups, ""]
+    if notes:
+        lines += ["Notes:", "", *notes, ""]
+    return lines
+
+
+def render(rows: list[dict], ideal: bool, window: Window | None = None) -> str:
+    """The tables of one mode as Markdown."""
+    if ideal:
+        lines = ["# Split gate evaluation: ideal location", "",
+                 "No model was called. The location is the full plan's (every node but PRE "
+                 "and REG; its modified source files and its first three source context "
+                 "files); file sizes are read at the plan's base commit."]
+        if window is not None:
+            lines += ["", f"W = {window.tokens:,} (compaction trigger {window.trigger:,} from "
+                          f"the {window.source}); W/2 = {half(window.tokens):,}."]
+        lines.append("")
+    else:
+        lines = ["# Split gate evaluation: gate outputs", "",
+                 "No model was called: the gate outputs, the plans and the single-agent runs "
+                 "were read. The decision is made again from each gate's location with the "
+                 "W it recorded. Non-test `.py` files only.", "",
+                 *_hits_table(rows)]
+    lines += _decision_tables(rows)
     return "\n".join(lines) + "\n"
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--ideal", action="store_true",
+                        help="use the full plans' location instead of the gate outputs")
     parser.add_argument("--gate-dir", default=str(DEFAULT_GATE_DIR),
                         help=f"directory of <task>.json gate outputs (default {DEFAULT_GATE_DIR})")
     parser.add_argument("--out", help="write the tables here (default <gate-dir>/evaluation.md)")
+    parser.add_argument("--append", action="store_true",
+                        help="add the tables after what --out already holds")
     parser.add_argument("--json", help="also write every number as JSON to this file")
     args = parser.parse_args(argv)
     gate_dir = Path(args.gate_dir)
-    rows = [evaluate_task(task, gate_dir) for task in TASKS]
-    text = render(rows)
+    if args.ideal:
+        window = agent_window()
+        rows = [evaluate_ideal_task(task, window) for task in TASKS]
+        text = render(rows, ideal=True, window=window)
+    else:
+        rows = [evaluate_gate_task(task, gate_dir) for task in TASKS]
+        text = render(rows, ideal=False)
     print(text, end="")
     out = Path(args.out) if args.out else gate_dir / "evaluation.md"
     out.parent.mkdir(parents=True, exist_ok=True)
+    if args.append and out.exists():
+        previous = out.read_text(encoding="utf-8")
+        text = previous + ("\n" if previous and not previous.endswith("\n\n") else "") + text
     out.write_text(text, encoding="utf-8")
-    print(f"\nwrote {out}")
+    print(f"\n{'added to' if args.append else 'wrote'} {out}")
     if args.json:
         Path(args.json).write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n",
                                    encoding="utf-8")
