@@ -485,6 +485,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     if args.planner == "v2" and args.outline == "two-level":
         return _error("--outline two-level applies only to --planner v3 "
                       "(v2 always has the full outline)")
+    if args.planner == "v2" and args.gate:
+        return _error("--gate applies only to --planner v3")
     outline = args.outline or ("two-level" if args.planner == "v3" else "full")
     options = PlanOptions(request_path=request_path, repo=Path(args.repo),
                           out=Path(args.out), final_checks=list(args.final_check),
@@ -493,9 +495,13 @@ def _cmd_plan(args: argparse.Namespace) -> int:
                           merge=not args.no_merge, planner=args.planner, ablate=ablate,
                           outline=outline, max_model_calls=args.max_calls or None,
                           max_input_tokens=args.max_input_tokens or None,
-                          max_plan_s=args.max_time or None)
+                          max_plan_s=args.max_time or None, gate=args.gate)
+    workers = [planner.planner_worker(), planner.draft_worker()]
+    if args.gate:
+        from .gate import locate_worker
+        workers.append(locate_worker())
     try:
-        result = run_plan(options, planner.planner_worker(), planner.draft_worker())
+        result = run_plan(options, *workers)
     except (GitError, RuntimeError, OSError, UnicodeDecodeError) as exc:
         return _error(str(exc))
     if args.planner == "v3":
@@ -508,13 +514,27 @@ def _print_plan_start(report: dict) -> None:
     estimate = fast["estimated_changed_lines"]
     print(f"draft items: {len(report['draft_items'])}  estimated changed lines: "
           f"{'-' if estimate is None else estimate}")
-    if fast["threshold"] is None:
+    if "gate" in report:
+        _print_gate_line(report["gate"])
+    if fast.get("replaced_by") == "gate":
+        print("fast path: replaced by --gate (--fast-path-lines is not used)")
+    elif fast["threshold"] is None:
         print("fast path: off")
     elif fast["taken"]:
         print(f"fast path: taken ({estimate} < {fast['threshold']} lines): "
               "single-agent graph, steps 2 and 3 skipped")
     elif estimate is not None:
         print(f"fast path: not taken ({estimate} >= {fast['threshold']} lines)")
+
+
+def _print_gate_line(gate: dict) -> None:
+    """``gate: split (clear_split): <reason>``, or why there is no decision."""
+    if gate.get("decision"):
+        print(f"gate: {gate['decision']} ({gate['zone']}): {gate['reason']}")
+    elif gate.get("errors"):
+        print(f"gate: no decision ({gate['errors'][0]['message']})")
+    else:
+        print(f"gate: no decision ({gate.get('note') or 'see the errors'})")
 
 
 def _print_plan_end(args: argparse.Namespace, result, report: dict) -> None:
@@ -524,7 +544,9 @@ def _print_plan_end(args: argparse.Namespace, result, report: dict) -> None:
     print(f"model calls: {totals['model_calls']}  tokens: {totals['input_tokens']} in / "
           f"{totals['output_tokens']} out  time: {report['duration_s']:.1f}s")
     for entry in report.get("round_usage", []):
-        print(f"  step {entry['step']} round {entry['round']}: {entry['model_calls']} calls, "
+        where = ("gate" if entry["step"] == "gate"
+                 else f"step {entry['step']} round {entry['round']}")
+        print(f"  {where}: {entry['model_calls']} calls, "
               f"{entry['input_tokens']:,} in / {entry['output_tokens']:,} out, "
               f"{entry['duration_s']:.0f}s, {entry['ended']}")
     if report.get("outline_mode") == "two-level":
@@ -581,6 +603,11 @@ def _print_plan_v3(args: argparse.Namespace, result) -> int:
         print(f"ablated: {', '.join(report['ablate'])} (rules turned off)")
     _print_plan_end(args, result, report)
     print(f"wrote {result.report_path}")
+    gate = report.get("gate")
+    if gate is not None and gate.get("output"):
+        print(f"wrote {gate['output']}")
+    if gate is not None and gate.get("decision") == "single" and report["graph_written"]:
+        print("wrote single-agent graph (gate: single)")
     return EXIT_OK if result.success else EXIT_INVALID
 
 
@@ -856,6 +883,10 @@ def build_parser() -> argparse.ArgumentParser:
                                "split (default 500)")
     plan_cmd.add_argument("--no-fast-path", action="store_true",
                           help="always split, whatever the estimate")
+    plan_cmd.add_argument("--gate", action="store_true",
+                          help="v3 only: after step 1 the split gate decides (one more model "
+                               "call) instead of the fast path: split plans as usual, single "
+                               "writes the single-agent graph (default: off)")
     plan_cmd.add_argument("--planner", choices=("v2", "v3"), default="v3",
                           help="planner version (default v3: the model reports task facts, "
                                "the program builds the graph)")

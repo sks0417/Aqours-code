@@ -609,7 +609,9 @@ class PlanOptions:
     outline) is "two-level" (:mod:`outline_levels`) or "full" (the outline of
     planner v3.1, to reproduce earlier plans). ``max_model_calls``,
     ``max_input_tokens`` and ``max_plan_s`` limit the whole plan, all rounds
-    of both steps (:mod:`plan_budget`); None turns one off.
+    of both steps (:mod:`plan_budget`); None turns one off. ``gate`` (v3
+    only) runs the split gate after step 1 instead of the fast path
+    (:mod:`gate`): step 2 only when it says split.
     """
 
     request_path: Path
@@ -627,6 +629,7 @@ class PlanOptions:
     max_model_calls: int | None = DEFAULT_MAX_MODEL_CALLS
     max_input_tokens: int | None = DEFAULT_MAX_INPUT_TOKENS
     max_plan_s: float | None = DEFAULT_MAX_PLAN_S
+    gate: bool = False
 
     def budget(self, started: float) -> PlanBudget:
         """The budget of one run of these options, started at ``started``."""
@@ -779,16 +782,21 @@ def revise_checked(graph: Graph, conventions: list[str], index: RepoIndex
 
 
 def run_plan(options: PlanOptions, worker: Worker,
-             draft_stage_worker: Worker | None = None) -> PlanResult:
+             draft_stage_worker: Worker | None = None,
+             gate_worker: Worker | None = None) -> PlanResult:
     """Run the planner version of ``options.planner``.
 
-    ``worker`` runs Step 2; ``draft_stage_worker`` runs Step 1 (default: ``worker``).
+    ``worker`` runs Step 2; ``draft_stage_worker`` runs Step 1 (default:
+    ``worker``); ``gate_worker`` makes the gate's location call of
+    ``options.gate`` (default: ``draft_stage_worker``).
     """
     if options.planner not in PLANNERS:
         raise ValueError(f"unknown planner {options.planner!r} (use {', '.join(PLANNERS)})")
+    if options.gate and options.planner != "v3":
+        raise ValueError("the gate applies only to planner v3")
     if options.planner == "v3":
         from .planner_v3 import run_plan_v3  # planner_v3 imports this module
-        return run_plan_v3(options, worker, draft_stage_worker)
+        return run_plan_v3(options, worker, draft_stage_worker, gate_worker)
     return run_plan_v2(options, worker, draft_stage_worker)
 
 

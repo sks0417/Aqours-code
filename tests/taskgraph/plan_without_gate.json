@@ -1,0 +1,631 @@
+{
+  "fast_path": {
+    "exit_code": 0,
+    "files": [
+      "graph.json",
+      "graph.json.logs",
+      "graph.json.report.json"
+    ],
+    "graph": {
+      "base_commit": "48e0476cbc3aac7a8ed14cde30fde8165053b4b5",
+      "edges": [],
+      "final_checks": [
+        "python -m pytest -q tests"
+      ],
+      "generator": {
+        "kind": "planner",
+        "model": "scripted-model",
+        "planner_version": "planner-v3.2",
+        "revision_mode": "none"
+      },
+      "nodes": [
+        {
+          "check": {
+            "commands": [
+              "python -m pytest -q tests"
+            ],
+            "timeout_s": 300
+          },
+          "context_files": [],
+          "edit_set": {
+            "any_file": true,
+            "create": [],
+            "modify": [],
+            "symbols": []
+          },
+          "goal": "Add job cancellation to the toy queue.\n\n\nKeep the existing tests passing and add tests for the new behaviour.",
+          "id": "solve",
+          "kind": "implement",
+          "provides": [],
+          "requires": [],
+          "requires_impl": [],
+          "title": "Implement the whole request"
+        }
+      ],
+      "repo": "toy",
+      "request": "Add job cancellation to the toy queue.\n",
+      "request_id": "single",
+      "revision_log": [
+        {
+          "action": "other",
+          "nodes": [
+            "solve"
+          ],
+          "reason": "fast path: estimated 100 changed lines < threshold 500"
+        }
+      ]
+    },
+    "output": [
+      "draft items: 2  estimated changed lines: 100",
+      "fast path: taken (100 < 500 lines): single-agent graph, steps 2 and 3 skipped",
+      "nodes: 1  edges: 0  PRE: no  REG: no  revision rounds: 0  success: yes",
+      "model calls: 1  tokens: 100 in / 10 out  time: <t>s",
+      "  step 1 round 1: 1 calls, 100 in / 10 out, <t>s, answer",
+      "outline (two-level): 549 characters, level 1 158, level 2 20 (0 files; 0 cut by the budget); file list 33",
+      "wrote <tmp>/out/graph.json",
+      "wrote <tmp>/out/graph.json.report.json"
+    ],
+    "report": {
+      "ablate": [],
+      "base_commit": "48e0476cbc3aac7a8ed14cde30fde8165053b4b5",
+      "behavior_without_why": [],
+      "conventions": [],
+      "decision_counts": {},
+      "decisions": [],
+      "draft_items": [
+        {
+          "description": "achieve S",
+          "id": "S",
+          "title": "item S"
+        },
+        {
+          "description": "achieve R",
+          "id": "R",
+          "title": "item R"
+        }
+      ],
+      "duration_s": 0,
+      "edges": 0,
+      "errors": [],
+      "estimated_changed_lines": 100,
+      "facts": null,
+      "fast_path": {
+        "estimated_changed_lines": 100,
+        "taken": true,
+        "threshold": 500
+      },
+      "file_list_chars": 33,
+      "goal_chars": {
+        "solve": 109
+      },
+      "graph_round": null,
+      "graph_written": true,
+      "limits": {
+        "input_tokens": 6000000,
+        "model_calls": 150,
+        "seconds": 0
+      },
+      "long_goals": {},
+      "model": "scripted-model",
+      "node_units": {},
+      "nodes": 1,
+      "normalisations": [],
+      "out": "<tmp>/out/graph.json",
+      "outline_chars": 549,
+      "outline_level1_chars": 158,
+      "outline_level2_chars": 20,
+      "outline_level2_cut": [],
+      "outline_level2_files": [],
+      "outline_mode": "two-level",
+      "outline_omitted_files": [],
+      "outline_reduction": null,
+      "parallelism": null,
+      "planner": "v3",
+      "planner_version": "planner-v3.2",
+      "pre_node": null,
+      "reg_node": null,
+      "repo": "<tmp>/toy",
+      "request": "<tmp>/request.md",
+      "revision_reasons": [],
+      "revision_rounds": 0,
+      "round_usage": [
+        {
+          "duration_s": 0,
+          "ended": "answer",
+          "input_tokens": 100,
+          "model_calls": 1,
+          "output_tokens": 10,
+          "round": 1,
+          "step": 1
+        }
+      ],
+      "rounds": [],
+      "stage1": [
+        {
+          "agent": {
+            "duration_s": 0,
+            "error": "",
+            "input_tokens": 100,
+            "model_calls": 1,
+            "ok": true,
+            "output_tokens": 10,
+            "reason": ""
+          },
+          "answer": "Plan below.\n\n```json\n{\n  \"estimated_changed_lines\": 100,\n  \"items\": [\n    {\n      \"id\": \"S\",\n      \"title\": \"item S\",\n      \"description\": \"achieve S\"\n    },\n    {\n      \"id\": \"R\",\n      \"title\": \"item R\",\n      \"description\": \"achieve R\"\n    }\n  ]\n}\n```\n",
+          "errors": [],
+          "round": 1
+        }
+      ],
+      "stage_totals": {
+        "stage1": {
+          "input_tokens": 100,
+          "model_calls": 1,
+          "output_tokens": 10
+        },
+        "stage2": {
+          "input_tokens": 0,
+          "model_calls": 0,
+          "output_tokens": 0
+        }
+      },
+      "stopped": null,
+      "success": true,
+      "test_imports": {
+        "files": 1,
+        "sources": 3,
+        "unresolved": [
+          "broken.py"
+        ]
+      },
+      "totals": {
+        "input_tokens": 100,
+        "model_calls": 1,
+        "output_tokens": 10
+      },
+      "units": 0,
+      "used": {
+        "input_tokens": 100,
+        "model_calls": 1,
+        "output_tokens": 10,
+        "seconds": 0
+      }
+    },
+    "step1_requests": [
+      {
+        "attempt": 1,
+        "log_dir": "<tmp>/out/graph.json.logs/draft",
+        "model_budget": {
+          "max_calls": 150,
+          "max_input_tokens": 6000000
+        },
+        "node_id": "planner-draft",
+        "prompt": "# Task: list the pieces of work in a request\n\nYou are planning, not implementing. Another planner will read the code\nlater; your part is to read the request.\n\nList the separate pieces of work that the request below asks for, using the\nrequest text. Make one item per feature or concern that the request names.\nDo not guess how the code is organised and do not name files in the items;\nthat comes later, after the code is read. If the request asks for one thing,\noutput one item. Do not add items for testing, documentation, or integration\nunless the request names them as work of their own.\n\nThe list of repository files with their line counts is given only so that\nyou can judge the size of the work. You cannot open the files. Estimate how\nmany lines of code (including tests) the whole request will add or change.\n\nAnswer as the last ```json block of your final answer:\n\n```json\n{\"estimated_changed_lines\": <number>,\n \"items\": [{\"id\": \"1\", \"title\": \"Short name\",\n            \"description\": \"What this item must achieve, in one or two sentences.\"}]}\n```\n\nThe example shows the format only; replace <number> with your own estimate.\n\n- `estimated_changed_lines`: one non-negative whole number for the whole\n  request, not per item.\n- `items`: at least one. `id` is unique (`\"1\"`, `\"2\"`, ...); `title` is a\n  few words; `description` says what the item must achieve, not how.\n\n# The request\n\nAdd job cancellation to the toy queue.\n\n# Repository files\n\n- README.md: 1 lines\n- broken.py: 2 lines\n- models.py: 20 lines\n- runner.py: 11 lines\n- store.py: 16 lines\n- tests/test_basic.py: 9 lines\n",
+        "repo_guard": true,
+        "timeout_s": 1800.0
+      }
+    ],
+    "step2_requests": []
+  },
+  "plan": {
+    "exit_code": 0,
+    "files": [
+      "graph.json",
+      "graph.json.logs",
+      "graph.json.report.json"
+    ],
+    "graph": {
+      "base_commit": "48e0476cbc3aac7a8ed14cde30fde8165053b4b5",
+      "edges": [],
+      "final_checks": [
+        "python -m pytest -q tests"
+      ],
+      "generator": {
+        "kind": "planner",
+        "model": "scripted-model",
+        "planner_version": "planner-v3.2",
+        "revision_mode": "none"
+      },
+      "nodes": [
+        {
+          "check": {
+            "commands": [
+              "python -m pytest -q tests"
+            ],
+            "timeout_s": 300
+          },
+          "context_files": [],
+          "edit_set": {
+            "any_file": false,
+            "create": [
+              "tests/test_cancel.py"
+            ],
+            "modify": [
+              "store.py"
+            ],
+            "symbols": [
+              "store.py::JobStore.cancel"
+            ]
+          },
+          "goal": "goal S\n\nRepository conventions:\n- All storage access goes through JobStore.",
+          "id": "S",
+          "kind": "implement",
+          "provides": [
+            "store.py::JobStore.cancel"
+          ],
+          "requires": [],
+          "requires_impl": [],
+          "title": "title S"
+        },
+        {
+          "check": {
+            "commands": [
+              "python -m pytest -q tests"
+            ],
+            "timeout_s": 300
+          },
+          "context_files": [
+            "README.md"
+          ],
+          "edit_set": {
+            "any_file": false,
+            "create": [
+              "tests/test_skip.py"
+            ],
+            "modify": [
+              "runner.py"
+            ],
+            "symbols": [
+              "runner.py::run_loop"
+            ]
+          },
+          "goal": "goal R\n\nRepository conventions:\n- All storage access goes through JobStore.",
+          "id": "R",
+          "kind": "implement",
+          "provides": [
+            "runner.py::run_loop"
+          ],
+          "requires": [],
+          "requires_impl": [],
+          "title": "title R"
+        }
+      ],
+      "repo": "<tmp>/toy",
+      "request": "Add job cancellation to the toy queue.\n",
+      "request_id": "graph",
+      "revision_log": []
+    },
+    "output": [
+      "draft items: 2  estimated changed lines: 800",
+      "fast path: not taken (800 >= 500 lines)",
+      "nodes: 2  edges: 0  PRE: no  REG: no  revision rounds: 0  success: yes",
+      "units: 2  decisions: P1: 1  P2: 0  P3: 0  P4: 2",
+      "parallelism: critical path 80 / 160 lines (0.50 <= 0.70) -> split",
+      "model calls: 2  tokens: 200 in / 20 out  time: <t>s",
+      "  step 1 round 1: 1 calls, 100 in / 10 out, <t>s, answer",
+      "  step 2 round 1: 1 calls, 100 in / 10 out, <t>s, answer",
+      "outline (two-level): 549 characters, level 1 158, level 2 20 (0 files; 0 cut by the budget); file list 33",
+      "wrote <tmp>/out/graph.json",
+      "wrote <tmp>/out/graph.json.report.json"
+    ],
+    "report": {
+      "ablate": [],
+      "base_commit": "48e0476cbc3aac7a8ed14cde30fde8165053b4b5",
+      "behavior_without_why": [],
+      "conventions": [
+        "All storage access goes through JobStore."
+      ],
+      "decision_counts": {
+        "P1": 1,
+        "P2": 0,
+        "P3": 0,
+        "P4": 2
+      },
+      "decisions": [
+        {
+          "nodes": [
+            "S"
+          ],
+          "numbers": {
+            "unresolved": 1
+          },
+          "property": "P4",
+          "reason": "the imports of 1 Python file(s) cannot be read (broken.py), so it is unknown which tests S affects: it runs the whole suite",
+          "rule": "full_suite_fallback",
+          "units": [
+            "S"
+          ]
+        },
+        {
+          "nodes": [
+            "R"
+          ],
+          "numbers": {
+            "unresolved": 1
+          },
+          "property": "P4",
+          "reason": "the imports of 1 Python file(s) cannot be read (broken.py), so it is unknown which tests R affects: it runs the whole suite",
+          "rule": "full_suite_fallback",
+          "units": [
+            "R"
+          ]
+        },
+        {
+          "nodes": [
+            "S"
+          ],
+          "numbers": {
+            "critical": 80,
+            "ratio": 0.5,
+            "threshold": 0.7,
+            "total": 160
+          },
+          "property": "P1",
+          "reason": "the longest chain of nodes S has 80 lines, 50% of all 160 lines, at most 70%: enough of the work runs in parallel to pay for the extra nodes, so the graph stays split",
+          "rule": "parallel_enough",
+          "units": []
+        }
+      ],
+      "draft_items": [
+        {
+          "description": "achieve S",
+          "id": "S",
+          "title": "item S"
+        },
+        {
+          "description": "achieve R",
+          "id": "R",
+          "title": "item R"
+        }
+      ],
+      "duration_s": 0,
+      "edges": 0,
+      "errors": [],
+      "estimated_changed_lines": 800,
+      "facts": {
+        "conventions": [
+          "All storage access goes through JobStore."
+        ],
+        "together": [],
+        "units": [
+          {
+            "context_files": [],
+            "create": [
+              "tests/test_cancel.py"
+            ],
+            "edits": [
+              {
+                "file": "store.py",
+                "kind": "logic",
+                "lines": 30,
+                "note": "",
+                "standalone": false,
+                "symbols": [
+                  "store.py::JobStore.cancel"
+                ]
+              }
+            ],
+            "goal": "goal S",
+            "id": "S",
+            "item": "S",
+            "provides": [
+              "store.py::JobStore.cancel"
+            ],
+            "size": 80,
+            "tests": [
+              "tests/test_cancel.py"
+            ],
+            "title": "title S",
+            "uses": []
+          },
+          {
+            "context_files": [
+              "README.md"
+            ],
+            "create": [
+              "tests/test_skip.py"
+            ],
+            "edits": [
+              {
+                "file": "runner.py",
+                "kind": "logic",
+                "lines": 30,
+                "note": "",
+                "standalone": false,
+                "symbols": [
+                  "runner.py::run_loop"
+                ]
+              }
+            ],
+            "goal": "goal R",
+            "id": "R",
+            "item": "R",
+            "provides": [
+              "runner.py::run_loop"
+            ],
+            "size": 80,
+            "tests": [
+              "tests/test_skip.py"
+            ],
+            "title": "title R",
+            "uses": []
+          }
+        ]
+      },
+      "fast_path": {
+        "estimated_changed_lines": 800,
+        "taken": false,
+        "threshold": 500
+      },
+      "file_list_chars": 33,
+      "goal_chars": {
+        "R": 75,
+        "S": 75
+      },
+      "graph_round": 1,
+      "graph_written": true,
+      "limits": {
+        "input_tokens": 6000000,
+        "model_calls": 150,
+        "seconds": 0
+      },
+      "long_goals": {},
+      "model": "scripted-model",
+      "node_units": {
+        "R": [
+          "R"
+        ],
+        "S": [
+          "S"
+        ]
+      },
+      "nodes": 2,
+      "normalisations": [],
+      "out": "<tmp>/out/graph.json",
+      "outline_chars": 549,
+      "outline_level1_chars": 158,
+      "outline_level2_chars": 20,
+      "outline_level2_cut": [],
+      "outline_level2_files": [],
+      "outline_mode": "two-level",
+      "outline_omitted_files": [],
+      "outline_reduction": null,
+      "parallelism": {
+        "collapsed": false,
+        "critical": 80,
+        "node_work": {
+          "R": 80,
+          "S": 80
+        },
+        "path": [
+          "S"
+        ],
+        "ratio": 0.5,
+        "threshold": 0.7,
+        "total": 160
+      },
+      "planner": "v3",
+      "planner_version": "planner-v3.2",
+      "pre_node": null,
+      "reg_node": null,
+      "repo": "<tmp>/toy",
+      "request": "<tmp>/request.md",
+      "revision_reasons": [],
+      "revision_rounds": 0,
+      "round_usage": [
+        {
+          "duration_s": 0,
+          "ended": "answer",
+          "input_tokens": 100,
+          "model_calls": 1,
+          "output_tokens": 10,
+          "round": 1,
+          "step": 1
+        },
+        {
+          "duration_s": 0,
+          "ended": "answer",
+          "input_tokens": 100,
+          "model_calls": 1,
+          "output_tokens": 10,
+          "round": 1,
+          "step": 2
+        }
+      ],
+      "rounds": [
+        {
+          "agent": {
+            "duration_s": 0,
+            "error": "",
+            "input_tokens": 100,
+            "model_calls": 1,
+            "ok": true,
+            "output_tokens": 10,
+            "reason": ""
+          },
+          "answer": "Plan below.\n\n```json\n{\n  \"conventions\": [\n    \"All storage access goes through JobStore.\"\n  ],\n  \"units\": [\n    {\n      \"id\": \"S\",\n      \"item\": \"S\",\n      \"title\": \"title S\",\n      \"goal\": \"goal S\",\n      \"size\": 80,\n      \"edits\": [\n        {\n          \"file\": \"store.py\",\n          \"kind\": \"logic\",\n          \"symbols\": [\n            \"store.py::JobStore.cancel\"\n          ],\n          \"lines\": 30,\n          \"standalone\": false\n        }\n      ],\n      \"create\": [\n        \"tests/test_cancel.py\"\n      ],\n      \"provides\": [\n        \"store.py::JobStore.cancel\"\n      ],\n      \"tests\": [\n        \"tests/test_cancel.py\"\n      ]\n    },\n    {\n      \"id\": \"R\",\n      \"item\": \"R\",\n      \"title\": \"title R\",\n      \"goal\": \"goal R\",\n      \"size\": 80,\n      \"edits\": [\n        {\n          \"file\": \"runner.py\",\n          \"kind\": \"logic\",\n          \"symbols\": [\n            \"runner.py::run_loop\"\n          ],\n          \"lines\": 30,\n          \"standalone\": false\n        }\n      ],\n      \"create\": [\n        \"tests/test_skip.py\"\n      ],\n      \"provides\": [\n        \"runner.py::run_loop\"\n      ],\n      \"tests\": [\n        \"tests/test_skip.py\"\n      ],\n      \"context_files\": [\n        \"README.md\"\n      ]\n    }\n  ]\n}\n```\n",
+          "errors": [],
+          "facts_json": "{\n  \"conventions\": [\n    \"All storage access goes through JobStore.\"\n  ],\n  \"units\": [\n    {\n      \"id\": \"S\",\n      \"item\": \"S\",\n      \"title\": \"title S\",\n      \"goal\": \"goal S\",\n      \"size\": 80,\n      \"edits\": [\n        {\n          \"file\": \"store.py\",\n          \"kind\": \"logic\",\n          \"symbols\": [\n            \"store.py::JobStore.cancel\"\n          ],\n          \"lines\": 30,\n          \"standalone\": false\n        }\n      ],\n      \"create\": [\n        \"tests/test_cancel.py\"\n      ],\n      \"provides\": [\n        \"store.py::JobStore.cancel\"\n      ],\n      \"tests\": [\n        \"tests/test_cancel.py\"\n      ]\n    },\n    {\n      \"id\": \"R\",\n      \"item\": \"R\",\n      \"title\": \"title R\",\n      \"goal\": \"goal R\",\n      \"size\": 80,\n      \"edits\": [\n        {\n          \"file\": \"runner.py\",\n          \"kind\": \"logic\",\n          \"symbols\": [\n            \"runner.py::run_loop\"\n          ],\n          \"lines\": 30,\n          \"standalone\": false\n        }\n      ],\n      \"create\": [\n        \"tests/test_skip.py\"\n      ],\n      \"provides\": [\n        \"runner.py::run_loop\"\n      ],\n      \"tests\": [\n        \"tests/test_skip.py\"\n      ],\n      \"context_files\": [\n        \"README.md\"\n      ]\n    }\n  ]\n}\n",
+          "normalisations": [],
+          "round": 1
+        }
+      ],
+      "stage1": [
+        {
+          "agent": {
+            "duration_s": 0,
+            "error": "",
+            "input_tokens": 100,
+            "model_calls": 1,
+            "ok": true,
+            "output_tokens": 10,
+            "reason": ""
+          },
+          "answer": "Plan below.\n\n```json\n{\n  \"estimated_changed_lines\": 800,\n  \"items\": [\n    {\n      \"id\": \"S\",\n      \"title\": \"item S\",\n      \"description\": \"achieve S\"\n    },\n    {\n      \"id\": \"R\",\n      \"title\": \"item R\",\n      \"description\": \"achieve R\"\n    }\n  ]\n}\n```\n",
+          "errors": [],
+          "round": 1
+        }
+      ],
+      "stage_totals": {
+        "stage1": {
+          "input_tokens": 100,
+          "model_calls": 1,
+          "output_tokens": 10
+        },
+        "stage2": {
+          "input_tokens": 100,
+          "model_calls": 1,
+          "output_tokens": 10
+        }
+      },
+      "stopped": null,
+      "success": true,
+      "test_imports": {
+        "files": 1,
+        "sources": 3,
+        "unresolved": [
+          "broken.py"
+        ]
+      },
+      "totals": {
+        "input_tokens": 200,
+        "model_calls": 2,
+        "output_tokens": 20
+      },
+      "units": 2,
+      "used": {
+        "input_tokens": 200,
+        "model_calls": 2,
+        "output_tokens": 20,
+        "seconds": 0
+      }
+    },
+    "step1_requests": [
+      {
+        "attempt": 1,
+        "log_dir": "<tmp>/out/graph.json.logs/draft",
+        "model_budget": {
+          "max_calls": 150,
+          "max_input_tokens": 6000000
+        },
+        "node_id": "planner-draft",
+        "prompt": "# Task: list the pieces of work in a request\n\nYou are planning, not implementing. Another planner will read the code\nlater; your part is to read the request.\n\nList the separate pieces of work that the request below asks for, using the\nrequest text. Make one item per feature or concern that the request names.\nDo not guess how the code is organised and do not name files in the items;\nthat comes later, after the code is read. If the request asks for one thing,\noutput one item. Do not add items for testing, documentation, or integration\nunless the request names them as work of their own.\n\nThe list of repository files with their line counts is given only so that\nyou can judge the size of the work. You cannot open the files. Estimate how\nmany lines of code (including tests) the whole request will add or change.\n\nAnswer as the last ```json block of your final answer:\n\n```json\n{\"estimated_changed_lines\": <number>,\n \"items\": [{\"id\": \"1\", \"title\": \"Short name\",\n            \"description\": \"What this item must achieve, in one or two sentences.\"}]}\n```\n\nThe example shows the format only; replace <number> with your own estimate.\n\n- `estimated_changed_lines`: one non-negative whole number for the whole\n  request, not per item.\n- `items`: at least one. `id` is unique (`\"1\"`, `\"2\"`, ...); `title` is a\n  few words; `description` says what the item must achieve, not how.\n\n# The request\n\nAdd job cancellation to the toy queue.\n\n# Repository files\n\n- README.md: 1 lines\n- broken.py: 2 lines\n- models.py: 20 lines\n- runner.py: 11 lines\n- store.py: 16 lines\n- tests/test_basic.py: 9 lines\n",
+        "repo_guard": true,
+        "timeout_s": 1800.0
+      }
+    ],
+    "step2_requests": [
+      {
+        "attempt": 1,
+        "log_dir": "<tmp>/out/graph.json.logs",
+        "model_budget": {
+          "max_calls": 149,
+          "max_input_tokens": 5999900
+        },
+        "node_id": "planner",
+        "prompt": "# Task: describe the work a request needs, grounded in the code\n\nYou are planning, not implementing. You get a request and a draft: the\npieces of work the request asks for, listed from the request text alone,\nbefore anyone looked at the code. Look at the code and describe, for every\ndraft item, the work it needs: which existing files it changes and how much,\nwhich new files it creates, what it provides to other work and what it uses\nfrom it. Several coding agents will later do the work, each in its own copy\nof the repository. Output the description in the JSON format at the end of\nthis prompt.\n\nYou describe the work; you do not design the task graph. The program\ndecides which units become nodes, which shared edits are made first or\nlast, what runs in parallel, and how each node is checked, from what you\nreport. Report truthfully, even when two units edit the same file or the\nsame function. When you are unsure whether an edit can be written on its\nown, say standalone false.\n\nLook before you describe. Go through the request and the draft items, then\nthe repository: its outline, its README, and any specification the README\nor the request points to. Find out which files each item must change, which\nnew files are needed, what the items share, and which conventions the code\nfollows.\n\nThe outline below has two levels. Level 1 lists every source file with its\nnumber of lines and the names of its top-level classes and functions. Level 2\nadds signatures, methods, fields and line numbers, but only for some files:\nthe files the request names, the files that define a name the request uses,\nand the files they import or that import them. Work from the outline. When you\nneed the definitions of another file, or how a function works inside, read it\nwith read_file, and read only the lines you need. Do not read test files: their\nnames in the file list are enough to choose where new tests go (a collapsed\ndirectory shows how many files it has; list them with glob).\n\n`read_file` reads part of a file with `offset` (how many lines to skip) and\n`limit` (how many lines to return): for lines 120 to 160, pass `offset` 119\nand `limit` 41. When you need several files, ask for all of them in one turn.\n\nTo find where something is defined or used, search for it with `grep` first,\nthen `read_file` only the few dozen lines around the match. Do not page\nthrough a large file to find it.\n\nYou have read-only tools (read_file, glob, grep). Do not try to change any file.\n\n## Concepts\n\n**Units.** A unit is one piece of work. By default one draft item is one\nunit. When an item contains several parts that are large, unrelated to each\nother, and in different files, give it several units with the same `item`.\nEvery draft item has at least one unit. Do not split an item just because it\nis big, and do not combine different items into one unit.\n\n**Logic and registration edits.** An edit is a change to one existing file,\nor to a new file that another unit creates.\nA `logic` edit implements behaviour. A `registration` edit only enters a\nname into a list or table: an export, `__all__`, a registry, a route table,\na few lines that name something defined elsewhere. Say in `note` what it\nregisters.\n\n**Provides and uses.** `provides` lists the symbols a unit adds or changes\nfor other code to use, including the names it registers. `uses` lists the\nsymbols a unit needs that another unit provides, or that this unit itself\nregisters. A symbol that exists already and that no unit changes is not\nlisted.\n\n- `need: \"interface\"`: the unit only needs the symbol to exist with its\n  name and signature. This is the usual case: creating, reading or raising\n  a class, a field or an exception, and calling a function or method whose\n  result the unit's tests can replace with a small fake.\n- `need: \"behavior\"`: the unit's code or tests depend on a result that only\n  the provider's real code produces, so that a fake would make the tests\n  meaningless. Say which result in `why`, in one sentence. If you cannot\n  name such a result, the need is \"interface\".\n- Name the method you call, not its class: `RecipeBook.rate`, not\n  `RecipeBook`. A use of a class means its constructor and fields only.\n\nWhen the unit's own code or tests import one of its own symbols through a\nname the unit registers (a test writes `from package import Name`), list that\nregistered name in `uses` too.\n\n**Standalone edits.** A `logic` edit is `standalone` when it can be written\nusing only the code already in the repository: it needs neither the unit's\nother changes nor any other unit's work. When you are unsure, say `false`.\n\n**Together.** Units that cannot be written or tested apart, not even with a\nfake standing in for the other, are listed together with a reason. This is\nrare. Editing the same file, or using another unit's fields, is not a\nreason to list units together.\n\n**Repository conventions.** Most repositories have rules that all their\ncode follows, stated in the README or the specification or visible in the\nexisting code. Examples: \"the current time comes only from the injected\nclock; a module function that needs it takes a `now` argument from its\ncaller and never reads the system time\", \"all database access goes through\nthe storage class\", \"argument checks use the helpers in the validation\nmodule\". Find these rules and list them in `conventions`. The program\nappends them to every goal, so every worker sees them; a worker that misses\none breaks code that other work relies on.\n\n**A short goal.** `goal`: the worker also receives the whole request, so do\nnot repeat it. Name the part of the request this unit implements (quote its\nheading or item title), then add only what the request does not say: where\nin the code the change goes, which existing functions or classes to use,\nand decisions this unit shares with others. Keep it under 800 characters.\nA specification file is not repeated either: no field types or meanings,\nvalidation rules, defaults, return formats or error codes in `goal`. Point\nto its sections with `SPEC.md#Heading` in `context_files`; the worker\nreceives those sections.\n\n## Output format\n\nFinish with your description as the last ```json code block in your final\nanswer. Earlier text and code blocks are ignored; only the last ```json block\nis read.\n\n```json\n{\n  \"conventions\": [\"A rule every unit must follow.\"],\n  \"units\": [\n    {\n      \"id\": \"A\",\n      \"item\": \"1\",\n      \"title\": \"Short name\",\n      \"goal\": \"The part of the request, then where in the code it goes.\",\n      \"size\": 150,\n      \"edits\": [\n        {\"file\": \"pkg/module.py\", \"kind\": \"logic\",\n         \"symbols\": [\"pkg/module.py::Name\"], \"lines\": 120, \"standalone\": false},\n        {\"file\": \"pkg/__init__.py\", \"kind\": \"registration\",\n         \"symbols\": [\"pkg/__init__.py::Name\"], \"lines\": 1, \"note\": \"export Name from pkg\"}\n      ],\n      \"create\": [\"tests/test_name.py\"],\n      \"provides\": [\"pkg/module.py::Name\", \"pkg/__init__.py::Name\"],\n      \"uses\": [{\"symbol\": \"pkg/__init__.py::Name\", \"need\": \"interface\"},\n               {\"symbol\": \"pkg/store.py::Store.total\", \"need\": \"behavior\",\n                \"why\": \"The tests check the totals Store.total computes.\"}],\n      \"tests\": [\"tests/test_name.py\"],\n      \"context_files\": [\"README.md\"]\n    }\n  ],\n  \"together\": [{\"units\": [\"A\", \"B\"], \"reason\": \"Why one cannot stand without the other.\"}]\n}\n```\n\nField rules:\n\n- `conventions`: the repository's rules, one short sentence each; empty if\n  there are none.\n- `id`: unique; letters, digits, `_` and `-`. `item`: the id of the draft\n  item the unit belongs to. `title`: a few words.\n- `size`: the number of lines the unit adds or changes, tests included.\n- `edits`: changes to existing files (or to a new file that another unit\n  creates, see `create`), one entry per file. `kind` is\n  `logic` or `registration`. `symbols`: for `logic`, the classes and\n  functions changed or added (so that two units changing the same function\n  can be recognised); for `registration`, the registered names, written as\n  symbols of the file they are registered in (`pkg/__init__.py::Name`).\n  For a change inside a class, name the member (`path.py::Class.method`,\n  `path.py::Class.field`), not the class. Name the class itself only when the\n  whole class is new or rewritten.\n  Every symbol of an edit is in that edit's file. `lines`: how many lines of\n  that file change. `standalone`: only for `logic` (see above). `note`: for\n  `registration`, what it registers.\n- `create`: new files, tests included. They must not exist yet, and each new\n  file is created by exactly one unit. When several units add code to the\n  same new file, one unit lists it in `create` and the others list it in\n  `edits`, with the symbols they add.\n- `provides`: each symbol is in a file of the unit's `edits` or `create`; a\n  registered name is also in the `symbols` of its registration edit.\n- `uses`: each symbol is provided by some unit (this unit's registered\n  names included); `need` is `\"interface\"` or `\"behavior\"`. `why` is\n  required when `need` is `\"behavior\"`: one sentence naming the result that\n  only the provider's real code produces.\n- `tests`: the unit's own test files, each in its `create` or `edits`.\n  Empty when the unit has no behaviour that can be observed on its own (pure\n  wiring).\n- `context_files`: context for the worker; each path must exist or be\n  created by a unit. Use `SPEC.md#Exact heading` for the sections the unit\n  needs (several headings from one file are allowed); headings must match\n  exactly, without the Markdown `#` prefix. Python files outside the unit's\n  own files are given as signatures and docstrings only.\n- `together`: optional; each entry names existing units and gives a reason.\n- Paths are relative to the repository root and use `/`. Symbols are\n  `path/to/file.py::Name` or `path/to/file.py::Class.method` (only `.py`\n  files); a class attribute or dataclass field is `path/to/file.py::Class.field`.\n- Optional fields may be left out; lists default to empty.\n\n## Example\n\nA toy example, unrelated to your request. Request: \"Let readers rate\nrecipes, list the best-rated recipes, export a shopping list, and add a\ncommand line for rating and for the best-rated list.\" The draft items, from\nthe request alone:\n\n- 1: **Star ratings**. Readers rate a recipe from one to five stars.\n- 2: **Best-rated list**. The book lists recipes by their average rating.\n- 3: **Shopping-list export**. Export the ingredients of chosen recipes as\n  one shopping list.\n- 4: **Command line**. `recipes rate` and `recipes best` commands.\n\nThe outline shows `recipes/models.py` (`Recipe`), `recipes/book.py` (the\n`RecipeBook` facade) and `recipes/__init__.py`, which exports the public\nfunctions. The README says that recipes are saved and loaded only through\n`RecipeBook`, and that `RecipeBook` takes an injected `clock`.\n\n```json\n{\n  \"conventions\": [\n    \"Recipes are saved and loaded only through RecipeBook; no module reads or writes the storage files directly.\",\n    \"The current time comes only from RecipeBook's injected clock: a function that needs it takes a `now` argument from its caller.\"\n  ],\n  \"units\": [\n    {\n      \"id\": \"R\", \"item\": \"1\", \"title\": \"Star ratings\",\n      \"goal\": \"\\\"Star ratings\\\": a ratings list on Recipe in recipes/models.py, and rate(book, recipe_id, stars, *, now) in a new recipes/ratings.py that stores through RecipeBook. Tests in tests/test_ratings.py import rate from recipes.\",\n      \"size\": 140,\n      \"edits\": [\n        {\"file\": \"recipes/models.py\", \"kind\": \"logic\", \"symbols\": [\"recipes/models.py::Recipe.ratings\"], \"lines\": 15, \"standalone\": true},\n        {\"file\": \"recipes/__init__.py\", \"kind\": \"registration\", \"symbols\": [\"recipes/__init__.py::rate\"], \"lines\": 1, \"note\": \"export rate from recipes\"}\n      ],\n      \"create\": [\"recipes/ratings.py\", \"tests/test_ratings.py\"],\n      \"provides\": [\"recipes/models.py::Recipe.ratings\", \"recipes/ratings.py::rate\", \"recipes/__init__.py::rate\"],\n      \"uses\": [{\"symbol\": \"recipes/__init__.py::rate\", \"need\": \"interface\"}],\n      \"tests\": [\"tests/test_ratings.py\"],\n      \"context_files\": [\"SPEC.md#Star ratings\", \"recipes/book.py\"]\n    },\n    {\n      \"id\": \"B\", \"item\": \"2\", \"title\": \"Best-rated list\",\n      \"goal\": \"\\\"Best-rated list\\\": RecipeBook.best_rated in recipes/book.py, ranking by the mean of Recipe.ratings. Tests in tests/test_best_rated.py build rated recipes themselves.\",\n      \"size\": 90,\n      \"edits\": [\n        {\"file\": \"recipes/book.py\", \"kind\": \"logic\", \"symbols\": [\"recipes/book.py::RecipeBook.best_rated\"], \"lines\": 40, \"standalone\": false}\n      ],\n      \"create\": [\"tests/test_best_rated.py\"],\n      \"provides\": [\"recipes/book.py::RecipeBook.best_rated\"],\n      \"uses\": [{\"symbol\": \"recipes/models.py::Recipe.ratings\", \"need\": \"interface\"}],\n      \"tests\": [\"tests/test_best_rated.py\"],\n      \"context_files\": [\"SPEC.md#Best-rated list\"]\n    },\n    {\n      \"id\": \"S\", \"item\": \"3\", \"title\": \"Shopping-list export\",\n      \"goal\": \"\\\"Shopping-list export\\\": shopping_list(book, recipe_ids) in a new recipes/shopping.py. Tests in tests/test_shopping.py import it from recipes.shopping.\",\n      \"size\": 120,\n      \"edits\": [\n        {\"file\": \"recipes/__init__.py\", \"kind\": \"registration\", \"symbols\": [\"recipes/__init__.py::shopping_list\"], \"lines\": 1, \"note\": \"export shopping_list from recipes\"}\n      ],\n      \"create\": [\"recipes/shopping.py\", \"tests/test_shopping.py\"],\n      \"provides\": [\"recipes/shopping.py::shopping_list\", \"recipes/__init__.py::shopping_list\"],\n      \"tests\": [\"tests/test_shopping.py\"],\n      \"context_files\": [\"SPEC.md#Shopping-list export\"]\n    },\n    {\n      \"id\": \"C\", \"item\": \"4\", \"title\": \"Command line\",\n      \"goal\": \"\\\"Command line\\\": a new recipes/cli.py with the rate and best commands. rate calls recipes.rate with now from the book's clock; its tests use a fake rate. The best command's tests check the printed ranking of real ratings. Tests in tests/test_cli.py.\",\n      \"size\": 160,\n      \"create\": [\"recipes/cli.py\", \"tests/test_cli.py\"],\n      \"provides\": [\"recipes/cli.py::main\"],\n      \"uses\": [\n        {\"symbol\": \"recipes/__init__.py::rate\", \"need\": \"interface\"},\n        {\"symbol\": \"recipes/book.py::RecipeBook.best_rated\", \"need\": \"behavior\",\n         \"why\": \"C's tests check the scores best_rated computes from stored ratings\"}\n      ],\n      \"tests\": [\"tests/test_cli.py\"],\n      \"context_files\": [\"SPEC.md#Command line\"]\n    }\n  ]\n}\n```\n\nWhat the facts say, and why:\n\n- R registers `rate` in `recipes/__init__.py`, and its own tests import\n  `rate` through that name, so R lists `recipes/__init__.py::rate` in `uses`.\n  C also uses that name. Both only call `rate`, so `\"interface\"` is enough.\n- S registers `shopping_list`, but nobody imports it through the package:\n  S's tests import it from `recipes.shopping`.\n- B only reads the `Recipe.ratings` field, and its tests build rated\n  recipes themselves, so it says `\"interface\"`.\n- C's tests check the scores `best_rated` computes from stored ratings, a\n  result only B's real code produces, so C says `\"behavior\"` and names that\n  result in `why`.\n- R's change to `Recipe` adds one field with only the existing code, so it\n  is `standalone`; B's ranking reads that new field, so it is not.\n- R and B are not listed `together`: B can be written and tested with\n  recipes it rates itself. `together` is only for units that cannot be\n  written or tested apart even with a fake, which is rare.\n\n# The request\n\nAdd job cancellation to the toy queue.\n\n# Draft items\n\nThe pieces of work in the request, listed from the request text alone. Every unit belongs to one of them (`item`).\n\n- S: **item S**. achieve S\n- R: **item R**. achieve R\n\n# Repository\n\nThe repository is checked out in your working directory. Its source files are in the outline below; its other files:\n\n- README.md\n- tests/test_basic.py\n\n# Repository outline\n\nLevel 1 lists every source file; level 2 gives the signatures, methods, fields and line numbers of some files only (those the request names, those that define a name the request uses, and the files they import or that import them). Read any other file's definitions with read_file when you need them.\n\n## Level 1: every source file\n\n- broken.py (2 lines): (could not be parsed)\n- models.py (20 lines): JobStatus, Job, Config\n- runner.py (11 lines): run_loop()\n- store.py (16 lines): JobStore\n\n## Level 2: details of some files\n\n(no file was chosen)\n",
+        "repo_guard": true,
+        "timeout_s": 1800.0
+      }
+    ]
+  }
+}

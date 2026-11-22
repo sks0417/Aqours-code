@@ -825,7 +825,7 @@ python -m aqours_code.taskgraph plan <request.md> --repo <path> --out <graph.jso
     [--planner v3|v2] [--ablate p1,p2,p3,p4]
     [--final-check "python -m pytest -q tests"] [--timeout 1800] [--request-id <id>]
     [--fast-path-lines 500] [--no-fast-path] [--no-merge] [--outline two-level|full]
-    [--max-calls 150] [--max-input-tokens 6000000] [--max-time 2400]
+    [--max-calls 150] [--max-input-tokens 6000000] [--max-time 2400] [--gate]
 ```
 
 `--planner v3` (the default, `planner_version` `planner-v3.2`) is described in
@@ -862,6 +862,51 @@ no answer to check: the plan stops at once with an `AGENT` error (or
 `LIMIT`, when a plan limit ended the round) naming the step and round, the
 reason, and the calls and tokens used so far. Step 1 is not attempted again
 either. A revision round is only for an answer the model gave.
+
+**The split gate (`--gate`, v3 only, off by default).** With `--gate` the
+[split gate](#the-split-gate-gate) decides after Step 1 whether the request
+is planned at all, instead of the fast path (`--fast-path-lines` is then not
+used, and the report's `fast_path` says it was replaced by the gate):
+
+1. Step 1 runs once, as without the gate.
+2. The gate takes that draft (it is not drafted again), makes its one
+   location call through the same child process with no file tools, and
+   decides with its rule of three zones.
+3. `split`: Step 2 and everything after it run as usual on the same draft.
+   `single`: there is no Step 2; the plan writes the single-agent graph and
+   ends. That graph is the one of the [`single` command](#generating-a-single-agent-control)
+   (one `solve` node, any file, the whole request, the same
+   `--final-check` handling), except for three things: its goal has a
+   section *Where to look (from a quick look at the repository; not
+   verified)* before the closing sentence about tests, its
+   `planner_version` is `planner-v3.2+gate-v2`, and its `revision_log` gives
+   the gate's decision, zone and reason.
+4. A failed gate (the location call failed, or its answer cannot be read)
+   stops the plan with a `GATE` error (`LIMIT` when a plan limit ended it),
+   and no graph is written: the plan never quietly falls back to splitting or
+   to a single agent.
+
+The *Where to look* section lists, for each feature, the files the gate
+located to modify and to read: one line per feature, titles and paths only,
+no way of implementing anything, at most 1,500 characters (lines that do not
+fit are left out and counted). It is a starting point for the agent, not a
+plan: the gate made it from the outline without reading any code, so the
+section says that the files may be incomplete or wrong and must be checked.
+
+The gate's cost is part of the plan's cost. Its call runs within the plan's
+limits (`--max-calls`, `--max-input-tokens`, `--max-time`; it gets one call
+and what is left of the tokens and time), and the report counts it as a
+stage of its own: `stage_totals.gate`, included in `totals`, `gate_rounds`,
+and a `round_usage` entry with `step` `gate`. The report's `gate` field has
+the decision, zone and reason, M, W (and the compaction trigger it came
+from), the concentration, each feature's files, the call's tokens and the
+path of the gate's full output, `<graph.json>.gate.json` (the format of
+`gate --out`). The terminal shows the gate's line after Step 1's
+(`gate: split (clear_split): ...`), the gate's call in the usage lines, and
+for a single ends with `wrote single-agent graph (gate: single)`. Without
+`--gate`, `plan` is exactly as before: `test_plan_without_gate.py` compares
+its prompts, output, report and graph with those of the code before
+`--gate` existed.
 
 Planner v2 builds the graph in the three steps of the project proposal: a
 draft from the request alone, grounding in the code, and a rule-based
@@ -1771,8 +1816,9 @@ python -m aqours_code.taskgraph gate --from-report <graph.json.report.json> [--j
 ```
 
 decides "split or single" with few tokens, before any full plan: only a
-`split` would be worth step 2 of the planner (`gate.py`). It plans nothing,
-and neither `plan` nor its fast path calls it yet. The repository is cloned
+`split` would be worth step 2 of the planner (`gate.py`). It plans nothing;
+`plan --gate` runs the same gate inside a plan
+([above](#planner)), and `plan` without `--gate` does not. The repository is cloned
 at the base commit as in `plan`: the HEAD of `--repo`, or with
 `--from-report` the `base_commit` of that plan.
 

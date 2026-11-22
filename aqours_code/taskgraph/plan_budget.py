@@ -16,6 +16,9 @@ when a limit is reached.
 A round whose agent failed (``worker_error``, ``worker_timeout``,
 ``model_budget``) gave no answer, so it is not revised: the plan stops with an
 error naming the step and round, the reason, and the calls and tokens used.
+
+``plan --gate`` makes one more model call between the steps, the gate's
+location call; it is counted as step :data:`GATE_STEP`, round 1.
 """
 from __future__ import annotations
 
@@ -30,6 +33,14 @@ DEFAULT_MAX_INPUT_TOKENS = 6_000_000
 DEFAULT_MAX_PLAN_S = 2400.0
 # No round is started with less time than this left.
 MIN_ROUND_S = 60.0
+# The step of the gate's location call (``plan --gate``), between steps 1 and 2.
+GATE_STEP = "gate"
+GATE_ROUND = "the gate's location call"
+
+
+def round_name(step, number: int) -> str:
+    """``step 2 round 1``, or the gate's location call."""
+    return GATE_ROUND if step == GATE_STEP else f"step {step} round {number}"
 
 # limit -> (unit in messages, option of ``plan``)
 LIMITS = {"model_calls": ("model calls", "--max-calls"),
@@ -122,6 +133,10 @@ class PlanBudget:
                         "message": message}
         return Issue(code, [], message)
 
+    def stop(self, code: str, step, number: int, reason: str, message: str) -> Issue:
+        """Record that the plan stops after a round for a reason of its own (the gate)."""
+        return self._stop(code, step, number, reason, message)
+
     def limit_issue(self, step: int, number: int) -> Issue | None:
         """Before a round: a LIMIT error when a limit leaves no room for it."""
         limit = self.reached()
@@ -129,7 +144,7 @@ class PlanBudget:
             return None
         return self._stop(
             "LIMIT", step, number, limit,
-            f"planning stopped before step {step} round {number}: "
+            f"planning stopped before {round_name(step, number)}: "
             f"{self.limits.text(limit)} was reached. So far: {self.so_far()}. "
             f"Raise it with {LIMITS[limit][1]}.")
 
@@ -145,10 +160,16 @@ class PlanBudget:
         if limit:
             return self._stop(
                 "LIMIT", step, number, limit,
-                f"planning stopped in step {step} round {number}: {self.limits.text(limit)} "
+                f"planning stopped in {round_name(step, number)}: {self.limits.text(limit)} "
                 f"was reached before the planner answered. So far: {self.so_far()}. "
                 f"Raise it with {LIMITS[limit][1]}.")
         reason = result.reason or "worker_error"
+        if step == GATE_STEP:
+            return self._stop(
+                "GATE", step, number, reason,
+                f"planning stopped: {GATE_ROUND} failed ({reason}): {result.error[-2000:]}. "
+                f"Without the gate's decision the plan does not go on. So far: "
+                f"{self.so_far()}.")
         return self._stop(
             "AGENT", step, number, reason,
             f"planning stopped: the planner agent of step {step} round {number} failed "

@@ -13,6 +13,12 @@
 
 v3 does not run the merges M1 and M2 of v2 (:mod:`revise`).
 
+``plan --gate`` (``PlanOptions.gate``) runs the split gate (:mod:`gate`)
+between Steps 1 and 2 instead of the fast path: one location call on Step 1's
+draft. ``split`` goes on to Steps 2 and 3 with the same draft; ``single``
+writes the single-agent graph with the gate's hints in its goal and stops; a
+failed gate stops the plan with an error.
+
 :func:`run_resynth` (the ``resynth`` command) runs Step 3 again on the facts
 saved in a v3 report, without a model: the same facts under other rules or
 another ``--ablate``, at no planning cost. It also reads the report of a
@@ -32,7 +38,9 @@ from . import gitops
 from .affected import TestImports, scan_test_imports
 from .cleanup import remove_tree
 from .facts import Facts, Normalisation, check_facts, read_facts
-from .plan_budget import PlanBudget
+from .gate import (GATE_VERSION, SINGLE, SPLIT, FeatureFiles, GateRun, agent_window,
+                   gate_single_graph, locate_model_budget, plan_report)
+from .plan_budget import GATE_STEP, PlanBudget
 from .outline import Outline, build_outline
 from .outline_levels import (TwoLevelOutline, build_two_level_outline, other_files_list,
                              two_level_instructions)
@@ -44,7 +52,7 @@ from .repo_index import RepoIndex, build_index
 from .schema import Graph, dump_graph, load_graph
 from .synthesize import FactsConflict, Synthesis, SynthesisError, synthesize
 from .validate import Issue, validate
-from .workers import Worker, WorkerRequest, write_json_atomic
+from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
 FACTS_PROMPT_PATH = Path(__file__).resolve().parent / "planner_facts_prompt.md"
 
@@ -207,6 +215,10 @@ class _V3Run:
     saved_outline: dict | None = None
     # plan: the limits and what the rounds used (resynth makes no model call)
     budget: PlanBudget | None = None
+    # plan --gate: the gate replaces the fast path; its call, report field and output
+    gate: bool = False
+    gate_rounds: list[dict] = field(default_factory=list)
+    gate_report: dict | None = None
 
     def outline_fields(self) -> dict:
         """The report's fields about the outline and the file list of the prompt."""
@@ -234,9 +246,17 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         dump_graph(graph, run.out)
     else:
         run.out.unlink(missing_ok=True)  # never leave a stale graph from an earlier run
-    stage_totals = {"stage1": _totals(run.stage1), "stage2": _totals(run.rounds)}
+    stage_totals = {"stage1": _totals(run.stage1),
+                    **({"gate": _totals(run.gate_rounds)} if run.gate else {}),
+                    "stage2": _totals(run.rounds)}
     goal_chars = {node.id: len(node.goal) for node in graph.nodes} if graph is not None else {}
     built = synthesis is not None and success
+    fast_path = {"taken": run.fast_path, "estimated_changed_lines": run.estimate,
+                 "threshold": run.threshold}
+    if run.gate:
+        fast_path.update(replaced_by="gate",
+                         note="plan --gate: the gate decides instead of the fast path; "
+                              "--fast-path-lines is not used")
     report = {
         "planner": "v3",
         "planner_version": PLANNER_VERSION,
@@ -250,9 +270,10 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         "ablate": sorted(run.ablate),
         "draft_items": run.draft_items,
         "estimated_changed_lines": run.estimate,
-        "fast_path": {"taken": run.fast_path, "estimated_changed_lines": run.estimate,
-                      "threshold": run.threshold},
+        "fast_path": fast_path,
+        **({"gate": run.gate_report} if run.gate else {}),
         "stage1": run.stage1,
+        **({"gate_rounds": run.gate_rounds} if run.gate else {}),
         "revision_rounds": max(len(run.rounds) - 1, 0),
         "revision_reasons": [{"round": entry["round"],
                               "codes": list(dict.fromkeys(issue["code"]
@@ -286,7 +307,7 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         "normalisations": [{"round": entry["round"], **fix} for entry in run.rounds
                            for fix in entry.get("normalisations", [])],
         "rounds": run.rounds,
-        "totals": {key: stage_totals["stage1"][key] + stage_totals["stage2"][key]
+        "totals": {key: sum(stage[key] for stage in stage_totals.values())
                    for key in ("model_calls", "input_tokens", "output_tokens")},
         "stage_totals": stage_totals,
         **(run.budget or PlanBudget(started=started)).report(),
@@ -298,11 +319,84 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
     return PlanResult(success=success, graph=graph, report=report, report_path=report_path)
 
 
+def gate_path_for(out: Path) -> Path:
+    """``<out>.gate.json`` next to ``out``: the gate's output of ``plan --gate``."""
+    return out.with_name(f"{out.name}.gate.json")
+
+
+def _gate_stage(run: _V3Run, options: PlanOptions, request: str, clone: Path,
+                index: RepoIndex, items: list[DraftItem], worker: Worker,
+                log_dir: Path, started: float) -> str | None:
+    """The gate on Step 1's draft: one location call within the plan's limits.
+
+    Returns ``single`` or ``split``, or None when the gate failed (the error
+    is in ``run.errors``). Writes the gate's output next to the graph.
+    """
+    budget = run.budget
+    gate_run = GateRun(agent_window())
+    gate_run.measure(clone, index)
+    prompt = gate_run.build_prompt(request, items)
+    errors: list[Issue] = []
+    result: WorkerResult | None = None
+    stop = budget.limit_issue(GATE_STEP, 1)
+    if stop is not None:
+        errors = [stop]
+    else:
+        fields = budget.request_fields(options.timeout_s)
+        result = worker.run(WorkerRequest(
+            node_id="gate-locate", attempt=1, prompt=prompt.text, workspace=clone,
+            log_dir=log_dir / "gate", repo_guard=True, timeout_s=fields["timeout_s"],
+            model_budget=locate_model_budget(fields["model_budget"])))
+        budget.add(GATE_STEP, 1, result)
+        if not result.ok:
+            errors = [budget.failure_issue(GATE_STEP, 1, result)]
+        gate_run.read_answer(result, items, index, clone)
+        if result.ok and gate_run.errors:
+            problems = "; ".join(issue.message for issue in gate_run.errors)
+            errors = [budget.stop("GATE", GATE_STEP, 1, "unreadable_answer",
+                                  f"planning stopped: the gate's answer could not be read "
+                                  f"({problems}). Without the gate's decision the plan does "
+                                  f"not go on. So far: {budget.so_far()}.")]
+        run.gate_rounds.append({"round": 1, "answer": result.final_answer,
+                                "errors": [_issue_dict(issue) for issue in errors],
+                                "agent": _agent_dict(result)})
+    gate_run.errors = list(errors)
+    path = gate_path_for(run.out)
+    data = {
+        "gate_version": GATE_VERSION,
+        "model": run.info.model,
+        "request": run.request,
+        "repo": str(run.repo),
+        "base_commit": run.info.base_commit,
+        "plan": str(run.out),
+        "out": str(path),
+        "logs": str(log_dir / "gate"),
+        **gate_run.output_fields(),
+        "draft": {"source": "plan step 1", "path": None,
+                  "estimated_changed_lines": run.estimate, "items": run.draft_items,
+                  "usage": _totals(run.stage1), "rounds": []},
+        "totals": gate_run.usage(),
+        "duration_s": round(time.monotonic() - started, 3),
+    }
+    write_json_atomic(path, data)
+    run.gate_report = plan_report(data, path)
+    if errors:
+        run.errors = errors
+        return None
+    return gate_run.decision["decision"]
+
+
 def run_plan_v3(options: PlanOptions, worker: Worker,
-                draft_stage_worker: Worker | None = None) -> PlanResult:
-    """Run planner v3; write the graph and the report."""
+                draft_stage_worker: Worker | None = None,
+                gate_worker: Worker | None = None) -> PlanResult:
+    """Run planner v3; write the graph and the report.
+
+    With ``options.gate`` the gate decides after Step 1 (``gate_worker``,
+    default ``draft_stage_worker``, makes its call).
+    """
     started = time.monotonic()
     draft_stage_worker = draft_stage_worker or worker
+    gate_worker = gate_worker or draft_stage_worker
     request = options.request_path.read_text(encoding="utf-8")
     repo = options.repo.resolve()
     out = options.out
@@ -315,7 +409,11 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
                      final_checks=list(options.final_checks),
                      model=str(model) if model is not None else None)
     run = _V3Run(info, str(options.request_path), repo, out, frozenset(options.ablate),
-                 threshold=options.fast_path_lines, budget=options.budget(started))
+                 threshold=None if options.gate else options.fast_path_lines,
+                 budget=options.budget(started), gate=options.gate)
+    if options.gate:
+        run.gate_report = {"ok": False, "errors": [], "decision": None,
+                           "note": "the gate did not run: step 1 gave no draft"}
     budget = run.budget
     tmp = Path(tempfile.mkdtemp(prefix="tg-plan-"))
     try:
@@ -338,11 +436,22 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
             run.draft_items = [item.model_dump() for item in draft_items.items]
             run.estimate = draft_items.estimated_changed_lines
             run.fast_path = run.threshold is not None and run.estimate < run.threshold
+        gate_decision: str | None = None
+        if options.gate and draft_items is not None:
+            gate_decision = _gate_stage(run, options, request, clone, index, draft_items.items,
+                                        gate_worker, log_dir, started)
         if run.fast_path:
             run.graph = fast_path_graph(info, repo, run.estimate, run.threshold,
                                         PLANNER_VERSION)
             run.errors = list(validate(run.graph, index).errors)
-        elif draft_items is not None:
+        elif gate_decision == SINGLE:
+            features = [FeatureFiles(feature["id"], feature["title"], feature["modify"],
+                                     feature["reference"])
+                        for feature in run.gate_report["features"]]
+            run.graph = gate_single_graph(info, repo, features, run.gate_report,
+                                          f"{PLANNER_VERSION}+{GATE_VERSION}")
+            run.errors = list(validate(run.graph, index).errors)
+        elif draft_items is not None and (not options.gate or gate_decision == SPLIT):
             revision: FactsRevision | None = None
             for number in range(options.max_revisions + 1):
                 stop = budget.limit_issue(2, number + 1)

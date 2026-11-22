@@ -3,7 +3,8 @@
 ``python -m aqours_code.taskgraph gate`` asks whether a request is worth the
 full plan (step 2 of the planner) or one agent should do it. It calls the
 model once (plus step 1 when no draft can be reused) and plans nothing.
-Neither ``plan`` nor its fast path uses it yet.
+``plan --gate`` runs the same gate (:class:`GateRun`) on its own Step 1 draft
+(:mod:`planner_v3`); ``plan`` without ``--gate`` does not.
 
 Levels, from cheap to less cheap:
 
@@ -64,10 +65,12 @@ from .outline import _File, _read, is_source_file
 from .outline_levels import (COMMON_DEFINED_IN, MIN_NAME_CHARS, _path_forms, defined_names,
                              level1_line, module_name)
 from .plan_budget import PlanBudget
-from .planner import (DRAFT_ATTEMPTS, DraftError, DraftItem, DraftItems, _agent_dict,
-                      _issue_dict, extract_json_block, file_sizes, parse_items,
-                      report_path_for, run_draft_stage)
+from .planner import (DRAFT_ATTEMPTS, DraftError, DraftItem, DraftItems, GraphInfo,
+                      _agent_dict, _generator, _issue_dict, extract_json_block, file_sizes,
+                      parse_items, report_path_for, run_draft_stage)
 from .repo_index import RepoIndex, build_index
+from .schema import Graph
+from .single import SINGLE_INSTRUCTION, single_graph
 from .validate import Issue
 from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
 
@@ -864,6 +867,109 @@ def _draft(options: GateOptions, request: str, clone: Path, index: RepoIndex,
     return GateDraft(items, "step1", None, usage, rounds, list(errors))
 
 
+@dataclass
+class GateRun:
+    """The gate's work on one checkout: sizes, the location call and the decision.
+
+    ``gate`` and ``plan --gate`` share it: :meth:`measure` reads level 0,
+    :meth:`build_prompt` searches and writes the location prompt, the caller
+    makes the call, and :meth:`read_answer` checks the answer and decides.
+    """
+
+    window: Window
+    input_limit: int = LOCATE_INPUT_LIMIT
+    files: list[_File] = field(default_factory=list)
+    sizes: dict[str, int] = field(default_factory=dict)
+    level0: dict = field(default_factory=dict)
+    searches: dict[str, FeatureSearch] = field(default_factory=dict)
+    prompt: LocatePrompt | None = None
+    result: WorkerResult | None = None
+    located: LocateAnswer | None = None
+    decision: dict = field(default_factory=dict)
+    errors: list[Issue] = field(default_factory=list)
+
+    def measure(self, clone: Path, index: RepoIndex) -> None:
+        """Level 0: the characters of every source file of the checkout."""
+        self.files = [_read(clone, path) for path in sorted(index.files)
+                      if is_source_file(path)]
+        self.sizes = {file.path: file_chars(clone, file.path) for file in self.files}
+        self.level0 = {"source_files": len(self.files), "chars": sum(self.sizes.values()),
+                       "tokens": sum(estimate_tokens(chars) for chars in self.sizes.values()),
+                       "oversized": [{"path": path, "tokens": estimate_tokens(chars)}
+                                     for path, chars in self.sizes.items()
+                                     if estimate_tokens(chars) > self.window.tokens],
+                       "sizes": self.sizes}
+
+    def build_prompt(self, request: str, items: list[DraftItem]) -> LocatePrompt:
+        """The program search and the location prompt."""
+        definers, modules = definitions(self.files), module_paths(self.files)
+        self.searches = {item.id: search_feature(f"{item.title}\n{item.description}",
+                                                 self.files, definers, modules)
+                         for item in items}
+        self.prompt = build_locate_prompt(request, items, self.files, self.searches,
+                                          self.input_limit)
+        return self.prompt
+
+    def read_answer(self, result: WorkerResult, items: list[DraftItem], index: RepoIndex,
+                    clone: Path) -> None:
+        """Check the answer of a call that answered (``result.ok``) and decide.
+
+        A format problem goes to :attr:`errors` and leaves no decision.
+        """
+        self.result = result
+        if not result.ok:
+            return
+        try:
+            self.located = parse_locations(result.final_answer, items, index)
+        except DraftError as exc:
+            self.errors += exc.issues
+            return
+        involved = {path for feature in self.located.features
+                    for path in feature.modify + feature.reference}
+        tokens = {path: estimate_tokens(self.sizes[path] if path in self.sizes
+                                        else file_chars(clone, path))
+                  for path in involved}
+        self.decision = decide(self.located.features, tokens, w=self.window.tokens)
+
+    def usage(self) -> dict:
+        """Model calls and tokens of the location call."""
+        return _usage(self.result if self.result is not None else WorkerResult(ok=False))
+
+    def output_fields(self) -> dict:
+        """The fields of the gate output about the location and the decision."""
+        decision, located, result, prompt = self.decision, self.located, self.result, self.prompt
+        usage = self.usage()
+        return {
+            "ok": bool(decision),
+            "errors": [_issue_dict(issue) for issue in self.errors],
+            "decision": decision.get("decision"),
+            "zone": decision.get("zone"),
+            "reason": decision.get("reason"),
+            "window": self.window.to_dict(),
+            "constants": {"B0": B0, "W_at_default_trigger": W_AT_DEFAULT_TRIGGER,
+                          "default_compact_trigger": DEFAULT_COMPACT_TRIGGER,
+                          "clear_single_concentration": str(CLEAR_SINGLE_CONCENTRATION),
+                          "clear_split_concentration": str(CLEAR_SPLIT_CONCENTRATION),
+                          "chars_per_token": CHARS_PER_TOKEN, "max_reference": MAX_REFERENCE,
+                          "locate_input_limit": self.input_limit, "fixed": True},
+            "material": decision.get("material"),
+            "features": decision.get("features", []),
+            "groups": decision.get("groups", []),
+            "shared": decision.get("shared"),
+            "concentration": decision.get("concentration"),
+            "oversized": decision.get("oversized", []),
+            "dropped": located.dropped if located is not None else [],
+            "notes": located.notes if located is not None else [],
+            "search": {key: value.to_dict() for key, value in self.searches.items()},
+            "locate": {**(prompt.report() if prompt is not None else {}),
+                       "agent": _agent_dict(result) if result is not None else None,
+                       "input_tokens": usage["input_tokens"],
+                       "output_tokens": usage["output_tokens"],
+                       "answer": result.final_answer if result is not None else None},
+            "level0": self.level0,
+        }
+
+
 def run_gate(options: GateOptions, locate_worker: Worker,
              draft_stage_worker: Worker | None = None) -> GateResult:
     """Run the gate; write ``options.out`` when given.
@@ -879,14 +985,8 @@ def run_gate(options: GateOptions, locate_worker: Worker,
     base = gitops.head(repo, options.base_commit or "HEAD")
     model = locate_worker.describe().get("model")
     window = options.window if options.window is not None else agent_window()
-    errors: list[Issue] = []
+    gate_run = GateRun(window, options.input_limit)
     draft: GateDraft | None = None
-    searches: dict[str, FeatureSearch] = {}
-    prompt: LocatePrompt | None = None
-    result: WorkerResult | None = None
-    located: LocateAnswer | None = None
-    decision: dict = {}
-    level0: dict = {}
     tmp = Path(tempfile.mkdtemp(prefix="tg-gate-"))
     if options.out is not None:
         options.out.parent.mkdir(parents=True, exist_ok=True)
@@ -897,48 +997,28 @@ def run_gate(options: GateOptions, locate_worker: Worker,
         clone = tmp / "repo"
         gitops.clone_for_run(repo, clone, base)
         index = build_index(clone, base)
-        files = [_read(clone, path) for path in sorted(index.files) if is_source_file(path)]
-        sizes = {file.path: file_chars(clone, file.path) for file in files}
-        level0 = {"source_files": len(files), "chars": sum(sizes.values()),
-                  "tokens": sum(estimate_tokens(chars) for chars in sizes.values()),
-                  "oversized": [{"path": path, "tokens": estimate_tokens(chars)}
-                                for path, chars in sizes.items()
-                                if estimate_tokens(chars) > window.tokens],
-                  "sizes": sizes}
+        gate_run.measure(clone, index)
         draft = _draft(options, request, clone, index, draft_stage_worker or locate_worker,
                        log_root / "draft")
-        errors += draft.errors
+        gate_run.errors += draft.errors
         if draft.items is not None:
             items = draft.items.items
-            definers, modules = definitions(files), module_paths(files)
-            searches = {item.id: search_feature(f"{item.title}\n{item.description}", files,
-                                                definers, modules) for item in items}
-            prompt = build_locate_prompt(request, items, files, searches, options.input_limit)
+            prompt = gate_run.build_prompt(request, items)
             result = locate_worker.run(WorkerRequest(
                 node_id="gate-locate", attempt=1, prompt=prompt.text, workspace=clone,
                 log_dir=log_root / "locate", timeout_s=options.timeout_s, repo_guard=True,
                 model_budget=dict(LOCATE_BUDGET)))
             if not result.ok:
-                errors.append(Issue("AGENT", [], f"the location call failed "
-                                                 f"({result.reason or 'worker_error'}): "
-                                                 f"{result.error[-2000:]}"))
-            else:
-                try:
-                    located = parse_locations(result.final_answer, items, index)
-                except DraftError as exc:
-                    errors += exc.issues
-            if located is not None:
-                involved = {path for feature in located.features
-                            for path in feature.modify + feature.reference}
-                tokens = {path: estimate_tokens(sizes[path] if path in sizes
-                                                else file_chars(clone, path))
-                          for path in involved}
-                decision = decide(located.features, tokens, w=window.tokens)
+                gate_run.errors.append(Issue("AGENT", [], f"the location call failed "
+                                                          f"({result.reason or 'worker_error'}): "
+                                                          f"{result.error[-2000:]}"))
+            gate_run.read_answer(result, items, index, clone)
     finally:
         remove_tree(tmp)
-    locate_usage = _usage(result) if result is not None else _usage(WorkerResult(ok=False))
+    locate_usage = gate_run.usage()
     draft_usage = draft.usage if draft is not None and draft.source == "step1" else \
         {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
+    fields = gate_run.output_fields()
     data = {
         "gate_version": GATE_VERSION,
         "model": str(model) if model is not None else None,
@@ -949,41 +1029,126 @@ def run_gate(options: GateOptions, locate_worker: Worker,
         "draft_from": str(options.draft_from) if options.draft_from else None,
         "out": str(options.out) if options.out else None,
         "logs": str(log_root) if options.out else None,
-        "ok": bool(decision),
-        "errors": [_issue_dict(issue) for issue in errors],
-        "decision": decision.get("decision"),
-        "zone": decision.get("zone"),
-        "reason": decision.get("reason"),
-        "window": window.to_dict(),
-        "constants": {"B0": B0, "W_at_default_trigger": W_AT_DEFAULT_TRIGGER,
-                      "default_compact_trigger": DEFAULT_COMPACT_TRIGGER,
-                      "clear_single_concentration": str(CLEAR_SINGLE_CONCENTRATION),
-                      "clear_split_concentration": str(CLEAR_SPLIT_CONCENTRATION),
-                      "chars_per_token": CHARS_PER_TOKEN, "max_reference": MAX_REFERENCE,
-                      "locate_input_limit": options.input_limit, "fixed": True},
-        "material": decision.get("material"),
-        "features": decision.get("features", []),
-        "groups": decision.get("groups", []),
-        "shared": decision.get("shared"),
-        "concentration": decision.get("concentration"),
-        "oversized": decision.get("oversized", []),
-        "dropped": located.dropped if located is not None else [],
-        "notes": located.notes if located is not None else [],
+        **{key: value for key, value in fields.items() if key not in ("search", "locate",
+                                                                      "level0")},
         "draft": draft.report() if draft is not None else None,
-        "search": {key: value.to_dict() for key, value in searches.items()},
-        "locate": {**(prompt.report() if prompt is not None else {}),
-                   "agent": _agent_dict(result) if result is not None else None,
-                   "input_tokens": locate_usage["input_tokens"],
-                   "output_tokens": locate_usage["output_tokens"],
-                   "answer": result.final_answer if result is not None else None},
-        "level0": level0,
+        "search": fields["search"],
+        "locate": fields["locate"],
+        "level0": fields["level0"],
         "totals": {key: draft_usage[key] + locate_usage[key]
                    for key in ("model_calls", "input_tokens", "output_tokens")},
         "duration_s": round(time.monotonic() - started, 3),
     }
     if options.out is not None:
         write_json_atomic(options.out, data)
-    return GateResult(ok=bool(decision), data=data)
+    return GateResult(ok=bool(gate_run.decision), data=data)
+
+
+def locate_model_budget(plan_budget: Mapping | None) -> dict:
+    """The location call's model budget inside a plan: one call, and the plan's limits.
+
+    ``plan_budget`` is what is left of the plan (``PlanBudget.request_fields``),
+    or None when the plan has no limits.
+    """
+    budget = dict(LOCATE_BUDGET)
+    if plan_budget:
+        if plan_budget.get("max_calls") is not None:
+            budget["max_calls"] = min(budget["max_calls"], plan_budget["max_calls"])
+        budget["max_input_tokens"] = plan_budget.get("max_input_tokens")
+    return budget
+
+
+# ── the single-agent graph of plan --gate ──
+
+WHERE_TO_LOOK_TITLE = "Where to look (from a quick look at the repository; not verified)"
+WHERE_TO_LOOK_LIMIT = 1500  # characters of the whole section
+WHERE_TO_LOOK_NOTE = (
+    "Before any planning, a quick automatic look at the repository suggested these files "
+    "for each feature. It is rough: it may miss files or name wrong ones, so check them "
+    "yourself before you rely on them.")
+
+
+def _feature_line(feature: FeatureFiles) -> str:
+    title = " ".join(feature.title.split()) or feature.id
+    parts = []
+    if feature.modify:
+        parts.append(f"modify {', '.join(feature.modify)}")
+    if feature.reference:
+        parts.append(f"read {', '.join(feature.reference)}")
+    return f"- {title}: {'; '.join(parts) if parts else 'no file found'}"
+
+
+def where_to_look(features: list[FeatureFiles], limit: int = WHERE_TO_LOOK_LIMIT) -> str:
+    """The hint section of the single-agent goal: one line per feature, files only.
+
+    At most ``limit`` characters: lines that do not fit are left out and a
+    last line says how many.
+    """
+    head = f"## {WHERE_TO_LOOK_TITLE}\n\n{WHERE_TO_LOOK_NOTE}\n"
+    lines = [_feature_line(feature) for feature in features]
+    text = head + "\n" + "\n".join(lines) if lines else head + "\n- (no feature)"
+    if len(text) <= limit:
+        return text
+    kept: list[str] = []
+    for number, line in enumerate(lines):
+        rest = len(lines) - number - 1
+        cut = f"- ... {rest} more feature(s) left out to keep this section short"
+        candidate = head + "\n" + "\n".join([*kept, line, cut] if rest else [*kept, line])
+        if len(candidate) > limit:
+            break
+        kept.append(line)
+    rest = len(lines) - len(kept)
+    cut = f"- ... {rest} more feature(s) left out to keep this section short"
+    text = head + "\n" + "\n".join([*kept, cut])
+    return text[:limit]
+
+
+def gate_goal(request: str, features: list[FeatureFiles]) -> str:
+    """The single-agent goal with the hint section before the closing instruction."""
+    return f"{request}\n\n{where_to_look(features)}\n\n{SINGLE_INSTRUCTION}"
+
+
+def gate_single_graph(info: GraphInfo, repo: Path, features: list[FeatureFiles],
+                      decision: Mapping, version: str) -> Graph:
+    """The graph of ``plan --gate`` when the gate says single.
+
+    The graph of the ``single`` command (one ``solve`` node, any file, the
+    whole request, the same final checks), with the hint section in the
+    goal, ``planner_version`` ``version`` and the gate's decision in the
+    revision log.
+    """
+    graph = single_graph(info.request, repo, info.final_checks)
+    data = graph.model_dump(mode="json", by_alias=True)
+    data["base_commit"] = info.base_commit
+    data["nodes"][0]["goal"] = gate_goal(info.request, features)
+    data["generator"] = _generator(info, "none", version)
+    data["revision_log"] = [{
+        "action": "other", "nodes": [node["id"] for node in data["nodes"]],
+        "reason": f"gate: {decision['decision']} ({decision['zone']}): {decision['reason']}"}]
+    return Graph.model_validate(data)
+
+
+def plan_report(data: Mapping, output: Path) -> dict:
+    """The ``gate`` field of a plan report: the decision and what it rests on."""
+    material = data.get("material") or {}
+    return {
+        "ok": data.get("ok", False),
+        "errors": data.get("errors", []),
+        "decision": data.get("decision"),
+        "zone": data.get("zone"),
+        "reason": data.get("reason"),
+        "M": material.get("M"),
+        "W": (data.get("window") or {}).get("W"),
+        "window": data.get("window"),
+        "concentration": data.get("concentration"),
+        "features": [{"id": feature["id"], "title": feature["title"],
+                      "modify": [entry["path"] for entry in feature["modify"]],
+                      "reference": [entry["path"] for entry in feature["reference"]]}
+                     for feature in data.get("features") or []],
+        "locate_tokens": {key: (data.get("locate") or {}).get(key) or 0
+                          for key in ("input_tokens", "output_tokens")},
+        "output": str(output),
+    }
 
 
 def locate_worker() -> Worker:
