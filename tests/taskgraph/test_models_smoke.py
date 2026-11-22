@@ -157,11 +157,18 @@ PROBLEM_STDOUT = (
 )
 
 
+LIMITS_128K = {"initial": 128000, "escalated": 128000}
+
+
 def make_run(tmp_path: Path, *, name: str = "run", ops: str = OPS_WITH_MUL,
              tests: str = TESTS_WITH_MUL, trace: list[dict] = HEALTHY_TRACE,
              stdout: str = "> bash\n", status: str = "success", final_ok: bool = True,
-             worker_reason: str = "", with_summary: bool = True) -> Path:
-    """A run directory of the single graph with one attempt of node ``solve``."""
+             worker_reason: str = "", with_summary: bool = True,
+             worker_extra: dict | None = None) -> Path:
+    """A run directory of the single graph with one attempt of node ``solve``.
+
+    ``worker_extra`` replaces fields of ``config["worker"]`` (what describe() reported).
+    """
     base = tmp_path / f"{name}-base"
     commit = smoke.prepare(base)
     run = tmp_path / name
@@ -175,8 +182,10 @@ def make_run(tmp_path: Path, *, name: str = "run", ops: str = OPS_WITH_MUL,
     smoke.git(repo, "commit", "-q", "-am", "tg: merge solve")
     integration = smoke.git(repo, "rev-parse", "HEAD")
 
+    worker = {"worker": "aqours", "model_provider": "fake", "model": "fake-model",
+              "max_tokens": LIMITS_128K, **(worker_extra or {})}
     config = {"base_commit": commit,
-              "worker": {"worker": "aqours", "model_provider": "fake", "model": "fake-model"}}
+              "worker": {key: value for key, value in worker.items() if value is not ...}}
     (run / "config.json").write_text(json.dumps(config), encoding="utf-8")
     (node / "worker_1_config.json").write_text(
         json.dumps({"workspace": str(run / "wt" / "solve")}), encoding="utf-8")
@@ -331,6 +340,9 @@ def test_check_of_a_healthy_run_passes(tmp_path):
         "fake-model", "fake", "fake-model")
     assert result.status == "success"
     assert (result.model_calls, result.input_tokens, result.output_tokens) == (4, 1200, 300)
+    assert result.max_tokens == LIMITS_128K
+    assert ("  output limits      : initial 128000, escalated 128000"
+            in smoke.format_check(result).splitlines())
     assert result.final_check_passed
     assert result.mul_implemented and result.mul_tests == ["test_mul"]
     assert result.changed_files == ["calc/ops.py", "tests/test_ops.py"]
@@ -372,6 +384,19 @@ def test_check_counts_every_problem_in_the_logs(tmp_path):
     assert "escape attempts                       : 2" in report
     assert "the run did not use the model in .env" in report
     assert "Smoke result: FAIL" in report
+
+
+def test_check_shows_limits_that_are_not_recorded_or_invalid(tmp_path):
+    # a run from before the limits were recorded: no worker.max_tokens at all
+    old = make_run(tmp_path, name="old", worker_extra={"max_tokens": ...})
+    report = smoke.format_check(smoke.check(old, tmp_path / "missing.env"))
+    assert ("  output limits      : not recorded (config.json of the run has no "
+            "worker.max_tokens)") in report.splitlines()
+    error = "AQOURS_CODE_MAX_TOKENS must be a positive whole number, got '0'"
+    bad = make_run(tmp_path, name="bad", worker_extra={"max_tokens": None,
+                                                       "max_tokens_error": error})
+    report = smoke.format_check(smoke.check(bad, tmp_path / "missing.env"))
+    assert f"  output limits      : invalid: {error}" in report.splitlines()
 
 
 def test_check_of_a_run_that_did_not_finish(tmp_path):

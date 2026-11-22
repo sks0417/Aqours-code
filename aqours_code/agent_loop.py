@@ -19,6 +19,7 @@ from .model_budget import (
     finalization_reserve_active,
 )
 from .runtime import AgentRuntime
+from . import config as _config
 from .model_api import (
     assistant_message_from_response,
     effective_initial_max_tokens,
@@ -1242,10 +1243,14 @@ def agent_loop(
         runtime.config.model_provider
         if runtime is not None else MODEL_PROVIDER
     )
+    # AQOURS_CODE_MAX_TOKENS / AQOURS_CODE_ESCALATED_MAX_TOKENS; an invalid
+    # setting stops here, before any model call.
+    configured_initial, configured_escalated = (
+        _config.configured_max_tokens())
     max_tokens = effective_initial_max_tokens(
         provider_name,
         state.current_model,
-        configured_default_max_tokens=DEFAULT_MAX_TOKENS,
+        configured_default_max_tokens=configured_initial,
     )
     # Todos are scoped to one user/cron turn. Incomplete items remain available
     # through every context compaction inside this loop.
@@ -1445,7 +1450,7 @@ def agent_loop(
                     provider_name,
                     state.current_model,
                     current_max_tokens=max_tokens,
-                    configured_escalated_max_tokens=ESCALATED_MAX_TOKENS,
+                    configured_escalated_max_tokens=configured_escalated,
                 )
                 if escalated_max_tokens > max_tokens:
                     max_tokens = escalated_max_tokens
@@ -1469,7 +1474,7 @@ def agent_loop(
         max_tokens = effective_initial_max_tokens(
             provider_name,
             state.current_model,
-            configured_default_max_tokens=DEFAULT_MAX_TOKENS,
+            configured_default_max_tokens=configured_initial,
         )
         state.has_escalated = False
         messages.append(assistant_message_from_response(response))

@@ -11,7 +11,8 @@ commit is the same on every platform; it prints the commit.
 
 ``check`` reads a finished (or broken) ``taskgraph run`` directory and prints
 what the smoke test is for: the model in ``.env`` and the one the run used,
-the run status, model calls and tokens, whether the final check passed,
+the output limits of the run (initial and escalated max_tokens), the run
+status, model calls and tokens, whether the final check passed,
 whether ``mul`` was implemented and tested, and how often the logs show an
 HTTP error on a model request, a reply cut at ``max_tokens``, a tool input
 that did not parse (``_raw``), and an escape attempt. It ends with the four
@@ -357,6 +358,8 @@ class Check:
     env_model: str | None
     run_provider: str | None
     run_model: str | None
+    max_tokens: dict | None  # {"initial", "escalated"} of the run's worker, if recorded
+    max_tokens_note: str
     summary_found: bool
     status: str
     nodes: dict
@@ -437,8 +440,13 @@ def check(run_dir: Path, env_file: Path | None = None) -> Check:
         "finishes normally": (answered, ending),
     }
     passed = status == "success" and all(ok for ok, _ in criteria.values())
+    max_tokens = worker.get("max_tokens")
+    if not isinstance(max_tokens, dict):
+        max_tokens = None
+    note = str(worker.get("max_tokens_error") or "")
     return Check(run_dir=str(run_dir), env_model=env_model,
                  run_provider=worker.get("model_provider"), run_model=worker.get("model"),
+                 max_tokens=max_tokens, max_tokens_note=note,
                  summary_found=summary is not None, status=status, nodes=nodes,
                  model_calls=calls, input_tokens=tokens_in, output_tokens=tokens_out,
                  final_checks=final_checks, final_check_passed=final_passed,
@@ -457,6 +465,14 @@ def format_check(result: Check) -> str:
                  else "unknown (no config.json)")
     lines.append(f"  model in .env      : {result.env_model or '(not set)'}")
     lines.append(f"  model of the run   : {run_model}")
+    if result.max_tokens is not None:
+        limits = (f"initial {result.max_tokens.get('initial')}, "
+                  f"escalated {result.max_tokens.get('escalated')}")
+    elif result.max_tokens_note:
+        limits = f"invalid: {result.max_tokens_note}"
+    else:
+        limits = "not recorded (config.json of the run has no worker.max_tokens)"
+    lines.append(f"  output limits      : {limits}")
     if result.run_model and result.env_model and result.run_model != result.env_model:
         lines.append("  warning: the run did not use the model in .env (an AQOURS_CODE_* "
                      "environment variable wins over .env)")

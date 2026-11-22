@@ -19,7 +19,14 @@ try:
 except ImportError:
     def load_dotenv(*args, **kwargs): return False
 
-from .model_api import build_model_client, provider_from_env
+from collections.abc import Mapping as _Mapping
+
+from .model_api import (
+    build_model_client,
+    effective_escalated_max_tokens,
+    effective_initial_max_tokens,
+    provider_from_env,
+)
 from .command_executor import LocalCommandExecutor
 
 load_dotenv(override=False)
@@ -134,6 +141,8 @@ def validate_runtime_configuration() -> None:
         raise RuntimeError(
             "AQOURS_CODE_SUMMARY_MAX_TOKENS must be between 1000 and 64000"
         )
+    if MAX_TOKENS_ERROR:
+        raise RuntimeError(MAX_TOKENS_ERROR)
 
 
 class LazyModelClient:
@@ -147,8 +156,82 @@ client = LazyModelClient()
 SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
-DEFAULT_MAX_TOKENS = 8_000
-ESCALATED_MAX_TOKENS = 16_000
+# The output limit (max_tokens) of a model call, and the limit of the one retry
+# after a reply cut at that limit. DeepSeek models with a 128K output limit
+# ignore both (model_api.effective_initial_max_tokens).
+MAX_TOKENS_ENV = "AQOURS_CODE_MAX_TOKENS"
+ESCALATED_MAX_TOKENS_ENV = "AQOURS_CODE_ESCALATED_MAX_TOKENS"
+BUILTIN_MAX_TOKENS = 8_000
+BUILTIN_ESCALATED_MAX_TOKENS = 16_000
+_WHOLE_NUMBER = re.compile(r"[0-9]+")
+
+
+def parse_max_tokens(environ: _Mapping[str, str]) -> tuple[int, int, str]:
+    """``(initial, escalated, error)`` from AQOURS_CODE_MAX_TOKENS and
+    AQOURS_CODE_ESCALATED_MAX_TOKENS in ``environ``.
+
+    An unset or empty variable takes its default (8000 and 16000). Each must
+    be a positive whole number, and the escalated limit must be at least the
+    initial one. Otherwise ``error`` says what is wrong, and both limits are
+    the defaults (``configured_max_tokens`` then refuses to give them).
+    """
+    values, errors, defaulted = {}, [], set()
+    for name, default in ((MAX_TOKENS_ENV, BUILTIN_MAX_TOKENS),
+                          (ESCALATED_MAX_TOKENS_ENV, BUILTIN_ESCALATED_MAX_TOKENS)):
+        raw = str(environ.get(name) or "").strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+            raw = raw[1:-1].strip()
+        if not raw:
+            values[name] = default
+            defaulted.add(name)
+        elif _WHOLE_NUMBER.fullmatch(raw) and int(raw) > 0:
+            values[name] = int(raw)
+        else:
+            errors.append(f"{name} must be a positive whole number, got {raw!r}")
+    if not errors and values[ESCALATED_MAX_TOKENS_ENV] < values[MAX_TOKENS_ENV]:
+        initial, escalated = values[MAX_TOKENS_ENV], values[ESCALATED_MAX_TOKENS_ENV]
+        if ESCALATED_MAX_TOKENS_ENV in defaulted:
+            errors.append(f"{ESCALATED_MAX_TOKENS_ENV} must be at least {MAX_TOKENS_ENV} "
+                          f"({initial}); it is not set, and its default is {escalated}: "
+                          f"set {ESCALATED_MAX_TOKENS_ENV} as well")
+        else:
+            errors.append(f"{ESCALATED_MAX_TOKENS_ENV} ({escalated}) must be at least "
+                          f"{MAX_TOKENS_ENV} ({initial})")
+    if errors:
+        return BUILTIN_MAX_TOKENS, BUILTIN_ESCALATED_MAX_TOKENS, "; ".join(errors)
+    return values[MAX_TOKENS_ENV], values[ESCALATED_MAX_TOKENS_ENV], ""
+
+
+DEFAULT_MAX_TOKENS, ESCALATED_MAX_TOKENS, MAX_TOKENS_ERROR = parse_max_tokens(os.environ)
+
+
+def configured_max_tokens() -> tuple[int, int]:
+    """The configured ``(initial, escalated)`` output limits, read at each use.
+
+    Raises ``RuntimeError`` when AQOURS_CODE_MAX_TOKENS or
+    AQOURS_CODE_ESCALATED_MAX_TOKENS is invalid, so no model call is made
+    with a limit nobody asked for.
+    """
+    if MAX_TOKENS_ERROR:
+        raise RuntimeError(MAX_TOKENS_ERROR)
+    return DEFAULT_MAX_TOKENS, ESCALATED_MAX_TOKENS
+
+
+def model_max_tokens(provider: str, model: str) -> dict:
+    """The output limits a call to ``model`` actually uses: ``{"initial", "escalated"}``.
+
+    ``escalated`` is the limit of the retry after a reply cut at ``initial``;
+    when it equals ``initial`` there is no such retry.
+    """
+    initial, escalated = configured_max_tokens()
+    first = effective_initial_max_tokens(provider, model,
+                                         configured_default_max_tokens=initial)
+    return {"initial": first,
+            "escalated": effective_escalated_max_tokens(
+                provider, model, current_max_tokens=first,
+                configured_escalated_max_tokens=escalated)}
+
+
 MAX_RETRIES = _env_int("AQOURS_CODE_MODEL_MAX_RETRIES", 3)
 MAX_CONSECUTIVE_529 = 2
 MAX_RECOVERY_RETRIES = 0

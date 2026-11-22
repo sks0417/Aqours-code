@@ -36,11 +36,14 @@ def effective_initial_max_tokens(
     *,
     configured_default_max_tokens: int,
 ) -> int:
+    """The output limit a model call starts with.
+
+    DeepSeek models with a 128K output limit always start at 128K, whatever
+    is configured (AQOURS_CODE_MAX_TOKENS); every other model uses
+    ``configured_default_max_tokens``.
+    """
     if uses_deepseek_128k_output(provider_name, model):
-        return max(
-            int(configured_default_max_tokens),
-            DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS,
-        )
+        return DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS
     return int(configured_default_max_tokens)
 
 
@@ -51,16 +54,15 @@ def effective_escalated_max_tokens(
     current_max_tokens: int,
     configured_escalated_max_tokens: int,
 ) -> int:
-    provider_escalation = (
-        DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS
-        if uses_deepseek_128k_output(provider_name, model)
-        else configured_escalated_max_tokens
-    )
-    return max(
-        int(current_max_tokens),
-        int(configured_escalated_max_tokens),
-        int(provider_escalation),
-    )
+    """The output limit of the retry after a reply cut at ``current_max_tokens``.
+
+    Never below the current limit. DeepSeek models with a 128K output limit
+    use 128K, whatever is configured (AQOURS_CODE_ESCALATED_MAX_TOKENS);
+    every other model uses ``configured_escalated_max_tokens``.
+    """
+    if uses_deepseek_128k_output(provider_name, model):
+        return max(int(current_max_tokens), DEEPSEEK_THINKING_ESCALATED_MAX_TOKENS)
+    return max(int(current_max_tokens), int(configured_escalated_max_tokens))
 
 
 def _clean_env(value: str | None) -> str | None:

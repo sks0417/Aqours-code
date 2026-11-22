@@ -72,7 +72,8 @@ from .repo_index import RepoIndex, build_index
 from .schema import Graph
 from .single import SINGLE_INSTRUCTION, single_graph
 from .validate import Issue
-from .workers import Worker, WorkerRequest, WorkerResult, write_json_atomic
+from .workers import (Worker, WorkerRequest, WorkerResult, stage_max_tokens,
+                      write_json_atomic)
 
 # v2: the decision of three zones, W scaled to the compaction trigger
 GATE_VERSION = "gate-v2"
@@ -984,6 +985,8 @@ def run_gate(options: GateOptions, locate_worker: Worker,
     repo = options.repo.resolve()
     base = gitops.head(repo, options.base_commit or "HEAD")
     model = locate_worker.describe().get("model")
+    max_tokens = stage_max_tokens({"step1": draft_stage_worker or locate_worker,
+                                   "locate": locate_worker})
     window = options.window if options.window is not None else agent_window()
     gate_run = GateRun(window, options.input_limit)
     draft: GateDraft | None = None
@@ -1022,6 +1025,11 @@ def run_gate(options: GateOptions, locate_worker: Worker,
     data = {
         "gate_version": GATE_VERSION,
         "model": str(model) if model is not None else None,
+        # the output limits of the calls made here: step 1 (unless the draft
+        # was reused) and the location call
+        "max_tokens": {**({"step1": max_tokens["step1"]}
+                          if draft is not None and draft.source == "step1" else {}),
+                       "locate": max_tokens["locate"]},
         "request": str(options.request_path),
         "repo": str(repo),
         "base_commit": base,

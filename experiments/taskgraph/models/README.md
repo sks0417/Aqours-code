@@ -34,14 +34,59 @@ AQOURS_CODE_API_KEY=
 
 Every other setting (context limits, compaction, timeouts, ...) is the same
 in every file, so that switching files changes the model and nothing else. To
-add a model, copy an existing model file and change the four lines.
+add a model, copy an existing model file and change the four lines. The one
+exception is the output limit, below: non-DeepSeek model files also set it.
+
+### Output limits: `AQOURS_CODE_MAX_TOKENS`
+
+A model call asks for at most `AQOURS_CODE_MAX_TOKENS` output tokens
+(default 8000); a reply cut at that limit is retried once with
+`AQOURS_CODE_ESCALATED_MAX_TOKENS` (default 16000). Each must be a positive
+whole number, and the escalated limit at least the initial one; otherwise
+every agent stops before its first model call and says which setting is
+wrong. Unset (or empty), both keep their defaults, as before.
+
+DeepSeek's models (`deepseek-flash`, `deepseek-v4-flash`, `deepseek-v4-pro`
+with provider `deepseek`) always use 128000 for both, whatever the two
+variables say (`model_api.effective_initial_max_tokens`). With the defaults,
+every other model is cut at 8000 or 16000: a thinking model such as MiniMax
+spends that on its reasoning, and the tool call never comes.
+
+So that every model works under the same conditions as DeepSeek, **every
+non-DeepSeek model file sets**
+
+```text
+AQOURS_CODE_MAX_TOKENS=128000
+AQOURS_CODE_ESCALATED_MAX_TOKENS=128000
+```
+
+(the DeepSeek files leave them out; they would change nothing there). On
+OpenRouter, the models of these experiments all allow at least 128000 output
+tokens:
+
+| Model | Maximum output (tokens) |
+| --- | --- |
+| `minimax/minimax-m3.1-flash` | 524,288 or more |
+| `qwen/qwen3.8-flash` | 131,072 |
+| `anthropic/claude-sonnet-5.5` | 128,000 |
+
+If a later model allows less than 128000, set both to its maximum output and
+note that in the experiment's record, since its conditions then differ from
+DeepSeek's.
+
+The limits a run used are recorded: `max_tokens: {"initial", "escalated"}`
+under `worker` (and `lead_worker`) in the run's `config.json`, in every
+`worker_<n>_config.json`, per stage (`step1`, `step2`, `gate`) in a plan's
+report, and per call (`step1`, `locate`) in the gate's output. The smoke
+check prints them.
 
 `.env` and every `.env.<name>` are ignored by git (`.gitignore`: `.env`,
 `.env.*`, `!.env.example`); only `.env.example` is tracked.
 
 `aqours_code.config` loads `.env` with `override=False`: an `AQOURS_CODE_*`
 variable set in the shell wins over `.env`. Both scripts warn when one of the
-four is set (they print its name, never its value).
+four is set (they print its name, never its value). The same holds for the
+two output limits; the smoke check shows the ones the run actually used.
 
 ## `use_model.ps1`
 
@@ -145,6 +190,7 @@ Options:
 Smoke check of C:\tg\smoke\...\runs\<run_id>
   model in .env      : <AQOURS_CODE_MODEL of .env>
   model of the run   : <provider> / <model>      (config.json of the run)
+  output limits      : initial 128000, escalated 128000
   run status         : success  [solve: merged, attempts 1]
   model calls        : ...
   tokens             : ... in / ... out
@@ -165,7 +211,9 @@ Smoke result: PASS
   [ok  ] finishes normally: ...
 ```
 
-The model calls and tokens are the run's totals (`summary.json`). `mul` is
+The output limits are `worker.max_tokens` of the run's `config.json` (what the
+worker's child process reported before the run). The model calls and tokens
+are the run's totals (`summary.json`). `mul` is
 read from the integration commit in `runs\<run_id>\repo` and parsed, not run.
 The log counts come from every attempt of every node under `nodes\`, up to
 three examples each (anything that looks like a key is replaced by

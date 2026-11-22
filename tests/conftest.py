@@ -11,6 +11,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 os.environ.setdefault("AQOURS_CODE_WORKDIR", tempfile.mkdtemp(prefix="aqours_code_collect_"))
+# The suite runs with the default output limits (8000 / 16000), whatever the
+# shell or .env sets: an empty value means the default, and a variable that is
+# present (even empty) is not taken from .env (load_dotenv(override=False)).
+# Tests of the two settings set them explicitly.
+os.environ["AQOURS_CODE_MAX_TOKENS"] = ""
+os.environ["AQOURS_CODE_ESCALATED_MAX_TOKENS"] = ""
 
 
 @pytest.fixture(autouse=True)

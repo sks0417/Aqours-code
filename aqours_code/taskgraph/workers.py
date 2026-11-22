@@ -119,6 +119,24 @@ class CommandWorker:
                             error="" if result.ok else result.output[-4000:])
 
 
+def stage_max_tokens(stages: Mapping[str, "Worker"]) -> dict:
+    """``{stage: {"initial", "escalated"} | None}``: each stage worker's output limits.
+
+    From ``describe()["max_tokens"]``; a worker that several stages share is
+    described once, and one that reports no limits (or cannot describe itself)
+    gives None.
+    """
+    limits: dict = {}
+    seen: dict[int, dict | None] = {}
+    for stage, worker in stages.items():
+        if id(worker) not in seen:
+            describe = getattr(worker, "describe", None)
+            info = describe() if describe is not None else None
+            seen[id(worker)] = info.get("max_tokens") if isinstance(info, Mapping) else None
+        limits[stage] = seen[id(worker)]
+    return limits
+
+
 def write_json_atomic(path: Path, data: dict) -> None:
     """Write ``data`` as JSON through a temporary file and rename."""
     tmp = path.with_name(f"{path.name}.tmp")
@@ -141,6 +159,7 @@ class AqoursWorker:
                                   [sys.executable, "-m", WORKER_ENTRY_MODULE])
         self.kill_grace_s = kill_grace_s
         self.sandbox = sandbox
+        self._description: dict | None = None
 
     def preflight(self) -> None:
         """Raise ``SandboxUnavailable`` if the Docker sandbox cannot run."""
@@ -148,15 +167,21 @@ class AqoursWorker:
             check_docker(self.sandbox.image)
 
     def describe(self) -> dict:
-        """Ask the worker entry which provider and model it would use."""
-        info = {"worker": "aqours"}
-        result = run_process([*self.entry_command, "--describe"], cwd=Path.cwd(),
-                             env=utf8_env(), timeout=60)
-        try:
-            info.update(json.loads(result.output.strip().splitlines()[-1]))
-        except (IndexError, json.JSONDecodeError):
-            info["describe_error"] = result.output[-2000:]
-        return info
+        """Ask the worker entry which provider, model and output limits it would use.
+
+        The child is asked once; later calls return the same answer, which
+        ``config_for`` also copies into every attempt's configuration.
+        """
+        if self._description is None:
+            info = {"worker": "aqours"}
+            result = run_process([*self.entry_command, "--describe"], cwd=Path.cwd(),
+                                 env=utf8_env(), timeout=60)
+            try:
+                info.update(json.loads(result.output.strip().splitlines()[-1]))
+            except (IndexError, json.JSONDecodeError):
+                info["describe_error"] = result.output[-2000:]
+            self._description = info
+        return dict(self._description)
 
     def config_for(self, request: WorkerRequest) -> dict:
         """Return the worker_entry configuration for one attempt."""
@@ -182,6 +207,9 @@ class AqoursWorker:
             },
             "repo_guard": request.repo_guard,
             "model_budget": request.model_budget,
+            # what describe() reported: the output limits the child uses (None
+            # if this worker was not described)
+            "max_tokens": (self._description or {}).get("max_tokens"),
         }
 
     def _sandbox_config(self, request: WorkerRequest) -> dict:
