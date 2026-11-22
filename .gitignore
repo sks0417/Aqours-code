@@ -1,4 +1,8 @@
+# Model settings and API keys: .env and every .env.<name> (use_model.ps1), but
+# not the template
 .env
+.env.*
+!.env.example
 *.pyc
 __pycache__/
 .pytest_cache/
