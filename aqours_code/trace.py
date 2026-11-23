@@ -23,7 +23,7 @@ from .config import (
     TRACE_RETENTION_MAX_MB,
     TRACE_RETENTION_MAX_RUNS,
 )
-from .model_api import sanitize_base_url
+from .model_api import reasoning_tokens, sanitize_base_url
 
 
 CURRENT_TRACE = None
@@ -1075,15 +1075,28 @@ def record_llm_request(*, model: str, max_tokens: int, message_count: int,
 
 
 def record_llm_response(response, *, purpose: str = "lead", agent_role: str = ""):
+    """Record a model response; ``usage`` keeps the token counts the provider gave.
+
+    ``input_tokens`` and ``output_tokens`` are also read from the
+    OpenAI-compatible names (``prompt_tokens``, ``completion_tokens``), and
+    ``reasoning_tokens`` is added when the provider reports it
+    (model_api.reasoning_tokens).
+    """
     usage = getattr(response, "usage", None)
     usage_payload = {}
-    for name in (
-        "input_tokens", "output_tokens", "cache_creation_input_tokens",
-        "cache_read_input_tokens", "total_tokens",
+    for name, alias in (
+        ("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"),
+        ("cache_creation_input_tokens", None), ("cache_read_input_tokens", None),
+        ("total_tokens", None),
     ):
         value = getattr(usage, name, None)
+        if value is None and alias is not None:
+            value = getattr(usage, alias, None)
         if value is not None:
             usage_payload[name] = value
+    reasoning = reasoning_tokens(usage)
+    if reasoning is not None:
+        usage_payload["reasoning_tokens"] = reasoning
     record_event("llm_response", stop_reason=getattr(response, "stop_reason", None),
                  content=_truncate(_content_text(getattr(response, "content", ""))),
                  purpose=purpose, agent_role=agent_role, usage=usage_payload)

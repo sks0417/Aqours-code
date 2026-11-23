@@ -53,7 +53,7 @@ from .schema import Graph, dump_graph, load_graph
 from .synthesize import FactsConflict, Synthesis, SynthesisError, synthesize
 from .validate import Issue, validate
 from .workers import (Worker, WorkerRequest, WorkerResult, stage_max_tokens,
-                      write_json_atomic)
+                      stage_reasoning_effort, write_json_atomic)
 
 FACTS_PROMPT_PATH = Path(__file__).resolve().parent / "planner_facts_prompt.md"
 
@@ -222,6 +222,8 @@ class _V3Run:
     # plan: each stage worker's output limits ({"step1", "step2"[, "gate"]});
     # resynth makes no model call
     max_tokens: dict | None = None
+    # and the thinking level each asks for (None: none), the same stages
+    reasoning_effort: dict | None = None
     gate_report: dict | None = None
 
     def outline_fields(self) -> dict:
@@ -266,6 +268,7 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         "planner_version": PLANNER_VERSION,
         "model": run.info.model,
         "max_tokens": run.max_tokens,
+        "reasoning_effort": run.reasoning_effort,
         "request": run.request,
         "repo": str(run.repo),
         "base_commit": run.info.base_commit,
@@ -374,6 +377,9 @@ def _gate_stage(run: _V3Run, options: PlanOptions, request: str, clone: Path,
         "max_tokens": ({"step1": run.max_tokens.get("step1"),
                         "locate": run.max_tokens.get("gate")}
                        if run.max_tokens is not None else None),
+        "reasoning_effort": ({"step1": run.reasoning_effort.get("step1"),
+                              "locate": run.reasoning_effort.get("gate")}
+                             if run.reasoning_effort is not None else None),
         "request": run.request,
         "repo": str(run.repo),
         "base_commit": run.info.base_commit,
@@ -423,8 +429,10 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
     if options.gate:
         run.gate_report = {"ok": False, "errors": [], "decision": None,
                            "note": "the gate did not run: step 1 gave no draft"}
-    run.max_tokens = stage_max_tokens({"step1": draft_stage_worker, "step2": worker,
-                                       **({"gate": gate_worker} if options.gate else {})})
+    stages = {"step1": draft_stage_worker, "step2": worker,
+              **({"gate": gate_worker} if options.gate else {})}
+    run.max_tokens = stage_max_tokens(stages)
+    run.reasoning_effort = stage_reasoning_effort(stages)
     budget = run.budget
     tmp = Path(tempfile.mkdtemp(prefix="tg-plan-"))
     try:

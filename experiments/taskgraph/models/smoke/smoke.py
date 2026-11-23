@@ -11,9 +11,9 @@ commit is the same on every platform; it prints the commit.
 
 ``check`` reads a finished (or broken) ``taskgraph run`` directory and prints
 what the smoke test is for: the model in ``.env`` and the one the run used,
-the output limits of the run (initial and escalated max_tokens), the run
-status, model calls and tokens, whether the final check passed,
-whether ``mul`` was implemented and tested, and how often the logs show an
+the output limits of the run (initial and escalated max_tokens), the
+thinking level it asked for (reasoning effort), the run status, model calls
+and tokens, whether the final check passed, whether ``mul`` was implemented and tested, and how often the logs show an
 HTTP error on a model request, a reply cut at ``max_tokens``, a tool input
 that did not parse (``_raw``), and an escape attempt. It ends with the four
 things the smoke test confirms (README.md) and exits 0 if all of them hold.
@@ -360,6 +360,10 @@ class Check:
     run_model: str | None
     max_tokens: dict | None  # {"initial", "escalated"} of the run's worker, if recorded
     max_tokens_note: str
+    # the thinking level the run's worker asked for (None: none), if recorded
+    reasoning_effort: str | None
+    reasoning_effort_recorded: bool
+    reasoning_effort_note: str
     summary_found: bool
     status: str
     nodes: dict
@@ -444,9 +448,13 @@ def check(run_dir: Path, env_file: Path | None = None) -> Check:
     if not isinstance(max_tokens, dict):
         max_tokens = None
     note = str(worker.get("max_tokens_error") or "")
+    effort = worker.get("reasoning_effort")
     return Check(run_dir=str(run_dir), env_model=env_model,
                  run_provider=worker.get("model_provider"), run_model=worker.get("model"),
                  max_tokens=max_tokens, max_tokens_note=note,
+                 reasoning_effort=str(effort) if effort is not None else None,
+                 reasoning_effort_recorded="reasoning_effort" in worker,
+                 reasoning_effort_note=str(worker.get("reasoning_effort_error") or ""),
                  summary_found=summary is not None, status=status, nodes=nodes,
                  model_calls=calls, input_tokens=tokens_in, output_tokens=tokens_out,
                  final_checks=final_checks, final_check_passed=final_passed,
@@ -473,6 +481,15 @@ def format_check(result: Check) -> str:
     else:
         limits = "not recorded (config.json of the run has no worker.max_tokens)"
     lines.append(f"  output limits      : {limits}")
+    if result.reasoning_effort_note:
+        effort = f"invalid: {result.reasoning_effort_note}"
+    elif result.reasoning_effort is not None:
+        effort = result.reasoning_effort
+    elif result.reasoning_effort_recorded:
+        effort = "none sent (the provider's default)"
+    else:
+        effort = "not recorded (config.json of the run has no worker.reasoning_effort)"
+    lines.append(f"  reasoning effort   : {effort}")
     if result.run_model and result.env_model and result.run_model != result.env_model:
         lines.append("  warning: the run did not use the model in .env (an AQOURS_CODE_* "
                      "environment variable wins over .env)")

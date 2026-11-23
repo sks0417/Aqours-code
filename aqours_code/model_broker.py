@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
+from .model_api import reasoning_tokens
 from .provider_errors import is_transient_provider_error as _is_transient_provider_error
 from .provider_errors import provider_error_kind as _provider_error_kind
 
@@ -147,13 +148,18 @@ def _response_usage(response) -> dict:
         cache_creation_tokens,
         cache_read_tokens,
     ))
-    return {
+    result = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cache_creation_input_tokens": cache_creation_tokens,
         "cache_read_input_tokens": cache_read_tokens,
         "total_tokens": total_tokens,
     }
+    # passed on to the child's trace only when the provider reports it
+    reasoning = reasoning_tokens(usage)
+    if reasoning is not None:
+        result["reasoning_tokens"] = reasoning
+    return result
 
 
 def _response_payload(response) -> dict:

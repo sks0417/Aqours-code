@@ -183,7 +183,7 @@ def make_run(tmp_path: Path, *, name: str = "run", ops: str = OPS_WITH_MUL,
     integration = smoke.git(repo, "rev-parse", "HEAD")
 
     worker = {"worker": "aqours", "model_provider": "fake", "model": "fake-model",
-              "max_tokens": LIMITS_128K, **(worker_extra or {})}
+              "max_tokens": LIMITS_128K, "reasoning_effort": "high", **(worker_extra or {})}
     config = {"base_commit": commit,
               "worker": {key: value for key, value in worker.items() if value is not ...}}
     (run / "config.json").write_text(json.dumps(config), encoding="utf-8")
@@ -343,6 +343,8 @@ def test_check_of_a_healthy_run_passes(tmp_path):
     assert result.max_tokens == LIMITS_128K
     assert ("  output limits      : initial 128000, escalated 128000"
             in smoke.format_check(result).splitlines())
+    assert result.reasoning_effort == "high"
+    assert "  reasoning effort   : high" in smoke.format_check(result).splitlines()
     assert result.final_check_passed
     assert result.mul_implemented and result.mul_tests == ["test_mul"]
     assert result.changed_files == ["calc/ops.py", "tests/test_ops.py"]
@@ -397,6 +399,25 @@ def test_check_shows_limits_that_are_not_recorded_or_invalid(tmp_path):
                                                        "max_tokens_error": error})
     report = smoke.format_check(smoke.check(bad, tmp_path / "missing.env"))
     assert f"  output limits      : invalid: {error}" in report.splitlines()
+
+
+def test_check_shows_a_level_that_is_none_not_recorded_or_invalid(tmp_path):
+    def line(name: str, extra: dict) -> str:
+        report = smoke.format_check(smoke.check(make_run(tmp_path, name=name, worker_extra=extra),
+                                                tmp_path / "missing.env"))
+        return next(item for item in report.splitlines() if "reasoning effort" in item)
+
+    # recorded as null: the requests asked no level (unset, or deepseek-flash)
+    assert line("none", {"reasoning_effort": None}) == (
+        "  reasoning effort   : none sent (the provider's default)")
+    # a run from before the level was recorded
+    assert line("old", {"reasoning_effort": ...}) == (
+        "  reasoning effort   : not recorded (config.json of the run has no "
+        "worker.reasoning_effort)")
+    error = ("AQOURS_CODE_REASONING_EFFORT must be one of low, medium, high, xhigh, max "
+             "(or unset), got 'hgh'")
+    assert line("bad", {"reasoning_effort": None, "reasoning_effort_error": error}) == (
+        f"  reasoning effort   : invalid: {error}")
 
 
 def test_check_of_a_run_that_did_not_finish(tmp_path):

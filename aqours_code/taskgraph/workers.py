@@ -119,22 +119,38 @@ class CommandWorker:
                             error="" if result.ok else result.output[-4000:])
 
 
-def stage_max_tokens(stages: Mapping[str, "Worker"]) -> dict:
-    """``{stage: {"initial", "escalated"} | None}``: each stage worker's output limits.
+def stage_described(stages: Mapping[str, "Worker"], key: str) -> dict:
+    """``{stage: describe()[key] | None}`` for each stage worker.
 
-    From ``describe()["max_tokens"]``; a worker that several stages share is
-    described once, and one that reports no limits (or cannot describe itself)
-    gives None.
+    A worker that several stages share is described once, and one that
+    reports no ``key`` (or cannot describe itself) gives None.
     """
-    limits: dict = {}
-    seen: dict[int, dict | None] = {}
+    values: dict = {}
+    seen: dict[int, object] = {}
     for stage, worker in stages.items():
         if id(worker) not in seen:
             describe = getattr(worker, "describe", None)
             info = describe() if describe is not None else None
-            seen[id(worker)] = info.get("max_tokens") if isinstance(info, Mapping) else None
-        limits[stage] = seen[id(worker)]
-    return limits
+            seen[id(worker)] = info.get(key) if isinstance(info, Mapping) else None
+        values[stage] = seen[id(worker)]
+    return values
+
+
+def stage_max_tokens(stages: Mapping[str, "Worker"]) -> dict:
+    """``{stage: {"initial", "escalated"} | None}``: each stage worker's output limits.
+
+    From ``describe()["max_tokens"]`` (stage_described).
+    """
+    return stage_described(stages, "max_tokens")
+
+
+def stage_reasoning_effort(stages: Mapping[str, "Worker"]) -> dict:
+    """``{stage: effort | None}``: the thinking level each stage worker asks for.
+
+    From ``describe()["reasoning_effort"]`` (stage_described); None when the
+    worker asks none, reports none or cannot describe itself.
+    """
+    return stage_described(stages, "reasoning_effort")
 
 
 def write_json_atomic(path: Path, data: dict) -> None:
@@ -207,9 +223,10 @@ class AqoursWorker:
             },
             "repo_guard": request.repo_guard,
             "model_budget": request.model_budget,
-            # what describe() reported: the output limits the child uses (None
-            # if this worker was not described)
+            # what describe() reported: the output limits and thinking level the
+            # child uses (None if this worker was not described)
             "max_tokens": (self._description or {}).get("max_tokens"),
+            "reasoning_effort": (self._description or {}).get("reasoning_effort"),
         }
 
     def _sandbox_config(self, request: WorkerRequest) -> dict:

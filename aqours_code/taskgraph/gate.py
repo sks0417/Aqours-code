@@ -73,7 +73,7 @@ from .schema import Graph
 from .single import SINGLE_INSTRUCTION, single_graph
 from .validate import Issue
 from .workers import (Worker, WorkerRequest, WorkerResult, stage_max_tokens,
-                      write_json_atomic)
+                      stage_reasoning_effort, write_json_atomic)
 
 # v2: the decision of three zones, W scaled to the compaction trigger
 GATE_VERSION = "gate-v2"
@@ -985,8 +985,9 @@ def run_gate(options: GateOptions, locate_worker: Worker,
     repo = options.repo.resolve()
     base = gitops.head(repo, options.base_commit or "HEAD")
     model = locate_worker.describe().get("model")
-    max_tokens = stage_max_tokens({"step1": draft_stage_worker or locate_worker,
-                                   "locate": locate_worker})
+    stages = {"step1": draft_stage_worker or locate_worker, "locate": locate_worker}
+    max_tokens = stage_max_tokens(stages)
+    reasoning_effort = stage_reasoning_effort(stages)
     window = options.window if options.window is not None else agent_window()
     gate_run = GateRun(window, options.input_limit)
     draft: GateDraft | None = None
@@ -1022,14 +1023,16 @@ def run_gate(options: GateOptions, locate_worker: Worker,
     draft_usage = draft.usage if draft is not None and draft.source == "step1" else \
         {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
     fields = gate_run.output_fields()
+    step1_called = draft is not None and draft.source == "step1"
     data = {
         "gate_version": GATE_VERSION,
         "model": str(model) if model is not None else None,
-        # the output limits of the calls made here: step 1 (unless the draft
-        # was reused) and the location call
-        "max_tokens": {**({"step1": max_tokens["step1"]}
-                          if draft is not None and draft.source == "step1" else {}),
+        # the output limits and thinking levels of the calls made here: step 1
+        # (unless the draft was reused) and the location call
+        "max_tokens": {**({"step1": max_tokens["step1"]} if step1_called else {}),
                        "locate": max_tokens["locate"]},
+        "reasoning_effort": {**({"step1": reasoning_effort["step1"]} if step1_called else {}),
+                             "locate": reasoning_effort["locate"]},
         "request": str(options.request_path),
         "repo": str(repo),
         "base_commit": base,

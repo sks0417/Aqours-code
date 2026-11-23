@@ -129,20 +129,35 @@ def counting_client(inner, budget: dict | None) -> CountingClient:
 
 
 def describe() -> dict:
-    """Return the provider, model and output limits the worker would use, without calling it.
+    """Return the provider, model, output limits and thinking level the worker
+    would use, without calling it.
 
     ``max_tokens`` is ``{"initial", "escalated"}``: the output limit of each
     model call and of the retry after a reply cut at it (config.model_max_tokens).
     If AQOURS_CODE_MAX_TOKENS or AQOURS_CODE_ESCALATED_MAX_TOKENS is invalid,
     it is None and ``max_tokens_error`` says why (the worker itself then fails).
+
+    ``reasoning_effort`` is the thinking level its requests ask for, or None
+    when they ask none (config.model_reasoning_effort). If
+    AQOURS_CODE_REASONING_EFFORT is invalid, it is None and
+    ``reasoning_effort_error`` says why (the worker then fails).
     """
-    from aqours_code.config import MODEL, MODEL_PROVIDER, model_max_tokens  # noqa: PLC0415
+    from aqours_code.config import (  # noqa: PLC0415
+        MODEL,
+        MODEL_PROVIDER,
+        model_max_tokens,
+        model_reasoning_effort,
+    )
 
     info = {"model_provider": MODEL_PROVIDER, "model": MODEL}
     try:
         info["max_tokens"] = model_max_tokens(MODEL_PROVIDER, MODEL or "")
     except RuntimeError as exc:
         info["max_tokens"], info["max_tokens_error"] = None, str(exc)
+    try:
+        info["reasoning_effort"] = model_reasoning_effort(MODEL_PROVIDER, MODEL or "")
+    except RuntimeError as exc:
+        info["reasoning_effort"], info["reasoning_effort_error"] = None, str(exc)
     return info
 
 

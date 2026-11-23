@@ -30,6 +30,86 @@ def uses_deepseek_128k_output(provider_name: str, model: str) -> bool:
     )
 
 
+# AQOURS_CODE_REASONING_EFFORT (config.parse_reasoning_effort)
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def is_deepseek(provider_name: str, model: str) -> bool:
+    """The DeepSeek provider, or a model of the DeepSeek rules above.
+
+    Such requests keep their own thinking setting (uses_deepseek_thinking);
+    AQOURS_CODE_REASONING_EFFORT does not change them.
+    """
+    return (str(provider_name).casefold() == "deepseek"
+            or str(model).casefold() in DEEPSEEK_128K_OUTPUT_MODELS)
+
+
+def is_openrouter(base_url: str | None) -> bool:
+    """Whether ``base_url`` is OpenRouter's (openrouter.ai or a subdomain)."""
+    try:
+        host = (urllib.parse.urlsplit(_clean_env(base_url) or "").hostname or "").casefold()
+    except ValueError:
+        return False
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+
+def reasoning_effort_fields(provider_name: str, model: str, base_url: str | None,
+                            reasoning_effort: str | None) -> dict:
+    """The fields an OpenAI-compatible request adds for ``reasoning_effort``.
+
+    None, or a DeepSeek request (is_deepseek), adds nothing. OpenRouter takes
+    its unified ``"reasoning": {"effort": ...}`` (the only one it passes on to
+    Anthropic models); any other provider takes ``"reasoning_effort"``.
+    """
+    if not reasoning_effort or is_deepseek(provider_name, model):
+        return {}
+    if is_openrouter(base_url):
+        return {"reasoning": {"effort": reasoning_effort}}
+    return {"reasoning_effort": reasoning_effort}
+
+
+def effective_reasoning_effort(provider_name: str, model: str, base_url: str | None,
+                               reasoning_effort: str | None) -> str | None:
+    """The thinking level a request to ``model`` asks for, or None if it asks none.
+
+    DeepSeek's thinking models ask DEEPSEEK_REASONING_EFFORT and its other
+    models nothing, whatever ``reasoning_effort`` is; the anthropic provider
+    (the Anthropic SDK) asks nothing; every other provider asks
+    ``reasoning_effort``.
+    """
+    if uses_deepseek_thinking(provider_name, model):
+        return DEEPSEEK_REASONING_EFFORT
+    if str(provider_name).casefold() == "anthropic":
+        return None
+    return reasoning_effort if reasoning_effort_fields(
+        provider_name, model, base_url, reasoning_effort) else None
+
+
+def _details_value(details, name: str):
+    return details.get(name) if isinstance(details, dict) else getattr(details, name, None)
+
+
+def reasoning_tokens(usage) -> int | None:
+    """The reasoning tokens a provider reports in ``usage``, or None if it reports none.
+
+    From ``completion_tokens_details.reasoning_tokens`` (OpenAI-compatible
+    chat completions: OpenRouter, DeepSeek, OpenAI),
+    ``output_tokens_details.reasoning_tokens``, or ``reasoning_tokens`` itself
+    (a usage already read, as the model broker passes it on).
+    """
+    if usage is None:
+        return None
+    candidates = [_details_value(usage, "reasoning_tokens")]
+    for details_name in ("completion_tokens_details", "output_tokens_details"):
+        details = _details_value(usage, details_name)
+        if details is not None:
+            candidates.append(_details_value(details, "reasoning_tokens"))
+    for value in candidates:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
 def effective_initial_max_tokens(
     provider_name: str,
     model: str,
@@ -219,11 +299,17 @@ def assistant_message_from_response(response) -> dict:
 
 
 class OpenAICompatibleMessages:
-    def __init__(self, api_key: str | None, base_url: str, extra_headers: dict | None = None, provider_name: str = "OpenAI-compatible provider"):
+    def __init__(self, api_key: str | None, base_url: str, extra_headers: dict | None = None,
+                 provider_name: str = "OpenAI-compatible provider",
+                 reasoning_effort: str | None = None):
+        if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError(f"invalid reasoning effort {reasoning_effort!r}")
         self.api_key = _clean_env(api_key)
         self.base_url = base_url.rstrip("/")
         self.extra_headers = extra_headers or {}
         self.provider_name = provider_name
+        # AQOURS_CODE_REASONING_EFFORT; None sends no thinking setting
+        self.reasoning_effort = reasoning_effort
 
     def create(self, *, model: str, system: str | None = None,
                messages: list[dict], tools: list[dict] | None = None,
@@ -254,6 +340,10 @@ class OpenAICompatibleMessages:
             payload["tools"] = _tools_to_openai(tools)
             if not deepseek_thinking:
                 payload["tool_choice"] = "auto"
+        if thinking != {"type": "disabled"}:
+            # a call that turns thinking off is left as it is
+            payload.update(reasoning_effort_fields(
+                self.provider_name, model, self.base_url, self.reasoning_effort))
         payload.update(kwargs)
         request = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(payload).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", **self.extra_headers}, method="POST")
         try:
@@ -271,8 +361,11 @@ class OpenAICompatibleMessages:
 
 
 class OpenAICompatibleClient:
-    def __init__(self, api_key: str | None, base_url: str, extra_headers: dict | None = None, provider_name: str = "OpenAI-compatible provider"):
-        self.messages = OpenAICompatibleMessages(api_key, base_url, extra_headers, provider_name)
+    def __init__(self, api_key: str | None, base_url: str, extra_headers: dict | None = None,
+                 provider_name: str = "OpenAI-compatible provider",
+                 reasoning_effort: str | None = None):
+        self.messages = OpenAICompatibleMessages(api_key, base_url, extra_headers, provider_name,
+                                                 reasoning_effort)
 
 
 class AnthropicClient:
@@ -324,17 +417,28 @@ def build_model_client(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
+    reasoning_effort: str | None = None,
 ):
+    """The client of ``provider``.
+
+    ``reasoning_effort`` (AQOURS_CODE_REASONING_EFFORT) is the thinking level
+    the OpenAI-compatible providers ask for (reasoning_effort_fields); the
+    anthropic provider ignores it.
+    """
     api_key = _clean_env(api_key) or _clean_env(os.getenv("AQOURS_CODE_API_KEY"))
     base_url = _clean_env(base_url) or _clean_env(os.getenv("AQOURS_CODE_BASE_URL"))
     if provider == "anthropic":
         return AnthropicClient(api_key=api_key, base_url=base_url)
     if provider == "deepseek":
-        return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "", provider_name="DeepSeek")
+        return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "", provider_name="DeepSeek",
+                                      reasoning_effort=reasoning_effort)
     if provider == "openai":
-        return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "", provider_name="OpenAI")
+        return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "", provider_name="OpenAI",
+                                      reasoning_effort=reasoning_effort)
     if provider == "openai_compatible":
-        return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "", provider_name="OpenAI-compatible provider")
+        return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "",
+                                      provider_name="OpenAI-compatible provider",
+                                      reasoning_effort=reasoning_effort)
     raise ValueError(f"Unknown AQOURS_CODE_PROVIDER: {provider}")
 
 

@@ -22,9 +22,11 @@ except ImportError:
 from collections.abc import Mapping as _Mapping
 
 from .model_api import (
+    REASONING_EFFORTS,
     build_model_client,
     effective_escalated_max_tokens,
     effective_initial_max_tokens,
+    effective_reasoning_effort,
     provider_from_env,
 )
 from .command_executor import LocalCommandExecutor
@@ -94,6 +96,8 @@ def get_model_client(provider: str | None = None):
             provider,
             api_key=API_KEY,
             base_url=BASE_URL,
+            # an invalid AQOURS_CODE_REASONING_EFFORT stops here, before any call
+            reasoning_effort=configured_reasoning_effort(),
         )
         _CLIENT_PROVIDER = provider
     return _CLIENT
@@ -143,6 +147,8 @@ def validate_runtime_configuration() -> None:
         )
     if MAX_TOKENS_ERROR:
         raise RuntimeError(MAX_TOKENS_ERROR)
+    if REASONING_EFFORT_ERROR:
+        raise RuntimeError(REASONING_EFFORT_ERROR)
 
 
 class LazyModelClient:
@@ -230,6 +236,57 @@ def model_max_tokens(provider: str, model: str) -> dict:
             "escalated": effective_escalated_max_tokens(
                 provider, model, current_max_tokens=first,
                 configured_escalated_max_tokens=escalated)}
+
+
+# The thinking level asked of every model that is not DeepSeek's
+# (model_api.reasoning_effort_fields). Unset, no thinking setting is sent.
+REASONING_EFFORT_ENV = "AQOURS_CODE_REASONING_EFFORT"
+
+
+def parse_reasoning_effort(environ: _Mapping[str, str]) -> tuple[str | None, str]:
+    """``(effort, error)`` from AQOURS_CODE_REASONING_EFFORT in ``environ``.
+
+    Unset or empty gives ``(None, "")``: nothing is sent, as before. Otherwise
+    the value (any case, optionally quoted) must be one of REASONING_EFFORTS,
+    given in lower case; if it is not, ``effort`` is None and ``error`` says
+    what is wrong (``configured_reasoning_effort`` then refuses to give it).
+    """
+    raw = str(environ.get(REASONING_EFFORT_ENV) or "").strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+        raw = raw[1:-1].strip()
+    if not raw:
+        return None, ""
+    if raw.casefold() in REASONING_EFFORTS:
+        return raw.casefold(), ""
+    return None, (f"{REASONING_EFFORT_ENV} must be one of "
+                  f"{', '.join(REASONING_EFFORTS)} (or unset), got {raw!r}")
+
+
+REASONING_EFFORT, REASONING_EFFORT_ERROR = parse_reasoning_effort(os.environ)
+
+
+def configured_reasoning_effort() -> str | None:
+    """AQOURS_CODE_REASONING_EFFORT, or None when it is not set.
+
+    Raises ``RuntimeError`` when it is invalid, so no model call is made with
+    a thinking level nobody asked for.
+    """
+    if REASONING_EFFORT_ERROR:
+        raise RuntimeError(REASONING_EFFORT_ERROR)
+    return REASONING_EFFORT
+
+
+def model_reasoning_effort(provider: str, model: str, base_url: str | None = None) -> str | None:
+    """The thinking level the requests to ``model`` ask for, or None if they ask none.
+
+    DeepSeek follows its own rule, whatever AQOURS_CODE_REASONING_EFFORT says
+    ("high" for deepseek-v4-*, nothing for deepseek-flash); every other
+    OpenAI-compatible model gets the configured level; the anthropic provider
+    gets none (model_api.effective_reasoning_effort).
+    """
+    return effective_reasoning_effort(
+        provider, model, BASE_URL if base_url is None else base_url,
+        configured_reasoning_effort())
 
 
 MAX_RETRIES = _env_int("AQOURS_CODE_MODEL_MAX_RETRIES", 3)

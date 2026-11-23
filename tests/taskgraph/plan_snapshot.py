@@ -76,9 +76,10 @@ def plan_snapshot(repo: Path, work: Path, monkeypatch, capsys, estimate: int,
     code = main(["plan", str(request), "--repo", str(repo), "--out", str(out),
                  "--final-check", FINAL, *flags])
     report = json.loads((out.parent / "graph.json.report.json").read_text(encoding="utf-8"))
-    # a record added after the golden snapshot (the output limits of each stage);
-    # it changes nothing the plan does
+    # records added after the golden snapshot (the output limits and thinking
+    # level of each stage); they change nothing the plan does
     report.pop("max_tokens", None)
+    report.pop("reasoning_effort", None)
     graph = json.loads(out.read_text(encoding="utf-8")) if out.exists() else None
     tmp = str(work)
     return normalise({

@@ -17,6 +17,8 @@ os.environ.setdefault("AQOURS_CODE_WORKDIR", tempfile.mkdtemp(prefix="aqours_cod
 # Tests of the two settings set them explicitly.
 os.environ["AQOURS_CODE_MAX_TOKENS"] = ""
 os.environ["AQOURS_CODE_ESCALATED_MAX_TOKENS"] = ""
+# Likewise no thinking level (nothing sent, as before the setting existed).
+os.environ["AQOURS_CODE_REASONING_EFFORT"] = ""
 
 
 @pytest.fixture(autouse=True)

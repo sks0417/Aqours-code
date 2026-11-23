@@ -34,8 +34,9 @@ AQOURS_CODE_API_KEY=
 
 Every other setting (context limits, compaction, timeouts, ...) is the same
 in every file, so that switching files changes the model and nothing else. To
-add a model, copy an existing model file and change the four lines. The one
-exception is the output limit, below: non-DeepSeek model files also set it.
+add a model, copy an existing model file and change the four lines. The two
+exceptions are the output limit and the thinking level, below: non-DeepSeek
+model files also set them.
 
 ### Output limits: `AQOURS_CODE_MAX_TOKENS`
 
@@ -80,13 +81,75 @@ under `worker` (and `lead_worker`) in the run's `config.json`, in every
 report, and per call (`step1`, `locate`) in the gate's output. The smoke
 check prints them.
 
+### Thinking level: `AQOURS_CODE_REASONING_EFFORT`
+
+`AQOURS_CODE_REASONING_EFFORT` is the thinking level a request asks for:
+`low`, `medium`, `high`, `xhigh` or `max`. Any other value stops every agent
+before its first model call, with a message naming the setting. Unset (or
+empty), no thinking setting is sent, as before.
+
+When it is set, `model_api` sends it by provider
+(`model_api.reasoning_effort_fields`):
+
+| Provider | What the request gets |
+| --- | --- |
+| DeepSeek (provider `deepseek`, or a model named `deepseek-flash`, `deepseek-v4-flash` or `deepseek-v4-pro`) | nothing changes: `deepseek-v4-*` keep `thinking` enabled with `reasoning_effort: "high"`, `deepseek-flash` gets no thinking setting, whatever the variable says |
+| base URL on `openrouter.ai` | `"reasoning": {"effort": <value>}`, OpenRouter's unified field (the only one it passes on to Anthropic models) |
+| any other OpenAI-compatible provider | `"reasoning_effort": <value>` |
+| provider `anthropic` (the Anthropic SDK) | nothing |
+
+No other request field changes, and a request that turns thinking off
+(`thinking: {"type": "disabled"}`, the DeepSeek compaction summary) is left as
+it is. The setting applies to every request of the client: graph nodes,
+planner, gate, team lead and members, subagents, teammates and the compaction
+summary.
+
+So that every model thinks at the same level as DeepSeek, **every non-DeepSeek
+model file sets**
+
+```text
+AQOURS_CODE_REASONING_EFFORT=high
+```
+
+(the DeepSeek files leave it out; it would change nothing there). This rests
+on two defaults:
+
+- DeepSeek thinks when a request has no thinking setting, at level `high`
+  (DeepSeek's API documentation). That is what `deepseek-flash` gets.
+- On OpenRouter, MiniMax M3.1 Flash always thinks (thinking cannot be turned
+  off), at level `max` by default. Without the setting every reply is slow
+  and very long.
+
+The providers do not define the levels the same way: `high` on one model is
+not necessarily the same amount of thinking as `high` on another. Setting the
+same level everywhere is the closest alignment there is; the reasoning tokens
+in the traces (below) show how much each model actually thought.
+
+The level a run asked for is recorded, as `reasoning_effort` next to
+`max_tokens`: under `worker` (and `lead_worker`) in the run's `config.json`,
+in every `worker_<n>_config.json`, per stage (`step1`, `step2`, `gate`) in a
+plan's report, and per call (`step1`, `locate`) in the gate's output. It is
+the level the requests ask for (`config.model_reasoning_effort`): the
+variable's value, `"high"` for DeepSeek's `deepseek-v4-*`, and `null` when
+they ask none (the variable unset, `deepseek-flash`, provider `anthropic`),
+which leaves the provider's default. The smoke check prints it.
+
+When a provider reports reasoning tokens
+(`usage.completion_tokens_details.reasoning_tokens`, or
+`usage.output_tokens_details.reasoning_tokens`), every `llm_response` event of
+a trace has them as `usage.reasoning_tokens`, beside `input_tokens` and
+`output_tokens` (also read from the OpenAI-compatible `prompt_tokens` and
+`completion_tokens`). A provider that reports none gets no
+`reasoning_tokens`.
+
 `.env` and every `.env.<name>` are ignored by git (`.gitignore`: `.env`,
 `.env.*`, `!.env.example`); only `.env.example` is tracked.
 
 `aqours_code.config` loads `.env` with `override=False`: an `AQOURS_CODE_*`
 variable set in the shell wins over `.env`. Both scripts warn when one of the
 four is set (they print its name, never its value). The same holds for the
-two output limits; the smoke check shows the ones the run actually used.
+two output limits and the thinking level; the smoke check shows the ones the
+run actually used.
 
 ## `use_model.ps1`
 
@@ -191,6 +254,7 @@ Smoke check of C:\tg\smoke\...\runs\<run_id>
   model in .env      : <AQOURS_CODE_MODEL of .env>
   model of the run   : <provider> / <model>      (config.json of the run)
   output limits      : initial 128000, escalated 128000
+  reasoning effort   : high
   run status         : success  [solve: merged, attempts 1]
   model calls        : ...
   tokens             : ... in / ... out
@@ -212,7 +276,10 @@ Smoke result: PASS
 ```
 
 The output limits are `worker.max_tokens` of the run's `config.json` (what the
-worker's child process reported before the run). The model calls and tokens
+worker's child process reported before the run), and the reasoning effort is
+its `worker.reasoning_effort`: the level, `none sent (the provider's
+default)` for `null`, or `not recorded` for a run from before the setting
+existed. The model calls and tokens
 are the run's totals (`summary.json`). `mul` is
 read from the integration commit in `runs\<run_id>\repo` and parsed, not run.
 The log counts come from every attempt of every node under `nodes\`, up to
