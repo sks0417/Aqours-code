@@ -73,7 +73,8 @@ from .schema import Graph
 from .single import SINGLE_INSTRUCTION, single_graph
 from .validate import Issue
 from .workers import (Worker, WorkerRequest, WorkerResult, stage_max_tokens,
-                      stage_reasoning_effort, write_json_atomic)
+                      stage_openrouter_provider, stage_reasoning_effort,
+                      write_json_atomic)
 
 # v2: the decision of three zones, W scaled to the compaction trigger
 GATE_VERSION = "gate-v2"
@@ -988,6 +989,7 @@ def run_gate(options: GateOptions, locate_worker: Worker,
     stages = {"step1": draft_stage_worker or locate_worker, "locate": locate_worker}
     max_tokens = stage_max_tokens(stages)
     reasoning_effort = stage_reasoning_effort(stages)
+    openrouter_provider = stage_openrouter_provider(stages)
     window = options.window if options.window is not None else agent_window()
     gate_run = GateRun(window, options.input_limit)
     draft: GateDraft | None = None
@@ -1027,12 +1029,16 @@ def run_gate(options: GateOptions, locate_worker: Worker,
     data = {
         "gate_version": GATE_VERSION,
         "model": str(model) if model is not None else None,
-        # the output limits and thinking levels of the calls made here: step 1
-        # (unless the draft was reused) and the location call
+        # the output limits, thinking levels and OpenRouter providers of the
+        # calls made here: step 1 (unless the draft was reused) and the
+        # location call
         "max_tokens": {**({"step1": max_tokens["step1"]} if step1_called else {}),
                        "locate": max_tokens["locate"]},
         "reasoning_effort": {**({"step1": reasoning_effort["step1"]} if step1_called else {}),
                              "locate": reasoning_effort["locate"]},
+        "openrouter_provider": {**({"step1": openrouter_provider["step1"]}
+                                   if step1_called else {}),
+                                "locate": openrouter_provider["locate"]},
         "request": str(options.request_path),
         "repo": str(repo),
         "base_commit": base,

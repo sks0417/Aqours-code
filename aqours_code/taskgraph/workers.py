@@ -153,6 +153,16 @@ def stage_reasoning_effort(stages: Mapping[str, "Worker"]) -> dict:
     return stage_described(stages, "reasoning_effort")
 
 
+def stage_openrouter_provider(stages: Mapping[str, "Worker"]) -> dict:
+    """``{stage: [slug, ...] | None}``: the OpenRouter providers each stage
+    worker's requests are pinned to.
+
+    From ``describe()["openrouter_provider"]`` (stage_described); None when
+    they are not pinned, or the worker reports none or cannot describe itself.
+    """
+    return stage_described(stages, "openrouter_provider")
+
+
 def write_json_atomic(path: Path, data: dict) -> None:
     """Write ``data`` as JSON through a temporary file and rename."""
     tmp = path.with_name(f"{path.name}.tmp")
@@ -183,7 +193,8 @@ class AqoursWorker:
             check_docker(self.sandbox.image)
 
     def describe(self) -> dict:
-        """Ask the worker entry which provider, model and output limits it would use.
+        """Ask the worker entry which provider, model, output limits, thinking
+        level and OpenRouter provider it would use.
 
         The child is asked once; later calls return the same answer, which
         ``config_for`` also copies into every attempt's configuration.
@@ -223,10 +234,12 @@ class AqoursWorker:
             },
             "repo_guard": request.repo_guard,
             "model_budget": request.model_budget,
-            # what describe() reported: the output limits and thinking level the
-            # child uses (None if this worker was not described)
+            # what describe() reported: the output limits, thinking level and
+            # OpenRouter provider the child uses (None if this worker was not
+            # described)
             "max_tokens": (self._description or {}).get("max_tokens"),
             "reasoning_effort": (self._description or {}).get("reasoning_effort"),
+            "openrouter_provider": (self._description or {}).get("openrouter_provider"),
         }
 
     def _sandbox_config(self, request: WorkerRequest) -> dict:

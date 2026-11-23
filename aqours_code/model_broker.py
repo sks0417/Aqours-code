@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
-from .model_api import reasoning_tokens
+from .model_api import reasoning_tokens, served_provider
 from .provider_errors import is_transient_provider_error as _is_transient_provider_error
 from .provider_errors import provider_error_kind as _provider_error_kind
 
@@ -173,6 +173,10 @@ def _response_payload(response) -> dict:
     usage = _response_usage(response)
     if usage:
         payload["usage"] = usage
+    # who served it (OpenRouter), passed on to the child's trace
+    provider = served_provider(getattr(response, "provider", None))
+    if provider is not None:
+        payload["provider"] = provider
     return payload
 
 
@@ -201,6 +205,7 @@ def _response_object(payload: dict):
         stop_reason=payload.get("stop_reason") or "end_turn",
         usage=SimpleNamespace(**usage),
         reasoning_content=payload.get("reasoning_content"),
+        provider=served_provider(payload.get("provider")),
     )
 
 

@@ -19,6 +19,8 @@ os.environ["AQOURS_CODE_MAX_TOKENS"] = ""
 os.environ["AQOURS_CODE_ESCALATED_MAX_TOKENS"] = ""
 # Likewise no thinking level (nothing sent, as before the setting existed).
 os.environ["AQOURS_CODE_REASONING_EFFORT"] = ""
+# Likewise no OpenRouter provider (OpenRouter picks, as before the setting existed).
+os.environ["AQOURS_CODE_OPENROUTER_PROVIDER"] = ""
 
 
 @pytest.fixture(autouse=True)

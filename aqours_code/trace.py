@@ -23,7 +23,7 @@ from .config import (
     TRACE_RETENTION_MAX_MB,
     TRACE_RETENTION_MAX_RUNS,
 )
-from .model_api import reasoning_tokens, sanitize_base_url
+from .model_api import reasoning_tokens, sanitize_base_url, served_provider
 
 
 CURRENT_TRACE = None
@@ -1080,7 +1080,8 @@ def record_llm_response(response, *, purpose: str = "lead", agent_role: str = ""
     ``input_tokens`` and ``output_tokens`` are also read from the
     OpenAI-compatible names (``prompt_tokens``, ``completion_tokens``), and
     ``reasoning_tokens`` is added when the provider reports it
-    (model_api.reasoning_tokens).
+    (model_api.reasoning_tokens). ``provider`` is added when the response
+    names who served it (OpenRouter's top-level ``provider``, e.g. ``"Z.AI"``).
     """
     usage = getattr(response, "usage", None)
     usage_payload = {}
@@ -1097,9 +1098,11 @@ def record_llm_response(response, *, purpose: str = "lead", agent_role: str = ""
     reasoning = reasoning_tokens(usage)
     if reasoning is not None:
         usage_payload["reasoning_tokens"] = reasoning
+    provider = served_provider(getattr(response, "provider", None))
     record_event("llm_response", stop_reason=getattr(response, "stop_reason", None),
                  content=_truncate(_content_text(getattr(response, "content", ""))),
-                 purpose=purpose, agent_role=agent_role, usage=usage_payload)
+                 purpose=purpose, agent_role=agent_role, usage=usage_payload,
+                 **({"provider": provider} if provider is not None else {}))
 
 
 def record_tool_use(block):

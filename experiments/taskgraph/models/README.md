@@ -19,7 +19,7 @@ smoke/
 ## Model files: `.env.<name>`
 
 Each model has its own file in the repository root, next to `.env`:
-`.env.deepseek`, `.env.qwen`, `.env.sonnet`, ... A name has letters, digits,
+`.env.deepseek`, `.env.glm`, `.env.sonnet`, ... A name has letters, digits,
 `-` and `_`.
 
 A model file is a complete copy of `.env` that differs from the others **only
@@ -34,9 +34,10 @@ AQOURS_CODE_API_KEY=
 
 Every other setting (context limits, compaction, timeouts, ...) is the same
 in every file, so that switching files changes the model and nothing else. To
-add a model, copy an existing model file and change the four lines. The two
-exceptions are the output limit and the thinking level, below: non-DeepSeek
-model files also set them.
+add a model, copy an existing model file and change the four lines. The
+exceptions are below: the output limit and the thinking level, which every
+non-DeepSeek model file also sets, and the OpenRouter provider, which a model
+file of a model on OpenRouter may set (`.env.glm` does).
 
 ### Output limits: `AQOURS_CODE_MAX_TOKENS`
 
@@ -68,7 +69,8 @@ tokens:
 | Model | Maximum output (tokens) |
 | --- | --- |
 | `minimax/minimax-m3.1-flash` | 524,288 or more |
-| `qwen/qwen3.8-flash` | 131,072 |
+| `z-ai/glm-5.3-flash` | 131,072 (provider Z.AI, the one `.env.glm` is pinned to) |
+| `qwen/qwen3.8-flash` (no longer used, see [Models](#models)) | 131,072 |
 | `anthropic/claude-sonnet-5.5` | 128,000 |
 
 If a later model allows less than 128000, set both to its maximum output and
@@ -142,25 +144,124 @@ a trace has them as `usage.reasoning_tokens`, beside `input_tokens` and
 `completion_tokens`). A provider that reports none gets no
 `reasoning_tokens`.
 
+### OpenRouter provider: `AQOURS_CODE_OPENROUTER_PROVIDER`
+
+On OpenRouter one model is usually served by many providers, often quantized
+differently (fp4, fp8, ...). By default OpenRouter picks the provider of each
+request itself, so the calls of one run can land on different providers, and
+speed and quality vary from call to call.
+
+`AQOURS_CODE_OPENROUTER_PROVIDER` pins the requests to providers of your
+choice: a comma-separated list of OpenRouter provider slugs, such as `z-ai` or
+`z-ai,deepinfra`. When it is set and the base URL is on `openrouter.ai`, every
+request gets
+
+```json
+"provider": {"order": ["z-ai"], "allow_fallbacks": false}
+```
+
+(`model_api.openrouter_provider_fields`): OpenRouter tries those providers
+only, in that order, and fails the request rather than send it to another one
+(a failed request shows up as an HTTP error in the trace and in the smoke
+check). Requests to any other base URL, DeepSeek's requests (provider
+`deepseek`, or a model named `deepseek-flash`, `deepseek-v4-flash` or
+`deepseek-v4-pro`) and provider `anthropic` get nothing, and no other request
+field changes. Like the thinking level, it applies to every request of the
+client, the compaction summary included. Unset (or empty), nothing is sent and
+OpenRouter picks, as before. The slugs are taken in lower case; an empty entry
+or one that is not a slug (letters, digits and `-`, with `/` before an
+endpoint's part) stops every agent before its first model call, with a message
+naming the setting. The provider's name is not its slug: `Z.AI` is refused,
+`z-ai` is right.
+
+A slug is the provider's `slug` in OpenRouter's public provider list
+(`GET https://openrouter.ai/api/v1/providers`). A model's providers, with their
+quantization, are listed by
+`GET https://openrouter.ai/api/v1/models/<model>/endpoints`; there, an
+endpoint's `tag` (`z-ai/fp8`) pins that one endpoint, and the part before the
+`/` is the provider's slug, which covers all its endpoints of the model.
+
+What a run was pinned to is recorded, as `openrouter_provider` next to
+`reasoning_effort`: under `worker` (and `lead_worker`) in the run's
+`config.json`, in every `worker_<n>_config.json`, per stage (`step1`, `step2`,
+`gate`) in a plan's report, and per call (`step1`, `locate`) in the gate's
+output. It is the list the requests carry (`config.model_openrouter_provider`),
+or `null` when they carry none (the variable unset, a base URL that is not
+OpenRouter's, DeepSeek, provider `anthropic`).
+
+OpenRouter's response names the provider that served it (its top-level
+`provider`, the provider's name such as `Z.AI` rather than its slug). When it
+does, the `llm_response` event of the trace has it as `provider`, so every call
+can be checked; the model broker passes it on too. The smoke check prints what
+was set and which providers actually served the run.
+
 `.env` and every `.env.<name>` are ignored by git (`.gitignore`: `.env`,
 `.env.*`, `!.env.example`); only `.env.example` is tracked.
 
 `aqours_code.config` loads `.env` with `override=False`: an `AQOURS_CODE_*`
 variable set in the shell wins over `.env`. Both scripts warn when one of the
 four is set (they print its name, never its value). The same holds for the
-two output limits and the thinking level; the smoke check shows the ones the
-run actually used.
+two output limits, the thinking level and the OpenRouter provider; the smoke
+check shows the ones the run actually used.
+
+## Models
+
+### GLM-5.3-Flash: `z-ai/glm-5.3-flash`
+
+Added for its independent score on Terminal-Bench 4.0 (Artificial Analysis):
+32.8, between MiniMax (25.8) and DeepSeek (33.8).
+
+`.env.glm` is a model file like the others, on OpenRouter, pinned to the
+official provider, Z.AI (slug `z-ai`):
+
+```text
+AQOURS_CODE_PROVIDER=openai_compatible
+AQOURS_CODE_BASE_URL=https://openrouter.ai/api/v1
+AQOURS_CODE_MODEL=z-ai/glm-5.3-flash
+AQOURS_CODE_API_KEY=
+AQOURS_CODE_MAX_TOKENS=128000
+AQOURS_CODE_ESCALATED_MAX_TOKENS=128000
+AQOURS_CODE_REASONING_EFFORT=high
+AQOURS_CODE_OPENROUTER_PROVIDER=z-ai
+```
+
+Why pin it to Z.AI:
+
+- OpenRouter serves this model from many providers (on 2026-11-23 its
+  endpoint list had 41 endpoints from 35 providers: 19 quantized to fp4 or
+  nvfp4, 11 to fp8, 11 not stated). Left to OpenRouter, the calls of one run
+  would be spread over them, and a result could not be told apart from the
+  provider that happened to serve it.
+- Z.AI is the model's developer: its endpoint is the reference deployment,
+  the one least likely to differ from the model as it was built (chat
+  template, tool-call and reasoning parsing). It allows what the experiments
+  need: 1,048,576 tokens of context, 131,072 of output, tools with
+  `tool_choice` `auto`, and the reasoning settings.
+- One fixed provider makes every call of every run comparable. Z.AI has one
+  endpoint for this model (tag `z-ai/fp8`), so `z-ai` pins exactly that one.
+
+OpenRouter lists that endpoint as fp8 too: pinning it does not avoid
+quantization, it avoids mixing providers. With `allow_fallbacks: false`, a
+request fails while Z.AI is unavailable instead of moving to another provider;
+the smoke check counts those failures and shows which providers served the run
+(it should be `Z.AI` only).
+
+### Qwen3.8 Flash: no longer used
+
+`qwen/qwen3.8-flash` is not used any more. Through OpenRouter, its Alibaba
+Cloud provider answered too slowly (about 60 tokens per second), and planning
+did not finish within the planner's 30-minute limit per round.
 
 ## `use_model.ps1`
 
 ```powershell
-experiments\taskgraph\models\use_model.ps1 qwen
+experiments\taskgraph\models\use_model.ps1 glm
 ```
 
-copies `.env.qwen` over `.env` and prints three lines of the new `.env`:
+copies `.env.glm` over `.env` and prints three lines of the new `.env`:
 
 ```text
-copied .env.qwen to C:\Users\...\Aqours-code\.env
+copied .env.glm to C:\Users\...\Aqours-code\.env
 AQOURS_CODE_PROVIDER=openai_compatible
 AQOURS_CODE_BASE_URL=https://...
 AQOURS_CODE_MODEL=...
@@ -207,7 +308,7 @@ experiment except a shorter worker timeout for a much smaller task.
 Docker must be running, with the image `aqours-code-eval:py311`.
 
 ```powershell
-experiments\taskgraph\models\use_model.ps1 qwen
+experiments\taskgraph\models\use_model.ps1 glm
 ```
 
 ```powershell
@@ -255,6 +356,8 @@ Smoke check of C:\tg\smoke\...\runs\<run_id>
   model of the run   : <provider> / <model>      (config.json of the run)
   output limits      : initial 128000, escalated 128000
   reasoning effort   : high
+  provider set       : z-ai (no fallbacks)
+  provider served    : Z.AI x6
   run status         : success  [solve: merged, attempts 1]
   model calls        : ...
   tokens             : ... in / ... out
@@ -279,7 +382,12 @@ The output limits are `worker.max_tokens` of the run's `config.json` (what the
 worker's child process reported before the run), and the reasoning effort is
 its `worker.reasoning_effort`: the level, `none sent (the provider's
 default)` for `null`, or `not recorded` for a run from before the setting
-existed. The model calls and tokens
+existed. `provider set` is its `worker.openrouter_provider`: the providers the
+requests were pinned to, `none (OpenRouter picks ...)` for `null`, or `not
+recorded` for an older run. `provider served` counts the `provider` of the
+`llm_response` events in every attempt's trace under `nodes\`: each provider
+that served the run, with its number of replies, and how many replies named
+none (a provider other than OpenRouter names none). The model calls and tokens
 are the run's totals (`summary.json`). `mul` is
 read from the integration commit in `runs\<run_id>\repo` and parsed, not run.
 The log counts come from every attempt of every node under `nodes\`, up to

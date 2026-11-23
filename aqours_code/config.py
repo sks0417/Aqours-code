@@ -26,6 +26,7 @@ from .model_api import (
     build_model_client,
     effective_escalated_max_tokens,
     effective_initial_max_tokens,
+    effective_openrouter_provider,
     effective_reasoning_effort,
     provider_from_env,
 )
@@ -96,8 +97,10 @@ def get_model_client(provider: str | None = None):
             provider,
             api_key=API_KEY,
             base_url=BASE_URL,
-            # an invalid AQOURS_CODE_REASONING_EFFORT stops here, before any call
+            # an invalid AQOURS_CODE_REASONING_EFFORT or
+            # AQOURS_CODE_OPENROUTER_PROVIDER stops here, before any call
             reasoning_effort=configured_reasoning_effort(),
+            openrouter_provider=configured_openrouter_provider(),
         )
         _CLIENT_PROVIDER = provider
     return _CLIENT
@@ -149,6 +152,8 @@ def validate_runtime_configuration() -> None:
         raise RuntimeError(MAX_TOKENS_ERROR)
     if REASONING_EFFORT_ERROR:
         raise RuntimeError(REASONING_EFFORT_ERROR)
+    if OPENROUTER_PROVIDER_ERROR:
+        raise RuntimeError(OPENROUTER_PROVIDER_ERROR)
 
 
 class LazyModelClient:
@@ -287,6 +292,65 @@ def model_reasoning_effort(provider: str, model: str, base_url: str | None = Non
     return effective_reasoning_effort(
         provider, model, BASE_URL if base_url is None else base_url,
         configured_reasoning_effort())
+
+
+# The OpenRouter providers every OpenRouter request is pinned to, without
+# fallbacks (model_api.openrouter_provider_fields). Unset, OpenRouter picks
+# the provider of each request, as before.
+OPENROUTER_PROVIDER_ENV = "AQOURS_CODE_OPENROUTER_PROVIDER"
+# a provider slug (z-ai) or one of its endpoints (z-ai/fp8), as OpenRouter
+# names them; a display name such as Z.AI is not one
+_PROVIDER_SLUG = re.compile(r"[a-z0-9][a-z0-9-]*(?:/[a-z0-9][a-z0-9-]*)*")
+
+
+def parse_openrouter_provider(
+        environ: _Mapping[str, str]) -> tuple[tuple[str, ...] | None, str]:
+    """``(providers, error)`` from AQOURS_CODE_OPENROUTER_PROVIDER in ``environ``.
+
+    Unset or empty gives ``(None, "")``: no request is pinned, as before.
+    Otherwise the value (optionally quoted) is a comma-separated list of
+    OpenRouter provider slugs, such as ``z-ai`` or ``z-ai,deepinfra``, given
+    in lower case and in their order. An empty entry or one that is not a
+    slug gives ``providers`` None and an ``error`` saying what is wrong
+    (``configured_openrouter_provider`` then refuses to give it).
+    """
+    raw = str(environ.get(OPENROUTER_PROVIDER_ENV) or "").strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+        raw = raw[1:-1].strip()
+    if not raw:
+        return None, ""
+    providers = tuple(part.strip().casefold() for part in raw.split(","))
+    if all(_PROVIDER_SLUG.fullmatch(provider) for provider in providers):
+        return providers, ""
+    return None, (f"{OPENROUTER_PROVIDER_ENV} must be comma-separated OpenRouter provider "
+                  f"slugs such as z-ai (or unset), got {raw!r}")
+
+
+OPENROUTER_PROVIDER, OPENROUTER_PROVIDER_ERROR = parse_openrouter_provider(os.environ)
+
+
+def configured_openrouter_provider() -> tuple[str, ...] | None:
+    """AQOURS_CODE_OPENROUTER_PROVIDER, or None when it is not set.
+
+    Raises ``RuntimeError`` when it is invalid, so no request goes to a
+    provider nobody asked for.
+    """
+    if OPENROUTER_PROVIDER_ERROR:
+        raise RuntimeError(OPENROUTER_PROVIDER_ERROR)
+    return OPENROUTER_PROVIDER
+
+
+def model_openrouter_provider(provider: str, model: str,
+                              base_url: str | None = None) -> list[str] | None:
+    """The OpenRouter providers the requests to ``model`` are pinned to, or None.
+
+    The configured providers when the base URL is OpenRouter's and the
+    request is not DeepSeek's; None otherwise, and for the anthropic provider
+    (model_api.effective_openrouter_provider).
+    """
+    return effective_openrouter_provider(
+        provider, model, BASE_URL if base_url is None else base_url,
+        configured_openrouter_provider())
 
 
 MAX_RETRIES = _env_int("AQOURS_CODE_MODEL_MAX_RETRIES", 3)

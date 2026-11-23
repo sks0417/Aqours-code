@@ -12,7 +12,9 @@ commit is the same on every platform; it prints the commit.
 ``check`` reads a finished (or broken) ``taskgraph run`` directory and prints
 what the smoke test is for: the model in ``.env`` and the one the run used,
 the output limits of the run (initial and escalated max_tokens), the
-thinking level it asked for (reasoning effort), the run status, model calls
+thinking level it asked for (reasoning effort), the OpenRouter provider its
+requests were pinned to and the providers that actually served them (with how
+many replies each), the run status, model calls
 and tokens, whether the final check passed, whether ``mul`` was implemented and tested, and how often the logs show an
 HTTP error on a model request, a reply cut at ``max_tokens``, a tool input
 that did not parse (``_raw``), and an escape attempt. It ends with the four
@@ -226,6 +228,9 @@ class LogScan:
     raw_samples: list = field(default_factory=list)
     escape_attempts: int = 0
     escape_samples: list = field(default_factory=list)
+    # the provider each reply names (OpenRouter's "provider"): {name: replies}
+    served_by: dict = field(default_factory=dict)
+    replies: int = 0  # llm_response events, named or not
 
 
 def _attempts(node_dir: Path) -> list[int]:
@@ -237,7 +242,7 @@ def _attempts(node_dir: Path) -> list[int]:
     return sorted(numbers)
 
 
-def _scan_trace(path: Path, scan: LogScan, statuses: Counter) -> None:
+def _scan_trace(path: Path, scan: LogScan, statuses: Counter, served: Counter) -> None:
     last_error = None  # an error recorded again as it propagates is one error
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
@@ -252,6 +257,10 @@ def _scan_trace(path: Path, scan: LogScan, statuses: Counter) -> None:
         elif kind == "llm_response":
             if event.get("stop_reason") == "max_tokens":
                 scan.max_tokens += 1
+            scan.replies += 1
+            provider = event.get("provider")
+            if isinstance(provider, str) and provider:
+                served[provider] += 1
         elif kind == "tool_use":
             scan.tool_calls += 1
             tool_input = event.get("input")
@@ -292,6 +301,7 @@ def scan_logs(run_dir: Path) -> LogScan:
     """Scan every attempt's trace and stdout under ``nodes/``."""
     scan = LogScan()
     statuses: Counter = Counter()
+    served: Counter = Counter()
     nodes = run_dir / "nodes"
     for node_dir in sorted(nodes.iterdir()) if nodes.is_dir() else []:
         if not node_dir.is_dir():
@@ -299,12 +309,13 @@ def scan_logs(run_dir: Path) -> LogScan:
         for attempt in _attempts(node_dir):
             for trace in attempt_traces(node_dir, attempt):
                 scan.trace_files += 1
-                _scan_trace(trace, scan, statuses)
+                _scan_trace(trace, scan, statuses, served)
             stdout = node_dir / f"worker_{attempt}_stdout.txt"
             if stdout.is_file():
                 scan.stdout_files += 1
                 _scan_stdout(stdout, scan, statuses)
     scan.http_statuses = dict(sorted(statuses.items()))
+    scan.served_by = dict(served.most_common())
     for node_id, escapes in scan_run(run_dir).items():
         scan.escape_attempts += escapes.count
         for sample in escapes.samples():
@@ -364,6 +375,11 @@ class Check:
     reasoning_effort: str | None
     reasoning_effort_recorded: bool
     reasoning_effort_note: str
+    # the OpenRouter providers the run's worker was pinned to (None: not
+    # pinned), if recorded; who served the replies is in logs.served_by
+    openrouter_provider: list | None
+    openrouter_provider_recorded: bool
+    openrouter_provider_note: str
     summary_found: bool
     status: str
     nodes: dict
@@ -449,12 +465,17 @@ def check(run_dir: Path, env_file: Path | None = None) -> Check:
         max_tokens = None
     note = str(worker.get("max_tokens_error") or "")
     effort = worker.get("reasoning_effort")
+    pinned = worker.get("openrouter_provider")
     return Check(run_dir=str(run_dir), env_model=env_model,
                  run_provider=worker.get("model_provider"), run_model=worker.get("model"),
                  max_tokens=max_tokens, max_tokens_note=note,
                  reasoning_effort=str(effort) if effort is not None else None,
                  reasoning_effort_recorded="reasoning_effort" in worker,
                  reasoning_effort_note=str(worker.get("reasoning_effort_error") or ""),
+                 openrouter_provider=([str(item) for item in pinned]
+                                      if isinstance(pinned, list) else None),
+                 openrouter_provider_recorded="openrouter_provider" in worker,
+                 openrouter_provider_note=str(worker.get("openrouter_provider_error") or ""),
                  summary_found=summary is not None, status=status, nodes=nodes,
                  model_calls=calls, input_tokens=tokens_in, output_tokens=tokens_out,
                  final_checks=final_checks, final_check_passed=final_passed,
@@ -463,6 +484,10 @@ def check(run_dir: Path, env_file: Path | None = None) -> Check:
                  criteria={name: {"ok": ok, "detail": text}
                            for name, (ok, text) in criteria.items()},
                  passed=passed)
+
+
+def _replies(count: int) -> str:
+    return f"{count} reply" if count == 1 else f"{count} replies"
 
 
 def format_check(result: Check) -> str:
@@ -490,6 +515,22 @@ def format_check(result: Check) -> str:
     else:
         effort = "not recorded (config.json of the run has no worker.reasoning_effort)"
     lines.append(f"  reasoning effort   : {effort}")
+    if result.openrouter_provider_note:
+        pinned = f"invalid: {result.openrouter_provider_note}"
+    elif result.openrouter_provider:
+        pinned = f"{', '.join(result.openrouter_provider)} (no fallbacks)"
+    elif result.openrouter_provider_recorded:
+        pinned = "none (OpenRouter picks the provider of each request)"
+    else:
+        pinned = "not recorded (config.json of the run has no worker.openrouter_provider)"
+    lines.append(f"  provider set       : {pinned}")
+    served = ", ".join(f"{name} x{count}" for name, count in logs.served_by.items())
+    unnamed = logs.replies - sum(logs.served_by.values())
+    if not served:
+        served = f"none named in the traces ({_replies(logs.replies)})"
+    elif unnamed:
+        served += f"; {_replies(unnamed)} named none"
+    lines.append(f"  provider served    : {served}")
     if result.run_model and result.env_model and result.run_model != result.env_model:
         lines.append("  warning: the run did not use the model in .env (an AQOURS_CODE_* "
                      "environment variable wins over .env)")

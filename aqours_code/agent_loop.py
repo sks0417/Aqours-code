@@ -1247,8 +1247,10 @@ def agent_loop(
     # setting stops here, before any model call.
     configured_initial, configured_escalated = (
         _config.configured_max_tokens())
-    # AQOURS_CODE_REASONING_EFFORT: likewise (the client sends it)
+    # AQOURS_CODE_REASONING_EFFORT and AQOURS_CODE_OPENROUTER_PROVIDER:
+    # likewise (the client sends them)
     _config.configured_reasoning_effort()
+    _config.configured_openrouter_provider()
     max_tokens = effective_initial_max_tokens(
         provider_name,
         state.current_model,

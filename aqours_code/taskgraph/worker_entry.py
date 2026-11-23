@@ -129,8 +129,8 @@ def counting_client(inner, budget: dict | None) -> CountingClient:
 
 
 def describe() -> dict:
-    """Return the provider, model, output limits and thinking level the worker
-    would use, without calling it.
+    """Return the provider, model, output limits, thinking level and OpenRouter
+    provider the worker would use, without calling it.
 
     ``max_tokens`` is ``{"initial", "escalated"}``: the output limit of each
     model call and of the retry after a reply cut at it (config.model_max_tokens).
@@ -141,11 +141,19 @@ def describe() -> dict:
     when they ask none (config.model_reasoning_effort). If
     AQOURS_CODE_REASONING_EFFORT is invalid, it is None and
     ``reasoning_effort_error`` says why (the worker then fails).
+
+    ``openrouter_provider`` is the list of OpenRouter providers its requests
+    are pinned to (without fallbacks), or None when they are not
+    (config.model_openrouter_provider: AQOURS_CODE_OPENROUTER_PROVIDER unset,
+    a base URL that is not OpenRouter's, or DeepSeek). If the setting is
+    invalid, it is None and ``openrouter_provider_error`` says why (the
+    worker then fails).
     """
     from aqours_code.config import (  # noqa: PLC0415
         MODEL,
         MODEL_PROVIDER,
         model_max_tokens,
+        model_openrouter_provider,
         model_reasoning_effort,
     )
 
@@ -158,6 +166,10 @@ def describe() -> dict:
         info["reasoning_effort"] = model_reasoning_effort(MODEL_PROVIDER, MODEL or "")
     except RuntimeError as exc:
         info["reasoning_effort"], info["reasoning_effort_error"] = None, str(exc)
+    try:
+        info["openrouter_provider"] = model_openrouter_provider(MODEL_PROVIDER, MODEL or "")
+    except RuntimeError as exc:
+        info["openrouter_provider"], info["openrouter_provider_error"] = None, str(exc)
     return info
 
 

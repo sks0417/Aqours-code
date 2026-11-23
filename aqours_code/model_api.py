@@ -85,6 +85,41 @@ def effective_reasoning_effort(provider_name: str, model: str, base_url: str | N
         provider_name, model, base_url, reasoning_effort) else None
 
 
+def openrouter_provider_fields(provider_name: str, model: str, base_url: str | None,
+                               providers) -> dict:
+    """The field an OpenAI-compatible request adds for ``providers``.
+
+    ``providers`` are OpenRouter provider slugs (AQOURS_CODE_OPENROUTER_PROVIDER,
+    config.parse_openrouter_provider). Only a request to OpenRouter
+    (is_openrouter) that is not DeepSeek's (is_deepseek) gets
+    ``"provider": {"order": [...], "allow_fallbacks": false}``: OpenRouter
+    then sends it to those providers only, in that order, and fails rather
+    than pick another. No providers, or any other request, adds nothing.
+    """
+    if not providers or not is_openrouter(base_url) or is_deepseek(provider_name, model):
+        return {}
+    return {"provider": {"order": list(providers), "allow_fallbacks": False}}
+
+
+def effective_openrouter_provider(provider_name: str, model: str, base_url: str | None,
+                                  providers) -> list[str] | None:
+    """The OpenRouter providers a request to ``model`` is pinned to, or None if it is not.
+
+    The anthropic provider (the Anthropic SDK) is never pinned; every other
+    provider is pinned when openrouter_provider_fields adds the field.
+    """
+    if str(provider_name).casefold() == "anthropic":
+        return None
+    fields = openrouter_provider_fields(provider_name, model, base_url, providers)
+    return list(fields["provider"]["order"]) if fields else None
+
+
+def served_provider(value) -> str | None:
+    """The provider OpenRouter says served a reply (the response's top-level
+    ``provider``, e.g. ``"Z.AI"``), or None when it names none."""
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def _details_value(details, name: str):
     return details.get(name) if isinstance(details, dict) else getattr(details, name, None)
 
@@ -264,6 +299,7 @@ def _openai_message_to_response(
     message: dict,
     finish_reason: str | None,
     usage: dict | None = None,
+    provider: str | None = None,
 ):
     content = []
     text = message.get("content")
@@ -286,6 +322,8 @@ def _openai_message_to_response(
         stop_reason=stop_reason,
         usage=usage_object,
         reasoning_content=message.get("reasoning_content"),
+        # who served it, when the response says (OpenRouter); None otherwise
+        provider=served_provider(provider),
     )
 
 
@@ -301,15 +339,20 @@ def assistant_message_from_response(response) -> dict:
 class OpenAICompatibleMessages:
     def __init__(self, api_key: str | None, base_url: str, extra_headers: dict | None = None,
                  provider_name: str = "OpenAI-compatible provider",
-                 reasoning_effort: str | None = None):
+                 reasoning_effort: str | None = None,
+                 openrouter_provider=None):
         if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"invalid reasoning effort {reasoning_effort!r}")
+        if isinstance(openrouter_provider, str):
+            raise TypeError("openrouter_provider is a sequence of provider slugs")
         self.api_key = _clean_env(api_key)
         self.base_url = base_url.rstrip("/")
         self.extra_headers = extra_headers or {}
         self.provider_name = provider_name
         # AQOURS_CODE_REASONING_EFFORT; None sends no thinking setting
         self.reasoning_effort = reasoning_effort
+        # AQOURS_CODE_OPENROUTER_PROVIDER; None lets OpenRouter pick
+        self.openrouter_provider = tuple(openrouter_provider) if openrouter_provider else None
 
     def create(self, *, model: str, system: str | None = None,
                messages: list[dict], tools: list[dict] | None = None,
@@ -344,6 +387,9 @@ class OpenAICompatibleMessages:
             # a call that turns thinking off is left as it is
             payload.update(reasoning_effort_fields(
                 self.provider_name, model, self.base_url, self.reasoning_effort))
+        # every OpenRouter request, the compaction summary too
+        payload.update(openrouter_provider_fields(
+            self.provider_name, model, self.base_url, self.openrouter_provider))
         payload.update(kwargs)
         request = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(payload).encode("utf-8"), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", **self.extra_headers}, method="POST")
         try:
@@ -357,15 +403,17 @@ class OpenAICompatibleMessages:
             choice.get("message", {}),
             choice.get("finish_reason"),
             data.get("usage"),
+            data.get("provider"),
         )
 
 
 class OpenAICompatibleClient:
     def __init__(self, api_key: str | None, base_url: str, extra_headers: dict | None = None,
                  provider_name: str = "OpenAI-compatible provider",
-                 reasoning_effort: str | None = None):
+                 reasoning_effort: str | None = None,
+                 openrouter_provider=None):
         self.messages = OpenAICompatibleMessages(api_key, base_url, extra_headers, provider_name,
-                                                 reasoning_effort)
+                                                 reasoning_effort, openrouter_provider)
 
 
 class AnthropicClient:
@@ -418,27 +466,31 @@ def build_model_client(
     api_key: str | None = None,
     base_url: str | None = None,
     reasoning_effort: str | None = None,
+    openrouter_provider=None,
 ):
     """The client of ``provider``.
 
     ``reasoning_effort`` (AQOURS_CODE_REASONING_EFFORT) is the thinking level
-    the OpenAI-compatible providers ask for (reasoning_effort_fields); the
-    anthropic provider ignores it.
+    the OpenAI-compatible providers ask for (reasoning_effort_fields), and
+    ``openrouter_provider`` (AQOURS_CODE_OPENROUTER_PROVIDER) the OpenRouter
+    providers their OpenRouter requests are pinned to
+    (openrouter_provider_fields); the anthropic provider ignores both.
     """
     api_key = _clean_env(api_key) or _clean_env(os.getenv("AQOURS_CODE_API_KEY"))
     base_url = _clean_env(base_url) or _clean_env(os.getenv("AQOURS_CODE_BASE_URL"))
+    settings = {"reasoning_effort": reasoning_effort, "openrouter_provider": openrouter_provider}
     if provider == "anthropic":
         return AnthropicClient(api_key=api_key, base_url=base_url)
     if provider == "deepseek":
         return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "", provider_name="DeepSeek",
-                                      reasoning_effort=reasoning_effort)
+                                      **settings)
     if provider == "openai":
         return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "", provider_name="OpenAI",
-                                      reasoning_effort=reasoning_effort)
+                                      **settings)
     if provider == "openai_compatible":
         return OpenAICompatibleClient(api_key=api_key, base_url=base_url or "",
                                       provider_name="OpenAI-compatible provider",
-                                      reasoning_effort=reasoning_effort)
+                                      **settings)
     raise ValueError(f"Unknown AQOURS_CODE_PROVIDER: {provider}")
 
 

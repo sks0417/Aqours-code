@@ -53,7 +53,8 @@ from .schema import Graph, RevisionEntry, dump_graph
 from .single import single_graph
 from .validate import Issue, ancestors, edit_files, unique_nodes, validate
 from .workers import (AqoursWorker, Worker, WorkerRequest, WorkerResult, stage_max_tokens,
-                      stage_reasoning_effort, write_json_atomic)
+                      stage_openrouter_provider, stage_reasoning_effort,
+                      write_json_atomic)
 
 # v3.2: the planner (and the team lead) can search with grep.
 PLANNER_VERSION = "planner-v3.2"
@@ -815,6 +816,8 @@ def run_plan_v2(options: PlanOptions, worker: Worker,
     model = worker.describe().get("model")
     max_tokens = stage_max_tokens({"step1": draft_stage_worker, "step2": worker})
     reasoning_effort = stage_reasoning_effort({"step1": draft_stage_worker, "step2": worker})
+    openrouter_provider = stage_openrouter_provider({"step1": draft_stage_worker,
+                                                     "step2": worker})
     info = GraphInfo(request_id=options.request_id or out.stem, request=request,
                      repo=str(repo), base_commit=base_commit,
                      final_checks=list(options.final_checks),
@@ -913,6 +916,7 @@ def run_plan_v2(options: PlanOptions, worker: Worker,
         "model": info.model,
         "max_tokens": max_tokens,
         "reasoning_effort": reasoning_effort,
+        "openrouter_provider": openrouter_provider,
         "request": str(options.request_path),
         "repo": str(repo),
         "base_commit": base_commit,

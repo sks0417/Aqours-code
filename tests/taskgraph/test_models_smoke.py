@@ -420,6 +420,92 @@ def test_check_shows_a_level_that_is_none_not_recorded_or_invalid(tmp_path):
         f"  reasoning effort   : invalid: {error}")
 
 
+def served_by(trace: list[dict], *providers: str | None) -> list[dict]:
+    """``trace`` with its llm_response events naming ``providers`` in turn (None: no name)."""
+    names = iter(providers)
+    result = []
+    for item in trace:
+        if item["type"] == "llm_response":
+            name = next(names)
+            item = {**item, **({"provider": name} if name is not None else {})}
+        result.append(item)
+    return result
+
+
+def provider_lines(report: str) -> list[str]:
+    return [line for line in report.splitlines() if line.startswith("  provider ")]
+
+
+def test_check_shows_the_provider_set_and_the_providers_that_served(tmp_path):
+    run = make_run(tmp_path, trace=served_by(HEALTHY_TRACE, "Z.AI", "Z.AI", "Z.AI"),
+                   worker_extra={"openrouter_provider": ["z-ai"]})
+    result = smoke.check(run, env_file(tmp_path / ".env"))
+    assert result.passed
+    assert result.openrouter_provider == ["z-ai"]
+    assert (result.logs.served_by, result.logs.replies) == ({"Z.AI": 3}, 3)
+    report = smoke.format_check(result)
+    assert provider_lines(report) == ["  provider set       : z-ai (no fallbacks)",
+                                      "  provider served    : Z.AI x3"]
+    # right after the thinking level
+    lines = report.splitlines()
+    assert lines[lines.index("  reasoning effort   : high") + 1] == provider_lines(report)[0]
+
+
+def test_check_counts_every_provider_that_served_and_the_replies_that_name_none(tmp_path):
+    run = make_run(tmp_path, trace=served_by(PROBLEM_TRACE, "DeepInfra", "Z.AI", "Z.AI"),
+                   worker_extra={"openrouter_provider": ["z-ai", "deepinfra"]},
+                   status="failed", final_ok=False)
+    result = smoke.check(run, tmp_path / "missing.env")
+    assert result.logs.served_by == {"Z.AI": 2, "DeepInfra": 1}
+    assert provider_lines(smoke.format_check(result)) == [
+        "  provider set       : z-ai, deepinfra (no fallbacks)",
+        "  provider served    : Z.AI x2, DeepInfra x1"]
+    mixed = make_run(tmp_path, name="mixed", trace=served_by(HEALTHY_TRACE, "Z.AI", None, None))
+    assert provider_lines(smoke.format_check(smoke.check(mixed, tmp_path / "missing.env")))[1] == (
+        "  provider served    : Z.AI x1; 2 replies named none")
+    one = make_run(tmp_path, name="one", trace=served_by(HEALTHY_TRACE, "Z.AI", "Z.AI", None))
+    assert provider_lines(smoke.format_check(smoke.check(one, tmp_path / "missing.env")))[1] == (
+        "  provider served    : Z.AI x2; 1 reply named none")
+
+
+def test_check_counts_the_providers_of_a_run_that_did_not_finish(tmp_path):
+    # no trace_<n>.jsonl: the Aqours run trace of the attempt is read instead
+    run = make_run(tmp_path, trace=served_by(PROBLEM_TRACE, "Z.AI", "Z.AI", "Z.AI"),
+                   with_summary=False, worker_reason="worker_error")
+    assert smoke.check(run, tmp_path / "missing.env").logs.served_by == {"Z.AI": 3}
+
+
+def test_check_shows_a_provider_that_is_none_not_recorded_or_invalid(tmp_path):
+    def lines(name: str, extra: dict) -> list[str]:
+        run = make_run(tmp_path, name=name, worker_extra=extra)
+        return provider_lines(smoke.format_check(smoke.check(run, tmp_path / "missing.env")))
+
+    # recorded as null: not pinned (unset, not OpenRouter, or DeepSeek); no reply names one
+    assert lines("none", {"openrouter_provider": None}) == [
+        "  provider set       : none (OpenRouter picks the provider of each request)",
+        "  provider served    : none named in the traces (3 replies)"]
+    # a run from before the setting was recorded
+    assert lines("old", {})[0] == (
+        "  provider set       : not recorded (config.json of the run has no "
+        "worker.openrouter_provider)")
+    error = ("AQOURS_CODE_OPENROUTER_PROVIDER must be comma-separated OpenRouter provider "
+             "slugs such as z-ai (or unset), got 'Z.AI'")
+    assert lines("bad", {"openrouter_provider": None, "openrouter_provider_error": error})[0] == (
+        f"  provider set       : invalid: {error}")
+
+
+def test_check_json_has_the_providers(tmp_path):
+    run = make_run(tmp_path, trace=served_by(HEALTHY_TRACE, "Z.AI", "Z.AI", "Z.AI"),
+                   worker_extra={"openrouter_provider": ["z-ai"]})
+    out = tmp_path / "check.json"
+    assert smoke.main(["check", str(run), "--env-file", str(env_file(tmp_path / ".env")),
+                       "--json", str(out)]) == smoke.EXIT_PASS
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["openrouter_provider"] == ["z-ai"]
+    assert data["logs"]["served_by"] == {"Z.AI": 3}
+    assert data["logs"]["replies"] == 3
+
+
 def test_check_of_a_run_that_did_not_finish(tmp_path):
     run = make_run(tmp_path, trace=PROBLEM_TRACE, with_summary=False,
                    worker_reason="worker_error")

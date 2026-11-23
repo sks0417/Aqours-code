@@ -53,7 +53,8 @@ from .schema import Graph, dump_graph, load_graph
 from .synthesize import FactsConflict, Synthesis, SynthesisError, synthesize
 from .validate import Issue, validate
 from .workers import (Worker, WorkerRequest, WorkerResult, stage_max_tokens,
-                      stage_reasoning_effort, write_json_atomic)
+                      stage_openrouter_provider, stage_reasoning_effort,
+                      write_json_atomic)
 
 FACTS_PROMPT_PATH = Path(__file__).resolve().parent / "planner_facts_prompt.md"
 
@@ -224,6 +225,8 @@ class _V3Run:
     max_tokens: dict | None = None
     # and the thinking level each asks for (None: none), the same stages
     reasoning_effort: dict | None = None
+    # and the OpenRouter providers each is pinned to (None: not pinned)
+    openrouter_provider: dict | None = None
     gate_report: dict | None = None
 
     def outline_fields(self) -> dict:
@@ -269,6 +272,7 @@ def _finish(run: _V3Run, started: float, extra: dict | None = None) -> PlanResul
         "model": run.info.model,
         "max_tokens": run.max_tokens,
         "reasoning_effort": run.reasoning_effort,
+        "openrouter_provider": run.openrouter_provider,
         "request": run.request,
         "repo": str(run.repo),
         "base_commit": run.info.base_commit,
@@ -380,6 +384,9 @@ def _gate_stage(run: _V3Run, options: PlanOptions, request: str, clone: Path,
         "reasoning_effort": ({"step1": run.reasoning_effort.get("step1"),
                               "locate": run.reasoning_effort.get("gate")}
                              if run.reasoning_effort is not None else None),
+        "openrouter_provider": ({"step1": run.openrouter_provider.get("step1"),
+                                 "locate": run.openrouter_provider.get("gate")}
+                                if run.openrouter_provider is not None else None),
         "request": run.request,
         "repo": str(run.repo),
         "base_commit": run.info.base_commit,
@@ -433,6 +440,7 @@ def run_plan_v3(options: PlanOptions, worker: Worker,
               **({"gate": gate_worker} if options.gate else {})}
     run.max_tokens = stage_max_tokens(stages)
     run.reasoning_effort = stage_reasoning_effort(stages)
+    run.openrouter_provider = stage_openrouter_provider(stages)
     budget = run.budget
     tmp = Path(tempfile.mkdtemp(prefix="tg-plan-"))
     try:
