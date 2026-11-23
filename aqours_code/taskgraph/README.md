@@ -754,10 +754,13 @@ ids, the test command and the log parser, and workers never see it.
 1. Copy `final/` (without `.git`) to `sweevo_eval/` in the run directory; a
    run without `final/` (no `--hidden-tests`) has its integration commit
    exported from `repo/` instead.
-2. Put every file the test patch touches back to its version in the task
-   repository (delete it if the base has none), so that a worker's edit of a
-   test file cannot stop the patch from applying, then apply the test patch
-   (as SWE-bench does). Other test files a worker changed or added stay.
+2. Put every file the test patch touches back to its version at the task's
+   base commit (`task_commit` of `grading/instance.json`, the task
+   repository's first commit; its `HEAD` when there is none) and delete it if
+   the base has none, so that a worker's edit of a test file cannot stop the
+   patch from applying, then apply the test patch (as SWE-bench does). A
+   cleaned (v2) task's `HEAD` lacks tests the patch changes, which is why it
+   is the base and not `HEAD`. Other test files a worker changed or added stay.
    Last, `sweevo_eval/` becomes a git repository whose `HEAD` is the task's
    base commit, with all of this as uncommitted changes, the way SWE-bench's
    `/testbed` holds a patched base (some dvc tests open the repository in the

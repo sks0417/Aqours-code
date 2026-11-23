@@ -7,7 +7,9 @@ before the release and pass after it; ``PASS_TO_PASS`` (P2P) tests pass both
 times. The grading data lives in a task directory that workers never see
 (``experiments/taskgraph/sweevo/prepare.py`` writes it)::
 
-    <task>/repo/                   the repository, one commit (the base)
+    <task>/repo/                   the repository; its first commit is the base
+                                   (``task_commit``; a cleaned "v2" task adds a
+                                   commit that removes tests the release rewrites)
     <task>/request.md              the request
     <task>/sandbox.json            image and environment of the instance
     <task>/sandbox_skips.txt       tests left out of every score (optional)
@@ -15,8 +17,8 @@ times. The grading data lives in a task directory that workers never see
     <task>/grading/test.patch      the release's test changes
 
 Grading copies the code to a scratch directory, puts the files the test
-patch touches back to the base version and applies the patch (as SWE-bench
-does), runs the instance's test command on the test files of the patch in the
+patch touches back to the base version (the task's base commit, not the
+repository's ``HEAD``) and applies the patch (as SWE-bench does), runs the instance's test command on the test files of the patch in the
 instance image, and reads the statuses from pytest's ``-rA`` summary with the
 instance's own log parser. A test passes when its status is ``PASSED`` or
 ``XFAIL``, fails when it is ``FAILED`` or ``ERROR`` or missing from the log,
@@ -281,11 +283,24 @@ class SweevoTask:
     sandbox: SandboxConfig
     exclusions: tuple[str, ...] = ()
     test_timeout: int | None = None  # seconds per test (pytest-timeout), if the image has it
+    # the task repository's own base commit (instance.json "task_commit"): its first
+    # commit. A v2 task's HEAD is a later commit, without the tests the release rewrites.
+    task_commit: str | None = None
 
     @property
     def repo_dir(self) -> Path:
-        """The task repository; its ``HEAD`` is the base the test patch applies to."""
+        """The task repository; its base commit (``base_ref``) is what the test patch applies to."""
         return self.task_dir / REPO_DIR
+
+    @property
+    def base_ref(self) -> str:
+        """The base the test files are restored from: ``task_commit``, else ``HEAD``.
+
+        In a task as ``prepare.py`` writes it the two are the same commit; in a
+        cleaned (v2) task, ``HEAD`` lacks tests that the test patch changes, so
+        the patch would not apply over it.
+        """
+        return self.task_commit or "HEAD"
 
     @property
     def directives(self) -> list[str]:
@@ -330,6 +345,9 @@ def load_task(task_dir: Path, exclusions: Path | None = None) -> SweevoTask:
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int)
                                 or timeout <= 0):
         raise SweevoError(f"{instance_path}: \"test_timeout\" must be a positive integer")
+    task_commit = data.get("task_commit")
+    if task_commit is not None and (not isinstance(task_commit, str) or not task_commit.strip()):
+        raise SweevoError(f"{instance_path}: \"task_commit\" must be a commit id")
     return SweevoTask(
         task_dir=task_dir, instance_id=data["instance_id"], repo=data["repo"],
         base_commit=data["base_commit"], test_cmd=data["test_cmds"],
@@ -337,7 +355,7 @@ def load_task(task_dir: Path, exclusions: Path | None = None) -> SweevoTask:
         fail_to_pass=_id_list(data.get("FAIL_TO_PASS"), "FAIL_TO_PASS"),
         pass_to_pass=_id_list(data.get("PASS_TO_PASS"), "PASS_TO_PASS"),
         test_patch=test_patch, sandbox=sandbox, exclusions=tuple(skips),
-        test_timeout=timeout)
+        test_timeout=timeout, task_commit=task_commit)
 
 
 # ── running the tests ──
@@ -357,12 +375,19 @@ def stage_code(source: Path | None, dest: Path, task: SweevoTask, *,
     first (validation applies the gold patch this way). Then every file the
     test patch touches is put back to its base version (removed if the base
     has no such file), so that an edit of a test file cannot stop the patch
-    from applying, and the test patch is applied. Last, ``dest`` becomes a
-    git repository whose ``HEAD`` is the task's base commit, with all of
+    from applying, and the test patch is applied. The base is the task's
+    base commit (``task.base_ref``), not the task repository's ``HEAD``: a
+    cleaned task's ``HEAD`` lacks tests the patch changes. Last, ``dest``
+    becomes a git repository whose ``HEAD`` is that base commit, with all of
     this as uncommitted changes: SWE-bench's ``/testbed`` is such a
     repository, and some tests need one (dvc's ``Repo()`` in the current
     directory).
     """
+    base = task.base_ref
+    try:
+        gitops.head(task.repo_dir, base)
+    except gitops.GitError:
+        raise SweevoError(f"the base commit {base} is not in {task.repo_dir}") from None
     remove_tree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if commit is not None:
@@ -376,7 +401,7 @@ def stage_code(source: Path | None, dest: Path, task: SweevoTask, *,
     for item in patch_files(task.test_patch):
         for path in dict.fromkeys((item["old"], item["new"])):
             target = dest / path
-            content = gitops.blob_at(task.repo_dir, "HEAD", path)
+            content = gitops.blob_at(task.repo_dir, base, path)
             if content is None:
                 if target.is_file() or target.is_symlink():
                     target.unlink()
@@ -384,7 +409,7 @@ def stage_code(source: Path | None, dest: Path, task: SweevoTask, *,
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(content)
     gitops.apply_patch(dest, task.test_patch)
-    gitops.attach_repository(dest, task.repo_dir)
+    gitops.attach_repository(dest, task.repo_dir, base)
 
 
 def task_checks(task: SweevoTask) -> SandboxChecks:

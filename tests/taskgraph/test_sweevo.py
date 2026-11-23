@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from aqours_code.taskgraph import gitops
 from aqours_code.taskgraph import sandbox as sandbox_module
 from aqours_code.taskgraph import sweevo as sweevo_module
 from aqours_code.taskgraph.cli import main
@@ -369,6 +370,95 @@ def test_stage_code_restores_test_files_and_applies_the_test_patch(tmp_path):
     assert {line.strip() for line in git(dest, "status", "--porcelain").splitlines()} == {
         "M tests/test_old.py", "?? tests/data.json", "?? tests/test_mine.py",
         "?? tests/test_new.py"}
+
+
+def _with_task_commit(task_dir: Path) -> str:
+    """Record the repository's commit as instance.json's task_commit (as prepare.py does)."""
+    instance = task_dir / "grading" / "instance.json"
+    commit = git(task_dir / "repo", "rev-parse", "HEAD")
+    data = json.loads(instance.read_text(encoding="utf-8"))
+    instance.write_text(json.dumps({**data, "task_commit": commit}), encoding="utf-8")
+    return commit
+
+
+def _clean_like_v2(task_dir: Path) -> str:
+    """A second commit without test_old, as clean_tasks.py makes a v2 task: the patch
+    changes test_old's file, and its context no longer matches HEAD."""
+    commit_files(task_dir / "repo", {"tests/test_old.py": "from pkg import old\n"},
+                 "remove tests the release rewrites")
+    return git(task_dir / "repo", "rev-parse", "HEAD")
+
+
+def test_load_task_reads_the_task_commit(tmp_path):
+    task_dir = make_task(tmp_path)
+    assert load_task(task_dir).task_commit is None
+    assert load_task(task_dir).base_ref == "HEAD"  # tasks without it: as before
+    commit = _with_task_commit(task_dir)
+    task = load_task(task_dir)
+    assert task.task_commit == commit and task.base_ref == commit
+    instance = task_dir / "grading" / "instance.json"
+    data = json.loads(instance.read_text(encoding="utf-8"))
+    instance.write_text(json.dumps({**data, "task_commit": ""}), encoding="utf-8")
+    with pytest.raises(SweevoError, match="task_commit"):
+        load_task(task_dir)
+
+
+def test_stage_code_restores_the_test_files_from_the_base_not_head(tmp_path):
+    task_dir = make_task(tmp_path)
+    base = _with_task_commit(task_dir)
+    head = _clean_like_v2(task_dir)
+    task = load_task(task_dir)
+    assert head != base and task.base_ref == base
+    final = tmp_path / "final"
+    gitops.export_commit(task.repo_dir, "HEAD", final)  # the v2 HEAD, as a worker starts
+    assert "def test_old" not in (final / "tests" / "test_old.py").read_text(encoding="utf-8")
+    dest = tmp_path / "scratch"
+    stage_code(final, dest, task)
+    old = (dest / "tests" / "test_old.py").read_text(encoding="utf-8")
+    # the base's test_old is back, and the patch applied over it
+    assert "def test_old():" in old and "def test_old_again" in old
+    # the graded copy is a repository at the base, like for a v1 task
+    assert git(dest, "rev-parse", "HEAD") == base
+    assert {line.strip() for line in git(dest, "status", "--porcelain").splitlines()} == {
+        "M tests/test_old.py", "?? tests/data.json", "?? tests/test_new.py"}
+
+
+def test_restoring_from_head_would_break_the_v2_patch(tmp_path):
+    """Why the base matters: over HEAD of a v2 task the test patch does not apply."""
+    task_dir = make_task(tmp_path)
+    _with_task_commit(task_dir)
+    _clean_like_v2(task_dir)
+    task = dataclasses.replace(load_task(task_dir), task_commit=None)  # base_ref = HEAD
+    final = tmp_path / "final"
+    gitops.export_commit(task.repo_dir, "HEAD", final)
+    with pytest.raises(gitops.GitError):
+        stage_code(final, tmp_path / "scratch", task)
+
+
+def test_stage_code_of_a_v1_task_is_unchanged_by_the_task_commit(tmp_path):
+    """In a v1 task task_commit is HEAD: the staged code is the same either way."""
+    task_dir = make_task(tmp_path)
+    final = make_run(tmp_path, task_dir, final_files={
+        "pkg/__init__.py": "def old():\n    return 1\n\n\ndef new():\n    return 2\n"}) / "final"
+    stage_code(final, tmp_path / "without", load_task(task_dir))
+    _with_task_commit(task_dir)
+    stage_code(final, tmp_path / "with", load_task(task_dir))
+
+    def files(root: Path) -> dict:
+        return {path.relative_to(root).as_posix(): path.read_bytes()
+                for path in sorted(root.rglob("*"))
+                if path.is_file() and ".git" not in path.relative_to(root).parts}
+
+    assert files(tmp_path / "without") == files(tmp_path / "with")
+    assert git(tmp_path / "without", "rev-parse", "HEAD") == git(tmp_path / "with",
+                                                                   "rev-parse", "HEAD")
+
+
+def test_a_task_commit_missing_from_the_repository_is_an_error(tmp_path):
+    task_dir = make_task(tmp_path)
+    task = dataclasses.replace(load_task(task_dir), task_commit="0" * 40)
+    with pytest.raises(SweevoError, match="is not in"):
+        stage_code(None, tmp_path / "scratch", task, commit=(task.repo_dir, "HEAD"))
 
 
 def test_stage_code_from_a_commit_with_the_gold_patch(tmp_path):

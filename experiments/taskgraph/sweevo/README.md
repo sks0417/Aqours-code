@@ -18,6 +18,7 @@ instances.txt        the nine instance ids; "pilot" marks the pilot pair, "dropp
 prepare.py           writes the task directories and builds the task images
 validate_gold.py     grades the base and the gold patch; writes the exclusion lists
 validate_interface.py   checks the interface sections (size, test imports, no body or test text)
+clean_tasks.py       writes the cleaned (v2) tasks, see "Cleaned tasks (v2)"
 instances/<id>/sandbox_skips.txt   tests left out of every method's score
 validation/<id>.json               validation counts, times and image sizes
 validation/README.md               the validation table
@@ -323,6 +324,156 @@ containers have no network and keep the image's packages, so these tests
 cannot pass for any method. Installing the release's versions into the image
 would make them pass, but would grade a method that leaves `pyproject.toml`
 alone as if it had raised them, so the instance is left out.
+
+## Cleaned tasks (v2) — 修正版题目
+
+A task gives the agent the repository before the release, with the old tests;
+the release's test changes (`grading/test.patch`) are applied only when
+grading. Two kinds of failing test then keep an agent investigating without
+end, and neither says anything about its work:
+
+1. **Old tests of behaviour the release changes.** Some tests that the test
+   patch rewrites assert exactly what the release changes, so they fail when
+   the agent gets it right.
+2. **Tests that fail on the unchanged base.** Some of the image's packages are
+   newer than the release expected, and some tests fail before any change
+   (dvc 1.1.7's `tests/unit/command/test_dag.py` does not even collect:
+   networkx imports `fractions.gcd`, gone in Python 3.9).
+
+A v2 task fixes both. The original task directories, their grading and the
+runs made with them are not touched; v2 tasks are written elsewhere:
+
+```bash
+python experiments/taskgraph/sweevo/clean_tasks.py iterative__dvc_1.1.7_1.1.8 [<id> ...] --validate
+```
+
+writes `C:\tg\sweevo-tasks-v2\<id>\`, with the files of the original task and:
+
+| Path | What |
+| --- | --- |
+| `repo/` | the original repository (its one commit, `task_commit`, stays the first commit) plus a second commit, "remove tests the release rewrites", with a fixed author and date |
+| `cleaning.json` | every test removed: its file, its name (`Class::test` for a method), whether it is parametrized, its lines in the base, why (changed or deleted) and the hunks of the test patch that touch it (index and `@@` header, with the old line numbers); test classes left empty and removed; files removed; the patch's files left alone and why; the collection check |
+| `known_failing.txt` | the tests that fail or error on the base, one pytest id per line (`known_failing.json`: the command and counts; `known_failing.log`: the output) |
+| `request_iface_v2.md` | `request_iface.md` unchanged, then the section "Tests that already fail before any change" |
+| `single_iface.json` | the single-agent graph with `request_iface_v2.md`, at the v2 `HEAD` |
+| `single.json` | the plain graph (`request.md`), only moved to the v2 `HEAD` |
+| `validation.json` | `--validate`: base and gold of v1 and v2, compared |
+
+`grading/`, `sandbox.json`, `sandbox_skips.txt`, `Dockerfile`, `request.md`
+and `request_iface.md` are copied unchanged.
+
+**Fix 1: the tests the release rewrites are removed.** The test patch is read
+hunk by hunk, as old-file line numbers, and every existing test function or
+test method (`test*`, in a module matching the repository's `python_files`,
+by default `test_*.py` and `*_test.py`, and in classes `Test*`) that it
+changes or deletes is located in the base with `ast` and removed whole, from
+its first decorator to its last line, with the blank lines before it. A test
+is changed when a removed line is inside it (decorators included, so a new
+`parametrize` value counts), when added lines go inside it, or right after it
+indented deeper than its `def`, or right before it ending with a decorator; a
+change in a test class's header changes all its tests. Lines between
+definitions, a class's other members (fixtures, helpers) and module code are
+no test, so a patch that only adds tests to a file removes nothing there. A
+test class whose every test is removed goes too; a file the patch deletes (or
+renames) is removed. Tests the patch adds do not exist yet; every other test
+of the same file is kept, byte for byte. Each changed file must still parse,
+and in the task image pytest must collect from the patch's files exactly the
+base's tests less the removed ones, or the task is not written.
+
+**Fix 2: the tests that already fail are named.** The whole test suite
+(`tests` or `dask`) runs on the base (`task_commit`, a git repository, like
+for grading) in the task image with the task's own test command, the
+grading's extra pytest options and `sandbox.json`; no model is called. Every
+test that fails or errors (a module that does not collect is listed by its
+path) goes to `known_failing.txt`, less any test fix 1 removed.
+`request_iface_v2.md` appends to `request_iface.md`:
+
+````text
+## Tests that already fail before any change
+
+The tests below already fail (or cannot be collected) in this environment before
+any change is made to the repository. The reason has nothing to do with this task:
+the environment's packages, not the code you are asked to change. You do not need
+to fix them, and do not spend time investigating the environment because of them.
+
+N tests fail:
+
+```text
+tests/...
+```
+````
+
+With more than 60, the first 60 (in alphabetical order) are listed, with the
+total and the name of the full list. The section comes from the test run
+alone; before it is written, it is checked to contain no line of the test
+patch (20 characters or more) and no name of a test the patch adds or that fix
+1 removed.
+
+**Grading is unchanged.** `sweevo-eval` puts every file of the test patch back
+to the task's base commit, `task_commit` in `grading/instance.json`, before it
+applies the patch, and makes the graded copy a repository at that commit
+(`sweevo.stage_code`, `SweevoTask.base_ref`). Over the v2 `HEAD` the patch
+would not apply: its context lines include the tests fix 1 removed. In every
+v1 task `task_commit` is the repository's only commit, its `HEAD`, so v1 runs
+are graded exactly as before (a task directory without `task_commit` still
+uses `HEAD`). The graded files of a v1 and a v2 run with the same code are the
+same.
+
+`--validate` grades, as `validate_gold.py` does but writing nothing to its
+exclusion lists or reports, four fake runs without exclusions: the base and
+the base plus the gold patch, of v1 and of v2 (the v2 "base" is its `HEAD`,
+what a v2 agent starts from). It requires every F2P test to fail on the v2
+base, every F2P test to pass with the gold patch, and every listed test's
+status to be the one of v1, and writes `validation.json`.
+
+**What v2 costs.** Fix 1 tells an agent indirectly which old tests the release
+rewrites: they are the ones missing (and the subject of the second commit,
+which `git log` shows in the agent's container, says that tests were
+removed; it names none). This is a slight leak of the grading data. The
+known-failing section leaks nothing of the patch, but it tells the agent that
+those failures are not its business. Results of v1 and v2 tasks therefore
+cannot be put side by side: compare methods within one version only.
+
+### iterative__dvc_1.1.7_1.1.8 (v2)
+
+Second commit `a76fae8` (on `d6ebb16`, the v1 commit). Removed: 10 tests
+(19 collected ids) in 4 files; no file and no class.
+
+| File | Removed | Why |
+| --- | --- | --- |
+| `tests/func/test_run_multistage.py` | `test_run_params_default` | changed (`isinstance(...)` becomes `assert isinstance(...)`) |
+| `tests/unit/dependency/test_params.py` | `test_dumpd_with_info`, `test_dumpd_without_info`, `test_read_params_unsupported_format`, `test_read_params_nested`, `test_save_info_missing_param` | changed (`"params.yaml"` becomes `DEFAULT_PARAMS_FILE`) |
+| `tests/unit/remote/test_azure.py` | `test_get_file_hash` | changed (uses the new `azure` fixture) |
+| `tests/unit/test_ignore.py` | `test_ignore_from_file_should_filter_dirs_and_files`, `test_ignore_order` | deleted |
+| `tests/unit/test_ignore.py` | `test_match_ignore_from_file` (parametrized, 10 cases) | changed (its parameter list) |
+
+Left alone: `tests/func/test_ignore.py` (the patch only adds tests after the
+last one), `tests/remotes/__init__.py`, `azure.py`, `oss.py` (fixture modules,
+no tests) and the new `tests/docker-compose.yml`. Collected from the four
+files: 62 tests on the base, 43 on v2, the 19 removed ones less.
+
+The whole suite on the base (433 s): 683 passed, 573 failed, 103 errors.
+**674** tests are in `known_failing.txt` (2 more failed but are removed tests;
+34 captured log lines that the log parser reads as statuses are not tests).
+Most fail because the image's networkx imports `fractions.gcd`, gone in
+Python 3.9 (`ImportError: cannot import name 'gcd' from 'fractions'` 504
+times in the log): dvc builds its pipeline graph with networkx, so `add`,
+`repro`, `checkout`, `run` and more fail on the unchanged base. The request
+lists the first 60; none of them is in a file of the test patch (22 of the
+674 are).
+
+`--validate`, without exclusions:
+
+| | F2P | P2P | Resolved |
+| --- | --- | --- | --- |
+| v1 base | 0/8 | 82/82 | no |
+| v1 gold | 8/8 | 82/82 | yes |
+| v2 base | 0/8 | 82/82 | no |
+| v2 gold | 8/8 | 82/82 | yes |
+
+Every listed test has the same status in v1 and v2, for the base and for
+the gold patch, and v1 matches its earlier validation
+([`validation/iterative__dvc_1.1.7_1.1.8.json`](validation/iterative__dvc_1.1.7_1.1.8.json)).
 
 ## Running the baseline
 

@@ -220,13 +220,14 @@ def make_git_view(worktree: Path, view: Path) -> str:
     return commit
 
 
-def attach_repository(directory: Path, source: Path) -> None:
-    """Make ``directory`` a repository at ``source``'s ``HEAD``, its files uncommitted.
+def attach_repository(directory: Path, source: Path, commit: str = "HEAD") -> None:
+    """Make ``directory`` a repository at ``commit`` of ``source``, its files uncommitted.
 
     The history of ``source`` is cloned into ``directory/.git`` (no remote)
-    and the index is reset to ``HEAD``; the files already in ``directory``
-    are left as they are, so they show as changes against that commit, the
-    way SWE-bench's ``/testbed`` holds a patched base.
+    and its branch and index are reset to ``commit`` (default: ``source``'s
+    ``HEAD``); the files already in ``directory`` are left as they are, so
+    they show as changes against that commit, the way SWE-bench's
+    ``/testbed`` holds a patched base.
     """
     directory = Path(directory).resolve()
     clone = directory.parent / f".{directory.name}.clone"
@@ -241,7 +242,7 @@ def attach_repository(directory: Path, source: Path) -> None:
     git(directory, "remote", "remove", "origin")
     git(directory, "config", "user.name", USER_NAME)
     git(directory, "config", "user.email", USER_EMAIL)
-    git(directory, "reset", "-q")
+    git(directory, "reset", "-q", commit)
 
 
 def apply_patch(directory: Path, patch: str) -> None:
