@@ -65,6 +65,7 @@ from aqours_code.config import (  # noqa: E402
     MAX_RECOVERY_RETRIES,
     MODEL,
     MODEL_PROVIDER,
+    configured_rate_limit,
     get_model_client,
     validate_runtime_configuration,
 )
@@ -122,8 +123,20 @@ def remaining_timeout(deadline: float | None, configured: float | None = None) -
     return min(remaining, float(configured)) if configured is not None else remaining
 
 
-def model_broker_timeouts(request_timeout: float, remaining: float) -> tuple[float, float]:
-    """Return Provider and IPC timeouts within the shared case budget."""
+def model_broker_timeouts(
+    request_timeout: float,
+    remaining: float,
+    rate_limit: tuple[int, float] | None = None,
+) -> tuple[float, float]:
+    """Return Provider and IPC timeouts within the shared case budget.
+
+    ``rate_limit`` is the Broker's ``(retries, max_delay)`` of HTTP 429
+    (default: AQOURS_CODE_RATE_LIMIT_RETRIES / _MAX_DELAY); the IPC wait
+    covers those retries too, so the container does not give up on a Broker
+    that is still waiting out a rate limit.
+    """
+    rate_limit_retries, rate_limit_max_delay = (
+        configured_rate_limit() if rate_limit is None else rate_limit)
     remaining = max(0.1, float(remaining))
     provider_timeout = min(max(0.1, float(request_timeout)), remaining)
     ipc_timeout = min(
@@ -132,6 +145,8 @@ def model_broker_timeouts(request_timeout: float, remaining: float) -> tuple[flo
             max_provider_retries=DEFAULT_PROVIDER_RETRIES,
             retry_delay=DEFAULT_PROVIDER_RETRY_DELAY,
             delivery_grace=DEFAULT_IPC_DELIVERY_GRACE,
+            rate_limit_retries=rate_limit_retries,
+            rate_limit_max_delay=rate_limit_max_delay,
         ),
         remaining,
     )
@@ -1000,6 +1015,8 @@ def _model_broker_process(payload: dict):
         max_provider_retries=DEFAULT_PROVIDER_RETRIES,
         provider_retry_delay=DEFAULT_PROVIDER_RETRY_DELAY,
         delivery_grace=DEFAULT_IPC_DELIVERY_GRACE,
+        rate_limit_retries=payload.get("rate_limit_retries"),
+        rate_limit_max_delay=payload.get("rate_limit_max_delay"),
     )
     broker.serve_forever()
 
@@ -1035,8 +1052,11 @@ def _run_docker_agent_phase(
     (ipc_root / "responses").mkdir(parents=True, exist_ok=True)
     (ipc_root / "stats").mkdir(parents=True, exist_ok=True)
     remaining = remaining_timeout(case_deadline)
+    # HTTP 429 retries of the Broker (AQOURS_CODE_RATE_LIMIT_RETRIES / _MAX_DELAY)
+    rate_limit_retries, rate_limit_max_delay = configured_rate_limit()
     provider_timeout, broker_request_timeout = model_broker_timeouts(
-        float(os.getenv("AQOURS_CODE_REQUEST_TIMEOUT", "30")), remaining)
+        float(os.getenv("AQOURS_CODE_REQUEST_TIMEOUT", "30")), remaining,
+        (rate_limit_retries, rate_limit_max_delay))
     runtime_configuration = eval_runtime_configuration(
         escalated_max_tokens=escalated_max_tokens,
         request_timeout_seconds=provider_timeout,
@@ -1092,6 +1112,8 @@ def _run_docker_agent_phase(
             "max_tokens_per_call": escalated_max_tokens,
             "case_deadline": case_deadline,
             "provider_timeout": provider_timeout,
+            "rate_limit_retries": rate_limit_retries,
+            "rate_limit_max_delay": rate_limit_max_delay,
         },),
         name=f"aqours-code-model-broker-{case_name}",
     )
@@ -1206,6 +1228,11 @@ def _run_docker_agent_phase(
         "model_broker_calls": broker_stats.get("call_count", 0),
         "model_broker_rejected_calls": broker_stats.get("rejected_count", 0),
         "model_broker_retries": broker_stats.get("retry_count", 0),
+        # of those, the retries after HTTP 429 and the seconds they waited
+        "model_broker_rate_limit_retries": broker_stats.get(
+            "rate_limit_retry_count", 0),
+        "model_broker_rate_limit_wait_s": broker_stats.get(
+            "rate_limit_wait_seconds", 0),
         "model_broker_provider_errors": broker_stats.get(
             "provider_error_count", 0),
         "model_broker_requested_tokens": broker_stats.get(

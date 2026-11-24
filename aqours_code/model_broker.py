@@ -10,8 +10,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .model_api import reasoning_tokens, served_provider
+from .provider_errors import RateLimitRetriesExhausted, parse_rate_limit
+from .provider_errors import is_rate_limit_error as _is_rate_limit_error
 from .provider_errors import is_transient_provider_error as _is_transient_provider_error
 from .provider_errors import provider_error_kind as _provider_error_kind
+from .provider_errors import rate_limit_wait as _rate_limit_wait
 
 
 PROTOCOL_VERSION = 1
@@ -47,9 +50,12 @@ class BrokerRemoteError(RuntimeError):
 
     retry_managed = True
 
-    def __init__(self, error_kind: str, message: str, request_id: str):
+    def __init__(self, error_kind: str, message: str, request_id: str,
+                 rate_limit_retries: list[dict] | None = None):
         self.error_kind = error_kind or "broker_remote_error"
         self.request_id = request_id
+        # the Broker's 429 retries of this request (recovery traces them)
+        self.rate_limit_retries = list(rate_limit_retries or [])
         super().__init__(
             f"{self.error_kind}: {message} (request_id={request_id})")
 
@@ -67,15 +73,49 @@ def broker_ipc_wait_timeout(
     max_provider_retries: int = DEFAULT_PROVIDER_RETRIES,
     retry_delay: float = DEFAULT_PROVIDER_RETRY_DELAY,
     delivery_grace: float = DEFAULT_IPC_DELIVERY_GRACE,
+    rate_limit_retries: int = 0,
+    rate_limit_max_delay: float = 0.0,
 ) -> float:
-    """Cover all Provider attempts, retry delays, and final IPC delivery."""
+    """Cover all Provider attempts, retry delays, and final IPC delivery.
+
+    Each retry after HTTP 429 adds one more attempt and a wait of at most
+    ``rate_limit_max_delay``.
+    """
     provider_timeout = max(0.1, float(provider_timeout))
     retries = max(0, int(max_provider_retries))
+    rate_limited = max(0, int(rate_limit_retries))
     return (
         provider_timeout * (retries + 1)
         + max(0.0, float(retry_delay)) * retries
+        + (provider_timeout + max(0.0, float(rate_limit_max_delay))) * rate_limited
         + max(0.0, float(delivery_grace))
     )
+
+
+_RATE_LIMIT_RECORD_LIMIT = 64
+
+
+def _rate_limit_records(value) -> list[dict]:
+    """The Broker's 429 retry records from a response, with known fields only."""
+    if not isinstance(value, list):
+        return []
+    records = []
+    for item in value[:_RATE_LIMIT_RECORD_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            retry_after_s = item.get("retry_after_s")
+            records.append({
+                "retry": int(item["retry"]),
+                "max_retries": int(item["max_retries"]),
+                "delay_s": float(item["delay_s"]),
+                "retry_after": bool(item["retry_after"]),
+                "retry_after_s": None if retry_after_s is None else float(retry_after_s),
+                "capped": bool(item.get("capped", False)),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return records
 
 
 def _validate_token(value: str, label: str) -> str:
@@ -394,6 +434,8 @@ class BrokerModelClient:
                             or payload.get("nonce") != self.nonce
                             or payload.get("request_id") != request_id):
                         raise BrokerProtocolError("broker response identity mismatch")
+                    rate_limit_retries = _rate_limit_records(
+                        payload.get("rate_limit_retries"))
                     if not payload.get("ok"):
                         error = str(payload.get("error") or "model broker failed")
                         if error.startswith("BrokerProtocolError:"):
@@ -402,8 +444,11 @@ class BrokerModelClient:
                             str(payload.get("error_kind") or "broker_remote_error"),
                             error,
                             request_id,
+                            rate_limit_retries,
                         )
-                    return _response_object(payload.get("response"))
+                    response = _response_object(payload.get("response"))
+                    response.rate_limit_retries = rate_limit_retries
+                    return response
                 if time.monotonic() >= deadline:
                     raise BrokerIpcTimeout(request_id)
                 time.sleep(min(self.poll_interval, max(0, deadline - time.monotonic())))
@@ -426,7 +471,9 @@ class ModelBroker:
                  provider_timeout: float | None = None,
                  max_provider_retries: int = DEFAULT_PROVIDER_RETRIES,
                  provider_retry_delay: float = DEFAULT_PROVIDER_RETRY_DELAY,
-                 delivery_grace: float = DEFAULT_IPC_DELIVERY_GRACE):
+                 delivery_grace: float = DEFAULT_IPC_DELIVERY_GRACE,
+                 rate_limit_retries: int | None = None,
+                 rate_limit_max_delay: float | None = None):
         self.ipc_root = Path(ipc_root).resolve()
         self.nonce = _validate_token(nonce, "nonce")
         self.model_client = model_client
@@ -456,6 +503,23 @@ class ModelBroker:
             raise ValueError("max_provider_retries cannot be negative")
         if self.provider_retry_delay < 0 or self.delivery_grace < 0:
             raise ValueError("retry delay and delivery grace cannot be negative")
+        # HTTP 429 follows its own rules (provider_errors.rate_limit_wait), the
+        # same as recovery.with_retry's; unset, they come from
+        # AQOURS_CODE_RATE_LIMIT_RETRIES and AQOURS_CODE_RATE_LIMIT_MAX_DELAY.
+        if rate_limit_retries is None or rate_limit_max_delay is None:
+            env_retries, env_max_delay, error = parse_rate_limit(os.environ)
+            if error:
+                raise ValueError(error)
+            if rate_limit_retries is None:
+                rate_limit_retries = env_retries
+            if rate_limit_max_delay is None:
+                rate_limit_max_delay = env_max_delay
+        self.rate_limit_retries = int(rate_limit_retries)
+        self.rate_limit_max_delay = float(rate_limit_max_delay)
+        if self.rate_limit_retries < 0:
+            raise ValueError("rate_limit_retries cannot be negative")
+        if self.rate_limit_max_delay <= 0:
+            raise ValueError("rate_limit_max_delay must be greater than zero")
         self.request_count = 0
         self.call_count = 0
         self.rejected_count = 0
@@ -467,7 +531,10 @@ class ModelBroker:
         self.actual_total_token_count = 0
         self.usage_response_count = 0
         self.usage_missing_response_count = 0
-        self.retry_count = 0
+        self.retry_count = 0  # every retry, after 429 too
+        self.rate_limit_retry_count = 0
+        self.rate_limit_wait_seconds = 0.0
+        self.last_rate_limit_retries: list[dict] = []  # of the current request
         self.provider_error_count = 0
         self.last_error = ""
         self.last_error_kind = ""
@@ -538,12 +605,16 @@ class ModelBroker:
                 "usage_response_count": self.usage_response_count,
                 "usage_missing_response_count": self.usage_missing_response_count,
                 "retry_count": self.retry_count,
+                "rate_limit_retry_count": self.rate_limit_retry_count,
+                "rate_limit_wait_seconds": round(self.rate_limit_wait_seconds, 3),
                 "provider_error_count": self.provider_error_count,
                 "max_calls": self.max_calls,
                 "max_tokens_per_call": self.max_tokens_per_call,
                 "provider_timeout": self.provider_timeout,
                 "max_provider_retries": self.max_provider_retries,
                 "provider_retry_delay": self.provider_retry_delay,
+                "max_rate_limit_retries": self.rate_limit_retries,
+                "rate_limit_max_delay": self.rate_limit_max_delay,
                 "delivery_grace": self.delivery_grace,
                 "last_error": self.last_error,
                 "last_error_kind": self.last_error_kind,
@@ -565,7 +636,9 @@ class ModelBroker:
         self.last_request_attempts += 1
         self._write_stats()
 
-    def _retry_block_reason(self) -> str:
+    def _retry_block_reason(self, delay: float | None = None) -> str:
+        """Why no retry may start after ``delay`` seconds (default: the
+        retry delay of the errors other than 429), or "" if one may."""
         if self._stop.is_set():
             return "broker_stopping"
         if self.call_count >= self.max_calls:
@@ -573,7 +646,7 @@ class ModelBroker:
         if self.case_deadline is not None:
             remaining = self.case_deadline - time.monotonic()
             required = (
-                self.provider_retry_delay
+                (self.provider_retry_delay if delay is None else delay)
                 + self.provider_timeout
                 + self.delivery_grace
             )
@@ -599,7 +672,8 @@ class ModelBroker:
                 os.environ["AQOURS_CODE_REQUEST_TIMEOUT"] = old_timeout
 
     def _call_provider_with_retry(self, params: dict):
-        retries_used = 0
+        retries_used = 0  # retries after errors other than 429
+        rate_limited = 0  # retries after 429, counted apart
         requested_tokens = params["max_tokens"]
         while True:
             self._reserve_provider_attempt(requested_tokens)
@@ -627,6 +701,34 @@ class ModelBroker:
                 if (self.case_deadline is not None
                         and time.monotonic() >= self.case_deadline):
                     raise _ProviderCallError("case_timeout", exc) from exc
+                if _is_rate_limit_error(exc, error_kind):
+                    # 429: the same rules as recovery.with_retry, which does
+                    # not retry what the Broker sends back (retry_managed).
+                    if rate_limited >= self.rate_limit_retries:
+                        raise _ProviderCallError(error_kind, RateLimitRetriesExhausted(
+                            exc, retries=rate_limited,
+                            max_retries=self.rate_limit_retries)) from exc
+                    wait = _rate_limit_wait(exc, rate_limited + 1, self.rate_limit_max_delay)
+                    blocked = self._retry_block_reason(wait.delay_s)
+                    if blocked:
+                        self.retry_skipped_reason = blocked
+                        raise _ProviderCallError(error_kind, RateLimitRetriesExhausted(
+                            exc, retries=rate_limited,
+                            max_retries=self.rate_limit_retries, reason=blocked)) from exc
+                    rate_limited += 1
+                    self.retry_count += 1
+                    self.rate_limit_retry_count += 1
+                    self.rate_limit_wait_seconds += wait.delay_s
+                    self.last_rate_limit_retries.append(
+                        wait.record(rate_limited, self.rate_limit_retries))
+                    self._write_stats()
+                    if self._stop.wait(wait.delay_s):
+                        self.retry_skipped_reason = "broker_stopping"
+                        raise _ProviderCallError(error_kind, RateLimitRetriesExhausted(
+                            exc, retries=rate_limited,
+                            max_retries=self.rate_limit_retries,
+                            reason="broker_stopping")) from exc
+                    continue
                 if (not _is_transient_provider_error(error_kind)
                         or retries_used >= self.max_provider_retries):
                     raise _ProviderCallError(error_kind, exc) from exc
@@ -652,6 +754,7 @@ class ModelBroker:
             except OSError:
                 pass
             return
+        self.last_rate_limit_retries = []
         try:
             expected = _protocol_path(
                 self.ipc_root, "requests", self.nonce, request_id)
@@ -707,6 +810,9 @@ class ModelBroker:
                 "error": self.last_error,
                 "error_kind": self.last_error_kind,
             }
+        if self.last_rate_limit_retries:
+            # the container's trace records them (recovery.with_retry)
+            result["rate_limit_retries"] = list(self.last_rate_limit_retries)
         response_path = _protocol_path(
             self.ipc_root, "responses", self.nonce, request_id)
         _atomic_write_json(response_path, result)

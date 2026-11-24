@@ -111,6 +111,17 @@ All public Context and Compact settings use estimated tokens. The active agent c
 
 `pyproject.toml` is the authoritative dependency declaration. `evals/docker/requirements.lock` only pins the evaluation image and is not a second application dependency list.
 
+### Rate limits (HTTP 429)
+
+A model call answered with HTTP 429 is retried with longer waits than the other transient errors, and its retries are counted apart from them (529, 5xx and timeouts keep `AQOURS_CODE_MODEL_MAX_RETRIES`, default 3). Each wait is what the response's `Retry-After` header asks (seconds or an HTTP date); without one it is 10 s, 20 s, 40 s, then 60 s, doubling with ±10% jitter. Two optional settings adjust this:
+
+```dotenv
+# AQOURS_CODE_RATE_LIMIT_RETRIES=6     # retries after 429; 0 turns them off
+# AQOURS_CODE_RATE_LIMIT_MAX_DELAY=60  # longest single wait, in seconds (also caps Retry-After)
+```
+
+The retries must be a whole number and the maximum wait a positive number of seconds; any other value stops the run with a message naming the setting, before any model call, as an invalid `AQOURS_CODE_MAX_TOKENS` does. No retry starts whose wait would pass the run's deadline. When the retries run out, the error keeps the status and the provider's last message (`HTTP 429 rate limit: gave up after 6 retries (...); provider message: ...; last error: ...`). In a Docker evaluation the host-side model Broker applies the same rules (each retry also uses one call of its call budget) and the agent container does not retry again. Every 429 retry is a `rate_limit_retry` event in `trace.jsonl` with its number (`retry`), the seconds waited (`delay_s`), whether there was a Retry-After (`retry_after`, `retry_after_s`, `capped`) and who retried (`source`: `direct` or `broker`).
+
 ## Running a Coding Task
 
 Launch `Aqours_code` from the target repository root and provide a concrete task, for example:

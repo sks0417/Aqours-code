@@ -21,6 +21,9 @@ os.environ["AQOURS_CODE_ESCALATED_MAX_TOKENS"] = ""
 os.environ["AQOURS_CODE_REASONING_EFFORT"] = ""
 # Likewise no OpenRouter provider (OpenRouter picks, as before the setting existed).
 os.environ["AQOURS_CODE_OPENROUTER_PROVIDER"] = ""
+# Likewise the default 429 retries (6, waits of at most 60 s).
+os.environ["AQOURS_CODE_RATE_LIMIT_RETRIES"] = ""
+os.environ["AQOURS_CODE_RATE_LIMIT_MAX_DELAY"] = ""
 
 
 @pytest.fixture(autouse=True)

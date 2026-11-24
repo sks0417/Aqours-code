@@ -14,6 +14,7 @@ from aqours_code.model_broker import BrokerRemoteError
 @pytest.fixture(autouse=True)
 def no_wait(monkeypatch):
     monkeypatch.setattr(recovery, "retry_delay", lambda attempt: 0.0)
+    monkeypatch.setattr(recovery, "_sleep", lambda seconds: None)
     monkeypatch.setattr(recovery, "MAX_RETRIES", 3)
     monkeypatch.setattr(recovery, "CASE_DEADLINE", None)
 
@@ -103,7 +104,8 @@ def test_a_broker_managed_transient_error_is_not_retried_again():
     assert call.count == 1
 
 
-def test_rate_limits_are_retried_as_before():
+def test_rate_limits_are_still_retried():
+    # their waits and count are tested in tests/test_rate_limit_retry.py
     call = failing(RuntimeError("Model request failed: HTTP 429: slow down"))
     assert recovery.with_retry(call, recovery.RecoveryState()) == "ok"
     assert call.count == 2

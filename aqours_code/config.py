@@ -31,6 +31,7 @@ from .model_api import (
     provider_from_env,
 )
 from .command_executor import LocalCommandExecutor
+from .provider_errors import parse_rate_limit
 
 load_dotenv(override=False)
 
@@ -154,6 +155,8 @@ def validate_runtime_configuration() -> None:
         raise RuntimeError(REASONING_EFFORT_ERROR)
     if OPENROUTER_PROVIDER_ERROR:
         raise RuntimeError(OPENROUTER_PROVIDER_ERROR)
+    if RATE_LIMIT_ERROR:
+        raise RuntimeError(RATE_LIMIT_ERROR)
 
 
 class LazyModelClient:
@@ -351,6 +354,23 @@ def model_openrouter_provider(provider: str, model: str,
     return effective_openrouter_provider(
         provider, model, BASE_URL if base_url is None else base_url,
         configured_openrouter_provider())
+
+
+# HTTP 429 (rate limit): how many retries, and the longest wait before one
+# (provider_errors.rate_limit_wait). Other errors keep MAX_RETRIES.
+RATE_LIMIT_RETRIES, RATE_LIMIT_MAX_DELAY, RATE_LIMIT_ERROR = parse_rate_limit(os.environ)
+
+
+def configured_rate_limit() -> tuple[int, float]:
+    """``(retries, max_delay)`` of HTTP 429, from AQOURS_CODE_RATE_LIMIT_RETRIES
+    and AQOURS_CODE_RATE_LIMIT_MAX_DELAY (default 6 and 60 seconds).
+
+    Raises ``RuntimeError`` when either is invalid, so no model call is made
+    with retries nobody asked for.
+    """
+    if RATE_LIMIT_ERROR:
+        raise RuntimeError(RATE_LIMIT_ERROR)
+    return RATE_LIMIT_RETRIES, RATE_LIMIT_MAX_DELAY
 
 
 MAX_RETRIES = _env_int("AQOURS_CODE_MODEL_MAX_RETRIES", 3)

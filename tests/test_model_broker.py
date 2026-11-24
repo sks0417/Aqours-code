@@ -352,9 +352,14 @@ def test_ipc_wait_window_covers_retry_backoff_and_delivery_grace():
     assert broker_ipc_wait_timeout(
         60, max_provider_retries=1, retry_delay=1, delivery_grace=5,
     ) == 126
-    assert run_eval.model_broker_timeouts(60, 600) == (60, 126)
-    assert run_eval.model_broker_timeouts(60, 100) == (60, 100)
-    assert run_eval.model_broker_timeouts(720, 1500) == (720, 1446)
+    # without 429 retries, the window is what it was
+    assert run_eval.model_broker_timeouts(60, 600, (0, 0)) == (60, 126)
+    assert run_eval.model_broker_timeouts(60, 100, (0, 0)) == (60, 100)
+    assert run_eval.model_broker_timeouts(720, 1500, (0, 0)) == (720, 1446)
+    # each 429 retry adds one attempt and one wait of at most the maximum:
+    # 126 + 6 * (60 + 60) with the defaults (6 retries, 60 s)
+    assert run_eval.model_broker_timeouts(60, 2000) == (60, 846)
+    assert run_eval.model_broker_timeouts(60, 600) == (60, 600)
 
 
 @pytest.mark.parametrize(("message", "category"), [

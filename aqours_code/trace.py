@@ -1116,6 +1116,23 @@ def record_tool_result(tool_use_id: str, tool: str, result, **metadata):
                  content=_truncate(result), **metadata)
 
 
+def record_rate_limit_retry(*, retry: int, max_retries: int, delay_s: float,
+                            retry_after: bool, retry_after_s: float | None = None,
+                            capped: bool = False, source: str = "direct"):
+    """One retry after HTTP 429 (rate limit), a ``rate_limit_retry`` event.
+
+    ``retry`` is its number (1 is the first) of at most ``max_retries``,
+    ``delay_s`` the seconds waited before it, ``retry_after`` whether the
+    response had a Retry-After (``retry_after_s``: what it asked for, and
+    ``capped``: more than AQOURS_CODE_RATE_LIMIT_MAX_DELAY allows), and
+    ``source`` who retried: ``direct`` (recovery.with_retry) or ``broker``
+    (the Docker model Broker, on the host).
+    """
+    record_event("rate_limit_retry", retry=retry, max_retries=max_retries,
+                 delay_s=delay_s, retry_after=retry_after, retry_after_s=retry_after_s,
+                 capped=capped, source=source)
+
+
 def record_error(error):
     record_event("error", error_type=type(error).__name__, message=str(error))
 
